@@ -1,3 +1,11 @@
+#include <stdint.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/syscall.h>
+static inline uint32_t GetCurrentThreadId(void) {
+    return (uint32_t)syscall(SYS_gettid);
+}
+#endif
 // [Windows port] One-frame-chain timeline (totk_timeline.h), from MacNativeGames' totk_timeline.c (MIT). Changes: the
 // host clock is runtime_now_ns (QueryPerformanceCounter), thread ids from GetCurrentThreadId; GPU spans come from the
 // Vulkan back end (a timestamp at the start and end of each command buffer, placed so that it ends when the retire thread
@@ -6,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "totk_timeline.h"
 

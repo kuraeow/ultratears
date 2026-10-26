@@ -95,3 +95,43 @@ static void guest_fault_report(void) {
 }
 extern void (*rt_fault_extra)(void);
 __attribute__((constructor)) static void install_fault_report(void) { rt_fault_extra = guest_fault_report; }
+
+// Defensive fallback for sead::Heap::alloc (0x080006a920ull) when invoked without a valid heap context
+static void hle_sead_heap_alloc_override(Cpu *c) {
+    if (c->x[1] == 0) {
+        static pthread_mutex_t s_fallback_lock = PTHREAD_MUTEX_INITIALIZER;
+        static uint8_t *s_fallback_arena = NULL;
+        static uint64_t s_fallback_used = 0;
+        const uint64_t ARENA_SIZE = 32ULL << 20;  // 32 MiB fallback arena
+        uint64_t size = c->x[0] ? c->x[0] : 0x230;
+        uint64_t alignment = c->x[2] ? c->x[2] : 16;
+        if (alignment < 8) alignment = 8;
+        pthread_mutex_lock(&s_fallback_lock);
+        if (!s_fallback_arena) {
+            s_fallback_arena = (uint8_t *)hle_alloc(ARENA_SIZE);
+        }
+        uint64_t cur = (uint64_t)(uintptr_t)(s_fallback_arena + s_fallback_used);
+        uint64_t aligned = (cur + (alignment - 1)) & ~(alignment - 1);
+        uint64_t new_used = (aligned - (uint64_t)(uintptr_t)s_fallback_arena) + size;
+        if (new_used <= ARENA_SIZE) {
+            s_fallback_used = new_used;
+            c->x[0] = aligned;
+            memset((void *)(uintptr_t)c->x[0], 0, (size_t)size);
+        } else {
+            fprintf(stderr, "[totk] WARNING: sead::Heap fallback arena exhausted (%llu bytes requested)\n",
+                    (unsigned long long)size);
+            c->x[0] = 0;
+        }
+        pthread_mutex_unlock(&s_fallback_lock);
+        fprintf(stderr, "[totk] sead::Heap::alloc with NULL heap pointer -> fallback arena alloc %#llx (size=%llu, lr=%#llx)\n",
+                (unsigned long long)c->x[0], (unsigned long long)size, (unsigned long long)c->x[30]);
+        return;
+    }
+    GuestFn orig = dispatch_lookup(0x080006a920ull);
+    if (orig) orig(c);
+    else c->x[0] = 0;
+}
+
+__attribute__((constructor)) static void install_heap_override(void) {
+    hle_override(0x080006a920ull, hle_sead_heap_alloc_override, "sead::Heap::alloc");
+}

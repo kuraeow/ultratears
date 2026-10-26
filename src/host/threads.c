@@ -54,6 +54,7 @@ typedef struct event { int signaled; int refs; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; uint64_t host_context[2]; int prio, core; uint64_t mask;
+    uint64_t parent_tls, parent_tpidr;
     uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // 建立 / 退出的时刻与当时的游戏拍（现场导出用：作业工人是不是在卡住前退的） | Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
     int started, exited, cancel;
     pthread_t pt; pthread_cond_t cv;
@@ -237,7 +238,12 @@ uint32_t (*dm_thread_tick_fn)(void);   // the current game tick, when diagnostic
 static void *thread_main(void *p) {
     thr_t *t = p;
     t_self = t;
-    Cpu *c = guest_cpu_new(t->stack_top, guest_tls_alloc());
+    uint64_t tls = guest_tls_alloc();
+    if (t->parent_tls) {
+        memcpy((void *)(uintptr_t)(tls + 0x100), (const void *)(uintptr_t)(t->parent_tls + 0x100), 0x80);
+    }
+    Cpu *c = guest_cpu_new(t->stack_top, tls);
+    c->tpidr = t->parent_tpidr;
     guest_cpu_set(c);
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     c->x[0] = t->arg;
@@ -343,6 +349,11 @@ int svc_thread(int num, uint64_t *regs) {
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
+        Cpu *p = guest_cpu();
+        if (p) {
+            t->parent_tls = p->tpidrro;
+            t->parent_tpidr = p->tpidr;
+        }
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
