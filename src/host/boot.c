@@ -8,7 +8,9 @@
 #include "host.h"
 #include "version.h"   // build/version.h (tools/build_game.py, tools/version.py)
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 static void loader_ready(Cpu *c) { (void)c; fprintf(stderr, "[totk] rtld callback: modules linked\n"); }
@@ -41,7 +43,9 @@ static void *game_main(void *unused);
 // ultratears.cfg there may name other places: lines "name=value" give the ExeFS (exefs=), the RomFS image (romfs=),
 // shaders, texture cache, saves and fonts, each as the TOTK_* variable it stands for unless that is already set (a
 // TOTK_* line sets one directly).
+#ifdef _WIN32
 static char g_exefs[4096];
+#endif
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
 #ifdef _WIN32

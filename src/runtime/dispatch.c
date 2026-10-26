@@ -29,7 +29,8 @@ static int override_count;
 
 // Host implementations registered by name (HLE_FUNC, hle.h)
 #if defined(__linux__)
-extern const HleImplEntry __start_hle_impls[], __stop_hle_impls[];
+extern const HleImplEntry __start_hle_impls[] __attribute__((weak));
+extern const HleImplEntry __stop_hle_impls[] __attribute__((weak));
 #else
 // PE/COFF: the linker sorts .hle$a < .hle$m (entries) < .hle$z by the text after '$'.
 __attribute__((section(".hle$a"), used)) static const HleImplEntry __start_hle_impls[1];
@@ -38,6 +39,9 @@ __attribute__((section(".hle$z"), used)) static const HleImplEntry __stop_hle_im
 
 static const HleImplEntry *hle_lookup_entry(const char *name) {
     const HleImplEntry *start = __start_hle_impls, *stop = __stop_hle_impls;
+#if defined(__linux__)
+    if (!start || !stop) return NULL;
+#endif
     __asm__("" : "+r"(start), "+r"(stop));  // separate objects: keep the compiler from reasoning about them
     for (const HleImplEntry *p = start; p < stop; p++)
         if (p->name && !strcmp(p->name, name)) return p;
