@@ -10,16 +10,25 @@ void runtime_core_back(int *away);
 #define NVN_BLOCKING() __attribute__((cleanup(runtime_core_back))) int totk_core_away_ = runtime_core_away()
 
 typedef struct { const char *name; void *fn; } nvn_impl;
+
+#if defined(__linux__)
+#define NVN_SECTION_IMPL "nvni"
+#define NVN_SECTION_EXTRA "nvnx"
+#else
+#define NVN_SECTION_IMPL ".nvni$m"
+#define NVN_SECTION_EXTRA ".nvnx$m"
+#endif
+
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section(".nvni$m"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(NVN_SECTION_IMPL))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // 无原型的新版接口：不做签名检查
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section(".nvni$m"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(NVN_SECTION_IMPL))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 
@@ -27,7 +36,7 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 // name table (no counting thunk). They are returned directly by nvn_lookup.
 #define NVN_EXTRA(name, ret, ...)                                                                 \
     static ret x_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section(".nvnx$m"))) static const nvn_impl ex_##name = {#name, (void *)x_##name}; \
+    __attribute__((used, section(NVN_SECTION_EXTRA))) static const nvn_impl ex_##name = {#name, (void *)x_##name}; \
     static ret x_##name(__VA_ARGS__)
 
 // [Windows port] nvn_registry.c

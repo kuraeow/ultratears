@@ -52,8 +52,11 @@ ROMFS_CONTENT = 'b2a2e966a06158e098c03e564f77fd72809bc57275f04eb0725bcde14d52205
 ENCRYPTED = ('.nsp', '.nsz', '.xci', '.xcz', '.nca', '.ncz')
 GITHUB_RELEASES = 'https://api.github.com/repos/kuraeow/ultratears/releases?per_page=20'
 KEEP = {'game', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 'dev-local'}
-OUTPUT_OWN = {'setup.bat', 'VERSION.txt', 'THIRD-PARTY-NOTICES.md', 'licenses', 'ultratears.cfg', 'UltraTears.exe',
-              'UltraTears.pdb', 'setup-files.txt'}
+IS_LINUX = sys.platform.startswith("linux")
+EXE_NAME = "UltraTears" if IS_LINUX else "UltraTears.exe"
+XLATE_NAME = "ultrs-shaders" if IS_LINUX else "ultrs-shaders.exe"
+OUTPUT_OWN = {'setup.bat', 'setup.sh', 'VERSION.txt', 'THIRD-PARTY-NOTICES.md', 'licenses', 'ultratears.cfg',
+              'UltraTears', 'UltraTears.exe', 'UltraTears.pdb', 'setup-files.txt'}
 
 
 class Fail(Exception):
@@ -110,6 +113,13 @@ def sync_source(home):
 
 
 def deps_ready(home):
+    if IS_LINUX:
+        for tool in ("clang", "clang++", "ninja"):
+            if not shutil.which(tool) and not (pathlib.Path("/usr/bin") / tool).is_file():
+                return False
+        packages = subprocess.run([sys.executable, "-c", "import lz4, capstone, unicorn"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return packages.returncode == 0
     py = home / 'deps/python/python.exe'
     programs = (py, home / 'deps/clang64/bin/clang.exe', home / 'deps/clang64/bin/clang++.exe',
                 home / 'deps/clang64/bin/lld.exe', home / 'deps/clang64/bin/ninja.exe',
@@ -161,6 +171,23 @@ def download(url, path):
 
 def install_deps(home):
     if deps_ready(home):
+        return
+    if IS_LINUX:
+        missing_tools = [tool for tool in ("clang", "clang++", "ninja")
+                         if not shutil.which(tool) and not (pathlib.Path("/usr/bin") / tool).is_file()]
+        if missing_tools:
+            raise Fail(f"missing system build tools: {', '.join(missing_tools)}. Install clang, lld, ninja via your package manager.")
+        missing_pkgs = []
+        for pkg in ("lz4", "capstone", "unicorn"):
+            try:
+                __import__(pkg)
+            except ImportError:
+                missing_pkgs.append(pkg)
+        if missing_pkgs:
+            say(f"  installing missing python packages: {', '.join(missing_pkgs)}")
+            r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", *missing_pkgs])
+            if r.returncode != 0:
+                raise Fail(f"failed to install python packages: {' '.join(missing_pkgs)}. Run: pip install {' '.join(missing_pkgs)}")
         return
     name, url = builder_asset()
     cache = ROOT / 'dev-local/downloads'
@@ -216,20 +243,25 @@ def build_from_checkout(a):
         changed, removed = sync_source(home)
         say(f'UltraTears source -> {home}: {changed} files updated, {removed} removed')
         install_deps(home)
-        local_xlate = ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-        target_xlate = home / 'deps/shaders/ultrs-shaders.exe'
-        if local_xlate.is_file() and not filecmp.cmp(local_xlate, target_xlate, shallow=False):
-            target_xlate.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(local_xlate, target_xlate)
-            say('  installed the locally built shader translator')
+        for xlate_cand in ("ultrs-shaders", "ultrs-shaders.exe"):
+            local_xlate = ROOT / f"dev-local/build/shaders/{xlate_cand}"
+            target_xlate = home / f"deps/shaders/{xlate_cand}"
+            if local_xlate.is_file() and not filecmp.cmp(local_xlate, target_xlate, shallow=False):
+                target_xlate.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_xlate, target_xlate)
+                say("  installed the locally built shader translator")
     except Fail as e:
-        say(f'\nERROR preparing the build folder: {e}')
+        say(f"\nERROR preparing the build folder: {e}")
         return 1
-    cmd = [str(home / 'deps/python/python.exe'), str(home / 'tools/setup.py'), '--in-place', '--cpus', str(a.cpus),
-           '--dump', str(choose_dump(home, a.dump))]
+    py_exec = sys.executable if IS_LINUX else str(home / "deps/python/python.exe")
+    cmd = [py_exec, str(home / "tools/setup.py"), "--in-place", "--cpus", str(a.cpus),
+           "--dump", str(choose_dump(home, a.dump))]
     if a.only:
-        cmd += ['--only', a.only]
-    return subprocess.run(cmd, cwd=home, env=dict(os.environ, PYTHONNOUSERSITE='1')).returncode
+        cmd += ["--only", a.only]
+    env = os.environ.copy()
+    if not IS_LINUX:
+        env["PYTHONNOUSERSITE"] = "1"
+    return subprocess.run(cmd, cwd=home, env=env).returncode
 
 
 def sha256(path):
@@ -279,8 +311,8 @@ def step_check(dump, state):
             raise Fail(f'the Python package {mod} is missing: python -m pip install lz4 capstone unicorn')
     toolchain.env()
     if toolchain.XLATE is None:
-        raise Fail('the shader translator ultrs-shaders.exe is missing: build it with python tools/build_xlate.py '
-                   '(needs the .NET 10 SDK) or take deps\\shaders from the builder package')
+        raise Fail(f"the shader translator {XLATE_NAME} is missing: build it with python tools/build_xlate.py "
+                   "(needs the .NET 10 SDK) or take deps/shaders from the builder package")
     if packed(state) and all(ok_module(DATA / 'exefs' / n, h) for n, h in EXEFS.items()):
         return 'Tears of the Kingdom 1.4.3, already taken in (data\\exefs, data\\romfs): the dump is no longer needed'
     if not dump.is_dir():
@@ -345,7 +377,7 @@ def step_lift(dump, state, cpus):
 def step_compile(dump, state, cpus):
     run([sys.executable, 'tools/build_game.py', '--generated', DATA / 'generated', '--target', 'ultratears', '--cpus', cpus],
         'compiling')
-    return 'UltraTears.exe'
+    return EXE_NAME
 
 
 def step_shaders(dump, state, cpus):
@@ -378,7 +410,7 @@ def step_finish(dump, state, cpus):
         shutil.copytree(fonts, DATA / 'fonts', dirs_exist_ok=True)
     lines.append('fonts=data/fonts')
     (ROOT / 'ultratears.cfg').write_text('\n'.join(lines) + '\n')
-    (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
+    (ROOT / f"build/{EXE_NAME}").unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():
         say(f'  The game reads data\\romfs and data\\exefs now: {dump} (16 GB) is no longer needed.')
         if sys.stdin.isatty() and dump.resolve() == (ROOT / 'game').resolve():
@@ -416,6 +448,11 @@ def main():
             say(f'\nERROR preparing the build tools: {e}')
             sys.exit(1)
         importlib.reload(toolchain)
+    if hasattr(os, "nice"):
+        try:
+            os.nice(10)
+        except Exception:
+            pass
     state = load_state()
     if a.dump:
         state['dump'] = str(a.dump.resolve())
@@ -437,7 +474,7 @@ def main():
             sys.exit(1)
         save_state(state)
         say(f'  {result or "ok"} ({time.time() - t0:.0f} s)')
-    say(f'\nDone in {(time.time() - t_all) / 60:.0f} min. Start the game: UltraTears.exe in {ROOT}')
+    say(f"\nDone in {(time.time() - t_all) / 60:.0f} min. Start the game: {EXE_NAME} in {ROOT}")
 
 
 if __name__ == '__main__':
