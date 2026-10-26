@@ -1,7 +1,7 @@
-"""Write build/build.ninja for the runtime + the generated game code, and run ninja (MSYS2 CLANG64 clang/ninja).
+"""Write build/build.ninja for the runtime + the generated game code, and run ninja.
 
 usage: python tools/build_game.py [--generated data/generated] [--target probe_cpu] [-j N] [--cpus N]
-The ultratears target links UltraTears.exe in the game folder itself (its debug symbols: build/UltraTears.pdb).
+The ultratears target links the game executable in the game folder itself.
 Run in the game folder (tools/setup.py does): the generated C is in data/ (derived from the game), objects and
 executables go to build/; neither is ever in git.
 """
@@ -16,7 +16,9 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import CLANG64, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
-RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c']
+LINUX = sys.platform == 'linux'
+RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c',
+           'src/runtime/platform/linux.c' if LINUX else 'src/runtime/platform/windows.c']
 TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
            'ultratears': ['src/host/boot.c', 'src/host/guest.c', 'src/host/svc.c', 'src/host/threads.c', 'src/host/ipc.c',
                     'src/host/services_lm.c', 'src/host/overrides_oe.c',
@@ -36,9 +38,12 @@ GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_e
        'src/gfx/vkb_draw.c', 'src/gfx/tex/nvn_deswizzle.c', 'src/gfx/tex/astc.c', 'src/gfx/vkb_bc7.c',
        'src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/tex/bc7enc/rgbcx.cpp', 'src/gfx/tex/bc7key.c']
 GFX_INCLUDES = '-Isrc/gfx -Isrc/gfx/nvn -Isrc/gfx/nvn/include -Isrc/gfx/compat'
-LIBS = '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -liconv' \
-       ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++'
-CFLAGS = '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64'
+LIBS = ('-Lbuild/lib -L../../build/third_party/sdl3 -lSDL3 -lopus -lvpx -lzstd -lpthread -ldl -lm -lstdc++' if LINUX else
+        '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -liconv'
+        ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++')
+CFLAGS = ('-O2 -march=x86-64-v3 -g -fno-strict-aliasing -D_FILE_OFFSET_BITS=64' if LINUX else
+          '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64')
+CFLAGS += ' -I../../third_party/sdl3/include -I../../third_party/vulkan-headers/include'
 GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 
 
@@ -52,11 +57,12 @@ def write_if_changed(path, text):   # an unchanged file keeps its time: nothing 
 
 
 def version_files(build):
-    """build/version.h (the version and commit, tools/version.py) and the exe's resources: icon and version info."""
+    """Write build/version.h and, on Windows, the executable's icon and version resources."""
     v, commit = version.current()
     n = ','.join(str(x) for x in version.numbers(v))
     write_if_changed(build / 'version.h', f'#define ULTRS_VERSION "{v}"\n#define ULTRS_COMMIT "{commit}"\n')
-    write_if_changed(build / 'ultratears.rc', f'''1 ICON "assets/icon.ico"
+    if not LINUX:
+        write_if_changed(build / 'ultratears.rc', f'''1 ICON "assets/icon.ico"
 1 VERSIONINFO
 FILEVERSION {n}
 PRODUCTVERSION {n}
@@ -115,10 +121,10 @@ def main():
         '  command = clang -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
         '  depfile = $out.d',
         '  deps = gcc',
-        'rule rc',
-        '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
+        *([] if LINUX else ['rule rc', '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out']),
         'rule link',
-        f'  command = clang -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}',
+        (f'  command = clang -g -o $out @$out.rsp {LIBS}' if LINUX else
+         f'  command = clang -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}'),
         '  rspfile = $out.rsp',
         '  rspfile_content = $in',
         '',
@@ -129,10 +135,11 @@ def main():
         lines.append(f'build {obj}: cc {src}')
         objs.append(obj)
     if a.target == 'ultratears':
-        # the port's icon (assets/icon.ico, the author's own drawing: README.md, Legal) and version in the resources
+        # Windows resources: the port's icon (assets/icon.ico) and version information.
         print(f'UltraTears {version_files(build)}', flush=True)
-        lines.append('build build/obj/ultratears_res.o: rc build/ultratears.rc | assets/icon.ico')
-        objs.append('build/obj/ultratears_res.o')
+        if not LINUX:
+            lines.append('build build/obj/ultratears_res.o: rc build/ultratears.rc | assets/icon.ico')
+            objs.append('build/obj/ultratears_res.o')
         for src in GFX:
             cxx = src.endswith('.cpp')
             obj = f'build/obj/{src.rsplit(".", 1)[0].replace("/", "_")}.o'
@@ -152,20 +159,24 @@ def main():
             game_objs.append(obj)
     if not game_objs:
         sys.exit(f'no generated C in {gen}: run tools/gen_game.py first')
-    exe = 'UltraTears.exe' if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
+    exe = (('ultratears' if LINUX else 'UltraTears.exe') if a.target == 'ultratears' else
+           f'build/{a.target}' + ('' if LINUX else '.exe'))   # the game: in the game folder
     lines.append(f'build {exe}: link {" ".join(objs + game_objs)}')
-    lines.append(f'  pdb = build/{pathlib.Path(exe).stem}.pdb')
+    if not LINUX:
+        lines.append(f'  pdb = build/{pathlib.Path(exe).stem}.pdb')
     lines.append(f'default {exe}')
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
     env = tool_env()
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
-    # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
-    # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free.
-    ninja = [str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', 'build/build.ninja', f'-j{a.j}', '-k', '0']
+    # Windows keeps the user's CPUs free with process affinity and lower priority; Linux uses ninja's -j limit.
+    ninja = (['ninja'] if LINUX else [str(CLANG64 / 'ninja.exe')]) + [
+        '-C', str(ROOT), '-f', 'build/build.ninja', f'-j{a.j}', '-k', '0']
     sys.exit(run_limited(ninja, env, (1 << a.cpus) - 1))
 
 
 def run_limited(cmd, env, mask):
+    if LINUX:
+        return subprocess.run(cmd, env=env).returncode
     import ctypes
     CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY_CLASS = 0x4, 0x4000
     p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS)

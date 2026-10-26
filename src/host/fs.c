@@ -18,7 +18,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 #include "host.h"
@@ -181,7 +183,11 @@ static uint64_t lower(const char *p) {
 }
 static uint64_t file_index(const char *p) {
     uint64_t i = lower(p);
-    return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
+    if (i < file_count && !strcmp(p, entry_name(entry(i)))) return i;
+    for (uint64_t j = 0; j < file_count; j++) {
+        if (!strcasecmp(p, entry_name(entry(j)))) return j;
+    }
+    return UINT64_MAX;
 }
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
@@ -194,15 +200,19 @@ static const char *rom_path(const char *path) {
     if (!n || !path || strncmp(path, mount_name, n) || path[n] != ':' || path[n + 1] != '/') return NULL;
     path += n + 2;
     while (*path == '/') ++path;
-    if (!*path || strchr(path, '\\')) return NULL;
-    for (const char *part = path; *part;) {
+    if (!*path) return NULL;
+    static __thread char norm[4096];
+    size_t ni = 0;
+    for (; path[ni] && ni < sizeof(norm) - 1; ni++) norm[ni] = path[ni] == '\\' ? '/' : path[ni];
+    norm[ni] = 0;
+    for (const char *part = norm; *part;) {
         const char *end = strchr(part, '/');
         size_t size = end ? (size_t)(end - part) : strlen(part);
         if (!size || (size == 1 && part[0] == '.') || (size == 2 && part[0] == '.' && part[1] == '.')) return NULL;
         if (!end) break;
         part = end + 1;
     }
-    return path;
+    return norm;
 }
 static int fs_log_on = -1;
 static uint64_t fs_log_t0;

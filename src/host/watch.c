@@ -1,3 +1,4 @@
+#ifdef _WIN32
 // Memory write watch for development: which code writes a range of game memory.
 //   TOTK_WATCH=<address>:<bytes>[@<present>]
 // From that present on (default 1) the range's pages are guard pages. Every write into the range is recorded with the
@@ -203,3 +204,10 @@ void runtime_watch_tick(uint64_t present) {
         report();
     }
 }
+#else
+#include "host.h"
+
+void runtime_watch_tick(uint64_t present) {
+    (void)present;
+}
+#endif

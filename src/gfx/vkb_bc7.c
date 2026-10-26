@@ -11,12 +11,20 @@
 // BC1: the interface's 12x12 ASTC maps when opaque (tools/bc7build: a texture is BC1 only if none of its texels is
 // transparent; half the bytes of BC7, and 12x12 ASTC holds less detail than BC1 keeps). Nothing from the game is
 // in the repository or a build: the cache is made on the player's machine from the player's copy (README.md, Legal).
-#include <direct.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define _mkdir(path) mkdir(path, 0777)
+#define _fseeki64(file, offset, origin) fseeko(file, offset, origin)
+#define _ftelli64(file) ftello(file)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -147,7 +155,9 @@ static int quality(void) {   // TOTK_BC7_QUALITY=0..4 (bc7enc's uber level; back
 static void *encoder(void *unused) {
     (void)unused;
     pthread_setname_np("totk-bc7");
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);   // the game's and the recording threads come first
+#endif
     for (;;) {
         pthread_mutex_lock(&g_jmu);
         while (!g_jobs) pthread_cond_wait(&g_jcv, &g_jmu);
