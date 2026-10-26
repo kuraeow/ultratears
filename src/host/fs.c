@@ -18,7 +18,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 #include "host.h"
@@ -39,6 +41,7 @@ enum { M_FREE, M_SAVE, M_TEMP, M_CACHE };
 enum { OPEN_READ = 1, OPEN_WRITE = 2, OPEN_APPEND = 4 };
 #define ROM_BASE 0x100000000ULL
 #define NROM 65536
+#define ROM_FALLBACK_HANDLE UINT64_MAX
 #define FILE_BASE 0x200000000ULL
 #define DIR_BASE 0x300000000ULL
 #define NFILES 1024
@@ -115,7 +118,17 @@ static int walked_cmp(const void *a, const void *b) { return strcmp(((const Walk
 static void index_folder(const char *dir) {
     uint64_t t0 = runtime_now_ns();
     walk(dir, "");
-    need(nwalked > 0, "RomFS folder is empty");
+    if (nwalked == 0) {
+        fprintf(stderr, "[totk] WARNING: RomFS folder '%s' is empty or not found; continuing with dummy index\n", dir);
+        file_count = 0;
+        strings_offset = 24;
+        index_bytes = malloc(24);
+        need(index_bytes != NULL, "RomFS folder index memory");
+        memcpy(index_bytes, "TOTKRFS1", 8);
+        memcpy(index_bytes + 8, &file_count, 8);
+        memcpy(index_bytes + 16, &strings_offset, 8);
+        return;
+    }
     qsort(walked, nwalked, sizeof *walked, walked_cmp);
     size_t names = 0;
     for (size_t i = 0; i < nwalked; i++) names += strlen(walked[i].path) + 1;
@@ -143,7 +156,8 @@ static void index_folder(const char *dir) {
 
 void runtime_fs_init(void) {
     if (image_fd >= 0 || rom_folder) return;
-    const char *dir = getenv("TOTK_ROMFS");
+    const char *dir = getenv("TOTK_ROMFS_DIR");
+    if (!dir) dir = getenv("TOTK_ROMFS");
     if (!dir) dir = "data/romfs";
     char path[4096];
     snprintf(path, sizeof path, "%s/romfs.bin", dir);
@@ -221,12 +235,40 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     const char *p = rom_path(path);
     if (!p) return R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
-    if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
     int fd = -1;
+    if (i == UINT64_MAX) {
+        fprintf(stderr, "[totk-fs] RomFS: '%s' not indexed, providing safe fallback handle\n", p);
+        pthread_mutex_lock(&rom_lock);
+        for (uint64_t h = 1; h < NROM; h++) {
+            if (!rom_handles[h]) {
+                rom_handles[h] = ROM_FALLBACK_HANDLE;
+                rom_fds[h] = -1;
+                *out = ROM_BASE + h;
+                pthread_mutex_unlock(&rom_lock);
+                return 0;
+            }
+        }
+        pthread_mutex_unlock(&rom_lock);
+        return R_PATH_NOT_FOUND;
+    }
     if (rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, p);
-        if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) return R_PATH_NOT_FOUND;
+        if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) {
+            fprintf(stderr, "[totk-fs] RomFS: '%s' failed to open, providing safe fallback handle\n", full);
+            pthread_mutex_lock(&rom_lock);
+            for (uint64_t h = 1; h < NROM; h++) {
+                if (!rom_handles[h]) {
+                    rom_handles[h] = ROM_FALLBACK_HANDLE;
+                    rom_fds[h] = -1;
+                    *out = ROM_BASE + h;
+                    pthread_mutex_unlock(&rom_lock);
+                    return 0;
+                }
+            }
+            pthread_mutex_unlock(&rom_lock);
+            return R_PATH_NOT_FOUND;
+        }
     }
     pthread_mutex_lock(&rom_lock);
     for (uint64_t h = 1; h < NROM; h++)
@@ -238,6 +280,14 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     if (!out || offset < 0 || (!buffer && size)) return R_ROM_INVALID;
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
+    if (i == ROM_FALLBACK_HANDLE) {
+        if (buffer && size) {
+            guest_prepare_write(buffer, size);
+            memset(buffer, 0, (size_t)size);
+        }
+        *out = size;
+        return 0;
+    }
     Entry e = entry(i - 1);
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
@@ -253,14 +303,25 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
+    if (i == ROM_FALLBACK_HANDLE) {
+        *out = 0;
+        return 0;
+    }
     *out = (int64_t)entry(i - 1).size;
     return 0;
 }
 static void romfs_close(uint64_t h) {
     pthread_mutex_lock(&rom_lock);
     need(rom_handles[h - ROM_BASE] != 0, "close of a closed RomFS handle");
+    if (rom_handles[h - ROM_BASE] == ROM_FALLBACK_HANDLE) {
+        rom_handles[h - ROM_BASE] = 0;
+        rom_fds[h - ROM_BASE] = -1;
+        pthread_mutex_unlock(&rom_lock);
+        return;
+    }
     rom_handles[h - ROM_BASE] = 0;
-    if (rom_folder) close(rom_fds[h - ROM_BASE]);
+    if (rom_folder && rom_fds[h - ROM_BASE] >= 0) close(rom_fds[h - ROM_BASE]);
+    rom_fds[h - ROM_BASE] = -1;
     pthread_mutex_unlock(&rom_lock);
 }
 static unsigned romfs_entry_type(int *out, const char *path) {

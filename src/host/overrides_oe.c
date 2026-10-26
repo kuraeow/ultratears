@@ -5,7 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
+#else
+#ifndef LOCALE_NAME_MAX_LENGTH
+#define LOCALE_NAME_MAX_LENGTH 85
+#endif
 #endif
 
 #include "host.h"

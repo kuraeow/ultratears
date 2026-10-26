@@ -7,7 +7,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define _mkdir(path) mkdir(path, 0777)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
