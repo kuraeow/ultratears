@@ -172,7 +172,11 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     unsigned w = (unsigned)what;
     // 0x5F 分离采样器绑定数、0x60/0x61 在 SMO 实测表里没有：0x5F 按采样器池上限给 4096 未核，0x60/0x61 报红给 0
     // 0x5F separate sampler binding count and 0x60/0x61 are not in the table measured on SMO: 0x5F is given 4096 per the sampler pool limit, unverified; 0x60/0x61 report a failure and return 0
-    if (w >= sizeof g_devinfo / sizeof *g_devinfo) { die("unsupported NVN device property %#x", w); }
+    if (w >= sizeof g_devinfo / sizeof *g_devinfo) {
+        LOG("unsupported NVN device property %#x (returning 0)", w);
+        *out = 0;
+        return;
+    }
     *out = g_devinfo[w];
     OLOG("DeviceGetInteger %#x -> %d", w, *out);
 }
