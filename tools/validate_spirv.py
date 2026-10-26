@@ -19,10 +19,14 @@ def main():
 
     def worker(chunk):
         for f in chunk:
-            p = subprocess.Popen([SPIRV_VAL, '--target-env', 'vulkan1.3', '--scalar-block-layout', str(f)], stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, creationflags=0x4 | 0x4000)
-            ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
-            ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+            if sys.platform == "win32":
+                p = subprocess.Popen([SPIRV_VAL, "--target-env", "vulkan1.3", "--scalar-block-layout", str(f)], stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, creationflags=0x4 | 0x4000)
+                ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
+                ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+            else:
+                p = subprocess.Popen([SPIRV_VAL, "--target-env", "vulkan1.3", "--scalar-block-layout", str(f)], stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True)
             out, _ = p.communicate()
             first = next((l for l in out.splitlines() if l.strip()), '')
             with lock:

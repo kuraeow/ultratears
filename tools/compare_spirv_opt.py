@@ -39,10 +39,14 @@ def main():
             for name in ('ryujinx', 'eden'):
                 src = a.dir / name / f'{key}.spv'
                 dst = tmp / f'{name}-{key}.spv'
-                p = subprocess.Popen([OPT, '-O', '--target-env=vulkan1.3', '--scalar-block-layout', str(src), '-o', str(dst)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x4 | 0x4000)
-                ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
-                ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+                if sys.platform == "win32":
+                    p = subprocess.Popen([OPT, "-O", "--target-env=vulkan1.3", "--scalar-block-layout", str(src), "-o", str(dst)],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x4 | 0x4000)
+                    ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
+                    ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+                else:
+                    p = subprocess.Popen([OPT, "-O", "--target-env=vulkan1.3", "--scalar-block-layout", str(src), "-o", str(dst)],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if p.wait() or not dst.exists():
                     with lock: failed[name] += 1
                     continue

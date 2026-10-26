@@ -25,19 +25,30 @@ def main():
     out = ROOT / 'dev-local/build/shaders'   # a development tool's build: no game data, not in git
     env = dict(os.environ, NUGET_PACKAGES=str(ROOT / 'dev-local/nuget'), DOTNET_CLI_HOME=str(ROOT / 'dev-local/dotnet-home'),
                DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1')
-    proj = ROOT / 'third_party/shader_translator/ultrs-shaders.csproj'
-    rc = subprocess.run([a.dotnet, 'publish', str(proj), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true',
-                         '-p:PublishSingleFile=true', '-p:InvariantGlobalization=true',
-                         '-p:IncludeNativeLibrariesForSelfExtract=true',
-                         f'-p:RyuSrc={ROOT / "third_party/maxwell_shader"}',
-                         '-o', str(out), '-nologo', '-v:q', '-maxcpucount:4'], env=env).returncode
+    proj = ROOT / "third_party/shader_translator/ultrs-shaders.csproj"
+    if sys.platform.startswith("linux"):
+        rid = "linux-x64"
+    elif sys.platform == "darwin":
+        rid = "osx-arm64" if "arm" in os.uname().machine else "osx-x64"
+    else:
+        rid = "win-x64"
+    rc = subprocess.run([a.dotnet, "publish", str(proj), "-c", "Release", "-r", rid, "--self-contained", "true",
+                         "-p:PublishSingleFile=true", "-p:InvariantGlobalization=true",
+                         "-p:IncludeNativeLibrariesForSelfExtract=true",
+                         f"-p:RyuSrc={ROOT / 'third_party/maxwell_shader'}",
+                         "-o", str(out), "-nologo", "-v:q", "-maxcpucount:4"], env=env).returncode
     if rc:
         sys.exit(rc)
-    exe = out / 'ultrs-shaders.exe'
+    exe_name = "ultrs-shaders" if not rid.startswith("win") else "ultrs-shaders.exe"
+    exe = out / exe_name
     for f in out.iterdir():   # one program; the debug symbols are not needed
-        if f.suffix == '.pdb':
+        if f.suffix == ".pdb":
             f.unlink()
-    print(f'built {exe} ({exe.stat().st_size / 1e6:.0f} MB)')
+    if exe.is_file():
+        exe.chmod(0o755)
+        print(f"built {exe} ({exe.stat().st_size / 1e6:.0f} MB)")
+    else:
+        print(f"built in {out}")
 
 
 if __name__ == '__main__':
