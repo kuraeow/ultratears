@@ -5,6 +5,23 @@
 #include "../host/hle.h"
 #include "nvn_impl.h"
 
+#if defined(__linux__)
+extern const nvn_impl __start_nvni[] __attribute__((weak));
+extern const nvn_impl __stop_nvni[] __attribute__((weak));
+extern const nvn_impl __start_nvnx[] __attribute__((weak));
+extern const nvn_impl __stop_nvnx[] __attribute__((weak));
+
+const nvn_impl *nvn_registry_impls(unsigned *n) {
+    if (!__start_nvni || !__stop_nvni) { *n = 0; return NULL; }
+    *n = (unsigned)(__stop_nvni - __start_nvni);
+    return __start_nvni;
+}
+const nvn_impl *nvn_registry_extras(unsigned *n) {
+    if (!__start_nvnx || !__stop_nvnx) { *n = 0; return NULL; }
+    *n = (unsigned)(__stop_nvnx - __start_nvnx);
+    return __start_nvnx;
+}
+#else
 // The linker sorts .nvni$a < .nvni$m (NVN / NVN_NOPROTO entries) < .nvni$z by the text after '$'; likewise .nvnx.
 __attribute__((section(".nvni$a"), used)) static const nvn_impl impls_start[1];
 __attribute__((section(".nvni$z"), used)) static const nvn_impl impls_stop[1];
@@ -20,6 +37,7 @@ static const nvn_impl *range(const nvn_impl *a, const nvn_impl *b, unsigned *n) 
 }
 const nvn_impl *nvn_registry_impls(unsigned *n) { return range(impls_start, impls_stop, n); }
 const nvn_impl *nvn_registry_extras(unsigned *n) { return range(extras_start, extras_stop, n); }
+#endif
 
 // The native implementation of an NVN name (the thunks call it).
 void *nvn_impl_fn(const char *name, int extra) {

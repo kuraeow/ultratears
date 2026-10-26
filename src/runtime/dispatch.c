@@ -29,7 +29,8 @@ static int override_count;
 
 // Host implementations registered by name (HLE_FUNC, hle.h)
 #if defined(__linux__)
-extern const HleImplEntry __start_hle_impls[], __stop_hle_impls[];
+extern const HleImplEntry __start_hle_impls[] __attribute__((weak));
+extern const HleImplEntry __stop_hle_impls[] __attribute__((weak));
 #else
 // PE/COFF: the linker sorts .hle$a < .hle$m (entries) < .hle$z by the text after '$'.
 __attribute__((section(".hle$a"), used)) static const HleImplEntry __start_hle_impls[1];
@@ -38,6 +39,9 @@ __attribute__((section(".hle$z"), used)) static const HleImplEntry __stop_hle_im
 
 static const HleImplEntry *hle_lookup_entry(const char *name) {
     const HleImplEntry *start = __start_hle_impls, *stop = __stop_hle_impls;
+#if defined(__linux__)
+    if (!start || !stop) return NULL;
+#endif
     __asm__("" : "+r"(start), "+r"(stop));  // separate objects: keep the compiler from reasoning about them
     for (const HleImplEntry *p = start; p < stop; p++)
         if (p->name && !strcmp(p->name, name)) return p;
@@ -110,12 +114,64 @@ void *hle_alloc(uint64_t size) {
     return (void *)a;
 }
 
+static inline bool is_valid_guest_range(uint64_t addr, uint64_t size) {
+    if (!addr || !size) return true;
+    if (size > (2ULL << 30)) return false;  // > 2 GiB is invalid/overflow
+    if (addr < 0x10000ULL) return false;    // Near-null / unmapped lower 64 KiB
+    if (addr + size < addr) return false;   // Arithmetic overflow
+    return true;
+}
+
+static void safe_memcpy_impl(Cpu *c) {
+    uint64_t dst = c->x[0];
+    uint64_t src = c->x[1];
+    uint64_t size = c->x[2];
+    if (size == 0) return;
+    if (!is_valid_guest_range(dst, size) || !is_valid_guest_range(src, size)) {
+        static int warned = 0;
+        if (warned < 10) {
+            fprintf(stderr, "[totk] WARNING: safe_memcpy blocked invalid memory op: dst=%#llx src=%#llx size=%#llx (lr=%#llx)\n",
+                    (unsigned long long)dst, (unsigned long long)src, (unsigned long long)size, (unsigned long long)c->x[30]);
+            warned++;
+        }
+        return;
+    }
+    memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)size);
+}
+
+static void safe_memset_impl(Cpu *c) {
+    uint64_t dst = c->x[0];
+    int val = (int)(c->x[1] & 0xFF);
+    uint64_t size = c->x[2];
+    if (size == 0) return;
+    if (!is_valid_guest_range(dst, size)) {
+        static int warned = 0;
+        if (warned < 10) {
+            fprintf(stderr, "[totk] WARNING: safe_memset blocked invalid memory op: dst=%#llx val=%d size=%#llx (lr=%#llx)\n",
+                    (unsigned long long)dst, val, (unsigned long long)size, (unsigned long long)c->x[30]);
+            warned++;
+        }
+        return;
+    }
+    memset((void *)(uintptr_t)dst, val, (size_t)size);
+}
+
+HLE_FUNC("memcpy", hle_memcpy) { safe_memcpy_impl(c); }
+HLE_FUNC("memmove", hle_memmove) { safe_memcpy_impl(c); }
+HLE_FUNC("__memmove_fast", hle_memmove_fast) { safe_memcpy_impl(c); }
+HLE_FUNC("__memmove_device", hle_memmove_device) { safe_memcpy_impl(c); }
+HLE_FUNC("memset", hle_memset) { safe_memset_impl(c); }
+
 void dispatch_init(void) {
     const uint64_t *addrs[] = {main_fn_addrs, subsdk0_fn_addrs, sdk_fn_addrs};
     const GuestFn *fns[] = {main_fn_ptrs, subsdk0_fn_ptrs, sdk_fn_ptrs};
     uint64_t counts[] = {main_fn_count, subsdk0_fn_count, sdk_fn_count};
     for (int t = 0; t < MAX_MODULES; t++)
         tables[t] = (FnTable){addrs[t], fns[t], counts[t], addrs[t][0], addrs[t][counts[t] - 1]};
+
+    // Override guest memcpy PLT / SDK runtime entry points
+    hle_override(0x710c5b23c0ull, safe_memcpy_impl, "memcpy_sdk");
+    hle_override(0x7106bb7bd0ull, safe_memcpy_impl, "memcpy_plt");
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
