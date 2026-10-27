@@ -24,6 +24,10 @@ def drs_off(gen, addr):
             'if (!totk_drs_enabled() || ((c->x[8] >> 0) & 1) == 0) { goto L_800584c3c; } }')
 
 
+from camera_patches_v143 import CAMERA_PATCHES_V143
+
+
 PATCHES = {
     0x8005843e0: drs_off,
+    **CAMERA_PATCHES_V143,
 }

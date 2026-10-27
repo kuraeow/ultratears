@@ -49,11 +49,16 @@ uint32_t runtime_thread_current_handle(void);
 int runtime_module_query(uint64_t address, uint64_t *base, uint64_t *size, unsigned *state, unsigned *permission,
                          unsigned *attribute);
 
-// ---- input (overrides_input.c), fed by the window (window_sdl.c)
+// ---- input (overrides_input.c, mouse_camera.c), fed by the window (window_sdl.c)
+#include "mouse_camera.h"
 typedef struct { uint64_t buttons; int32_t lx, ly, rx, ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_set(const RuntimeGamepadState *s);
 void runtime_input_key(unsigned code, int down);   // Mac virtual key codes (MacNativeGames' key layout)
 void runtime_input_clear(void);
+void runtime_input_mouse_config(int enabled, float sensitivity, int invert_y);
+void runtime_input_mouse_motion(float dx, float dy);
+void runtime_input_mouse_clear(void);
+void runtime_input_mouse_frame(uint64_t now_ns);
 
 // ---- window (window_sdl.c): SDL3 on the main thread
 int window_init(void);              // 1 = window up (presentation may still be missing: logged)

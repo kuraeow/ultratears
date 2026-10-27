@@ -1,0 +1,29 @@
+/* Shared by the native input layer and input_config.py. SDL physical scancodes;
+ * 512/513/514 = left/right/middle mouse; 0 = unbound. Last column is the existing
+ * Mac-virtual-key input ABI. Left-hand defaults: Shift runs, Space jumps.
+ * Actions describe the game's default controls; in-game swaps/context still apply.
+ */
+INPUT_BINDING(MOVE_UP, "Movement", "Left stick up", "Move forward / navigate up", 26, 0, 13)
+INPUT_BINDING(MOVE_DOWN, "Movement", "Left stick down", "Move backward / navigate down", 22, 0, 1)
+INPUT_BINDING(MOVE_LEFT, "Movement", "Left stick left", "Move left / navigate left", 4, 0, 0)
+INPUT_BINDING(MOVE_RIGHT, "Movement", "Left stick right", "Move right / navigate right", 7, 0, 2)
+INPUT_BINDING(LOOK_UP, "Camera", "Right stick up", "Look up / move scope or selection up", 82, 0, 126)
+INPUT_BINDING(LOOK_DOWN, "Camera", "Right stick down", "Look down / move scope or selection down", 81, 0, 125)
+INPUT_BINDING(LOOK_LEFT, "Camera", "Right stick left", "Look left / move scope or selection left", 80, 0, 123)
+INPUT_BINDING(LOOK_RIGHT, "Camera", "Right stick right", "Look right / move scope or selection right", 79, 0, 124)
+INPUT_BINDING(A, "Actions", "A", "Interact, pick up, talk / confirm", 8, 0, 38)
+INPUT_BINDING(B, "Actions", "B", "Sprint (hold), put away / cancel", 225, 41, 40)
+INPUT_BINDING(X, "Actions", "X", "Jump / paraglider while airborne", 44, 0, 34)
+INPUT_BINDING(Y, "Actions", "Y", "Melee attack / charged attack (hold)", 512, 9, 32)
+INPUT_BINDING(L, "Actions", "L", "Use selected ability / ability wheel (hold)", 6, 0, 12)
+INPUT_BINDING(R, "Actions", "R", "Aim a thrown weapon / throw on release", 23, 0, 14)
+INPUT_BINDING(ZL, "Actions", "ZL", "Focus or lock on / raise shield (hold)", 514, 20, 58)
+INPUT_BINDING(ZR, "Actions", "ZR", "Draw bow (hold) / fire on release", 513, 21, 56)
+INPUT_BINDING(PLUS, "Menus", "+", "Open pouch / inventory and pause menus", 43, 0, 36)
+INPUT_BINDING(MINUS, "Menus", "-", "Open Purah Pad / map and adventure log", 53, 16, 48)
+INPUT_BINDING(STICK_L, "Actions", "Left stick press", "Crouch / stand up", 224, 0, 6)
+INPUT_BINDING(STICK_R, "Actions", "Right stick press", "Open / close the scope (tap)", 226, 0, 8)
+INPUT_BINDING(DPAD_UP, "Quick menus", "D-pad up", "Materials quick menu (hold)", 25, 0, 17)
+INPUT_BINDING(DPAD_DOWN, "Quick menus", "D-pad down", "Whistle for your horse", 10, 0, 5)
+INPUT_BINDING(DPAD_LEFT, "Quick menus", "D-pad left", "Shield quick menu (hold)", 29, 0, 3)
+INPUT_BINDING(DPAD_RIGHT, "Quick menus", "D-pad right", "Weapon / bow quick menu (hold)", 27, 0, 4)

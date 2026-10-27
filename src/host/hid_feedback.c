@@ -118,9 +118,16 @@ static uint32_t six_states(int *out, SixAxisState *s, int max, const uint32_t *h
         *out = 1; return 0;
     }
     for (int i = 0; i < n; i++) {
-        SixAxisState *d = &s[i]; *d = (SixAxisState){.delta_ns = (int64_t)m[i].delta_ns, .sampling = (int64_t)m[i].sampling, .attributes = SIX_AXIS_CONNECTED};
-        memcpy(d->acc, m[i].acc, sizeof d->acc); memcpy(d->gyro, m[i].gyro, sizeof d->gyro);
-        memcpy(d->angle, m[i].angle, sizeof d->angle); memcpy(d->dir, m[i].dir, sizeof d->dir);
+        memcpy(d->acc, m[i].acc, sizeof d->acc);
+        memcpy(d->dir, m[i].dir, sizeof d->dir);
+        if (mouse_camera_should_suppress_gyro()) {
+            /* Keep controller sensor fusion streaming live, but prevent gyro from rotating camera/aim while mouse owns look */
+            memset(d->gyro, 0, sizeof d->gyro);
+            memset(d->angle, 0, sizeof d->angle);
+        } else {
+            memcpy(d->gyro, m[i].gyro, sizeof d->gyro);
+            memcpy(d->angle, m[i].angle, sizeof d->angle);
+        }
     }
     *out = n; return 0;
 }

@@ -1,8 +1,8 @@
 /* nn::hid: one full-key controller (docked) or the handheld controller, fed by the keyboard and game controllers.
  * Ported from MacNativeGames games/totk/runtime/input.c @b75be8c (MIT); state ABI follows libnx HID. Changes: key codes
- * stay MacNativeGames' (Mac virtual key codes) and the window layer translates its own keys into them; the game
- * controller source is runtime_gamepad_read (none until the window / SDL3 layer of milestone 3.2); the diagnostic input
- * script / file commands are not ported. */
+ * retain the Mac virtual-key ABI; keyboard_input.c translates the saved SDL physical bindings. Relative mouse
+ * motion produces one right-stick sample per game frame. The SDL gamepad state is combined with keyboard/mouse. */
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -23,6 +23,44 @@ static uint64_t pending;
 static uint32_t styles = 1;
 static bool enabled, allowed = true;
 static int64_t sample;
+static int mouse_enabled, mouse_invert_y;
+static float mouse_sensitivity = 1;
+static double mouse_dx, mouse_dy;
+static int32_t mouse_rx, mouse_ry;
+static uint64_t mouse_frame_ns;
+
+void runtime_input_mouse_config(int on, float sensitivity, int invert_y) {
+    pthread_mutex_lock(&input_lock);
+    mouse_enabled = on; mouse_sensitivity = sensitivity; mouse_invert_y = invert_y;
+    mouse_dx = mouse_dy = 0; mouse_rx = mouse_ry = 0; mouse_frame_ns = 0;
+    pthread_mutex_unlock(&input_lock);
+}
+void runtime_input_mouse_motion(float dx, float dy) {
+    pthread_mutex_lock(&input_lock);
+    if (mouse_enabled) { mouse_dx += dx; mouse_dy += dy; }
+    pthread_mutex_unlock(&input_lock);
+}
+void runtime_input_mouse_clear(void) {
+    pthread_mutex_lock(&input_lock);
+    mouse_dx = mouse_dy = 0; mouse_rx = mouse_ry = 0; mouse_frame_ns = 0;
+    pthread_mutex_unlock(&input_lock);
+}
+/* Convert pixels per second to a compatibility right-stick vector once per game frame
+ * using radial vector clamping (preserving 2D direction without independent axis clipping). */
+void runtime_input_mouse_frame(uint64_t now_ns) {
+    pthread_mutex_lock(&input_lock);
+    uint64_t dt = now_ns - mouse_frame_ns;
+    mouse_rx = mouse_ry = 0;
+    if (mouse_enabled && mouse_frame_ns && dt >= 1000000 && dt <= 250000000) {
+        double scale = 32767.0 * mouse_sensitivity / (1000.0 * (dt * 1e-9));
+        double vx = mouse_dx * scale;
+        double vy = mouse_dy * scale * (mouse_invert_y ? 1.0 : -1.0);
+        mouse_camera_clamp_stick_vector(vx, vy, &mouse_rx, &mouse_ry);
+    }
+    mouse_frame_ns = now_ns;
+    mouse_dx = mouse_dy = 0;
+    pthread_mutex_unlock(&input_lock);
+}
 
 /* Mac virtual key codes -> Switch buttons (MacNativeGames' layout: J=A, K/Space=B, I=X, U=Y, Z/C=L/R ...). */
 static uint64_t button(unsigned code) {
@@ -50,13 +88,16 @@ void runtime_input_clear(void) {
     pthread_mutex_lock(&input_lock);
     memset(keys, 0, sizeof keys);
     pending = 0;
+    mouse_dx = mouse_dy = 0; mouse_rx = mouse_ry = 0; mouse_frame_ns = 0;
     memset(&g_pad, 0, sizeof g_pad);
     pthread_mutex_unlock(&input_lock);
 }
 
 /* TOTK_INPUT_SCRIPT=<frame>:<key>[*<frames held>],... (development: drive the game without a person, e.g.
    "520:J,700:J*30,900:W*120"). Frames are the graphics frontend's frames; keys are named as on the keyboard
-   (A-Z, RETURN, SPACE, TAB, ESCAPE, UP, DOWN, LEFT, RIGHT, LSHIFT, LALT) and go through the same layout as typing. */
+   (A-Z, RETURN, SPACE, TAB, ESCAPE, UP, DOWN, LEFT, RIGHT, LSHIFT, LALT). These diagnostic commands retain the
+   original layout independently of the user's physical-key remapping. This callback also advances the mouse sample
+   during normal gameplay, even when no input script is configured. */
 static int script_code(const char *k, size_t n) {
     static const struct { const char *name; int code; } named[] = {
         {"RETURN", 36}, {"SPACE", 49}, {"TAB", 48}, {"ESCAPE", 53}, {"UP", 126}, {"DOWN", 125}, {"LEFT", 123},
@@ -68,6 +109,7 @@ static int script_code(const char *k, size_t n) {
     return -1;
 }
 void runtime_input_script_tick(uint64_t frame) {
+    runtime_input_mouse_frame(runtime_now_ns());
     static const char *script;
     static int init;
     if (!init) { init = 1; script = getenv("TOTK_INPUT_SCRIPT"); }
@@ -118,17 +160,57 @@ static int pad_states(NpadState *out, int max, const uint32_t *id, uint32_t want
         for (unsigned i = 0; i < 128; i++) if (keys[i]) state.buttons |= button(i);
         state.buttons |= pending;
         pending = 0;
-        state.lx = 32767 * ((int)keys[2] - (int)keys[0]);       /* D / A */
-        state.ly = 32767 * ((int)keys[13] - (int)keys[1]);      /* W / S */
-        state.rx = 32767 * ((int)keys[124] - (int)keys[123]);   /* arrow right / left */
-        state.ry = 32767 * ((int)keys[126] - (int)keys[125]);   /* arrow up / down */
+        int32_t key_lx = 32767 * ((int)keys[2] - (int)keys[0]);       /* D / A */
+        int32_t key_ly = 32767 * ((int)keys[13] - (int)keys[1]);      /* W / S */
+        int32_t key_rx = 32767 * ((int)keys[124] - (int)keys[123]);   /* arrow right / left */
+        int32_t key_ry = 32767 * ((int)keys[126] - (int)keys[125]);   /* arrow up / down */
         RuntimeGamepadState pad;
         gamepad_read(&pad);
         state.buttons |= pad.buttons;
-        if (abs(pad.lx) > abs(state.lx)) state.lx = pad.lx;
-        if (abs(pad.ly) > abs(state.ly)) state.ly = pad.ly;
-        if (abs(pad.rx) > abs(state.rx)) state.rx = pad.rx;
-        if (abs(pad.ry) > abs(state.ry)) state.ry = pad.ry;
+
+        /* Left stick: select stronger 2D vector as a unit (never mix X and Y across devices) */
+        if (hypot((double)pad.lx, (double)pad.ly) > hypot((double)key_lx, (double)key_ly)) {
+            state.lx = pad.lx;
+            state.ly = pad.ly;
+        } else {
+            state.lx = key_lx;
+            state.ly = key_ly;
+        }
+
+        /* Right stick: single look owner in mouse mode; no per-axis mixing */
+        if (!mouse_enabled) {
+            if (hypot((double)pad.rx, (double)pad.ry) > hypot((double)key_rx, (double)key_ry)) {
+                state.rx = pad.rx;
+                state.ry = pad.ry;
+            } else {
+                state.rx = key_rx;
+                state.ry = key_ry;
+            }
+        } else {
+            MouseCameraConfig mcfg;
+            MouseCameraDiag mdiag;
+            mouse_camera_get_config(&mcfg);
+            mouse_camera_get_diag(&mdiag);
+            if (mdiag.owner == LOOK_OWNER_GAMEPAD) {
+                state.rx = pad.rx;
+                state.ry = pad.ry;
+            } else if (mcfg.backend == MOUSE_BACKEND_LEGACY_STICK) {
+                state.rx = mouse_rx;
+                state.ry = mouse_ry;
+            } else if (mdiag.last_cmd.route == LOOK_ROUTE_COMPAT_STICK) {
+                if (mdiag.last_cmd.compat_rx != 0 || mdiag.last_cmd.compat_ry != 0) {
+                    state.rx = mdiag.last_cmd.compat_rx;
+                    state.ry = mdiag.last_cmd.compat_ry;
+                } else {
+                    state.rx = mouse_rx;
+                    state.ry = mouse_ry;
+                }
+            } else {
+                /* Direct angle look (or lock-on / disabled): do not feed Npad right stick */
+                state.rx = 0;
+                state.ry = 0;
+            }
+        }
     }
     *out = state;
     pthread_mutex_unlock(&input_lock);
