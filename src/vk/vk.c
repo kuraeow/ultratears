@@ -147,6 +147,7 @@ static VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT ffsi = {VK_STRUCTURE_T
 static VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT ffl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
 static VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT ffld = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
 static int has_fl, has_fld;
+int vk_feedback_loop_dynamic;   // the dynamic state feature is on: vkb_draw.c sets it on every draw
 static VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
 static int has_lr;
 
@@ -200,7 +201,16 @@ static int create_device(void) {
         LOG("VK_EXT_shader_object is required but is not supported by this GPU or driver");
         return 0;
     }
-    vkc.has_feedback_loop = has_fl && has_fld && ffl.attachmentFeedbackLoopLayout && ffld.attachmentFeedbackLoopDynamicState;
+    vk_feedback_loop_dynamic = has_fld && ffld.attachmentFeedbackLoopDynamicState;
+    vkc.has_feedback_loop = has_fl && ffl.attachmentFeedbackLoopLayout && vk_feedback_loop_dynamic;
+    // AMD's Windows driver (2.0.388, ROG Ally) has the layout but not the dynamic state. Without the feature there is no
+    // state to set with shader objects, and targets in the feedback loop layout can still be sampled by the draw that
+    // renders to them, so the layout alone is used unless TOTK_VK_FEEDBACK_LAYOUT_ONLY=0.
+    if (!vkc.has_feedback_loop && has_fl && ffl.attachmentFeedbackLoopLayout) {
+        const char *e = getenv("TOTK_VK_FEEDBACK_LAYOUT_ONLY");
+        vkc.has_feedback_loop = !(e && !strcmp(e, "0"));
+        LOG("attachment feedback loops %s: layout without the dynamic state (TOTK_VK_FEEDBACK_LAYOUT_ONLY)", vkc.has_feedback_loop ? "on" : "off");
+    }
     if (!vkc.has_feedback_loop) LOG("no attachment feedback loops: textures that are attachments of their pass read empty");
     vkc.has_local_read = has_lr && flr.dynamicRenderingLocalRead;
     if (vkc.has_feedback_loop && !vkc.has_local_read) LOG("no barriers inside a pass: a draw sampling its own target may miss earlier draws' writes");

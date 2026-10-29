@@ -406,6 +406,7 @@ static vkb_image *handle_image(uint64_t h, const view_t **view) {
 // without it they would leave the pass, and the draw saw an empty texture instead (the audit's top substitution).
 static __thread vkb_image *g_fb_rt[9];   // this draw's targets: colour 0-7, depth 8
 static __thread uint32_t g_fb;           // the targets it samples (vkb.h VKB_FB_DEPTH)
+extern int vk_feedback_loop_dynamic;     // vk.c: without it the loop is the layout alone (no state to set)
 
 static int fb_index(const vkb_image *im) {   // the target bit of a sampled image, -1: not a target of this draw
     for (int i = 0; im && i < 9; i++) if (g_fb_rt[i] == im) return i;
@@ -1675,7 +1676,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
     VkShaderEXT objs[5] = {vobj, fs ? fs->obj : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     if (dyn(D_SHADERS, objs, sizeof objs)) vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
     set_dynamic_state(cb, vkb_rt_count(), vkb_rt_extent(), topo);
-    if (vkc.has_feedback_loop) {   // required state with shader objects once the feature is enabled
+    if (vkc.has_feedback_loop && vk_feedback_loop_dynamic) {   // required state with shader objects once the feature is enabled
         VkImageAspectFlags loop = (g_fb & 0xFF ? VK_IMAGE_ASPECT_COLOR_BIT : 0) | (g_fb & VKB_FB_DEPTH ? g_fb_rt[8]->aspect : 0);
         DYN(D_FBLOOP, VkImageAspectFlags, loop, vk.vkCmdSetAttachmentFeedbackLoopEnableEXT(cb, v_));
     }
