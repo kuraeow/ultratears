@@ -150,7 +150,23 @@ int totk_fr_cloth(void) { config(); return g_cloth && g_limit != 30; }
 int totk_fr_highfps(void) { config(); return g_highfps; }
 float totk_fr_step_seconds(void) { uint32_t u = atomic_load_explicit(&g_step_bits, memory_order_acquire); float s; memcpy(&s, &u, 4); return s; }
 float totk_fr_step_ratio30(void) { return totk_fr_step_seconds() * 30.0f; }
-float totk_fr_step_ticks60(void) { return totk_fr_step_seconds() * 60.0f; }
+/* TOTK_RT_PROBE=1 (development): the realtime producer site (tools/lifter/patches.py rt_step_ticks, before fmul s8, s0,
+   s1) logs the game's own s0 (nominal interval in ticks) and s1 (coefficient) whenever they change, with the step put
+   in their place: what the game asks for in menus and pauses that the measured step overrides. */
+static void rt_probe(void) {
+    static int on = -1;
+    static uint32_t last0 = 1, last1 = 1;
+    if (on < 0) on = getenv("TOTK_RT_PROBE") != NULL;
+    Cpu *c = on ? guest_cpu() : NULL;
+    if (!c) return;
+    uint32_t u0 = (uint32_t)c->v[0], u1 = (uint32_t)c->v[1];
+    if (u0 == last0 && u1 == last1) return;
+    last0 = u0; last1 = u1;
+    float f0, f1;
+    memcpy(&f0, &u0, 4); memcpy(&f1, &u1, 4);
+    LOG("[totk] realtime producer: game s0 %g s1 %g (product %g); step puts s0 %g\n", f0, f1, f0 * f1, totk_fr_step_seconds() * 60.0f);
+}
+float totk_fr_step_ticks60(void) { rt_probe(); return totk_fr_step_seconds() * 60.0f; }
 
 // ---- TOTK_SPEED_PROBE=1 (development): a line per 120 presents (=<n>: per n) with the frame rate, the game seconds stepped against
 // wall seconds and Link's ground speed (at any frame limit the same when game time follows wall time). The player

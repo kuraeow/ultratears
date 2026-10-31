@@ -186,38 +186,66 @@ static uint64_t file_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
 }
-/* The HeapDef table a bigger game resolution needs (render_res.c): its render-target heap and that heap's parent grown,
-   served from memory in place of the RomFS file (as totk-pc-recomp's romfs.c heapdef_overlay, MIT). */
+/* RomFS files served from memory in place of the game's (as totk-pc-recomp's romfs.c overlay, MIT): the HeapDef table
+   a bigger game resolution needs (render_res.c: its render-target heap and that heap's parent grown) and, above 30 fps,
+   the layout archive whose quick menus capture their background at once (ui_capture.c). */
 #define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
-static uint64_t ovr_index = UINT64_MAX;
-static uint8_t *ovr_data;
-static uint64_t ovr_size;
+#define UI_COMMON "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"
+#define ZS_DICTS "Pack/ZsDic.pack.zs"
+enum { NOVR = 4 };
+static struct { uint64_t index; uint8_t *data; uint64_t size; } ovr[NOVR];
+static int novr;
+static int ovr_find(uint64_t i) { for (int k = 0; k < novr; k++) if (ovr[k].index == i) return k; return -1; }
+// A whole RomFS file (malloc), NULL if absent or over max bytes.
+static void *rom_file(const char *path, size_t max, size_t *n) {
+    uint64_t i = file_index(path);
+    if (i == UINT64_MAX) return NULL;
+    Entry e = entry(i);
+    void *in = e.size && e.size < max ? malloc((size_t)e.size) : NULL;
+    int ok = in != NULL;
+    if (ok && rom_folder) {
+        char full[8192];
+        snprintf(full, sizeof full, "%s/%s", rom_dir, path);
+        int fd = open(full, O_RDONLY | O_BINARY);
+        ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok)
+        ok = pread(image_fd, in, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
+    if (!ok) { free(in); return NULL; }
+    *n = (size_t)e.size;
+    return in;
+}
+static void ovr_add(const char *path, void *data, size_t n) {
+    need(novr < NOVR, "RomFS overlay table");
+    ovr[novr].index = file_index(path), ovr[novr].data = data, ovr[novr].size = n;
+    novr++;
+}
 static void heapdef_overlay(void) {
     uint64_t totk_heap_extra_kib(void);
     int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
     void totk_resolution_log(void);
-    uint64_t i = totk_heap_extra_kib() ? file_index(HEAPDEF) : UINT64_MAX;
-    if (i != UINT64_MAX) {
-        Entry e = entry(i);
-        void *in = e.size && e.size < (16u << 20) ? malloc((size_t)e.size) : NULL;
-        int ok = in != NULL;
-        if (ok && rom_folder) {
-            char full[8192];
-            snprintf(full, sizeof full, "%s/%s", rom_dir, HEAPDEF);
-            int fd = open(full, O_RDONLY | O_BINARY);
-            ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
-            if (fd >= 0) close(fd);
-        } else if (ok)
-            ok = pread(image_fd, in, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
-        void *out = NULL;
-        size_t out_n = 0;
-        if (ok && totk_heapdef_build(in, (size_t)e.size, &out, &out_n)) {
-            ovr_index = i, ovr_data = out, ovr_size = out_n;
-            fprintf(stderr, "[totk] RomFS: %s served grown (%zu bytes)\n", HEAPDEF, out_n);
-        }
-        free(in);
+    int totk_ui_capture_build(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+    int totk_fr_fps60(void);
+    size_t n = 0, dn = 0, out_n = 0;
+    void *in = totk_heap_extra_kib() ? rom_file(HEAPDEF, 16u << 20, &n) : NULL, *out = NULL;
+    if (in && totk_heapdef_build(in, n, &out, &out_n)) {
+        ovr_add(HEAPDEF, out, out_n);
+        fprintf(stderr, "[totk] RomFS: %s served grown (%zu bytes)\n", HEAPDEF, out_n);
     }
+    free(in);
     totk_resolution_log();
+    // above 30 fps: the quick menus capture their background at once (host/ui_capture.c)
+    if (!totk_fr_fps60()) return;
+    in = rom_file(UI_COMMON, 64u << 20, &n);
+    void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
+    uint64_t t0 = runtime_now_ns();
+    if (in && dicts && totk_ui_capture_build(in, n, dicts, dn, &out, &out_n)) {
+        ovr_add(UI_COMMON, out, out_n);
+        fprintf(stderr, "[totk] RomFS: %s served with the quick menus' background captured at once (%.0f ms)\n", UI_COMMON,
+                (runtime_now_ns() - t0) / 1e6);
+    } else if (!in || !dicts)
+        fprintf(stderr, "[totk] RomFS: %s or %s missing: the quick menus keep the game's capture\n", UI_COMMON, ZS_DICTS);
+    free(in); free(dicts);
 }
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
@@ -275,11 +303,12 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
     Entry e = entry(i - 1);
-    if (i - 1 == ovr_index) {   /* the grown HeapDef, from memory */
-        if ((uint64_t)offset > ovr_size) return R_ROM_INVALID;
-        uint64_t n = size < ovr_size - (uint64_t)offset ? size : ovr_size - (uint64_t)offset;
+    int k = ovr_find(i - 1);
+    if (k >= 0) {   /* a file served from memory (heapdef_overlay) */
+        if ((uint64_t)offset > ovr[k].size) return R_ROM_INVALID;
+        uint64_t n = size < ovr[k].size - (uint64_t)offset ? size : ovr[k].size - (uint64_t)offset;
         guest_prepare_write(buffer, n);
-        memcpy(buffer, ovr_data + offset, (size_t)n);
+        memcpy(buffer, ovr[k].data + offset, (size_t)n);
         *out = n;
         return 0;
     }
@@ -297,7 +326,8 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    *out = i - 1 == ovr_index ? (int64_t)ovr_size : (int64_t)entry(i - 1).size;
+    int k = ovr_find(i - 1);
+    *out = k >= 0 ? (int64_t)ovr[k].size : (int64_t)entry(i - 1).size;
     return 0;
 }
 static void romfs_close(uint64_t h) {
