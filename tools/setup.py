@@ -441,9 +441,8 @@ def host_bias():
 
 def shader_packs(state):
     """(folder, gather bias, state key) of each pack this build makes: the PC's for Windows; for the Deck the PC's when
-    its card is AMD or Intel, or the only one when the build is for the Deck alone, else one of its own in shaders-deck.
-    [temporary] The Deck's own pack is translated here until the Linux launcher translates it on the Deck at its first
-    start (dev-local/docs/linux-deck.md)."""
+    its card is AMD or Intel, or the only one when the build is for the Deck alone, else one of its own in shaders-deck:
+    the Deck gets a pack ready to play, it translates nothing (dev-local/docs/linux-deck.md, 2026-11-01)."""
     plats, host = state['platforms'], host_bias()
     if os.name != 'nt':   # built on Linux (a Steam Deck, a Linux PC): for this machine's own card
         return [(DATA / 'shaders', host, 'shaders')]

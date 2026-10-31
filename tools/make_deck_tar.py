@@ -7,7 +7,9 @@ Run in the game folder. A tar, not a zip: it keeps the executable bit, which a z
 UltraTears/: ultratears (debug information stripped unless --keep-debug; the full one stays in linux/ for reading crash
 addresses on the PC), libSDL3.so.0, ultratears.cfg for Linux, and data/ - the RomFS, ExeFS, the BC7 texture cache, the
 fonts and the shader pack for the Deck's AMD GPU (--pack; default data/shaders-deck, else data/shaders) as
-data/shaders/translated.pack. Not inside: the generated C, the PC's driver shader cache (the Deck builds its own at the
+data/shaders/translated.pack, and data/generated - the game's C, so that the AppImage pointed at this folder on the Deck
+updates it without lifting the game again (it brings the builder; the tar has none). Not inside: the PC's objects (built
+by another compiler, the Deck's build compiles them anew), the PC's driver shader cache (the Deck builds its own at the
 first start), saves. Everything in it was made on this PC from the player's own copy of the game, for their own Deck:
 nothing of it is ever published.
 """
@@ -83,7 +85,7 @@ def main():
             files.append((ROOT / name, name, 0o644))
     if (ROOT / 'licenses').is_dir():
         files += [(p, p.relative_to(ROOT).as_posix(), 0o644) for p in sorted((ROOT / 'licenses').rglob('*')) if p.is_file()]
-    for sub in ('exefs', 'romfs', 'textures', 'fonts'):
+    for sub in ('exefs', 'romfs', 'textures', 'fonts', 'generated'):
         base = ROOT / 'data' / sub
         for dirpath, _, names in os.walk(base):
             for n in sorted(names):
