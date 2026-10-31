@@ -132,7 +132,7 @@ def zstd(tar_path, out, work):
             objs.append(str(o))
     (out / 'lib').mkdir()
     (out / 'include').mkdir()
-    ar = next(p for p in (bin_ / 'llvm-ar.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-ar.exe')) if p.is_file())
+    ar = bin_ / 'llvm-ar.exe'   # CLANG64 of a builder package or a source build has it
     subprocess.run([str(ar), 'rcs', str(out / 'lib/libzstd.a'), *objs], check=True)
     for h in ('zstd.h', 'zstd_errors.h', 'zdict.h'):
         shutil.copyfile(src / h, out / 'include' / h)

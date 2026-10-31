@@ -43,9 +43,10 @@ import public_tree  # noqa: E402
 import version  # noqa: E402
 
 PREFIX = CLANG64.parent if CLANG64 else None   # .../clang64
-# llvm-objcopy: the game for the Steam Deck without its debug information (tools/make_deck_tar.py)
+# llvm-objcopy: the game for the Steam Deck without its debug information (tools/make_deck_tar.py); llvm-ar: the Linux
+# kit made again from Valve's sysroot when deps/linux was deleted (tools/make_linux_kit.py)
 PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.exe', 'llvm-rc.exe', 'llvm-objcopy.exe',
-            'ninja.exe']
+            'llvm-ar.exe', 'ninja.exe']
 # MSYS2 package (share/licenses/<name>) of each part of clang64 the package carries
 LICENSES = ['clang', 'clang-libs', 'compiler-rt', 'crt', 'headers', 'libc++', 'libunwind', 'libwinpthread', 'winpthreads',
             'lld', 'llvm', 'llvm-libs', 'llvm-tools', 'ninja', 'SDL3', 'opus', 'libvpx', 'zstd', 'libiconv', 'zlib', 'xz',
