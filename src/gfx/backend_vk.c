@@ -2037,7 +2037,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             }
             if (vkb_shadow_on()) {
                 static uint64_t pin, pib, pob, pdf, psc, pwp, pwk, pwb, pu0, pu1, pu2;
-                VLOG("per frame: pool copies %.1f MiB of device memory; in %.0f copies %.2f MiB, back %.2f MiB, "
+                VLOG("per frame: pool copies (holding %.1f MiB of video memory in all) in %.0f copies %.2f MiB, back %.2f MiB, "
                      "left in game memory in a pass %.0f, write watch %.2f ms; pages copied back %.0f, left to CPU writes %.1f, merged by bytes %.1f; pool uses under the write lock %.0f to update + %.0f writes, writes under the read lock %.0f", (double)vkb_shadow_bytes() / 1048576.0,
                      (double)(g_sh_in - pin) / f, (double)(g_sh_in_bytes - pib) / 1048576.0 / f, (double)(g_sh_out_bytes - pob) / 1048576.0 / f,
                      (double)(g_sh_deferred - pdf) / f, (double)(g_sh_scan_ns - psc) / 1e6 / f,
@@ -2373,11 +2373,19 @@ static wpool_t g_wp[SLOTS][VKB_MAXREC + 1];
 int vkb_mt_on(void) {
     static int n = -1;
     if (n < 0) {
+        /* Half the logical processors the process may run on, at most 8: the game itself keeps 3-4 threads busy, so a
+           Steam Deck (8) records with 4, a 4-processor machine with 2, 16 and more with 8. */
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         int cpus = (int)si.dwNumberOfProcessors;
+        DWORD_PTR proc_mask, sys_mask;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) && proc_mask) {
+            int k = 0;
+            for (DWORD_PTR m = proc_mask; m; m &= m - 1) k++;
+            if (k < cpus) cpus = k;
+        }
         const char *e = getenv("TOTK_VK_RECORD_THREADS");
-        n = e && *e ? atoi(e) : cpus >= 8 ? 4 : cpus >= 4 ? 2 : 1;
+        n = e && *e ? atoi(e) : cpus >= 4 ? (cpus / 2 < 8 ? cpus / 2 : 8) : 1;
         if (n > VKB_MAXREC) n = VKB_MAXREC;
         if (n < 1) n = 1;
         static const char *const diag[] = {"TOTK_VK_DRAWTRACE", "TOTK_VK_TRACE", "TOTK_SNAP", "TOTK_GPU_PROF", "TOTK_GPU_PASSPROF",
@@ -2387,7 +2395,7 @@ int vkb_mt_on(void) {
         if (n > 1 && why) n = 1;
         if (n > 1 && g_ok != 1) n = 1;
         g_mt_threads = n;
-        VLOG("recording threads: %d%s%s", n, why ? " (one: " : "", why ? why : "");
+        VLOG("recording threads: %d of %d logical processors%s%s", n, cpus, why ? " (one: " : "", why ? why : "");
         if (why) VLOG("  (one thread while %s is set)", why);
     }
     return n > 1 && !atomic_load(&g_dump_key_at);   // F9 (TOTK_DUMP_KEY): its traced frames on one thread, in order

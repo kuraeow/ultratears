@@ -4,7 +4,7 @@
  * 2026 MacNativeGames contributors): the average of the last 5 present intervals, a frame longer than 1/15 s counted as
  * 1/15 s (slower frames slow the game down, as on the console), no lower bound (MacNativeGames #828: a 1/120 s floor ran
  * the game fast above 120 fps), a gap over 0.25 s (loading, a debugger) restarting the average. Changes: our own limit
- * setting and switches, read by the patched game code as functions.
+ * setting and switches, the last interval alone by default (TOTK_STEP_FRAMES below), read by the patched game code as functions.
  *
  * TOTK_FPS_LIMIT: 30 (the shipping code: the game presents every second 60 Hz tick and steps whole ticks), 40, 45, 60
  * (default), 120, 144 or any whole rate from 30 to 360, "display" (the refresh rate of the window's monitor) or
@@ -12,7 +12,11 @@
  * (realtime); our pacer (gfx/nvn/hle_nvn.c present_cfg) holds frames to the limit. [temporary] Above ~63 fps the game
  * has known problems no port has fixed yet (MacNativeGames #1348: the camera turns too fast, Link does not climb
  * steps): such limits are a beta, said in the log.
- * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0: the patches' shipping behaviour, for comparison. */
+ * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0: the patches' shipping behaviour, for comparison.
+ * TOTK_STEP_FRAMES=<1..8> (default 1; MacNativeGames uses 5): present intervals averaged into the step. With a variable
+ * refresh display a frame is shown as long as it took, and an average of 5 lags 2-3 frames behind: after slow frames the
+ * game kept the long step for a fraction of a second and Link ran visibly faster (user's 165 Hz G-Sync run, 2026-10-31). */
+#include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,12 +26,13 @@
 #include "host.h"
 #include "../runtime/rt.h"
 
-enum { STEP_SAMPLES = 5 };
+enum { STEP_MAX = 8 };
+static int g_steps = 1;    // TOTK_STEP_FRAMES: present intervals averaged into the step
 static int g_limit = -2;   // frames per second; 0 unlimited, -1 the monitor's rate; -2 not read yet
 static int g_realtime = 1, g_cloth = 1, g_highfps = 1;
 static _Atomic uint32_t g_step_bits;   // the step in seconds (float bits): what the game steps each frame
 static uint64_t g_last_ns;
-static double g_samples[STEP_SAMPLES];
+static double g_samples[STEP_MAX];
 static unsigned g_count, g_next;
 
 static int off(const char *name) { const char *e = getenv(name); return e && !strcmp(e, "0"); }
@@ -44,12 +49,16 @@ static void config(void) {
     g_realtime = !off("TOTK_REALTIME");
     g_cloth = g_realtime && !off("TOTK_CLOTH_REALTIME");
     g_highfps = !off("TOTK_HIGHFPS_FIX");
+    { const char *n = getenv("TOTK_STEP_FRAMES"); int v = n ? atoi(n) : 1; g_steps = v >= 1 && v <= STEP_MAX ? v : 1; }
     step_store(g_limit == 30 ? 1.0f / 30.0f : 1.0f / 60.0f);
     char lim[32];
     snprintf(lim, sizeof lim, g_limit > 0 ? "%d fps" : g_limit ? "the monitor's rate" : "unlimited", g_limit);
+    char how[96];
+    snprintf(how, sizeof how, g_steps == 1 ? ", game stepped by the last frame's time (at most 1/15 s)"
+             : ", game stepped by measured time (%d-frame average, at most 1/15 s)", g_steps);
     LOG("[totk] frame rate: limit %s; %s%s%s\n", lim,
         g_limit == 30 ? "the shipping code (whole 60 Hz ticks, interval 2)" : "present interval from 1 tick",
-        g_realtime ? ", game stepped by measured time (5-frame average, at most 1/15 s)" : ", whole-tick steps (TOTK_REALTIME=0)",
+        g_realtime ? how : ", whole-tick steps (TOTK_REALTIME=0)",
         g_limit == 30 || g_cloth ? "" : ", cloth clock shipping (TOTK_CLOTH_REALTIME=0)");
     if (g_limit != 30 && !g_realtime) LOG("[totk] [warning] frame rate: without TOTK_REALTIME the game runs fast above 30 fps when frames are shorter than its interval\n");
     if (g_limit == 0 || g_limit == -1 || g_limit > 63)
@@ -127,6 +136,24 @@ static void speed_probe(uint64_t now) {
 static void speed_probe(uint64_t now) { (void)now; }
 #endif
 
+/* TOTK_STATS: a line per 300 frames with how far the step the game moved by was from the time the frame really took
+   (the present interval that ended it): the part of the jerkiness the step itself makes. */
+static int step_err_cmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static void step_error(double dt) {
+    static int on = -1, n;
+    static double err[300], sum_dt, sum_step;
+    if (on < 0) on = getenv("TOTK_STATS") != NULL;
+    if (!on) return;
+    double step = totk_fr_step_seconds();
+    err[n++] = fabs(step - dt) * 1e3;
+    sum_dt += dt; sum_step += step;
+    if (n < 300) return;
+    qsort(err, n, sizeof *err, step_err_cmp);
+    LOG("[totk] frame step error (|step - frame time|, %d-frame step): p50 %.2f / p95 %.2f / max %.2f ms; game time x%.3f of real time\n",
+        g_steps, err[n / 2], err[n * 95 / 100], err[n - 1], sum_dt > 0 ? sum_step / sum_dt : 0);
+    n = 0; sum_dt = sum_step = 0;
+}
+
 // At every present (gfx/nvn/hle_nvn.c nvnQueuePresentTexture, the game thread).
 void runtime_frame_step_update(uint64_t now_ns) {
     config();
@@ -137,8 +164,9 @@ void runtime_frame_step_update(uint64_t now_ns) {
     g_last_ns = now_ns;
     if (dt > 0.25 || dt < 0.001) { g_count = g_next = 0; return; }   // keeps the last step
     if (dt > 1.0 / 15.0) dt = 1.0 / 15.0;
-    g_samples[g_next++ % STEP_SAMPLES] = dt;
-    if (g_count < STEP_SAMPLES) g_count++;
+    step_error(dt);
+    g_samples[g_next++ % g_steps] = dt;
+    if (g_count < (unsigned)g_steps) g_count++;
     double sum = 0;
     for (unsigned i = 0; i < g_count; i++) sum += g_samples[i];
     step_store((float)(sum / g_count));
