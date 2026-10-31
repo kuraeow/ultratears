@@ -2006,6 +2006,9 @@ void vkb_dump_request(void) {
     VLOG("F9: tracing from frame %llu, dump at %llu", (unsigned long long)f + 1, (unsigned long long)f + 3);
 }
 
+static __thread uint64_t t_present_slot;   // mtl_present_slot: when the next present may be shown
+void mtl_present_slot(uint64_t ns) { t_present_slot = ns; }
+
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_ticket, 1) + 1;
@@ -2130,7 +2133,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     VkBuffer shot = shot_record(cb, n, out, im->width, im->height);
     uint64_t fence = mtl_sub_commit();
     if (shot) shot_write(fence, im->width, im->height);
-    vkp_out_ready(slot, g_timeline, fence, crop);
+    vkp_out_ready(slot, g_timeline, fence, crop, t_present_slot);
     return n;
 }
 

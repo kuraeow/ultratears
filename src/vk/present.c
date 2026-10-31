@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint64_t runtime_now_ns(void);          // host/guest.c
+void plat_sleep_until_ns(uint64_t t);  // runtime/platform
+
 #define LOG(...) (fprintf(stderr, "[totk-vk] " __VA_ARGS__), fputc('\n', stderr))
 #define FRAMES 2          // frames in flight
 #define MAX_IMAGES 8
@@ -132,6 +135,7 @@ typedef struct {
     int state;                   // 0 free, 1 written (pending), 2 being shown
     uint64_t seq;                // when it was written (newest pending wins)
     VkSemaphore timeline; uint64_t value; int crop[4];
+    uint64_t not_before;         // shown no earlier than this (runtime_now_ns; the pacer's slot)
 } out_t;
 static out_t g_out[OUTS];
 static uint64_t g_out_seq;       // under mu
@@ -186,10 +190,10 @@ fail:
     return -1;
 }
 
-void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4]) {
+void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4], uint64_t not_before) {
     pthread_mutex_lock(&mu);
     out_t *o = &g_out[slot];
-    o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1;
+    o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1; o->not_before = not_before;
     if (crop) memcpy(o->crop, crop, sizeof o->crop); else memset(o->crop, 0, sizeof o->crop);
     for (int i = 0; i < OUTS; i++)   // older pending frames are never shown
         if (i != slot && g_out[i].state == 1 && g_out[i].seq < o->seq) g_out[i].state = 0;
@@ -281,6 +285,12 @@ static void *present_thread(void *unused) {
         for (int i = 0; i < OUTS; i++) if (g_out[i].state == 1 && (pick < 0 || g_out[i].seq > g_out[pick].seq)) pick = i;
         if (pick >= 0) g_out[pick].state = 2;
         pthread_mutex_unlock(&mu);
+        /* The steady rate (host/frame_rate.c): a frame drawn before its slot waits for it here, so frames reach the
+           screen one period apart whatever their work; a frame more than half a second away is a clock change. */
+        if (pick >= 0 && g_out[pick].not_before) {
+            uint64_t at = g_out[pick].not_before, now = runtime_now_ns();
+            if (at > now && at - now < 500000000ull) plat_sleep_until_ns(at);
+        }
         if (present_one(shown, slot, pick >= 0 ? &g_out[pick] : NULL)) slot = (slot + 1) % FRAMES;
         if (pick >= 0) {
             pthread_mutex_lock(&mu);

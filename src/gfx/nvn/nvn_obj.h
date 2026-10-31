@@ -154,6 +154,7 @@ void mtl_exec(const uint8_t *handle);
 void mtl_exec_rest(const uint64_t *handles, int n);   // 告知本次提交里当前句柄之后还有哪些句柄（通道前瞻跨句柄用） | Tells which handles in this submission still follow the current handle (used by the pass lookahead across handles)
 // 出图：把交换链贴图画到前端 CAMetalLayer（无窗口时只计数）
 // Present: draw the swapchain texture to the front-end CAMetalLayer (only counts when there is no window)
+void mtl_present_slot(uint64_t ns);   // UltraTears: the next mtl_present on this thread is shown no earlier than ns (0: at once)
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]);   // 出图入队、立即返回票号；period_s：该张至少显示的时长（= 出图周期，0 = 不限） | Enqueue a present and return the ticket immediately; period_s: minimum time this image is displayed (= present period, 0 = unlimited)
 void mtl_present_wait(uint64_t ticket);                    // 等该票号的出图处理完（blit 已提交到 GPU 队列） | Wait until the present with this ticket has been processed (blit committed to the GPU queue)
 void mtl_present_flush(void);                              // 等已入队的出图全部处理完 | Wait until all enqueued presents have been processed
