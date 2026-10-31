@@ -54,7 +54,12 @@ def main():
     if not a.keep_debug:   # about a third of the size without the debug information
         exe = ROOT / 'build-linux/ultratears.stripped'
         if not exe.is_file() or exe.stat().st_mtime < game.stat().st_mtime:
-            subprocess.run([str(CLANG64 / 'llvm-objcopy.exe'), '--strip-debug', str(game), str(exe)], check=True)
+            # the builder package's trimmed CLANG64 has no objcopy; the Linux kit is a developer's, so MSYS2's will do
+            objcopy = next((p for p in (CLANG64 / 'llvm-objcopy.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-objcopy.exe'))
+                            if p.is_file()), None)
+            if objcopy is None:
+                sys.exit('no llvm-objcopy to strip the debug information: install MSYS2 CLANG64 or pass --keep-debug')
+            subprocess.run([str(objcopy), '--strip-debug', str(game), str(exe)], check=True)
     out = ROOT / a.out
     tmp = out.with_suffix('.tar.part')
     files = 0
