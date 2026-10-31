@@ -14,7 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>  // [port] mach / QoS
+#ifdef _WIN32
+#include <windows.h>
+#endif  // [port] mach / QoS
 #undef near  // [port] windef.h macro
 
 #define REV(n) (0x30564552u + ((uint32_t)(n) << 24))   /* "REVn" */
@@ -251,9 +253,11 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) 
 }
 static void *render_thread(void *p) {
     AudioRenderer *r = p;
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);  // [port] QoS user-interactive
     // [port] nanosleep sleeps in whole scheduler ticks on Windows; a high-resolution waitable timer keeps the 5 ms period.
     HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
     const double frame = (double)r->param.sample_count / r->param.sample_rate;
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     while (__atomic_load_n(&r->running, __ATOMIC_ACQUIRE)) {
@@ -275,13 +279,22 @@ static void *render_thread(void *p) {
         next.tv_nsec += (long)ns; while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t wait = (int64_t)(next.tv_sec - now.tv_sec) * 1000000000LL + (next.tv_nsec - now.tv_nsec);
-        if (wait > 0) {   // [port]
+#ifdef _WIN32
+        if (wait > 0) {
             if (timer) { LARGE_INTEGER due = {.QuadPart = -(wait / 100)}; SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE); WaitForSingleObject(timer, INFINITE); }
             else { struct timespec d = {wait / 1000000000LL, wait % 1000000000LL}; nanosleep(&d, NULL); }
         }
+#else
+        if (wait > 0) {
+            struct timespec d = {wait / 1000000000LL, wait % 1000000000LL};
+            nanosleep(&d, NULL);
+        }
+#endif
         else if (wait < -100000000LL) next = now;   /* fell far behind (debugger, sleep): resynchronise */
     }
+#ifdef _WIN32
     if (timer) CloseHandle(timer);  // [port]
+#endif
     return NULL;
 }
 

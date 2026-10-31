@@ -1,10 +1,15 @@
 // Fidelity audit of the Vulkan NVN replayer: counting of substitutions and skips (vkb_audit.h).
 // Counting is always on (array increments on the replay thread); the per-shader tables and the report only within
 // a TOTK_AUDIT window.
-#include <direct.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#define _mkdir(path) mkdir(path, 0777)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"

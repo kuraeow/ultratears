@@ -8,10 +8,19 @@
 //  - visible effects of completion (event values, counter records) are written by the retire thread after the GPU has
 //    finished the submission, in submission order, and only then is the fence complete for mtl_wait (as on Metal).
 // Without a usable Vulkan device everything completes at once (the null device's behaviour, events still written).
+#ifndef _WIN32
+#define _GNU_SOURCE   // sched_getaffinity
+#include <sched.h>
+#endif
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#define CreateDirectoryA(path, sec) mkdir(path, 0777)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -49,7 +58,7 @@ static int g_npools, g_capools;
 static vkb_rw g_pool_mu;   // recording threads look pools up for every draw (read); changes write
 static uint64_t g_pool_bytes;
 
-// vkb_lock.h: Windows slim reader-writer locks (zero-initialised = unlocked), with the wait measured as vkb_lock does
+#ifdef _WIN32
 void vkb_rw_read(vkb_rw *l, int kind) {
     if (TryAcquireSRWLockShared((PSRWLOCK)l)) return;
     uint64_t t0 = runtime_now_ns();
@@ -66,6 +75,21 @@ void vkb_rw_write(vkb_rw *l, int kind) {
     atomic_fetch_add_explicit(&vkb_lock_waits[kind], 1, memory_order_relaxed);
 }
 void vkb_rw_write_end(vkb_rw *l) { ReleaseSRWLockExclusive((PSRWLOCK)l); }
+#else
+#include <pthread.h>
+static pthread_rwlock_t *get_rw(vkb_rw *l) {
+    if (!l->opaque) {
+        pthread_rwlock_t *rw = (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
+        pthread_rwlock_init(rw, NULL);
+        l->opaque = rw;
+    }
+    return (pthread_rwlock_t *)l->opaque;
+}
+void vkb_rw_read(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_rdlock(get_rw(l)); }
+void vkb_rw_read_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
+void vkb_rw_write(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_wrlock(get_rw(l)); }
+void vkb_rw_write_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
+#endif
 
 // ---- per recording thread (vkb_mt.c design, implemented below in "several recording threads")
 static __thread int t_worker;          // vkb_worker(): 0 the translation thread (and any other), 1.. the recording threads
@@ -244,9 +268,13 @@ static void backend_init(void) {
 static int import_host(uintptr_t a, uintptr_t b, VkBuffer *out_buf, VkDeviceMemory *out_mem) {
     // The import needs committed memory: guest pages are committed on first touch, so the range is committed now.
     // A virtual pool is an inaccessible address range (totk_vpool_win.c): no memory to import (sparse binding, later).
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION mi;
     if (a >= GUEST_LO && b <= GUEST_HI) plat_commit(a, b - a);
     else if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || mi.Protect == PAGE_NOACCESS) return 0;
+#else
+    if (a >= GUEST_LO && b <= GUEST_HI) plat_commit(a, b - a);
+#endif
     VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     if (!vk_check(vk.vkGetMemoryHostPointerPropertiesEXT(vkc.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                           (void *)a, &hp), "host pointer properties")) return 0;
@@ -1020,12 +1048,16 @@ static const pool_ent *pool_find(uintptr_t addr, uint64_t len);
 static void checkpoint_addr(const char *k1) {   // an address: what the memory and the pool table hold now
     unsigned long long a = strtoull(k1, NULL, 16);
     if (!a) return;
-    MEMORY_BASIC_INFORMATION mi = {0};
-    VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi);
     vkb_rw_read(&g_pool_mu, LK_POOLS);
     const pool_ent *p = pool_find((uintptr_t)a, 1);
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mi = {0};
+    VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi);
     VLOG("    memory %#llx: state %#lx protect %#lx region %p+%#llx; pool %s %#llx..%#llx", a, mi.State, mi.Protect, mi.BaseAddress,
          (unsigned long long)mi.RegionSize, p ? "registered" : "none", p ? (unsigned long long)p->lo : 0ull, p ? (unsigned long long)p->hi : 0ull);
+#else
+    VLOG("    memory %#llx: pool %s %#llx..%#llx", a, p ? "registered" : "none", p ? (unsigned long long)p->lo : 0ull, p ? (unsigned long long)p->hi : 0ull);
+#endif
     vkb_rw_read_end(&g_pool_mu);
 }
 static void checkpoint_line(const char *how, uint32_t n) {
@@ -2383,6 +2415,7 @@ int vkb_mt_on(void) {
     if (n < 0) {
         /* Half the logical processors the process may run on, at most 8: the game itself keeps 3-4 threads busy, so a
            Steam Deck (8) records with 4, a 4-processor machine with 2, 16 and more with 8. */
+#ifdef _WIN32
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         int cpus = (int)si.dwNumberOfProcessors;
@@ -2392,6 +2425,11 @@ int vkb_mt_on(void) {
             for (DWORD_PTR m = proc_mask; m; m &= m - 1) k++;
             if (k < cpus) cpus = k;
         }
+#else
+        cpu_set_t set;
+        int cpus = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (cpus < 1) cpus = 4;
+#endif
         const char *e = getenv("TOTK_VK_RECORD_THREADS");
         n = e && *e ? atoi(e) : cpus >= 4 ? (cpus / 2 < 8 ? cpus / 2 : 8) : 1;
         if (n > VKB_MAXREC) n = VKB_MAXREC;

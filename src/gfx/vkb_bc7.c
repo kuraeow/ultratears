@@ -11,12 +11,20 @@
 // BC1: the interface's 12x12 ASTC maps when opaque (tools/bc7build: a texture is BC1 only if none of its texels is
 // transparent; half the bytes of BC7, and 12x12 ASTC holds less detail than BC1 keeps). Nothing from the game is
 // in the repository or a build: the cache is made on the player's machine from the player's copy (README.md, Legal).
-#include <direct.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define _mkdir(path) mkdir(path, 0777)
+#define _fseeki64(file, offset, origin) fseeko(file, offset, origin)
+#define _ftelli64(file) ftello(file)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -98,11 +106,17 @@ static int open_files(void) {   // g_mu held
     }
     _fseeki64(g_idx, good, SEEK_SET);
     snprintf(path, sizeof path, "%s/bc7.pack", d);
+#ifdef _WIN32
     HANDLE f = pack_size > 0 ? CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                                            FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
     HANDLE m = f != INVALID_HANDLE_VALUE ? CreateFileMappingA(f, NULL, PAGE_READONLY, (DWORD)((uint64_t)pack_size >> 32), (DWORD)pack_size, NULL) : NULL;
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     if (m) { g_map = MapViewOfFile(m, FILE_MAP_READ, 0, 0, (SIZE_T)pack_size); CloseHandle(m); }
+#else
+    const void *plat_map_file(const char *path, uint64_t len, uint64_t *size);   // platform/linux.c (mmap: not reachable here)
+    uint64_t mapped_size;
+    if (pack_size > 0) g_map = plat_map_file(path, (uint64_t)pack_size, &mapped_size);
+#endif
     if (g_map) g_map_size = (uint64_t)pack_size;
     VLOG("BC7 cache %s: %zu surfaces, %.1f MiB%s", d, g_n, pack_size / 1048576.0, g_map ? " (mapped)" : "");
     g_open = 1;
@@ -162,7 +176,9 @@ static int quality(void) {   // TOTK_BC7_QUALITY=0..4 (bc7enc's uber level; back
 static void *encoder(void *unused) {
     (void)unused;
     pthread_setname_np("totk-bc7");
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);   // the game's and the recording threads come first
+#endif
     for (;;) {
         pthread_mutex_lock(&g_jmu);
         while (!g_jobs) pthread_cond_wait(&g_jcv, &g_jmu);
