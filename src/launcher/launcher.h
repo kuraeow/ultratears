@@ -92,6 +92,7 @@ std::string python_path(const std::string &root);         // deps/python/python.
 struct Icon { SDL_Texture *tex = nullptr; float w = 0, h = 0; };   // w, h: logical size (design pixels)
 struct Media {
     ImFont *regular = nullptr, *medium = nullptr, *small = nullptr, *title = nullptr, *brand = nullptr;
+    ImFont *label = nullptr, *control = nullptr;   // the Play screen: setting names; tabs, choices, lists
     Icon emblem, pattern, check, error, folder, warn, chevron;
 };
 extern Media g_media;

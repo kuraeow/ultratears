@@ -148,6 +148,8 @@ void media_load(SDL_Renderer *r, float scale) {
     g_media.small = style("Inter_18pt-Regular.ttf", 13, 18, scale, ranges);
     g_media.title = style("MontserratAlternates-Bold.ttf", 25, 32, scale, ranges);
     g_media.brand = style("MontserratAlternates-SemiBold.ttf", 17, 22, scale, ranges);
+    g_media.label = style("Inter_18pt-Regular.ttf", 16, 24, scale, ranges);
+    g_media.control = style("Inter_18pt-Medium.ttf", 14, 20, scale, ranges);
     io.FontDefault = g_media.regular;
     for (Icon *i : {&g_media.emblem, &g_media.pattern, &g_media.check, &g_media.error, &g_media.folder, &g_media.warn, &g_media.chevron})
         drop(*i);

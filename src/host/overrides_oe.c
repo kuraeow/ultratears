@@ -63,6 +63,9 @@ static uint64_t desired_language(void) {
             : !strcmp(language, "pt") ? portuguese : "en-US";
         memcpy(code, selected, strlen(selected));
     }
+    static int logged;
+    if (!logged++)
+        fprintf(stderr, "[totk] game language %s (%s)\n", code, explicit_code ? "lang= / TOTK_LANG" : "Windows or TOTK_LOCALE");
     uint64_t result;
     memcpy(&result, code, 8);
     return result;

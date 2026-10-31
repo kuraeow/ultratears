@@ -85,8 +85,14 @@ static int create_swapchain(void) {
     VkPresentModeKHR modes[16];
     if (nm > 16) nm = 16;
     vk.vkGetPhysicalDeviceSurfacePresentModesKHR(vkc.gpu, vkc.surface, &nm, modes);
+    // vsync= in ultratears.cfg (TOTK_VSYNC): on (default) shows whole frames only, mailbox where the driver has it
+    // (the game is not held to the display) else fifo; off presents at once (immediate: lowest latency, may tear)
+    const char *vs = getenv("TOTK_VSYNC");
+    int vsync_off = vs && (!strcmp(vs, "0") || !strcmp(vs, "off"));
     mode = VK_PRESENT_MODE_FIFO_KHR;
     for (uint32_t i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    if (vsync_off)
+        for (uint32_t i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = vkc.surface,
@@ -100,7 +106,7 @@ static int create_swapchain(void) {
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < nimages; i++) vk.vkCreateSemaphore(vkc.device, &si, NULL, &render_done[i]);
     LOG("swapchain %ux%u, %u images, %s", extent.width, extent.height, nimages,
-        mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo");
+        mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     return 1;
 }
 

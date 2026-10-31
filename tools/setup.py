@@ -474,7 +474,15 @@ def step_finish(dump, state, cpus):
     if fonts.is_dir() and list(fonts.glob('*.bfttf')):
         shutil.copytree(fonts, DATA / 'fonts', dirs_exist_ok=True)
     lines.append('fonts=data/fonts')
-    (ROOT / 'ultratears.cfg').write_text('\n'.join(lines) + '\n')
+    # the player's settings (fps=, window=, vsync=, lang=: the launcher's Play screen, or written by hand) are kept:
+    # an update must not reset them
+    cfg = ROOT / 'ultratears.cfg'
+    ours = {l.split('=', 1)[0] for l in lines if '=' in l}
+    if cfg.is_file():
+        for l in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+            if '=' in l and not l.startswith('#') and l.split('=', 1)[0] not in ours:
+                lines.append(l)
+    cfg.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     (ROOT / DEBUG_BAT).write_bytes(DEBUG_BAT_TEXT.replace('\n', '\r\n').encode())
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():

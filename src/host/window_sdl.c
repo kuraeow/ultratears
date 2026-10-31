@@ -94,6 +94,16 @@ int window_init(void) {
     pad_lock = SDL_CreateMutex();
     window = SDL_CreateWindow("UltraTears", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) { fprintf(stderr, "[totk] window: %s\n", SDL_GetError()); return 0; }
+    // window= in ultratears.cfg (TOTK_WINDOW): window (default), borderless (the desktop's size, no mode change) or
+    // fullscreen (exclusive, at the desktop's resolution and refresh rate); F11 / Alt+Enter still switch
+    const char *mode = getenv("TOTK_WINDOW");
+    if (mode && (!SDL_strcmp(mode, "borderless") || !SDL_strcmp(mode, "fullscreen"))) {
+        const SDL_DisplayMode *desk = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window));
+        if (!SDL_strcmp(mode, "fullscreen") && desk)
+            SDL_SetWindowFullscreenMode(window, desk);
+        SDL_SetWindowFullscreen(window, true);
+        fprintf(stderr, "[totk] window: %s\n", mode);
+    }
     if (!vkp_init(window))
         runtime_fail("Vulkan initialization failed (Vulkan 1.3 with VK_EXT_shader_object is required)");
     return 1;

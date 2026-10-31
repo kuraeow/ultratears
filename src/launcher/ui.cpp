@@ -981,10 +981,243 @@ static void screen_broken() {   // the exe without the rest of the zip: nothing 
     rich(g_media.regular, 36, y, 700, {{T("broken_text"), C_SUB}});
 }
 
+// ---------------------------------------------------------------- Play: the game's settings
+// The player's keys in the install folder's ultratears.cfg, read by the game at its start (src/host/boot.c) and kept by
+// setup.py on an update: fps=, window=, vsync=, lang=. A key left out is the game's default.
+static std::string cfg_path() { return path_join(U.install, "ultratears.cfg"); }
+
+static std::vector<std::string> cfg_read() {
+    std::vector<std::string> out;
+    size_t n = 0;
+    char *t = (char *)SDL_LoadFile(cfg_path().c_str(), &n);
+    if (!t)
+        return out;
+    std::string s(t, n);
+    SDL_free(t);
+    for (size_t pos = 0; pos < s.size();) {
+        size_t e = s.find('\n', pos);
+        if (e == std::string::npos)
+            e = s.size();
+        std::string l = s.substr(pos, e - pos);
+        pos = e + 1;
+        if (!l.empty() && l.back() == '\r')
+            l.pop_back();
+        out.push_back(l);
+    }
+    return out;
+}
+
+static std::vector<std::string> g_cfg;   // read again a second after the last read: the screen asks every frame
+static Uint64 g_cfg_at;
+
+static const std::vector<std::string> &cfg_lines() {
+    if (!g_cfg_at || SDL_GetTicks() - g_cfg_at > 1000) {
+        g_cfg = cfg_read();
+        g_cfg_at = SDL_GetTicks();
+    }
+    return g_cfg;
+}
+
+static std::string cfg_get(const char *key) {
+    std::string want = std::string(key) + "=";
+    for (const std::string &l : cfg_lines())
+        if (l.rfind(want, 0) == 0)
+            return l.substr(want.size());
+    return "";
+}
+
+static void cfg_set(const char *key, const std::string &value) {   // "" removes the key: the game's default
+    std::string want = std::string(key) + "=", text;
+    bool done = false;
+    for (const std::string &l : cfg_lines()) {
+        if (l.rfind(want, 0) == 0) {
+            if (!done && !value.empty())
+                text += want + value + "\n";
+            done = true;
+            continue;
+        }
+        text += l + "\n";
+    }
+    if (!done && !value.empty())
+        text += want + value + "\n";
+    SDL_SaveFile(cfg_path().c_str(), text.data(), text.size());
+    g_cfg_at = 0;
+}
+
+struct Opt { const char *value, *label; };   // label: a text key, else shown as it is
+static const char *opt_label(const Opt &o) { return has_text(o.label) ? T(o.label) : o.label; }
+
+static const Opt WINDOW_OPTS[] = {{"fullscreen", "win_full"}, {"borderless", "win_borderless"}, {"", "win_window"}};
+static const Opt FPS_OPTS[] = {{"30", "30"}, {"40", "40"}, {"45", "45"}, {"", "60"}, {"120", "fps_120"},
+                               {"144", "fps_144"}, {"display", "fps_display"}, {"unlimited", "fps_unlimited"}};
+static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de", "Deutsch"}, {"es", "Español"},
+                                {"fr", "Français"}, {"it", "Italiano"}, {"nl", "Nederlands"}, {"pt", "Português"},
+                                {"pt-BR", "Português (Brasil)"}, {"ru", "Русский"}, {"ja", "lang_ja"}, {"ko", "lang_ko"},
+                                {"zh-Hans", "lang_zh"}};
+// [temporary] hidden until the game renders at another resolution (dev-local/docs/plan.md): the rows are ready
+static const bool SHOW_RESOLUTION = false;
+static const Opt RES_OPTS[] = {{"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"}, {"3840x2160", "3840 × 2160"}};
+static const Opt SCALE_OPTS[] = {{"", "scale_none"}, {"fsr1", "FSR 1"}};
+
+template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
+    std::string value = v == same_as_default ? "" : v;
+    for (size_t i = 0; i < N; i++)
+        if (value == opts[i].value)
+            return (int)i;
+    return -1;
+}
+
+static const ImU32 C_FIELD = IM_COL32(43, 43, 43, 255);
+static const ImU32 C_FIELD_HOVER = IM_COL32(54, 54, 54, 255);
+static const ImU32 C_SEG = IM_COL32(36, 36, 36, 255);
+static const ImU32 C_SEG_ON = IM_COL32(58, 58, 58, 255);
+
+// The design's segmented control, right-aligned at x_right; returns the index chosen this frame or -1.
+template <size_t N> static int segmented(const char *id, float x_right, float cy, const Opt (&opts)[N], int sel) {
+    float w[N], total = 4;
+    for (size_t i = 0; i < N; i++)
+        total += (w[i] = text_w(g_media.control, opt_label(opts[i])) + 24);
+    float x = x_right - total, y = cy - 16;
+    DL->AddRectFilled(P(x, y), P(x_right, y + 32), C_SEG, 8 * S);
+    int chosen = -1;
+    float ix = x + 2;
+    for (size_t i = 0; i < N; i++) {
+        bool hov, down;
+        char hid[64];
+        SDL_snprintf(hid, sizeof hid, "%s%d", id, (int)i);
+        if (hit(hid, ix, y + 2, w[i], 28, &hov, &down) && (int)i != sel)
+            chosen = (int)i;
+        if ((int)i == sel || hov)
+            DL->AddRectFilled(P(ix, y + 2), P(ix + w[i], y + 30), (int)i == sel ? C_SEG_ON : C_FIELD, 6 * S);
+        const char *l = opt_label(opts[i]);
+        text(g_media.control, ix + 12, cy - g_media.control->FontSize / S / 2, C_TEXT, l);
+        ix += w[i];
+    }
+    return chosen;
+}
+
+// A drop-down list: the box right-aligned at x_right, its list in a popup (scrolls when long).
+template <size_t N> static int dropdown(const char *id, float x_right, float cy, float w, const Opt (&opts)[N], int sel) {
+    if (w <= 0) {   // as wide as its longest choice, at least the design's 126
+        w = 126;
+        for (size_t i = 0; i < N; i++)
+            w = SDL_max(w, text_w(g_media.control, opt_label(opts[i])) + 52);
+    }
+    float x = x_right - w, y = cy - 16;
+    bool hov, down;
+    char pid[64];
+    SDL_snprintf(pid, sizeof pid, "dd_%s", id);
+    if (hit(id, x, y, w, 32, &hov, &down))
+        ImGui::OpenPopup(pid);
+    bool open = ImGui::IsPopupOpen(pid);
+    DL->AddRectFilled(P(x, y), P(x_right, y + 32), hov || open ? C_FIELD_HOVER : C_FIELD, 6 * S);
+    text(g_media.control, x + 12, cy - g_media.control->FontSize / S / 2, C_TEXT, sel >= 0 ? opt_label(opts[sel]) : "");
+    icon(g_media.chevron, x_right - 12 - 14, cy - 7, 14);
+    int chosen = -1;
+    float lh = 30, ph = SDL_min(N * lh + 8, 248.0f), py = cy + 20 + ph > 470 ? y - 4 - ph : cy + 20;
+    ImGui::SetNextWindowPos(P(x, py));
+    ImGui::SetNextWindowSize(ImVec2(w * S, ph * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    if (ImGui::BeginPopup(pid)) {
+        ImDrawList *keep = DL;
+        ImVec2 keep_o = O;
+        DL = ImGui::GetWindowDrawList();
+        ImVec2 wp = ImGui::GetWindowPos();
+        O = ImVec2(wp.x - x * S, wp.y - ImGui::GetScrollY() - py * S);
+        DL->AddRectFilled(P(x, py), P(x_right, py + 8 + N * lh), C_FIELD, 6 * S);
+        for (size_t i = 0; i < N; i++) {
+            float iy = py + 4 + lh * i;
+            bool ih, idn;
+            char hid[64];
+            SDL_snprintf(hid, sizeof hid, "%s_%d", id, (int)i);
+            if (hit(hid, x + 4, iy, w - 8, lh, &ih, &idn)) {
+                chosen = (int)i;
+                ImGui::CloseCurrentPopup();
+            }
+            if (ih || (int)i == sel)
+                DL->AddRectFilled(P(x + 4, iy), P(x_right - 4, iy + lh), ih ? C_FIELD_HOVER : C_SEG_ON, 4 * S);
+            text(g_media.control, x + 12, iy + lh / 2 - g_media.control->FontSize / S / 2, C_TEXT, opt_label(opts[i]));
+        }
+        ImGui::SetCursorScreenPos(P(x, py + 8 + N * lh));
+        ImGui::Dummy(ImVec2(1, 1));
+        DL = keep, O = keep_o;
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
+    return chosen;
+}
+
+static bool toggle(const char *id, float x_right, float cy, bool on) {   // the design's switch, 38 x 22
+    float x = x_right - 38, y = cy - 11;
+    bool hov, down;
+    bool clicked = hit(id, x, y, 38, 22, &hov, &down);
+    ImU32 bg = on ? (hov ? C_GREEN_HOVER : C_GREEN) : (hov ? C_FIELD_HOVER : C_FIELD);
+    DL->AddRectFilled(P(x, y), P(x_right, y + 22), bg, 11 * S);
+    DL->AddCircleFilled(P(on ? x_right - 11 : x + 11, cy), 8 * S, C_TEXT, 24);
+    return clicked;
+}
+
+static int g_tab = 0;   // 0 general, 1 the game's language
+
+static void play_tabs() {   // instead of the header on the Play screen (the design)
+    static const char *const TABS[] = {"tab_main", "tab_lang"};
+    float x = 36;
+    for (int i = 0; i < 2; i++) {
+        const char *l = T(TABS[i]);
+        float w = text_w(g_media.control, l) + 24;
+        bool hov, down;
+        if (hit(TABS[i], x, 20, w, 32, &hov, &down))
+            g_tab = i;
+        if (i == g_tab || hov)
+            DL->AddRectFilled(P(x, 20), P(x + w, 52), i == g_tab ? C_DARK : C_CARD_HOVER, 6 * S);
+        text(g_media.control, x + 12, 36 - g_media.control->FontSize / S / 2, C_TEXT, l);
+        x += w + 2;
+    }
+    DL->AddLine(P(0, 60), P(800, 60), IM_COL32(40, 40, 40, 255), S);
+}
+
+static void row_label(float cy, const char *key) {
+    text(g_media.label, 52, cy - g_media.label->FontSize / S / 2, C_TEXT, T(key));
+}
+
 static void screen_play() {
-    float y = title(82, T("play_title"), nullptr) + 4;
-    std::string sub = Tf("play_sub", {{"path", U.install}});
-    rich(g_media.regular, 36, y, 700, {{sub.c_str(), C_SUB}});
+    float top = 80, y = top + 20;
+    text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_lang"));
+    float cy = top + 52;
+    if (g_tab == 0) {
+        row_label(cy, "row_window");
+        int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_get("window")));
+        if (k >= 0)
+            cfg_set("window", WINDOW_OPTS[k].value);
+        if (SHOW_RESOLUTION) {
+            cy += 40;
+            row_label(cy, "row_res");
+            if ((k = dropdown("res", 748, cy, 126, RES_OPTS, opt_index(RES_OPTS, cfg_get("resolution")))) >= 0)
+                cfg_set("resolution", RES_OPTS[k].value);
+            cy += 40;
+            row_label(cy, "row_scale");
+            if ((k = dropdown("scale", 748, cy, 126, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("upscale")))) >= 0)
+                cfg_set("upscale", SCALE_OPTS[k].value);
+        }
+        cy += 40;
+        row_label(cy, "row_fps");
+        if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_get("fps"), "60"))) >= 0)
+            cfg_set("fps", FPS_OPTS[k].value);
+        cy += 40;
+        row_label(cy, "row_vsync");
+        std::string vs = cfg_get("vsync");
+        bool on = !(vs == "0" || vs == "off");
+        if (toggle("vsync", 748, cy, on))
+            cfg_set("vsync", on ? "off" : "");
+    } else {
+        row_label(cy, "row_text");
+        int k = dropdown("lang", 748, cy, 0, LANG_OPTS, opt_index(LANG_OPTS, cfg_get("lang")));
+        if (k >= 0)
+            cfg_set("lang", LANG_OPTS[k].value);
+    }
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(764, cy + 28), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
 }
 
 static void screen_update() {
@@ -1045,7 +1278,7 @@ static void screen_update_footer() {
 
 // "Version X is out — Update" next to the language button, while nothing is being built
 static void update_banner(float right) {
-    if (!U.has_upd || (U.screen != SCR_DUMP && U.screen != SCR_PLAY))
+    if (!U.has_upd || U.screen != SCR_DUMP)   // the Play screen offers it at the bottom
         return;
     std::string t = Tf("upd_banner", {{"v", U.upd.version}});
     const char *go = T("upd_open");
@@ -1057,10 +1290,25 @@ static void update_banner(float right) {
 
 static bool g_play_failed = false;
 static void screen_play_footer() {
-    if (g_play_failed)
-        text(g_media.small, 36, 425, C_ERR, T("play_failed"));
-    if (button("play", T("play"), 604, 408, 160, 48, PRIMARY))
+    // Play; with a newer release found also Update, and what is new (the design: Play grey beside a green Update)
+    if (button("play", T("play"), 36, 408, 116, 48, U.has_upd ? DARK : PRIMARY))
         g_play_failed = !start_game(U.install);
+    float x = 168;
+    if (U.has_upd) {
+        if (button("upd_open", T("upd_open"), 160, 408, 136, 48, PRIMARY))
+            U.screen = SCR_UPDATE;
+        x = 312;
+        std::string a = Tf("upd_avail", {{"v", U.upd.version}});
+        rich(g_media.label, x, 408, 450, {{(a + ".").c_str(), C_TEXT}, {" ", C_TEXT}, {T("upd_notes"), C_TEXT, U.upd.page.c_str()}});
+    }
+    if (g_play_failed) {
+        text(g_media.small, x, U.has_upd ? 434 : 425, C_ERR, T("play_failed"));
+        return;
+    }
+    if (!U.version_line.empty()) {
+        std::string v = Tf(U.has_upd ? "cur_ver" : "port_ver", {{"v", U.version_line}});
+        text(g_media.small, x, (U.has_upd ? 443 : 432) - g_media.small->FontSize / S / 2, C_SUB, v.c_str());
+    }
 }
 
 // ---------------------------------------------------------------- frame
@@ -1147,7 +1395,7 @@ void ui_frame(float scale) {
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DL = ImGui::GetWindowDrawList();
     O = ImVec2(0, 0);
-    bool lang = U.screen == SCR_DUMP || U.screen == SCR_PLAY || U.screen == SCR_BROKEN;
+    bool lang = U.screen == SCR_DUMP || U.screen == SCR_BROKEN;
 
     // the body scrolls when it does not fit (long texts, a small screen); the header and the buttons stay
     ImGui::SetCursorScreenPos(P(0, 72));
@@ -1177,7 +1425,10 @@ void ui_frame(float scale) {
     case SCR_UPDATE: screen_update_footer(); break;
     default: break;
     }
-    header(lang);   // last: the language list lies over the body
+    if (U.screen == SCR_PLAY)
+        play_tabs();
+    else
+        header(lang);   // last: the language list lies over the body
     ImGui::End();
 }
 
@@ -1232,8 +1483,13 @@ void ui_demo(const char *name) {
     } else if (n == "run") {   // a real build at once, as if Prepare was pressed
         U.dump_st = D_OK;
         start_build();
-    } else if (n == "play") {
+    } else if (n == "play" || n == "play_upd" || n == "play_lang") {
         U.screen = SCR_PLAY;
+        g_tab = n == "play_lang" ? 1 : 0;
+        if (n != "play") {
+            U.upd.version = "0.3.0", U.upd.page = ULTRS_REPO "/releases";
+            U.has_upd = true;
+        }
     }
 }
 
