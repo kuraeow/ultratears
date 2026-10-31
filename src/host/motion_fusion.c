@@ -34,6 +34,15 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
+/* [port] Zero-rate calibration (L12, GitHub #39, 2026-10-31): with a Pro Controller the aim crept to one side and then the
+   other with the controller at rest - its gyro's bias, which nothing took off (yaw has no reference). While the
+   controller is still (rotation under STILL_RAD and acceleration within 5 % of 1 G for STILL_S) the bias follows the
+   gyro's reading, and it is subtracted from every sample, as the Switch, Steam Input and SDL games do. Moving, the bias
+   stays as it was. TOTK_GYRO_CALIBRATE=0 turns it off. */
+#define STILL_RAD (4.0 * M_PI / 180)
+#define STILL_S 0.4
+static double bias[3], still_s;
+static int calibrate = -1, bias_set;
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -104,10 +113,25 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         deadzone = v * M_PI / 180;
         if (e) fprintf(stderr, "[gyro] dead zone %.2f deg/s (TOTK_GYRO_DEADZONE)\n", v);
     }
-    double rate = norm3(gyro), keep = rate > deadzone ? (rate - deadzone) / rate : 0;
-    for (int i = 0; i < 3; i++) gyro[i] *= keep;
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
+    if (calibrate < 0) { const char *e = getenv("TOTK_GYRO_CALIBRATE"); calibrate = !(e && !strcmp(e, "0")); }
+    if (calibrate) {
+        double g[3] = {gyro[0] - bias[0], gyro[1] - bias[1], gyro[2] - bias[2]}, a = norm3(acc);
+        if (norm3(g) < STILL_RAD && fabs(a - 1) < 0.05) still_s += dt; else still_s = 0;
+        if (still_s >= STILL_S) {   /* still: the bias follows the reading (about a second; at once the first time) */
+            double k = bias_set ? dt / 1.0 : 1;
+            for (int i = 0; i < 3; i++) bias[i] += (gyro[i] - bias[i]) * k;
+            if (!bias_set) {
+                bias_set = 1;
+                fprintf(stderr, "[gyro] at rest: zero-rate bias %.2f %.2f %.2f deg/s taken off (TOTK_GYRO_CALIBRATE=0: off)\n",
+                        bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI);
+            }
+        }
+        for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
+    }
+    double rate = norm3(gyro), keep = rate > deadzone ? (rate - deadzone) / rate : 0;
+    for (int i = 0; i < 3; i++) gyro[i] *= keep;
     last_ns = now; live = 1;
     if (restart) { align_to(acc); memset(angle, 0, sizeof angle); restart = 0; }
     else integrate(gyro, acc, dt);
