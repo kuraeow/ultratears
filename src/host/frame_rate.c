@@ -132,8 +132,33 @@ static void speed_probe(uint64_t now) {
         frames / wall, game, game / wall, pos);
     t0 = now; frames = 0; game = 0;
 }
+/* TOTK_SPEED_TRACE=<file> (development): a row per present with the frame's time, the step the game moved by and how
+   far Link moved in it. Steady running with Link's speed (moved / step) jumping from frame to frame means his motion
+   is not stepped by the frame's step (the jerkiness while the camera turns smoothly, 2026-10-31). */
+static void speed_trace(uint64_t now) {
+    static int on = -1;
+    static FILE *f;
+    static uint64_t last_ns, n;
+    static float last[3];
+    static int have;
+    if (on < 0) { const char *e = getenv("TOTK_SPEED_TRACE"); on = e && *e && (f = fopen(e, "w")) != NULL;
+                  if (on) fprintf(f, "frame\tframe_ms\tstep_ms\tmoved_mm\tspeed_by_step\tspeed_by_frame\ty\n"); }
+    if (!on) return;
+    float p[3];
+    int ok = player_pos(p);
+    double dt = last_ns ? (now - last_ns) * 1e-9 : 0, step = totk_fr_step_seconds();
+    if (ok && have && dt > 0) {
+        double d = hypot(p[0] - last[0], p[2] - last[2]);
+        fprintf(f, "%llu\t%.2f\t%.2f\t%.1f\t%.2f\t%.2f\t%.3f\n", (unsigned long long)n, dt * 1e3, step * 1e3, d * 1e3,
+                step > 0 ? d / step : 0, d / dt, p[1]);
+        if (!(n % 60)) fflush(f);
+    }
+    if (ok) memcpy(last, p, sizeof p);
+    have = ok; last_ns = now; n++;
+}
 #else
 static void speed_probe(uint64_t now) { (void)now; }
+static void speed_trace(uint64_t now) { (void)now; }
 #endif
 
 /* TOTK_STATS: a line per 300 frames with how far the step the game moved by was from the time the frame really took
@@ -158,6 +183,7 @@ static void step_error(double dt) {
 void runtime_frame_step_update(uint64_t now_ns) {
     config();
     speed_probe(now_ns);
+    speed_trace(now_ns);
     if (!g_realtime || !now_ns) return;
     if (!g_last_ns) { g_last_ns = now_ns; return; }
     double dt = (double)(now_ns - g_last_ns) * 1e-9;
