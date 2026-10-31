@@ -16,6 +16,7 @@
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR)
 #define VK_FN_DEVICE(X) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkQueueWaitIdle) \
+    X(vkGetDeviceFaultInfoEXT) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
     X(vkCreateCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) \
@@ -68,6 +69,7 @@ typedef struct {
     int has_checkpoints;     // TOTK_VK_CHECKPOINTS=1: VK_NV_device_diagnostic_checkpoints (where a lost device stopped)
     int has_memory_budget;   // VK_EXT_memory_budget: the memory this process uses per heap (the memory log line)
     int has_buffer_marker;   // TOTK_VK_CHECKPOINTS=1: VK_AMD_buffer_marker (the same, written by the GPU to host memory)
+    int has_device_fault;    // VK_EXT_device_fault: the driver's report of a lost device (vk_device_fault_report)
     int has_custom_border;   // VK_EXT_custom_border_color without a format: any sampler border colour, as on NVN
     uint32_t max_custom_border;   // ...at most this many such samplers at once (maxCustomBorderColorSamplers)
     uint32_t subgroup_pin;   // 32 where the driver may run shaders in other subgroup sizes (AMD: 32 or 64), else 0
@@ -82,3 +84,4 @@ int vk_init(SDL_Window *window);
 void vk_queue_lock(void);       // the queue is used by the replayer's submit thread and the present thread
 void vk_queue_unlock(void);
 int vk_check(VkResult r, const char *what);   // 1 on success, logs the failure otherwise
+void vk_device_fault_report(void);             // after a lost device: the driver's report (VK_EXT_device_fault)

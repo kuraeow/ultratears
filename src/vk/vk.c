@@ -17,9 +17,12 @@ static pthread_mutex_t queue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_queue_lock(void) { pthread_mutex_lock(&queue_mu); }
 void vk_queue_unlock(void) { pthread_mutex_unlock(&queue_mu); }
 
+void vk_device_fault_report(void);
 int vk_check(VkResult r, const char *what) {
     if (r == VK_SUCCESS) return 1;
     LOG("%s failed (%d)", what, (int)r);
+    static int reported;
+    if (r == VK_ERROR_DEVICE_LOST && !reported++) vk_device_fault_report();   // once, whichever call saw it first
     return 0;
 }
 
@@ -184,6 +187,7 @@ static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_T
 static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
 static VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
 static VkPhysicalDeviceCustomBorderColorFeaturesEXT fcbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+static VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
 static VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
 static VkPhysicalDeviceConditionalRenderingFeaturesEXT fcr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
 static VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
@@ -233,6 +237,8 @@ static int create_device(void) {
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
         // ...and written by the GPU to host memory, which outlives the device (the NVIDIA driver gave 0 checkpoints, 2026-10-27)
         {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
+        // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
+        {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
     };
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
@@ -277,6 +283,8 @@ static int create_device(void) {
     // NVN samplers take any border colour (TOTK clamps the grass interaction map to 0.5 grey); the samplers are made
     // before the texture is known, so the colour must work without a format
     vkc.has_custom_border = has_cbc && fcbc.customBorderColors && fcbc.customBorderColorWithoutFormat;
+    vkc.has_device_fault = vkc.has_device_fault && ffault.deviceFault;
+    ffault.deviceFaultVendorBinary = VK_FALSE;   // the counts and addresses are enough for the log
     if (vkc.has_custom_border) {
         VkPhysicalDeviceCustomBorderColorPropertiesEXT cbp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cbp};
@@ -322,4 +330,29 @@ int vk_init(SDL_Window *window) {
     if (!state) state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
     pthread_mutex_unlock(&mu);
     return state == 1;
+}
+
+/* After VK_ERROR_DEVICE_LOST (VK_EXT_device_fault): the driver's description of the fault, the GPU addresses it involved
+   and the vendor's codes, into the log. Nothing when the driver has no report. */
+void vk_device_fault_report(void) {
+    if (!vkc.has_device_fault || !vk.vkGetDeviceFaultInfoEXT) return;
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, NULL) != VK_SUCCESS) { LOG("device fault: no report from the driver"); return; }
+    VkDeviceFaultAddressInfoEXT addr[16];
+    VkDeviceFaultVendorInfoEXT ven[16];
+    if (n.addressInfoCount > 16) n.addressInfoCount = 16;
+    if (n.vendorInfoCount > 16) n.vendorInfoCount = 16;
+    n.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = addr, .pVendorInfos = ven};
+    VkResult r = vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { LOG("device fault: no report from the driver (%d)", (int)r); return; }
+    LOG("device fault: %s", info.description[0] ? info.description : "(no description)");
+    static const char *const kind[] = {"none", "invalid read", "invalid write", "invalid execute", "instruction pointer unknown",
+                                       "instruction pointer invalid", "instruction pointer fault"};
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        LOG("  address %#llx (+-%#llx): %s", (unsigned long long)addr[i].reportedAddress,
+            (unsigned long long)addr[i].addressPrecision, addr[i].addressType < 7 ? kind[addr[i].addressType] : "?");
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        LOG("  vendor: %s (code %#llx, data %#llx)", ven[i].description, (unsigned long long)ven[i].vendorFaultCode,
+            (unsigned long long)ven[i].vendorFaultData);
 }
