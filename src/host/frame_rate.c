@@ -43,7 +43,9 @@ static void config(void) {
     const char *e = getenv("TOTK_FPS_LIMIT");
     char *end = NULL;
     long n = e ? strtol(e, &end, 10) : 60;
-    g_limit = !e || !*e ? 60 : !strcmp(e, "display") ? -1 : !strcmp(e, "unlimited") || !strcmp(e, "0") ? 0
+    /* "unlimited" (the launcher's "Unlimited") is 360, the highest limit, as totk-pc-recomp has no uncapped mode: with no
+       pacing at all the game's sound went silent ~10 s after the start (2026-10-31; 60, 120 and 165 kept it) */
+    g_limit = !e || !*e ? 60 : !strcmp(e, "display") ? -1 : !strcmp(e, "unlimited") || !strcmp(e, "0") ? 360
             : (end && !*end && n >= 30 && n <= 360) ? (int)n : 60;
     if (e && *e && g_limit == 60 && strcmp(e, "60")) LOG("[totk] TOTK_FPS_LIMIT=%s is not 30..360, display or unlimited: 60\n", e);
     g_realtime = !off("TOTK_REALTIME");
