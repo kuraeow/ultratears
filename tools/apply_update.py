@@ -17,7 +17,7 @@ import zipfile
 import zlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KEEP = {'data', 'build', 'userdata', 'diag', 'game', 'update'}   # the player's, never the package's
+KEEP = {'data', 'build', 'build-linux', 'linux', 'userdata', 'diag', 'game', 'update'}   # the player's, never the package's
 LISTING = 'package-files.txt'
 
 

@@ -29,7 +29,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gpu_check  # noqa: E402
 
 INSTALL_GB = 36            # a build from nothing at its peak (data 27 GB, objects 2.7, tools 0.8, the shader export)
+LINUX_GB = 31              # a build for Linux / Steam Deck on top: the tar 25.4, its objects 2.7, the game 1.4, shaders 1.7
 VRAM_GB, RAM_GB = 4, 16
+DECK_TAR = 'UltraTears-SteamDeck.tar'
 AMD = 0x1002
 RANK = {'discrete': 0, 'integrated': 1, 'virtual': 2, 'other': 3, 'CPU': 9}
 
@@ -97,11 +99,13 @@ def folder_size(p):
     return total
 
 
-def disk_case(folder):
+def disk_case(folder, linux=False):
     """Enough free space where the build goes? What is already built there (an update) counts as taken."""
     folder = pathlib.Path(folder)
-    have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps') if (folder / d).is_dir())
-    need = max(0, INSTALL_GB * 2**30 - have)
+    have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps', 'build-linux', 'linux') if (folder / d).is_dir())
+    if (folder / DECK_TAR).is_file():
+        have += (folder / DECK_TAR).stat().st_size
+    need = max(0, (INSTALL_GB + (LINUX_GB if linux else 0)) * 2**30 - have)
     probe = folder
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
@@ -112,14 +116,18 @@ def disk_case(folder):
              'args': {'need_gb': round(need / 2**30), 'free_gb': round(free / 2**30), 'drive': str(probe.resolve().drive or probe)}}]
 
 
-def cases(folder):
-    out = gpu_cases()
-    ram = ram_bytes()
-    if ram and ram < RAM_GB * 2**30 * 0.9:   # a 16 GB PC reports a little less (memory the firmware keeps)
-        out.append({'code': 'ram_low', 'sev': 'warn', 'args': {'gb': round(ram / 2**30)}})
-    if not avx2():
-        out.append({'code': 'cpu_no_avx2', 'sev': 'warn', 'args': {}})
-    return out + disk_case(folder)
+def cases(folder, platforms=('windows',)):
+    """platforms: what is built. A build for the Steam Deck alone asks nothing of this PC's graphics card, memory or CPU
+    (the game runs on the Deck), only the disk space."""
+    out = []
+    if 'windows' in platforms:
+        out = gpu_cases()
+        ram = ram_bytes()
+        if ram and ram < RAM_GB * 2**30 * 0.9:   # a 16 GB PC reports a little less (memory the firmware keeps)
+            out.append({'code': 'ram_low', 'sev': 'warn', 'args': {'gb': round(ram / 2**30)}})
+        if not avx2():
+            out.append({'code': 'cpu_no_avx2', 'sev': 'warn', 'args': {}})
+    return out + disk_case(folder, 'linux' in platforms)
 
 
 def text(case):

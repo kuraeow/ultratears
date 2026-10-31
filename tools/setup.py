@@ -4,6 +4,7 @@ From a Git checkout the build goes to dist\\, or to --output <folder>: the track
 builder package or a source folder without Git setup runs in place. Build tools this PC lacks are downloaded into
 deps\\ from where they are published (tools/deps_install.py, pinned in tools/deps.json); a builder package has them.
 usage: python tools/setup.py [--output <build folder>] [--dump <folder with exefs\\ and romfs\\>] [--cpus N] [--full]
+                             [--platform windows|linux|both]   (linux: for the Steam Deck; remembered)
        python tools/setup.py --check-dump <folder> [--json]   (is it a usable dump? for the launcher's folder screens)
 --json (the launcher): events on stdout, one JSON object a line, among the plain log lines: {"ev": "plan", "steps":
 [{"id", "weight"}]} (the share of a build from nothing, in %), {"ev": "step", "id", "state": "run" / "done" / "skip",
@@ -24,6 +25,8 @@ Steps (data\\ holds everything made from the dump; it never leaves this PC):
   shaders   every shader of the game found and translated to SPIR-V, data\\shaders
   textures  the ASTC textures re-encoded for PC graphics cards (BC7 / BC1), data\\textures
   finish    ultratears.cfg
+  deck      --platform linux / both: UltraTears-SteamDeck.tar, the game for the Steam Deck to carry there (the game
+            cross-compiled with the Linux kit, deps\\linux, in the compile step; its shaders in the shaders step)
 """
 import argparse
 import filecmp
@@ -194,6 +197,8 @@ def build_from_checkout(a):
         cmd += ['--json']
     if a.full:
         cmd += ['--full']
+    if a.platform:
+        cmd += ['--platform', a.platform]
     return subprocess.run(cmd, cwd=home, env=dict(os.environ, PYTHONNOUSERSITE='1')).returncode
 
 
@@ -244,7 +249,7 @@ def step_check(dump, state):
             raise Fail(f'the Python package {mod} is missing from {sys.executable}: delete the deps folder and run '
                        'setup again to reinstall the build tools')
     toolchain.env()
-    hardware()
+    hardware(state.get('platforms', ['windows']))
     if toolchain.XLATE is None:
         raise Fail('the shader translator deps\\shaders\\ultrs-shaders.exe is missing: run setup again to build it')
     if packed(state) and all(ok_module(DATA / 'exefs' / n, h) for n, h in EXEFS.items()):
@@ -253,11 +258,11 @@ def step_check(dump, state):
     return 'Tears of the Kingdom 1.4.3 (the code modules match)'
 
 
-def hardware():
+def hardware(platforms):
     """What this PC lacks (tools/hw_check.py), before an hour of building: not enough disk space stops the build; a card
     the game cannot run on asks whether to build anyway (ULTRS_SKIP_GPU_CHECK=1: no graphics question)."""
     import hw_check
-    cases = hw_check.cases(ROOT)
+    cases = hw_check.cases(ROOT, platforms)
     if os.environ.get('ULTRS_SKIP_GPU_CHECK'):
         cases = [c for c in cases if c['sev'] != 'stop']
     if progress.JSON:
@@ -399,10 +404,17 @@ def record_source_dates():
 
 
 def step_compile(dump, state, cpus):
-    run([sys.executable, 'tools/build_game.py', '--generated', DATA / 'generated', '--target', 'ultratears', '--cpus', cpus],
-        'compiling')
+    made = []
+    if 'windows' in state['platforms']:
+        run([sys.executable, 'tools/build_game.py', '--generated', DATA / 'generated', '--target', 'ultratears', '--cpus',
+             cpus], 'compiling')
+        made.append('UltraTears.exe')
+    if 'linux' in state['platforms']:   # the same C for Linux / Steam Deck, against the Linux kit (deps/linux)
+        run([sys.executable, 'tools/build_game.py', '--generated', DATA / 'generated', '--target', 'ultratears', '--cpus',
+             cpus, '--platform', 'linux'], 'compiling for Linux')
+        made.append('linux/ultratears')
     record_source_dates()
-    return 'UltraTears.exe'
+    return ', '.join(made)
 
 
 # The game reads the translated shaders from one file, data/shaders/translated.pack (issue #22: ~57,000 files before).
@@ -414,44 +426,91 @@ KEEP_SHADER_WORK = False
 SHADER_OLD = ['raw', 'ryujinx', 'ryujinx-code', 'jobs.jsonl', 'shaders.tsv', 'ryujinx-results.tsv', 'ryujinx-results-new.tsv']
 
 
+# Gathers on AMD and Intel round the other way from Maxwell: the translator biases their coordinates (TOTK_GATHER_BIAS,
+# its QueryHostGatherBiasPrecision; 0 on NVIDIA, 8 on AMD and Intel); a changed card translates again. The Steam Deck's
+# GPU is AMD's.
+DECK_BIAS = '8'
+
+
+def host_bias():
+    if 'TOTK_GATHER_BIAS' in os.environ:
+        return os.environ['TOTK_GATHER_BIAS']
+    import hw_check
+    return '0' if hw_check.game_gpu_vendor() in (None, 0x10de) else DECK_BIAS
+
+
+def shader_packs(state):
+    """(folder, gather bias, state key) of each pack this build makes: the PC's for Windows; for the Deck the PC's when
+    its card is AMD or Intel, or the only one when the build is for the Deck alone, else one of its own in shaders-deck.
+    [temporary] The Deck's own pack is translated here until the Linux launcher translates it on the Deck at its first
+    start (dev-local/docs/linux-deck.md)."""
+    plats, host = state['platforms'], host_bias()
+    if 'windows' not in plats:
+        return [(DATA / 'shaders', DECK_BIAS, 'shaders')]
+    packs = [(DATA / 'shaders', host, 'shaders')]
+    if 'linux' in plats and host != DECK_BIAS:
+        packs.append((DATA / 'shaders-deck', DECK_BIAS, 'deck-shaders'))
+    return packs
+
+
+def deck_pack(state):
+    return shader_packs(state)[-1][0] / 'translated.pack'
+
+
 def step_shaders(dump, state, cpus):
-    out = DATA / 'shaders'
-    pack = out / 'translated.pack'
     export = tree_hash([ROOT / 'tools/shaders/inventory.py', ROOT / 'tools/export_shaders.py'])
-    # Gathers on AMD and Intel round the other way from Maxwell: the translator biases their coordinates
-    # (TOTK_GATHER_BIAS, its QueryHostGatherBiasPrecision); a changed card translates again.
-    if 'TOTK_GATHER_BIAS' not in os.environ:
-        import hw_check
-        os.environ['TOTK_GATHER_BIAS'] = '0' if hw_check.game_gpu_vendor() in (None, 0x10de) else '8'
-    xlate = sha256(toolchain.XLATE)[:16] + ('' if os.environ['TOTK_GATHER_BIAS'] == '0' else '-g' + os.environ['TOTK_GATHER_BIAS'])
-    if state.get('shaders-pack') == f'{export}/{xlate}' and pack.is_file():
-        return 'up to date'
-    old = out / 'ryujinx'
-    if old.is_dir() and state.get('shaders-xlate') == xlate and not (out / 'work').exists():
-        run([sys.executable, 'tools/pack_shaders.py', old, pack], 'packing the shaders')
-    else:
-        work = out / 'work'
-        if state.get('shaders-export') != export or not (work / 'jobs.jsonl').is_file():
-            run([sys.executable, 'tools/export_shaders.py', DATA / 'romfs', work, DATA / 'exefs'], 'finding the shaders')
-            state['shaders-export'] = export
+    xlate_id = sha256(toolchain.XLATE)[:16]
+    work = DATA / 'shaders/work'
+    made = []
+    keep_bias = os.environ.get('TOTK_GATHER_BIAS')
+    try:
+        for out, bias, key in shader_packs(state):
+            pack = out / 'translated.pack'
+            xlate = xlate_id + ('' if bias == '0' else '-g' + bias)
+            if state.get(f'{key}-pack') == f'{export}/{xlate}' and pack.is_file():
+                continue
+            os.environ['TOTK_GATHER_BIAS'] = bias
+            old = out / 'ryujinx'
+            if key == 'shaders' and old.is_dir() and state.get('shaders-xlate') == xlate and not work.exists():
+                run([sys.executable, 'tools/pack_shaders.py', old, pack], 'packing the shaders')
+            else:
+                if state.get('shaders-export') != export or not (work / 'jobs.jsonl').is_file():
+                    run([sys.executable, 'tools/export_shaders.py', DATA / 'romfs', work, DATA / 'exefs'], 'finding the shaders')
+                    state['shaders-export'] = export
+                    state.pop('work-xlate', None)
+                    save_state(state)
+                # the work folder holds one translation: of this bias when it is the one made last
+                new_only = ['--new-only'] if state.get('work-xlate') == xlate else []
+                run([sys.executable, 'tools/run_ryujinx_xlate.py', work, '--workers', min(cpus, 32), '--quiet'] + new_only,
+                    'translating the shaders')
+                state['work-xlate'] = xlate
+                if key == 'shaders':
+                    state['shaders-xlate'] = xlate
+                save_state(state)
+                out.mkdir(parents=True, exist_ok=True)
+                run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack], 'packing the shaders')
+            state[f'{key}-pack'] = f'{export}/{xlate}'
             save_state(state)
-        new_only = ['--new-only'] if state.get('shaders-xlate') == xlate else []
-        run([sys.executable, 'tools/run_ryujinx_xlate.py', work, '--workers', min(cpus, 32), '--quiet'] + new_only,
-            'translating the shaders')
-        state['shaders-xlate'] = xlate
-        save_state(state)
-        run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack], 'packing the shaders')
-        if not KEEP_SHADER_WORK:
-            shutil.rmtree(work)
+            made.append(out.name)
+    finally:
+        if keep_bias is None:
+            os.environ.pop('TOTK_GATHER_BIAS', None)
+        else:
+            os.environ['TOTK_GATHER_BIAS'] = keep_bias
+    if work.exists() and not KEEP_SHADER_WORK:
+        shutil.rmtree(work)
+        state.pop('work-xlate', None)
     for name in SHADER_OLD:   # the layout from before the pack
-        p = out / name
+        p = DATA / 'shaders' / name
         if p.is_dir():
             shutil.rmtree(p)
         elif p.is_file():
             p.unlink()
+    if 'deck-shaders' not in [k for _, _, k in shader_packs(state)]:   # the Deck uses the PC's pack now
+        shutil.rmtree(DATA / 'shaders-deck', ignore_errors=True)
+        state.pop('deck-shaders-pack', None)
     state['shaders-export'] = export
-    state['shaders-pack'] = f'{export}/{xlate}'
-    return 'done'
+    return 'done: ' + ', '.join(made) if made else 'up to date'
 
 
 def step_textures(dump, state, cpus):
@@ -501,8 +560,27 @@ def step_finish(dump, state, cpus):
     return 'ultratears.cfg ready'
 
 
+DECK_TAR = 'UltraTears-SteamDeck.tar'
+
+
+def step_deck(dump, state, cpus):
+    """A build for Linux / Steam Deck: the game, its data and settings as UltraTears-SteamDeck.tar in this folder, which
+    the player carries to the Deck (tools/make_deck_tar.py). Made again when anything in it is newer."""
+    tar = ROOT / DECK_TAR
+    if 'linux' not in state['platforms']:
+        return 'not for the Steam Deck'
+    pack = deck_pack(state)
+    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', ROOT / 'ultratears.cfg', pack,
+              DATA / 'romfs/romfs.bin', DATA / 'textures/bc7.idx']
+    if tar.is_file() and state.get('deck-tar') == str(pack) and all(p.stat().st_mtime <= tar.stat().st_mtime for p in inputs if p.exists()):
+        return 'up to date'
+    run([sys.executable, 'tools/make_deck_tar.py', '--pack', pack.relative_to(ROOT)], 'packing the game for the Steam Deck')
+    state['deck-tar'] = str(pack)
+    return f'{DECK_TAR}, {tar.stat().st_size / 2**30:.1f} GiB'
+
+
 STEPS = [('check', step_check), ('romfs', step_romfs), ('lift', step_lift), ('compile', step_compile),
-         ('shaders', step_shaders), ('textures', step_textures), ('finish', step_finish)]
+         ('shaders', step_shaders), ('textures', step_textures), ('finish', step_finish), ('deck', step_deck)]
 
 
 def no_quick_edit():
@@ -538,6 +616,9 @@ def main():
     ap.add_argument('--check-dump', type=pathlib.Path, metavar='FOLDER', help='only say whether FOLDER is a usable dump')
     ap.add_argument('--full', action='store_true',
                     help='forget what was built and make every step again (the RomFS too while the dump is there)')
+    ap.add_argument('--platform', choices=list(PLATFORMS),
+                    help='what to build: the game for this PC (windows), for the Steam Deck (linux: a tar to carry to it) '
+                         'or both (default: as the last build, else windows; remembered)')
     a = ap.parse_args()
     global KEEP_SHADER_WORK
     KEEP_SHADER_WORK = a.keep_shader_work
@@ -556,8 +637,12 @@ def main():
     # The build runs on a Python 3.14 with the build's packages (deps_install.python_for), whichever Python started
     # setup: a source folder without Git (GitHub's Download ZIP) went on with the player's own, which may lack them or
     # be a version they do not install on. Then the rest of the tools, installed when this PC lacks them.
+    state = load_state()
+    if a.platform:
+        state['platforms'] = PLATFORMS[a.platform]
+    state.setdefault('platforms', ['windows'])
     if progress.JSON and not os.environ.get('ULTRATEARS_SETUP_OWN_PYTHON'):
-        progress.emit('plan', steps=[{'id': s, 'weight': w} for s, w in STEP_WEIGHTS.items()])
+        progress.emit('plan', steps=[{'id': s, 'weight': w} for s, w in step_weights(state['platforms']).items()])
         progress.emit('step', id='tools', state='run')
     t_tools = time.time()
     try:
@@ -568,14 +653,13 @@ def main():
         env = dict(os.environ, PYTHONNOUSERSITE='1', ULTRATEARS_SETUP_OWN_PYTHON='1')
         sys.exit(subprocess.run([str(py), str(ROOT / 'tools/setup.py')] + sys.argv[1:], cwd=ROOT, env=env).returncode)
     try:
-        deps_install.ensure_tools(ROOT)
+        deps_install.ensure_tools(ROOT, linux='linux' in state['platforms'])
     except deps_install.DepsError as e:
         fail_tools(e)
     if progress.JSON:
         progress.emit('step', id='tools', state='done', secs=round(time.time() - t_tools))
     awake()
     importlib.reload(toolchain)
-    state = load_state()
     if a.dump:
         state['dump'] = str(a.dump.resolve())
     if not state.get('dump'):
@@ -583,9 +667,10 @@ def main():
     dump = pathlib.Path(state['dump'])
     if a.full:
         full_rebuild(state, dump)
+    save_state(state)
     # a build of everything (the first, or --full) is timed for the launcher's estimates on this PC (full_secs)
     from_nothing = not a.only and (a.full or not any(state.get(k) for k in ('lift', 'shaders-pack', 'textures')))
-    say(f'UltraTears setup: dump {dump}, {a.cpus} CPUs')
+    say(f'UltraTears setup: dump {dump}, {a.cpus} CPUs, for {" and ".join(state["platforms"])}')
     t_all = time.time()
     kept = keep_source_dates()
     if kept:
@@ -609,12 +694,15 @@ def main():
         secs = time.time() - t0 - (ASKED - asked0)
         say(f'  {result or "ok"} ({progress.clock(secs)})')
         if progress.JSON:
-            skipped = result in ('up to date', 'already packed')   # the step had nothing to do (an update, a resume)
+            # the step had nothing to do (an update, a resume, no Deck)
+            skipped = result in ('up to date', 'already packed', 'not for the Steam Deck')
             progress.emit('step', id=name, state='skip' if skipped else 'done', secs=round(secs), note=result or '')
     if from_nothing:
         state['full_secs'], state['full_cpus'] = round(time.time() - t_all - ASKED), a.cpus
         save_state(state)
-    say(f'\nDone in {progress.clock(time.time() - t_all - ASKED)}. Start the game: UltraTears.exe in {ROOT}')
+    say(f'\nDone in {progress.clock(time.time() - t_all - ASKED)}.' +
+        (f' Start the game: UltraTears.exe in {ROOT}.' if 'windows' in state['platforms'] else '') +
+        (f' For the Steam Deck: carry {ROOT / DECK_TAR} to it and unpack it there.' if 'linux' in state['platforms'] else ''))
     if progress.JSON:
         progress.emit('done', secs=round(time.time() - t_all - ASKED))
 
@@ -623,6 +711,18 @@ def main():
 # 1:19, compile 15:39, shaders 2:54, textures 10:08; tools: a source build's first download). The launcher's overall bar
 # weighs each step's own progress by these; steps already done count in full.
 STEP_WEIGHTS = {'tools': 2, 'check': 1, 'romfs': 7, 'lift': 4, 'compile': 47, 'shaders': 9, 'textures': 30, 'finish': 0}
+PLATFORMS = {'windows': ['windows'], 'linux': ['linux'], 'both': ['windows', 'linux']}
+
+
+def step_weights(platforms):
+    """STEP_WEIGHTS for what is built: the game compiled once per platform, the Deck's shaders translated as well on a PC
+    that is not an AMD or Intel one, the tar of ~25 GB written (~3 min)."""
+    w = dict(STEP_WEIGHTS)
+    w['compile'] *= len(platforms)
+    if 'linux' in platforms:
+        w['shaders'] *= 2 if 'windows' in platforms else 1
+        w['deck'] = 6
+    return w
 
 
 def full_rebuild(state, dump):
@@ -632,10 +732,11 @@ def full_rebuild(state, dump):
     player who deleted it keeps the packed one (there is nothing to pack it from). Saves and settings stay."""
     keep_romfs = not (dump / 'romfs').is_dir()
     for k in list(state):
-        if k != 'dump' and not (keep_romfs and k == 'romfs'):
+        if k not in ('dump', 'platforms') and not (keep_romfs and k == 'romfs'):
             del state[k]
     root = ROOT.resolve()
-    for p in (ROOT / 'build/obj', ROOT / 'build/game', DATA / 'generated', DATA / 'shaders', DATA / 'textures'):
+    for p in (ROOT / 'build/obj', ROOT / 'build/game', ROOT / 'build-linux/obj', ROOT / 'build-linux/game',
+              DATA / 'generated', DATA / 'shaders', DATA / 'shaders-deck', DATA / 'textures'):
         if p.is_dir() and root in p.resolve().parents:
             shutil.rmtree(p)
     SOURCE_DATES.unlink(missing_ok=True)

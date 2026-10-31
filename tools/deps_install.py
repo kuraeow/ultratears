@@ -1,7 +1,8 @@
 """The build tools of a source build: what is missing on this PC is downloaded into deps/ from where it is published.
 
-tools/deps.json pins every download (URL, size, hash); nothing of it is in git and nothing comes from an UltraTears
-release. Each part is used from the PC when it is already there, else installed into deps/:
+tools/deps.json pins every download (URL, size, hash); nothing of it is in git, and only the Linux kit (a build for
+Linux / Steam Deck) comes from an UltraTears release. Each part is used from the PC when it is already there, else
+installed into deps/:
   - Python 3.14 with lz4, capstone and unicorn: the Python running setup.py when it is 3.14+ and has them, else
     deps/python (python.org's NuGet package, the wheels from PyPI unpacked into it; no pip, no compiler);
   - clang, lld, ninja and the libraries the port links (MSYS2 CLANG64): deps/clang64, ULTRS_CLANG64 or
@@ -390,13 +391,49 @@ def launcher_libs(home=ROOT):
     return out
 
 
+# ---------------------------------------------------------------- the Linux kit
+# A build for Linux / Steam Deck (setup.py --platform linux or both) needs the Linux kit in deps/linux: the files of
+# Valve's Steam Runtime "sniper" sysroot a compile and link of the game read, and a static zstd (tools/make_linux_kit.py,
+# ~18 MB). It is the one part published with UltraTears' releases, pinned in tools/deps.json "linux_kit".
+# ULTRS_LINUX_KIT_ZIP=<a local kit zip> installs that one instead, unchecked (development, before a kit is published).
+def linux_kit_for(home):
+    """deps/linux when installed from the current pin (or a local zip), else None."""
+    key = installed(home).get('linux_kit')
+    want = key_of(manifest()['linux_kit'])
+    if (home / 'deps/linux/sysroot').is_dir() and (key == want or (key == 'local' and os.environ.get('ULTRS_LINUX_KIT_ZIP'))):
+        return home / 'deps/linux'
+    return None
+
+
+def install_linux_kit(home):
+    item = manifest()['linux_kit']
+    local = os.environ.get('ULTRS_LINUX_KIT_ZIP')
+    say(f'  the Linux kit ({item["size"] / 2**20:.0f} MiB) -> deps\\linux')
+    path = pathlib.Path(local) if local else fetch(item, home / 'deps/downloads', 'the Linux kit')
+    wipe(home, 'linux')
+    own = (home / 'deps/linux').resolve()
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            rel = pathlib.PurePosixPath(info.filename)
+            if '..' in rel.parts or rel.is_absolute():
+                raise DepsError(f'unsafe path in {path.name}: {info.filename}')
+        z.extractall(own)
+    if not (own / 'sysroot/usr/include/stdio.h').is_file():
+        raise DepsError('the installed deps\\linux lacks the sysroot')
+    mark(home, 'linux_kit', 'local' if local else key_of(item))
+    if not local:
+        path.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------- entry points
-def ensure_tools(home):
-    """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing."""
+def ensure_tools(home, linux=False):
+    """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing; linux: the Linux kit too."""
     if clang64_for(home) is None:
         install_clang64(home)
     if not xlate_ok(home):
         build_xlate(home)
+    if linux and linux_kit_for(home) is None:
+        install_linux_kit(home)
 
 
 def ready(home):

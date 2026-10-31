@@ -218,6 +218,12 @@
   "sha512": "ae4fd528cb7e9f6af6aaf7de36715a69f761f183744f1bb3025d19f5a92447090ec561410e46266c1d10a63781ed6f3de771760bc76c876d87daabc367b898cd",
   "size": 300755826
  },
+ "linux_kit": {
+  "comment": "tools/make_linux_kit.py from the Steam Runtime sniper SDK sysroot 3.0.20261021.266025 and zstd 1.5.7; [temporary] not published yet: ULTRS_LINUX_KIT_ZIP names a local one",
+  "url": "https://github.com/kuraeow/ultratears/releases/download/linux-kit-1/ultrs-linux-kit-1.zip",
+  "size": 17947261,
+  "sha256": "2dfaf70a1e61d119a9f51209c7908501d73ccefe7b7aa240f235ca4f208e9ec1"
+ },
  "launcher": {
   "imgui": {
    "version": "1.91.9b",

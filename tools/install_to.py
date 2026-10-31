@@ -11,7 +11,7 @@ import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KEEP = {'data', 'build', 'userdata', 'diag', 'game', 'update', 'dist', 'dev-local'}   # the player's, never copied
+KEEP = {'data', 'build', 'build-linux', 'linux', 'userdata', 'diag', 'game', 'update', 'dist', 'dev-local'}   # the player's, never copied
 SETTINGS = 'ultratears-launcher.ini'
 
 
@@ -24,7 +24,7 @@ def package_files():
     if listing.is_file():
         return [f for f in listing.read_text(encoding='utf-8').splitlines() if f and (ROOT / f).is_file()]
     return sorted(p.relative_to(ROOT).as_posix() for p in ROOT.rglob('*')
-                  if p.is_file() and p.relative_to(ROOT).parts[0] not in KEEP and not p.name.endswith('.log'))
+                  if p.is_file() and p.relative_to(ROOT).parts[0] not in KEEP and not p.name.endswith(('.log', '.tar')))
 
 
 def main():
