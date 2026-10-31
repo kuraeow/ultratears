@@ -397,10 +397,11 @@ def launcher_libs(home=ROOT):
 # ~18 MB). It is the one part published with UltraTears' releases, pinned in tools/deps.json "linux_kit".
 # ULTRS_LINUX_KIT_ZIP=<a local kit zip> installs that one instead, unchecked (development, before a kit is published).
 def linux_kit_for(home):
-    """deps/linux when installed from the current pin (or a local zip), else None."""
+    """deps/linux when installed from the current pin or from a local zip (a developer's: kept until deps/linux is
+    deleted), else None."""
     key = installed(home).get('linux_kit')
     want = key_of(manifest()['linux_kit'])
-    if (home / 'deps/linux/sysroot').is_dir() and (key == want or (key == 'local' and os.environ.get('ULTRS_LINUX_KIT_ZIP'))):
+    if (home / 'deps/linux/sysroot').is_dir() and key in (want, 'local'):
         return home / 'deps/linux'
     return None
 
