@@ -221,9 +221,14 @@ def main():
     if linux:   # SDL3 beside the game (rpath $ORIGIN)
         import shutil
         (ROOT / 'linux').mkdir(exist_ok=True)
-        sdl = next((LINUX_KIT / 'sysroot/usr/lib/x86_64-linux-gnu').glob('libSDL3.so.0.*'), None)
-        if sdl:
-            shutil.copy2(sdl, ROOT / 'linux/libSDL3.so.0')
+        # the Linux kit has libSDL3.so.0 itself (its links made copies, tools/make_linux_kit.py); a full sysroot has it
+        # as a link to libSDL3.so.0.<version>, which Windows may have extracted as a copy or not at all
+        lib = LINUX_KIT / 'sysroot/usr/lib/x86_64-linux-gnu'
+        sdl = next((p for p in [lib / 'libSDL3.so.0', *sorted(lib.glob('libSDL3.so.0.*'))]
+                    if p.is_file() and p.stat().st_size > 1 << 20), None)
+        if not sdl:
+            sys.exit(f'libSDL3.so.0 is missing from the Linux kit ({lib}): the game for Linux needs it beside itself')
+        shutil.copy2(sdl, ROOT / 'linux/libSDL3.so.0')
     env = tool_env()
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
