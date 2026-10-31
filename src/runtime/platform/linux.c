@@ -186,26 +186,37 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-// Started from a desktop (the AppImage) there is no terminal: stdout / stderr go to ultratears.log in the data folder
-// (runtime/paths.h; rt_paths_init runs later, so the same rule is applied here). Processes started by this one (the
-// start screen re-executing itself for the game) append to the same log.
+// As on Windows (platform/windows.c): stdout / stderr go to ultratears.log next to the game, the last run's kept as
+// ultratears-previous.log, unless they are already captured (a pipe or a file: "| tee x.log"). A terminal keeps the
+// lines too: the log is the player's to send, wherever the game was started from (the launcher, Steam's Game Mode, a
+// terminal). TOTK_LOG_FILE=0: the log stays where stderr goes (development); a path: that file. Processes started by
+// this one append to the same log.
 static char g_log_path[1024];
 
-static void log_to_file_without_terminal(void) {
-    if (isatty(STDERR_FILENO)) return;
-    char dir[900];
-    const char *env = getenv("LARECOMP_DATA_ROOT"), *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+static void log_to_file(void) {
+    const char *force = getenv("TOTK_LOG_FILE");
+    if (force && !*force) force = NULL;
+    if (force && !strcmp(force, "0")) return;
     struct stat st;
-    if (env && *env) snprintf(dir, sizeof dir, "%s", env);
-    else if (stat("extracted", &st) == 0 && S_ISDIR(st.st_mode)) return;  // dev mode: wherever stderr goes already
-    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/ultratears", xdg);
-    else snprintf(dir, sizeof dir, "%s/.local/share/ultratears", home && *home ? home : "/tmp");
-    for (char *c = dir + 1; *c; c++)
-        if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
-    mkdir(dir, 0755);
-    snprintf(g_log_path, sizeof g_log_path, "%s/ultratears.log", dir);
+    bool tty = isatty(STDERR_FILENO);
+    if (!force && !tty && fstat(STDERR_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode))) return;
+    char dir[900];
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
+    if (n <= 0) return;
+    dir[n] = 0;
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    if (force && strcmp(force, "1") != 0) snprintf(g_log_path, sizeof g_log_path, "%s", force);
+    else snprintf(g_log_path, sizeof g_log_path, "%s/ultratears.log", dir);
     bool append = getenv("TOTK_LOG_APPEND") != NULL;
+    if (!append && (!force || !strcmp(force, "1"))) {
+        char prev[1024];
+        snprintf(prev, sizeof prev, "%s/ultratears-previous.log", dir);
+        rename(g_log_path, prev);
+    }
+    if (tty) fprintf(stderr, "UltraTears: the log is written to %s\n", g_log_path);
     if (!freopen(g_log_path, append ? "a" : "w", stderr)) { g_log_path[0] = 0; return; }
+    setvbuf(stderr, NULL, _IONBF, 0);
     dup2(STDERR_FILENO, STDOUT_FILENO);
     setenv("TOTK_LOG_APPEND", "1", 1);
 }
@@ -227,7 +238,7 @@ static void require_cpu(void) {}
 void plat_debug_console(int debug) { (void)debug; }   // a terminal, if any, is the user's: nothing to open or hide
 
 void plat_init(void) {
-    log_to_file_without_terminal();
+    log_to_file();
     require_cpu();
 }
 
