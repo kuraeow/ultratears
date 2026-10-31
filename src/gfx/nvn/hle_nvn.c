@@ -2503,7 +2503,6 @@ uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
-static _Atomic uint64_t g_release_ns, g_work_ns;   // UltraTears: steady rate (host/frame_rate.c): release, then work up to present
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
     totk_tl(TL_ACQ_IN, 0, 0);
@@ -2526,7 +2525,6 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
-    atomic_store(&g_release_ns, now_ns());   // UltraTears: the steady rate measures the frame's work from here
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
@@ -2852,11 +2850,6 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "maximum interpolation: uncapped, one interpolated frame per game frame" : "maximum interpolation: game interval, one interpolated frame per game frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game interval"); was = m; }
     if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    if (g_uncapped && uncapped_now() && hz > 0) {   // UltraTears: the steady rate (host/frame_rate.c)
-        extern uint64_t totk_fr_cadence_period(int top, double mon); extern float window_refresh_hz(void);
-        uint64_t p = totk_fr_cadence_period(hz, window_refresh_hz());
-        if (p) return (uint64_t)itv * p;
-    }
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
@@ -2926,7 +2919,6 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
-    { uint64_t r_ = atomic_load(&g_release_ns), n_ = now_ns(); atomic_store(&g_work_ns, r_ && n_ > r_ ? n_ - r_ : 0); }
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
@@ -3064,16 +3056,27 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    /* UltraTears: the paced step (host/frame_rate.c): this frame is shown the step its motion was made with after the
+       previous one (the present thread holds it to its slot, mtl_present_slot), and how late or early it came tunes the
+       next steps. */
+    uint64_t paced = 0;
+    if (g_uncapped && uncapped_now() && g_hz > 0) { extern uint64_t totk_fr_pace_period(int top); paced = totk_fr_pace_period(g_hz); }
     nvn_pacer pc = {o->pace};
-    uint64_t slot = now + nvn_pace(&pc, now, period);
-    {   /* UltraTears: steady rate (host/frame_rate.c): a frame later than its slot by over a quarter period counts as
-           late; the present thread shows the frame at its slot, not as soon as it is drawn (mtl_present_slot) */
-        extern void totk_fr_cadence_frame(int late, uint64_t work_ns);
-        if (o->pace && period) totk_fr_cadence_frame(now > o->pace + period + period / 4, atomic_load(&g_work_ns));
-        mtl_present_slot(period ? slot : 0);
-    }
+    uint64_t slot = now + nvn_pace(&pc, now, period);   // the limit's grid: how fast the game may make frames
     o->pace = pc.target;
-    if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
+    uint64_t avail = period ? slot + period : 0;
+    if (paced) {   /* the display slot: the previous one plus the step this frame was made with, or now if it came late; the
+                      game's next use of this image waits for it too (two frames in the works at most) */
+        static uint64_t dslot;
+        extern void totk_fr_pace_result(uint64_t late_ns, uint64_t margin_ns, uint64_t period_ns);
+        uint64_t want = dslot ? dslot + paced : now;
+        if (dslot) totk_fr_pace_result(now > want ? now - want : 0, want > now ? want - now : 0, paced);
+        dslot = want > now && want - now < 500000000ull ? want : now;
+        slot = dslot;
+        if (avail < dslot) avail = dslot;
+    }
+    mtl_present_slot(paced ? slot : 0);
+    if (idx >= 0 && idx < 4) o->avail[idx] = avail;
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // 屏幕上相邻两帧的显示间隔（掉帧看这个） | display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // 实际呈现间隔（窗口模式）：滞后 8 次出图取（呈现回调已到），第 n 次与第 n−1 次之差；−1 = 被丢弃
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded

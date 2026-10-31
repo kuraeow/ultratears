@@ -92,6 +92,43 @@ static const char *default_exefs(void) {
     return exefs;
 }
 
+/* A setting the player changes in the game (F10, the frame counter) kept in ultratears.cfg of the game folder (the
+   working directory), so the next start and the launcher's Play screen show it: the key's line goes, and with a value
+   "key=value" is added at the end. The other lines stay as they are. */
+void totk_cfg_set(const char *key, const char *value) {
+    FILE *f = fopen("ultratears.cfg", "rb");
+    if (!f) return;
+    char *in = NULL;
+    size_t n = 0, cap = 0, klen = strlen(key);
+    for (int c; (c = fgetc(f)) != EOF;) {
+        if (n + 2 > cap) { cap = cap ? cap * 2 : 4096; char *t = realloc(in, cap); if (!t) { free(in); fclose(f); return; } in = t; }
+        in[n++] = (char)c;
+    }
+    fclose(f);
+    FILE *w = fopen("ultratears.cfg.new", "wb");
+    if (!w) { free(in); return; }
+    int ok = 1;
+    for (size_t i = 0; i < n;) {
+        size_t e = i;
+        while (e < n && in[e] != '\n') e++;
+        int mine = e - i > klen && !strncmp(in + i, key, klen) && in[i + klen] == '=';
+        if (!mine) {
+            ok &= fwrite(in + i, 1, e - i, w) == e - i;
+            ok &= fputc('\n', w) != EOF;
+        }
+        i = e + 1;
+    }
+    if (*value) ok &= fprintf(w, "%s=%s\n", key, value) > 0;
+    ok &= fclose(w) == 0;
+    free(in);
+#ifdef _WIN32
+    if (ok && MoveFileExA("ultratears.cfg.new", "ultratears.cfg", MOVEFILE_REPLACE_EXISTING)) return;
+#else
+    if (ok && rename("ultratears.cfg.new", "ultratears.cfg") == 0) return;
+#endif
+    remove("ultratears.cfg.new");
+}
+
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log

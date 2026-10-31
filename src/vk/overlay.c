@@ -28,7 +28,12 @@ static int on(void) {
     }
     return v;
 }
-void vk_overlay_toggle(void) { atomic_store(&g_on, !on()); }
+void vk_overlay_toggle(void) {   // F10: also kept in ultratears.cfg (host/boot.c), as the launcher's setting shows it
+    int v = !on();
+    atomic_store(&g_on, v);
+    void totk_cfg_set(const char *key, const char *value);
+    totk_cfg_set("fps_overlay", v ? "1" : "");
+}
 
 // At every game frame the present thread shows.
 void vk_overlay_frame(void) {

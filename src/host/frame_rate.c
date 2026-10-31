@@ -30,7 +30,7 @@ enum { STEP_MAX = 8 };
 static int g_steps = 1;    // TOTK_STEP_FRAMES: present intervals averaged into the step
 static int g_limit = -2;   // frames per second; 0 unlimited, -1 the monitor's rate; -2 not read yet
 static int g_realtime = 1, g_cloth = 1, g_highfps = 1;
-static int g_cadence = 1;  // TOTK_CADENCE: a steady rate (constant step, frames shown on their slot), see the steady rate below
+static int g_cadence = 1;  // TOTK_CADENCE: the paced step (frames shown as long as the step they were made with), below
 static _Atomic uint32_t g_step_bits;   // the step in seconds (float bits): what the game steps each frame
 static uint64_t g_last_ns;
 static double g_samples[STEP_MAX];
@@ -58,7 +58,7 @@ static void config(void) {
     char how[96];
     snprintf(how, sizeof how, g_steps == 1 ? ", game stepped by the last frame's time (at most 1/15 s)"
              : ", game stepped by measured time (%d-frame average, at most 1/15 s)", g_steps);
-    if (g_cadence) snprintf(how, sizeof how, ", steady rate (a constant step, frames shown on their slot, rungs by lateness)");
+    if (g_cadence) snprintf(how, sizeof how, ", paced step (each frame shown for the step it was made with, any rate up to the limit)");
     LOG("[totk] frame rate: limit %s; %s%s%s\n", lim,
         g_limit == 30 ? "the shipping code (whole 60 Hz ticks, interval 2)" : "present interval from 1 tick",
         g_realtime ? how : ", whole-tick steps (TOTK_REALTIME=0)",
@@ -72,74 +72,75 @@ static void config(void) {
 // The limit for the pacer: frames per second, 0 unlimited, -1 the monitor's rate.
 int totk_fr_limit(void) { config(); return g_limit; }
 
-/* Steady rate (TOTK_CADENCE, default on above 30 fps with a limit; =0: the step follows each frame's measured time).
-   The game moves Link by the step of two presents before the one that shows him (its frame is pipelined; TOTK_SPEED_TRACE
-   on a run, 2026-10-31) while the camera follows the newest one, so with frames of 15-28 ms Link jerked against the
-   world, and a variable refresh display showed every uneven interval as it was. Here the step is constant, 1 / rate, and
-   the pacer (gfx/nvn/hle_nvn.c present_exec) shows each frame at its slot, one period after the previous one: steps and
-   intervals on screen are equal whatever the pipeline. The rate is a rung of a ladder under the limit: the limit, then
-   the monitor's rate divided by 2, 3, 4 ... down to 30 fps, the rates a display without variable refresh shows evenly too
-   (60 Hz: 60, 30; 165 Hz with the limit 60: 60, 55, 41.25, 33). A rung where frames miss their slot is left for the next
-   one down, and the next one up is tried when the frames' own work has fitted it with room for a while; a rise that
-   does not hold makes the next try wait longer. A late frame is shown at once and the game slows for it, as on the
-   console. */
-static double g_ladder[16], g_top = -1;
-static int g_rungs, g_rung = -1, g_last_dir;
-static unsigned g_seen, g_late, g_since_change, g_hold = 600, g_fit_n, g_fit_ok;
+/* Paced step (TOTK_CADENCE, default on above 30 fps with a limit; =0: each frame stepped by the last one's measured
+   time and shown as soon as it is drawn). The game moves Link by the step it read two presents before the one that shows
+   him (its frame is pipelined; TOTK_SPEED_TRACE on a run, 2026-10-31) while the camera follows the newest one, so when
+   frame times varied Link jerked against the world, and a variable refresh display showed every uneven interval as it
+   was. Here the step is a target frame time that follows what the PC manages (longer at once when frames come late,
+   shorter little by little while they are early), any rate up to the limit; each step is kept by its present's number,
+   and the pacer (gfx/nvn/hle_nvn.c present_exec) shows a frame one step after the previous one, the step its motion was
+   made with (TOTK_STEP_LAG presents before, default 2). Motion and time on screen then match at any rate. Game time
+   follows real time: what late frames lost comes back in small corrections of later steps. */
+enum { RING = 64 };
+static float g_ring[RING];               // the step stored at each present (game thread), by present number
+static _Atomic uint64_t g_k;             // presents stepped so far
+static _Atomic uint32_t g_target_bits;   // the target frame time, seconds (float bits): set by the pacer
+static double g_min_step = 1.0 / 60;     // 1 / the pacer's rate (the limit or the monitor's)
+static double g_wall, g_game;            // game thread: real time and game time stepped since the last restart
+static int g_lag = -1;                   // TOTK_STEP_LAG
 
-static void rung_set(int r, const char *why) {
-    if (r == g_rung) return;
-    double was = g_ladder[g_rung];
-    g_last_dir = r > g_rung ? 1 : -1;   // 1 down, -1 up
-    g_rung = r; g_seen = g_late = g_since_change = g_fit_n = g_fit_ok = 0;
-    step_store((float)(1.0 / g_ladder[g_rung]));
-    LOG("[totk] steady rate %.4g -> %.4g fps (%s)\n", was, g_ladder[g_rung], why);
+static float target_get(void) { uint32_t u = atomic_load(&g_target_bits); float f; memcpy(&f, &u, 4); return f > 0 ? f : (float)g_min_step; }
+static void target_set(float f) { uint32_t u; memcpy(&u, &f, 4); atomic_store(&g_target_bits, u); }
+
+// Game thread, at every present (dt: the present interval that just ended, 0 after a restart): the next frame's step.
+static void paced_step(double dt) {
+    double S = target_get();
+    if (dt <= 0) g_wall = g_game = 0;
+    g_wall += dt;
+    double c = (g_wall - g_game) * 0.05, lim = S * 0.1;   // a twentieth of the debt a frame, at most a tenth of a step
+    double step = S + (c > lim ? lim : c < -lim ? -lim : c);
+    if (step > 1.0 / 15.0) step = 1.0 / 15.0;
+    if (dt > 0) g_game += step;
+    uint64_t k = atomic_load(&g_k) + 1;
+    g_ring[k % RING] = (float)step;
+    atomic_store(&g_k, k);
+    step_store((float)step);
 }
 
-/* The pacer's period (ns) at the steady rate: top is the rate it would pace at (the limit or the monitor's rate), mon
-   the monitor's refresh rate (0 unknown: 60). 0: no steady rate. */
-uint64_t totk_fr_cadence_period(int top, double mon) {
+/* Translation thread, once per present in order (present_exec): how long after the previous frame this one is shown,
+   in ns: the step its motion was made with. top: the pacer's rate (the limit or the monitor's). 0: not paced. */
+uint64_t totk_fr_pace_period(int top) {
     config();
     if (!g_cadence || top < 30) return 0;
-    if (mon < 30) mon = 60;
-    if (top != g_top) {
-        g_top = top; g_rungs = 0;
-        g_ladder[g_rungs++] = top;
-        for (int d = 2; d < 16 && g_rungs < 16 && mon / d >= 29.99; d++) if (mon / d < top - 0.5) g_ladder[g_rungs++] = mon / d;
-        g_rung = 0;
-        step_store((float)(1.0 / top));
-        char list[160]; int o = 0;
-        for (int i = 0; i < g_rungs; i++) o += snprintf(list + o, sizeof list - (size_t)o, "%s%.4g", i ? " " : "", g_ladder[i]);
-        LOG("[totk] steady rate: rungs %s fps (monitor %.4g Hz)\n", list, mon);
-    }
-    return (uint64_t)(1e9 / g_ladder[g_rung] + 0.5);
+    if (g_lag < 0) { const char *e = getenv("TOTK_STEP_LAG"); g_lag = e ? atoi(e) : 2; if (g_lag < 0 || g_lag > 8) g_lag = 2; }
+    static int said;
+    if (!said) { said = 1; LOG("[totk] paced step: up to %d fps, frames shown %d presents after their step\n", top, g_lag); }
+    g_min_step = 1.0 / top;
+    static uint64_t kp;
+    uint64_t k = atomic_load(&g_k), want = ++kp > (uint64_t)g_lag ? kp - (uint64_t)g_lag : 0;
+    float st = want && want <= k && k - want < RING ? g_ring[want % RING] : (float)target_get();
+    return (uint64_t)(st * 1e9 + 0.5);
 }
 
-/* At every present the pacer schedules: late = the frame missed its slot by over a quarter period; work_ns = the time
-   from the frame's release (the end of the game's wait for its texture) to its present. */
-void totk_fr_cadence_frame(int late, uint64_t work_ns) {
-    if (!g_cadence || g_rung < 0) return;
-    g_seen++; g_since_change++;
-    if (late) g_late++;
-    if (g_seen >= 60) {   // a second at 60 fps: 4 late frames in it step down
-        if (g_late >= 4 && g_rung + 1 < g_rungs) {
-            if (g_last_dir < 0 && g_since_change < 600) g_hold = g_hold * 2 > 7200 ? 7200 : g_hold * 2;   // the rise did not hold
-            char why[64];
-            snprintf(why, sizeof why, "%u of %u frames late", g_late, g_seen);
-            rung_set(g_rung + 1, why);
-            return;
-        }
-        g_seen = g_late = 0;
-    }
-    if (g_since_change > 7200 && g_hold > 600) g_hold = 600;   // two minutes without a change: rises are tried often again
-    if (g_rung == 0) return;
-    // the rung above: its period less a sixth must hold the frame's work in 49 of 50 frames for g_hold frames
-    double up = 1e9 / g_ladder[g_rung - 1];
-    g_fit_n++;
-    if ((double)work_ns < up * 0.83) g_fit_ok++;
-    if (g_fit_n >= g_hold && g_since_change >= g_hold) {
-        if (g_fit_ok >= g_fit_n - g_fit_n / 50) { rung_set(g_rung - 1, "the frames fit the faster rate"); return; }
-        g_fit_n = g_fit_ok = 0;
+/* Translation thread, after the slot: late_ns = how far past the slot the frame came; margin_ns = how early it was. The
+   target goes halfway to the time a late frame took and shrinks by half a percent a frame while frames are early, never
+   under 1 / rate. (Growing by 3 % and a quarter of the lateness on every late frame held a Depths run at 23-36 fps.) */
+void totk_fr_pace_result(uint64_t late_ns, uint64_t margin_ns, uint64_t period_ns) {
+    if (!g_cadence) return;
+    double S = target_get(), late = late_ns * 1e-9;
+    static uint64_t n, nlate;
+    static double sum;
+    if (late_ns > period_ns / 8) { S += (S + late - S) * 0.5; nlate++; }   // halfway to the time the late frame took
+    else if (margin_ns > period_ns / 20) S *= 0.995;
+    if (S < g_min_step) S = g_min_step;
+    if (S > 1.0 / 15.0) S = 1.0 / 15.0;
+    target_set((float)S);
+    sum += S; n++;
+    static int stats = -1;
+    if (stats < 0) stats = getenv("TOTK_STATS") != NULL;
+    if (n == 600) {
+        if (stats) LOG("[totk] paced step: %.1f fps on average over 600 frames, %llu late\n", n / sum, (unsigned long long)nlate);
+        n = nlate = 0; sum = 0;
     }
 }
 
@@ -278,10 +279,10 @@ void runtime_frame_step_update(uint64_t now_ns) {
     if (!g_last_ns) { g_last_ns = now_ns; return; }
     double dt = (double)(now_ns - g_last_ns) * 1e-9;
     g_last_ns = now_ns;
-    if (dt > 0.25 || dt < 0.001) { g_count = g_next = 0; return; }   // keeps the last step
+    if (dt > 0.25 || dt < 0.001) { g_count = g_next = 0; if (g_cadence) paced_step(0); return; }   // keeps the last step
     if (dt > 1.0 / 15.0) dt = 1.0 / 15.0;
     step_error(dt);
-    if (g_cadence && g_rung >= 0) return;   // the step stays 1 / rate (rung_set)
+    if (g_cadence) { paced_step(dt); return; }
     g_samples[g_next++ % g_steps] = dt;
     if (g_count < (unsigned)g_steps) g_count++;
     double sum = 0;
