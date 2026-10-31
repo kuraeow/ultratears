@@ -1,5 +1,5 @@
 // The frame counter (F10, fps_overlay=1 in ultratears.cfg: TOTK_FPS_OVERLAY): the game's frames per second and their
-// average time, over half a second, in the window's top left corner. The text is drawn on the CPU with a 5x7 pixel font
+// average time, over half a second, in the window's top right corner (the top left holds the game's hearts). The text is drawn on the CPU with a 5x7 pixel font
 // of our own into a small host-visible buffer per frame in flight and copied into the swapchain image after the picture
 // (present.c present_one): a copy of a few kilobytes, no pipeline.
 #include "vk.h"
@@ -89,12 +89,14 @@ static int buffers(void) {
 }
 
 /* After the picture, with dst in TRANSFER_DST_OPTIMAL (written by the blit or FSR before): the counter's box copied
-   into its top left corner. slot: the present thread's frame in flight (its fence was waited for). */
+   into its top right corner. slot: the present thread's frame in flight (its fence was waited for). */
 void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot) {
     if (!on() || slot >= SLOTS || (fmt != VK_FORMAT_B8G8R8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_UNORM) || !buffers()) return;
     uint32_t px = ext.height >= 360 ? ext.height / 360 : 1;   // a font pixel: 4 screen pixels at 1440p, 2 at 720p
     size_t n = strlen(g_text);
-    uint32_t pad = 3 * px, w = (uint32_t)n * 6 * px - px + 2 * pad, h = 7 * px + 2 * pad, x0 = 8 * px, y0 = 8 * px;
+    // the box at the right edge: its right side stays put as the digits change
+    uint32_t pad = 3 * px, w = (uint32_t)n * 6 * px - px + 2 * pad, h = 7 * px + 2 * pad, y0 = 8 * px;
+    uint32_t x0 = ext.width > w + 8 * px ? ext.width - w - 8 * px : 0;
     if (w > MAX_W || h > MAX_H || x0 + w > ext.width || y0 + h > ext.height) return;
     uint8_t *p = g_map[slot];
     int bgr = fmt == VK_FORMAT_B8G8R8A8_UNORM;
