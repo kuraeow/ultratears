@@ -250,7 +250,7 @@ options.
 - UltraTears decrypts nothing and reads no keys: it takes the ExeFS and RomFS the player has already extracted.
 - No Nintendo SDK code or headers are used; the system and graphics layers are the port's own implementations.
 - Only the facts needed to run are in the source: addresses, hashes, short instruction replacements.
-- The icon (`assets/icon.ico`) is the author's own drawing, not Nintendo artwork.
+- The icon, emblem and cover are the author's own drawings, not Nintendo artwork.
 - UltraTears is not affiliated with or endorsed by Nintendo; you need your own purchased copy of the game.
 
 ## License
@@ -258,3 +258,7 @@ options.
 UltraTears is free software under the **GNU General Public License v3.0 or later** ([LICENSE](LICENSE)). Third-party
 code keeps its own license: [third_party/README.md](third_party/README.md); the builder package adds
 `THIRD-PARTY-NOTICES.md` and `licenses\` for the tools it carries.
+
+The **branding is not under the GPL**: the name UltraTears, the emblem and icon, the cover and the launcher's background
+pattern may be shared unchanged as part of UltraTears and used to refer to it, but not for other projects or modified
+versions. A fork keeps the code under the GPL with its own name and images. Details: [assets/BRANDING.md](assets/BRANDING.md).
