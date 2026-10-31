@@ -71,7 +71,8 @@ static const char *default_exefs(void) {
                 {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
                 // the player's settings (the launcher's Play screen writes them)
                 {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
-                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}};
+                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"},
+                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);

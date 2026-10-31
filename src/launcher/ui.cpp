@@ -1076,6 +1076,8 @@ static const Opt RES_OPTS[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}
                                {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};
 static const Opt SCALE_OPTS[] = {{"50", "50 %"}, {"67", "67 %"}, {"75", "75 %"}, {"", "scale_game"}, {"100", "100 %"},
                                  {"150", "150 %"}, {"200", "200 %"}};
+// sharpness= (src/vk/fsr.c): the RCAS pass of the present's FSR 1, when the window is larger than the game's output
+static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25 %"}, {"", "sharp_default"}, {"75", "75 %"}, {"100", "100 %"}};
 
 template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
     std::string value = v == same_as_default ? "" : v;
@@ -1273,6 +1275,10 @@ static void screen_play() {
         row_label(cy, "row_scale");
         if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
             cfg_set("scale", SCALE_OPTS[k].value);
+        cy += 40;
+        row_label(cy, "row_sharp");
+        if ((k = dropdown("sharp", 748, cy, 0, SHARP_OPTS, opt_index(SHARP_OPTS, cfg_get("sharpness"), "50"))) >= 0)
+            cfg_set("sharpness", SHARP_OPTS[k].value);
         cy += 40;
         row_label(cy, "row_fps");
         if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_get("fps"), "60"))) >= 0)
