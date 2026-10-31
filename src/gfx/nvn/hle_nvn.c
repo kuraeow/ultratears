@@ -2025,7 +2025,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. [Windows port] On by default since 2026-10-24: with
 // the Vulkan replay on the game's thread the Great Sky Island ran at ~95 ms a frame, with this thread at ~58 ms.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL, XJ_SHREL, XJ_POOLREL, XJ_TEXWRITE };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub, slot; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -2050,7 +2050,7 @@ static int async_replay(void) {
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot);
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate");
     { void plat_thread_boost(void); plat_thread_boost(); }   // [Windows port] the frame waits for this thread
@@ -2078,7 +2078,7 @@ static void *x_thread(void *unused) {
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
-            present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            present_exec(j.win, j.idx, j.period, j.crop, j.frame, j.slot);
             void vkb_tex_writeback_frame(void); vkb_tex_writeback_frame();   // GPU-drawn contents into game memory (vkb_tex.c)
             void vkb_tex_rtlog_frame(void); vkb_tex_rtlog_frame();           // TOTK_RT_LOG: how full the logged targets are
         }
@@ -2907,7 +2907,7 @@ void dm_nvn_probe_present_interval(void) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot) {
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
@@ -2918,7 +2918,21 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
-    if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
+    /* UltraTears: with the frame limit (uncapped, host/frame_rate.c), as totk-pc-recomp's nvnQueuePresentTexture (MIT,
+       nvn_api_obj.c, after MacNativeGames' nvn_pace.h): the display slot is paced here, at the game's present: the
+       previous slot plus one period of the limit (early: wait for it; late by less than a period: at once, keeping the
+       phase; later: from now). The present thread holds the host present until the slot (mtl_present_slot), the image is
+       free for the game one period later, and the real-time step follows the slots. */
+    present_cfg(o);
+    uint64_t qslot = 0;
+    if (g_uncapped && uncapped_now() && !dm_detclock_enabled()) {
+        uint64_t period = present_period(o), now = now_ns();
+        nvn_pacer pc = {o->pace};
+        qslot = now + nvn_pace(&pc, now, period);
+        o->pace = pc.target;
+        if (idx >= 0 && idx < 4) o->avail[idx] = period ? qslot + period : 0;
+    }
+    if (runtime_frame_step_update) runtime_frame_step_update(qslot ? qslot : now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
@@ -2940,12 +2954,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     uint64_t t0 = now_ns();
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
-        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
+        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9, .slot = qslot};
         memcpy(j.crop, o->crop, sizeof j.crop);
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, qslot);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);
@@ -3056,27 +3070,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
-    /* UltraTears: the paced step (host/frame_rate.c): this frame is shown the step its motion was made with after the
-       previous one (the present thread holds it to its slot, mtl_present_slot), and how late or early it came tunes the
-       next steps. */
-    uint64_t paced = 0;
-    if (g_uncapped && uncapped_now() && g_hz > 0) { extern uint64_t totk_fr_pace_period(int top); paced = totk_fr_pace_period(g_hz); }
-    nvn_pacer pc = {o->pace};
-    uint64_t slot = now + nvn_pace(&pc, now, period);   // the limit's grid: how fast the game may make frames
-    o->pace = pc.target;
-    uint64_t avail = period ? slot + period : 0;
-    if (paced) {   /* the display slot: the previous one plus the step this frame was made with, or now if it came late; the
-                      game's next use of this image waits for it too (two frames in the works at most) */
-        static uint64_t dslot;
-        extern void totk_fr_pace_result(uint64_t late_ns, uint64_t margin_ns, uint64_t period_ns);
-        uint64_t want = dslot ? dslot + paced : now;
-        if (dslot) totk_fr_pace_result(now > want ? now - want : 0, want > now ? want - now : 0, paced);
-        dslot = want > now && want - now < 500000000ull ? want : now;
-        slot = dslot;
-        if (avail < dslot) avail = dslot;
+    uint64_t slot;
+    if (qslot) slot = qslot;   // UltraTears: paced at the game's present (nvnQueuePresentTexture), held to it by the present thread
+    else {
+        nvn_pacer pc = {o->pace};
+        slot = now + nvn_pace(&pc, now, period);
+        o->pace = pc.target;
+        if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
     }
-    mtl_present_slot(paced ? slot : 0);
-    if (idx >= 0 && idx < 4) o->avail[idx] = avail;
+    mtl_present_slot(qslot);
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // 屏幕上相邻两帧的显示间隔（掉帧看这个） | display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // 实际呈现间隔（窗口模式）：滞后 8 次出图取（呈现回调已到），第 n 次与第 n−1 次之差；−1 = 被丢弃
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
