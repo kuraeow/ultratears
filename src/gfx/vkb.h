@@ -64,6 +64,7 @@ typedef struct vkb_image {
     int uploading;                 // an upload is being recorded (several threads: the others wait for it, vkb_tex_upload)
     VkImageUsageFlags usage;
     int compressed;                // block-compressed format: no attachment / storage use
+    int no_block_views;            // a 3D block-compressed image, made without block-texel views (vkb_tex.c make_image)
     int gpu_written;               // rendered / cleared / copied to by the GPU: never overwritten from game memory ([temporary])
     uint64_t upload_stamp;         // nvn_dirty generation of the last upload from game memory (0 = never)
     uint64_t dirty_checked;        // the submission in which the game memory was last checked for CPU writes

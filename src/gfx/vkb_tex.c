@@ -436,9 +436,14 @@ static int create(vkb_image *im, const tex_t *t) {
         usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // NVN views may reinterpret the format
     int compressed = !astc && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
-    if (compressed) flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   // read a block as RGBA16UI / RG32UI (TOTK's GPU BC encoder)
+    /* A 3D block-compressed image gets neither block-texel views nor 2D-array views: AMD's driver 26.10.1 on RDNA2 wrote
+       past the end of a BC4 volume made with both and lost the device at the logo (totk-pc-recomp issue #5, its fix
+       25b200f). The game's GPU encoder writes those volumes through the uncompressed stand-in and a copy
+       (vkb_tex_block_target), which needs neither. */
+    int bc3d = compressed && type == VK_IMAGE_TYPE_3D;
+    if (compressed && !bc3d) flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   // read a block as RGBA16UI / RG32UI (TOTK's GPU BC encoder)
     if (type == VK_IMAGE_TYPE_2D && !ms && layers >= 6 && w == h) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    if (type == VK_IMAGE_TYPE_3D) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    if (type == VK_IMAGE_TYPE_3D && !bc3d) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = f,
         .extent = {w, h, depth}, .mipLevels = levels, .arrayLayers = layers,
         .samples = ms && d->samples > 1 ? (VkSampleCountFlagBits)d->samples : VK_SAMPLE_COUNT_1_BIT,
@@ -467,6 +472,7 @@ static int create(vkb_image *im, const tex_t *t) {
     im->storage = t->mem;
     im->usage = usage;
     im->compressed = compressed;
+    im->no_block_views = bc3d;
     return 1;
 }
 
@@ -800,6 +806,12 @@ VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_ty
     int reinterpret_block = im->compressed && !(f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK);
     if (reinterpret_block) {   // [temporary] an uncompressed view of a compressed image: one level, one layer (and never a target)
         if (attachment) return VK_NULL_HANDLE;
+        if (im->no_block_views) {   // a 3D BC image has none (make_image); not seen so far
+            static int said;
+            if (!said++) VLOG("[temporary] texture %llu: an uncompressed view of a 3D block-compressed image is not made",
+                              (unsigned long long)im->serial);
+            return VK_NULL_HANDLE;
+        }
         nlev = 1;
         nlay = 1;
     }
