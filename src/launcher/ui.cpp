@@ -1283,32 +1283,40 @@ static void screen_play() {
     text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_ui_lang"));
     float cy = top + 52;
     if (g_tab == 0) {
+        const float ROW = 38;   // seven rows above Play (the design has five at 40)
         row_label(cy, "row_window");
         int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_get("window")));
         if (k >= 0)
             cfg_set("window", WINDOW_OPTS[k].value);
-        cy += 40;
+        cy += ROW;
         row_label(cy, "row_res");
         if ((k = dropdown("res", 748, cy, 0, RES_OPTS, opt_index(RES_OPTS, cfg_get("resolution")))) >= 0)
             cfg_set("resolution", RES_OPTS[k].value);
-        cy += 40;
+        cy += ROW;
         row_label(cy, "row_scale");
         if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
             cfg_set("scale", SCALE_OPTS[k].value);
-        cy += 40;
+        cy += ROW;
         row_label(cy, "row_sharp");
         if ((k = dropdown("sharp", 748, cy, 0, SHARP_OPTS, opt_index(SHARP_OPTS, cfg_get("sharpness"), "50"))) >= 0)
             cfg_set("sharpness", SHARP_OPTS[k].value);
-        cy += 40;
+        cy += ROW;
         row_label(cy, "row_fps");
         if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_get("fps"), "60"))) >= 0)
             cfg_set("fps", FPS_OPTS[k].value);
-        cy += 40;
+        cy += ROW;
         row_label(cy, "row_vsync");
         std::string vs = cfg_get("vsync");
         bool on = !(vs == "0" || vs == "off");
         if (toggle("vsync", 748, cy, on))
             cfg_set("vsync", on ? "off" : "");
+        cy += ROW;
+        row_label(cy, "row_counter");   // the frame counter, with its key in the game
+        text(g_media.small, 52 + text_w(g_media.label, T("row_counter")) + 10, cy - g_media.small->FontSize / S / 2, C_SUB,
+             T("counter_key"));
+        bool ctr = cfg_get("fps_overlay") == "1";
+        if (toggle("fps_overlay", 748, cy, ctr))
+            cfg_set("fps_overlay", ctr ? "" : "1");
     } else {   // the launcher's language (it was the header's button on the other screens), then the game's
         static const Opt UI_LANGS[] = {{"ru", "Русский"}, {"en", "English"}};
         row_label(cy, "row_ui_text");

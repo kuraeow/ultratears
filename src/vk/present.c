@@ -243,6 +243,10 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
             vk.vkCmdBlitImage(cb, out->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               1, &b, VK_FILTER_LINEAR);
         }
+        void vk_overlay_frame(void);
+        void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
+        vk_overlay_frame();   // the frame counter (overlay.c, F10)
+        vk_overlay_record(cb, images[idx], extent, format, slot);
     }
     barrier(cb, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);

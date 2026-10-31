@@ -144,6 +144,8 @@ static const Text TEXTS[] = {
     {"fps_display", {"Display rate (beta)", "Как у монитора (бета)"}},
     {"fps_unlimited", {"Unlimited (beta)", "Без ограничения (бета)"}},
     {"row_vsync", {"Vertical sync", "Вертикальная синхронизация"}},
+    {"row_counter", {"Frame counter", "Счётчик кадров"}},
+    {"counter_key", {"F10 in the game", "F10 в игре"}},
     {"row_text", {"Text and subtitles", "Текст и субтитры"}},
     {"lang_system", {"As in Windows", "Как в Windows"}},
     {"lang_ja", {"Japanese", "Японский"}},

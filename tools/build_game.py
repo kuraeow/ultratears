@@ -26,7 +26,7 @@ TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
                     'src/host/audio_renderer.c', 'src/host/audio_mixer.c', 'src/host/audio_effects.c',
                     'src/host/audio_reverb.c', 'src/host/opus_codec.c', 'src/host/movie_host.c', 'src/host/hid_feedback.c',
                     'src/host/shared_font.c',
-                    'src/host/window_sdl.c', 'src/vk/vk.c', 'src/vk/present.c', 'src/vk/fsr.c', 'src/host/motion_fusion.c',
+                    'src/host/window_sdl.c', 'src/vk/vk.c', 'src/vk/present.c', 'src/vk/fsr.c', 'src/vk/overlay.c', 'src/host/motion_fusion.c',
                     'src/host/profiler.c', 'src/host/watch.c', 'src/host/frame_rate.c', 'src/host/render_res.c', 'src/host/ui_capture.c']}
 # The graphics front end (MacNativeGames' NVN layer) with its macOS stand-ins: own include paths, own rule
 GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_ext.c', 'src/gfx/nvn/nvn_registry.c',

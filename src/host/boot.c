@@ -73,7 +73,8 @@ static const char *default_exefs(void) {
                 {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
                 {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"},
                 {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"},
-                {"gpu_marks", "TOTK_VK_CHECKPOINTS"}};   // the launcher's GPU markers (Debug tab)
+                {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
+                {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);

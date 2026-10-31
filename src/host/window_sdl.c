@@ -222,6 +222,11 @@ _Noreturn void window_loop(void) {
                         mouse_capture(false);   // Ctrl lets the mouse go (no button of the game's layout)
                         break;
                     }
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) {
+                        void vk_overlay_toggle(void);   // vk/overlay.c: the frame counter
+                        vk_overlay_toggle();
+                        break;
+                    }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F9) {
                         void vkb_dump_request(void);   // gfx/vkb.h: TOTK_DUMP_KEY (development)
                         vkb_dump_request();
