@@ -224,7 +224,9 @@ static void heapdef_overlay(void) {
     uint64_t totk_heap_extra_kib(void);
     int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
     void totk_resolution_log(void);
-    int totk_ui_capture_build(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+    int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
+                      void **out, size_t *out_n);
+    int totk_aspect_output(unsigned *w, unsigned *h);
     int totk_fr_fps60(void);
     size_t n = 0, dn = 0, out_n = 0;
     void *in = totk_heap_extra_kib() ? rom_file(HEAPDEF, 16u << 20, &n) : NULL, *out = NULL;
@@ -234,17 +236,21 @@ static void heapdef_overlay(void) {
     }
     free(in);
     totk_resolution_log();
-    // above 30 fps: the quick menus capture their background at once (host/ui_capture.c)
-    if (!totk_fr_fps60()) return;
+    // the layout archive: above 30 fps the quick menus capture their background at once (host/ui_capture.c); on an
+    // output of another shape than 16:9 the layouts are laid out for it (host/ui_aspect.c)
+    unsigned aw = 0, ah = 0;
+    int capture = totk_fr_fps60(), aspect = totk_aspect_output(&aw, &ah);
+    if (!capture && !aspect) return;
     in = rom_file(UI_COMMON, 64u << 20, &n);
     void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
     uint64_t t0 = runtime_now_ns();
-    if (in && dicts && totk_ui_capture_build(in, n, dicts, dn, &out, &out_n)) {
+    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, &out, &out_n)) {
         ovr_add(UI_COMMON, out, out_n);
-        fprintf(stderr, "[totk] RomFS: %s served with the quick menus' background captured at once (%.0f ms)\n", UI_COMMON,
-                (runtime_now_ns() - t0) / 1e6);
+        fprintf(stderr, "[totk] RomFS: %s served%s%s (%.0f ms)\n", UI_COMMON,
+                capture ? ", the quick menus' background captured at once" : "",
+                aspect ? ", the layouts for the output's shape" : "", (runtime_now_ns() - t0) / 1e6);
     } else if (!in || !dicts)
-        fprintf(stderr, "[totk] RomFS: %s or %s missing: the quick menus keep the game's capture\n", UI_COMMON, ZS_DICTS);
+        fprintf(stderr, "[totk] RomFS: %s or %s missing: the game's own layouts\n", UI_COMMON, ZS_DICTS);
     free(in); free(dicts);
 }
 static int folder_exists(const char *folder) {

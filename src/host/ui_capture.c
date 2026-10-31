@@ -96,9 +96,14 @@ static int move_keys(uint8_t *d, size_t lo, size_t hi, const char *const *panes,
     return changed;
 }
 
+int totk_ui_aspect_apply(uint8_t *blarc, size_t n, unsigned w, unsigned h);   // host/ui_aspect.c
+
 /* in: the RomFS file (zstd with a dictionary of dicts, the decompressed Pack/ZsDic.pack.zs); out: the fixed file,
-   compressed with the same dictionary (malloc). 1 on success; 0 leaves the game's file as it is. */
-int totk_ui_capture_build(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n) {
+   compressed with the same dictionary (malloc). capture: the quick menus' background at once (above 30 fps); w x h: an
+   output of another shape than 16:9, the layouts for it (host/ui_aspect.c; 0 x 0 none). Each part that does not find
+   the archive as expected is left out and says so. 1 when anything was done; 0 leaves the game's file as it is. */
+int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
+                  void **out, size_t *out_n) {
     *out = NULL;
     unsigned id = ZSTD_getDictID_fromFrame(in, n);
     unsigned long long raw = ZSTD_getFrameContentSize(in, n), praw = ZSTD_getFrameContentSize(dicts_z, dn);
@@ -130,12 +135,25 @@ int totk_ui_capture_build(const void *in, size_t n, const void *dicts_z, size_t 
     if (!dict || ZSTD_decompress_usingDict(dc, blarc, (size_t)raw, in, n, dict, dict_n) != raw) goto done;
     static const char *const shortcut[] = {"C_CaptureBG_00", "C_CaptureClearBG_00", "P_CaptureClearBG_00"};
     static const char *const builder[] = {"C_CaptureBG_00"};
-    size_t lo, hi;
-    if (!sarc_member(blarc, (size_t)raw, "anim/ShortCutBG_00_In.bflan", &lo, &hi) || move_keys(blarc, lo, hi, shortcut, 3) != 3 ||
-        !sarc_member(blarc, (size_t)raw, "anim/AutoBuilder_00_In.bflan", &lo, &hi) || move_keys(blarc, lo, hi, builder, 1) != 1) {
-        fprintf(stderr, "[totk] quick menu background: the layout archive is not as expected; the game keeps its own\n");
-        goto done;
+    int done_any = 0;
+    if (capture) {
+        size_t lo, hi, lo2, hi2;
+        uint8_t *copy = malloc((size_t)raw);   // both animations checked before either is changed
+        if (copy && sarc_member(blarc, (size_t)raw, "anim/ShortCutBG_00_In.bflan", &lo, &hi) &&
+            sarc_member(blarc, (size_t)raw, "anim/AutoBuilder_00_In.bflan", &lo2, &hi2)) {
+            memcpy(copy, blarc, (size_t)raw);
+            if (move_keys(copy, lo, hi, shortcut, 3) == 3 && move_keys(copy, lo2, hi2, builder, 1) == 1) {
+                free(blarc);
+                blarc = copy, copy = NULL, done_any = 1;
+            }
+        }
+        free(copy);
+        if (!done_any)
+            fprintf(stderr, "[totk] quick menu background: the layout archive is not as expected; the game keeps its own\n");
     }
+    if (w && h && totk_ui_aspect_apply(blarc, (size_t)raw, w, h))
+        done_any = 1;
+    if (!done_any) goto done;
     size_t cap = ZSTD_compressBound((size_t)raw);
     z = malloc(cap);
     size_t zn = z ? ZSTD_compress_usingDict(cc, z, cap, blarc, (size_t)raw, dict, dict_n, 3) : 0;

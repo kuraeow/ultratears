@@ -70,6 +70,33 @@ static int enter_dir(const char *path) { return chdir(path) == 0; }
 #define name_eq strcmp
 #endif
 
+/* The Steam Deck's defaults, for what ultratears.cfg leaves unset (as totk-pc-recomp's device profile, runtime/cfg.c): its
+   screen's 1280x800 (16:10: the camera and the UI follow, host/render_res.c), fullscreen, 40 fps (a divisor of the LCD's
+   and OLED's 40 Hz modes, and of 120 Hz). The Deck: SteamDeck=1 (Steam sets it there) or Valve's board, product Jupiter
+   (LCD) or Galileo (OLED). Any key the player set wins. */
+static void deck_defaults(void) {
+#ifndef _WIN32
+    const char *env = getenv("SteamDeck");
+    int deck = env && !strcmp(env, "1");
+    if (!deck) {
+        char vendor[64] = "", product[64] = "";
+        FILE *v = fopen("/sys/class/dmi/id/board_vendor", "r"), *p = fopen("/sys/class/dmi/id/product_name", "r");
+        if (v && fgets(vendor, sizeof vendor, v) && p && fgets(product, sizeof product, p)) {
+            vendor[strcspn(vendor, "\r\n")] = 0, product[strcspn(product, "\r\n")] = 0;
+            deck = !strcmp(vendor, "Valve") && (!strcmp(product, "Jupiter") || !strcmp(product, "Galileo"));
+        }
+        if (v) fclose(v);
+        if (p) fclose(p);
+    }
+    if (!deck) return;
+    setenv("TOTK_OUTPUT_RES", "1280x800", 0);
+    setenv("TOTK_WINDOW", "fullscreen", 0);
+    setenv("TOTK_FPS_LIMIT", "40", 0);
+    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps (the Deck's defaults where ultratears.cfg sets none)\n",
+            getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"));
+#endif
+}
+
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
     char path[4096];
@@ -114,6 +141,7 @@ static const char *default_exefs(void) {
         fprintf(stderr, "[totk] game folder %s (%s)\n", path, cfg);
     } else
         fprintf(stderr, "[totk] game folder %s (no ultratears.cfg: setup.py's layout)\n", path);
+    deck_defaults();
     return exefs;
 }
 

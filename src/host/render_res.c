@@ -102,6 +102,29 @@ int totk_scene_size(float *w, float *h) {
     return 1;
 }
 
+// 16:9 within 1% (1366x768 counts): the shape the game's own layouts and camera are made for.
+static int is_16x9(unsigned w, unsigned h) {
+    double rel = ((double)w / h) / ((double)BASE_W / BASE_H);
+    return rel >= 0.99 && rel <= 1.01;
+}
+
+// Another shape than 16:9 (16:10 as the Steam Deck's 1280x800, 21:9, 32:9): the camera takes the output's ratio (the
+// aspect code patch, tools/lifter/patches.py: so a 21:9 output shows more of the world at the sides, Hor+, instead of
+// a stretched 16:9 view) and the UI's layouts are laid out for it (host/ui_aspect.c, through fs.c). As
+// totk-pc-recomp's runtime/resolution.c res_init (MIT). 0: the game's own 16:9.
+int totk_aspect(float *ratio) {
+    if (!active() || is_16x9(R.ow, R.oh)) return 0;
+    *ratio = (float)R.ow / (float)R.oh;
+    return 1;
+}
+
+int totk_aspect_output(unsigned *w, unsigned *h) {   // the output when it is not 16:9 (fs.c: the layouts for it)
+    float r;
+    if (!totk_aspect(&r)) return 0;
+    *w = R.ow, *h = R.oh;
+    return 1;
+}
+
 void totk_resolution_log(void) {   // once, after the RomFS is up (fs.c)
     if (!changed()) {
         fprintf(stderr, "[totk] resolution: the game's own (output 1920x1080, scene 1600x900)\n");
@@ -114,6 +137,9 @@ void totk_resolution_log(void) {   // once, after the RomFS is up (fs.c)
     }
     fprintf(stderr, "[totk] resolution: output %ux%u, scene %ux%u%s; render-target heap +%llu KiB\n", R.ow, R.oh, R.sw,
             R.sh, R.scene_set ? "" : " (the game's own 5/6 of the output)", (unsigned long long)totk_heap_extra_kib());
+    float r;
+    if (totk_aspect(&r))
+        fprintf(stderr, "[totk] resolution: camera aspect ratio %.4f (16:9 is 1.7778), UI laid out for it\n", r);
 }
 
 // ---- the HeapDef table (totk-pc-recomp res_heapdef_build). BYML version 2..7, little endian ("YB"): a hash node is

@@ -75,6 +75,21 @@ def output_size(gen, addr):   # movk x8, #0x438, lsl #32: the swapchain size the
             f'if (totk_output_size(&s_)) c->x[8] = s_; else {{ {gen.c_of(0xf2c08708, addr)} }} }}')
 
 
+def aspect(orig):
+    """The camera's aspect ratio for an output of another shape than 16:9 (src/host/render_res.c totk_aspect): sites that
+    leave the ratio sead's perspective projection takes in s0. Two camera sites (update: ldr s0, [x19, #0x140]; setup:
+    ldr s0, [x22, #0x68]) load the camera's copy of DefaultAspect 1.777778, two viewport routines divide width by height
+    (fdiv s0, s0, s1). After the original instruction s0 takes the output's ratio, so a 21:9 output shows more of the
+    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from totk-pc-recomp's
+    recomp/patches-v143.txt (set aspect; MIT, Copyright (c) 2026 Valiantsin Dzerakh), from MacNativeGames'
+    game_patches_v143.c / aspect_patch.h (MIT, Copyright (c) 2026 MacNativeGames contributors)."""
+    def f(gen, addr):
+        expect(gen, addr, orig, 'aspect')
+        return (f'{gen.c_of(orig, addr)} {{ extern int totk_aspect(float *r); float r_; '
+                f'if (totk_aspect(&r_)) {set_s(0, "r_")} }}')
+    return f
+
+
 def output_canvas(gen, addr):   # before lsr x4, x3, #32: the display configuration's canvas (+0x10) and active output (+0x508)
     expect(gen, addr, 0xd360fc64, 'output_canvas')
     return ('{ extern int totk_output_size(uint64_t *packed); uint64_t s_; '
@@ -169,6 +184,8 @@ PATCHES = {
     MAIN + 0x585e50: scene_size(0),
     MAIN + 0x585e60: scene_size(1),
     MAIN + 0xbdb584: output_size,
+    MAIN + 0x628c74: aspect(0xbd414260), MAIN + 0xb43460: aspect(0xbd406ac0),
+    MAIN + 0x1ff04f4: aspect(0x1e211800), MAIN + 0x253fbb0: aspect(0x1e211800),
     **{MAIN + a: fps60(o, r) for a, o, r in FPS60},
     MAIN + 0x2daa54: rt_ratio_load,
     MAIN + 0x2daa6c: rt_ratio_skip(0x5e21d800),   # scvtf s0, s0
