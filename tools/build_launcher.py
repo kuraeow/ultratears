@@ -4,7 +4,10 @@ and starts the game (src/launcher/). It holds no code of the game, so a release 
 SDL3 (static, the one the game links) + Dear ImGui, nanosvg and stb_image (downloaded into deps/launcher, pinned in
 tools/deps.json); the fonts, icons and images of assets/launcher/ are compiled in, so the exe is one file. MSYS2 CLANG64
 clang/ninja, as tools/build_game.py.
-usage: python tools/build_launcher.py [--out <folder>] [--debug]   (default: dev-local/build/launcher)
+usage: python tools/build_launcher.py [--out <folder>] [--debug] [--platform linux]   (default: dev-local/build/launcher)
+--platform linux: ultratears-launcher for Linux / Steam Deck, cross-compiled with the Linux kit as the game is
+(tools/build_game.py LINUX_KIT; default out dev-local/build/launcher-linux): SDL3 shared beside it (rpath $ORIGIN),
+libstdc++ static, libcurl of the system loaded when an update is looked for.
 """
 import argparse
 import pathlib
@@ -18,6 +21,7 @@ from toolchain import CLANG64, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
 EXE = 'UltraTears Launcher.exe'
+LINUX_EXE = 'ultratears-launcher'
 SOURCES = ['src/launcher/main.cpp', 'src/launcher/ui.cpp', 'src/launcher/setup_proc.cpp', 'src/launcher/platform.cpp',
            'src/launcher/text.cpp', 'src/launcher/json.cpp', 'src/launcher/media.cpp', 'src/launcher/update.cpp',
            'deps/launcher/imgui/imgui.cpp', 'deps/launcher/imgui/imgui_draw.cpp', 'deps/launcher/imgui/imgui_tables.cpp',
@@ -26,6 +30,7 @@ SOURCES = ['src/launcher/main.cpp', 'src/launcher/ui.cpp', 'src/launcher/setup_p
 ASSETS = ['fonts/Inter_18pt-Regular.ttf', 'fonts/Inter_18pt-Medium.ttf', 'fonts/MontserratAlternates-Bold.ttf',
           'fonts/MontserratAlternates-SemiBold.ttf', 'l_emblem.png', 'l_pattern.png', 'l_ic_check.svg', 'l_ic_error.svg',
           'l_ic_folder.svg', 'l_ic_warn.svg', 'l_ic_chevron.svg']
+LINUX_LIBS = '-stdlib=libstdc++ -static-libstdc++ -Wl,-rpath,$$ORIGIN -lSDL3 -lm -lpthread -ldl'
 LIBS = ('-static -mwindows -lSDL3 -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi '
         '-lshell32 -lwinmm -ldwmapi -lwinhttp -lbcrypt -liconv -lc++')
 
@@ -86,10 +91,12 @@ END
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out', type=pathlib.Path, default=ROOT / 'dev-local/build/launcher')
+    ap.add_argument('--out', type=pathlib.Path)
     ap.add_argument('--debug', action='store_true', help='-O0, a console for the log lines')
+    ap.add_argument('--platform', default='windows', choices=['windows', 'linux'])
     a = ap.parse_args()
-    build = a.out.resolve()
+    linux = a.platform == 'linux'
+    build = (a.out or ROOT / ('dev-local/build/launcher-linux' if linux else 'dev-local/build/launcher')).resolve()
     (build / 'obj').mkdir(parents=True, exist_ok=True)
     deps_install.launcher_libs(ROOT)   # Dear ImGui, nanosvg, stb_image: deps/launcher, pinned in tools/deps.json
     assets_c(build)
@@ -97,12 +104,20 @@ def main():
     opt = '-O0' if a.debug else '-O2'
     b = build.as_posix()
     libs = LIBS.replace('-mwindows', '-mconsole') if a.debug else LIBS
+    target, cxxlib = '-gcodeview -DUNICODE -D_UNICODE', ''
+    if linux:   # the Linux kit, as the game's (tools/build_game.py)
+        import build_game
+        if not (build_game.LINUX_KIT / 'sysroot').is_dir():
+            sys.exit(f'the Linux kit is missing ({build_game.LINUX_KIT})')
+        target, cxxlib = build_game.linux_flags(), ' -stdlib=libstdc++'
+        libs = (f'{build_game.linux_flags()} --rtlib=libgcc --unwindlib=libgcc -no-pie '
+                f'-L{build_game.LINUX_KIT.as_posix()}/lib {LINUX_LIBS}')
     lines = [
         f'builddir = {b}',
-        f'flags = {opt} -g -gcodeview -march=x86-64-v2 -Ideps/launcher/imgui -Ideps/launcher/imgui/backends -Ideps/launcher/nanosvg '
-        f'-Ideps/launcher/stb -I{b} -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DUNICODE -D_UNICODE',
+        f'flags = {opt} -g -march=x86-64-v2 -Ideps/launcher/imgui -Ideps/launcher/imgui/backends -Ideps/launcher/nanosvg '
+        f'-Ideps/launcher/stb -I{b} -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS {target}',
         'rule cxx',
-        '  command = clang++ -MD -MF $out.d $flags -std=c++17 -fno-exceptions -fno-rtti -Wall -Wno-unused-function -c $in -o $out',
+        f'  command = clang++ -MD -MF $out.d $flags{cxxlib} -std=c++17 -fno-exceptions -fno-rtti -Wall -Wno-unused-function -c $in -o $out',
         '  depfile = $out.d',
         '  deps = gcc',
         'rule cc',
@@ -112,7 +127,8 @@ def main():
         'rule rc',
         '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
         'rule link',
-        f'  command = clang++ -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out $in {libs}',
+        f'  command = clang++ -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out $in {libs}' if not linux else
+        f'  command = clang++ -fuse-ld=lld -g -o $out $in {libs}',
         '',
     ]
     objs = []
@@ -122,16 +138,20 @@ def main():
         objs.append(obj)
     e = esc(b)
     lines.append(f'build {e}/obj/assets.o: cc {e}/assets.c')
-    lines.append(f'build {e}/obj/launcher_res.o: rc {e}/launcher.rc | assets/icon.ico')
-    objs += [f'{e}/obj/assets.o', f'{e}/obj/launcher_res.o']
-    exe = esc(f'{b}/{EXE}')
+    objs.append(f'{e}/obj/assets.o')
+    if not linux:   # the icon and version of the exe
+        lines.append(f'build {e}/obj/launcher_res.o: rc {e}/launcher.rc | assets/icon.ico')
+        objs.append(f'{e}/obj/launcher_res.o')
+    name = LINUX_EXE if linux else EXE
+    exe = esc(f'{b}/{name}')
     lines.append(f'build {exe}: link {" ".join(objs)}')
-    lines.append(f'  pdb = {b}/UltraTears-Launcher.pdb')
+    if not linux:
+        lines.append(f'  pdb = {b}/UltraTears-Launcher.pdb')
     lines.append(f'default {exe}')
     write_if_changed(build / 'build.ninja', ('\n'.join(lines) + '\n').encode())
     rc = subprocess.run([str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', str(build / 'build.ninja')], env=tool_env()).returncode
     if rc == 0:
-        print(f'{build / EXE}')
+        print(f'{build / name}')
     sys.exit(rc)
 
 

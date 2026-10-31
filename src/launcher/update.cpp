@@ -1,7 +1,7 @@
 // Updates of the builder package from GitHub Releases: at most one question a day (ultratears-launcher.ini, updates=off
 // turns it off), the newest release's builder zip downloaded into update\ of the package, its size and SHA-256 (the
 // digest GitHub keeps for every release file) checked before tools/apply_update.py puts it in place.
-// [temporary] Linux: no HTTP client yet (WinHTTP on Windows); the Linux build will need one (libcurl or the curl tool).
+// HTTP: WinHTTP on Windows, the system's libcurl on Linux; SHA-256: BCrypt on Windows, its own on Linux.
 #include "launcher.h"
 #include <atomic>
 #ifdef _WIN32
@@ -9,19 +9,20 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <winhttp.h>
+#else
+#include <dlfcn.h>
+#include <mutex>
 #endif
 
-static std::wstring wide(const std::string &s) {
 #ifdef _WIN32
+static std::wstring wide(const std::string &s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     std::wstring w(n > 0 ? n - 1 : 0, L'\0');
     if (n > 1)
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
     return w;
-#else
-    return std::wstring(s.begin(), s.end());
-#endif
 }
+#endif
 
 // GET url (https, redirects followed); sink gets the body in pieces and returns false to stop. total: Content-Length.
 template <class Sink> static bool http_get(const std::string &url, Sink sink, uint64_t *total, std::string &err) {
@@ -80,9 +81,84 @@ template <class Sink> static bool http_get(const std::string &url, Sink sink, ui
             WinHttpCloseHandle(h);
     return ok;
 #else
-    (void)url, (void)sink, (void)total;
-    err = "not available on this system yet";
-    return false;
+    // libcurl of the system, loaded when first needed (SteamOS and nearly every distribution have libcurl.so.4; Debian's
+    // GnuTLS build is libcurl-gnutls.so.4): no headers needed, the few calls and their option numbers declared here
+    static void *lib = dlopen("libcurl.so.4", RTLD_NOW);
+    if (!lib)
+        lib = dlopen("libcurl-gnutls.so.4", RTLD_NOW);
+    if (!lib) {
+        err = "libcurl is missing on this system";
+        return false;
+    }
+    using easy_init_t = void *(*)();
+    using easy_setopt_t = int (*)(void *, int, ...);
+    using easy_perform_t = int (*)(void *);
+    using easy_getinfo_t = int (*)(void *, int, ...);
+    using easy_cleanup_t = void (*)(void *);
+    using easy_strerror_t = const char *(*)(int);
+    using slist_append_t = void *(*)(void *, const char *);
+    using slist_free_t = void (*)(void *);
+    using global_init_t = int (*)(long);
+    auto easy_init = (easy_init_t)dlsym(lib, "curl_easy_init");
+    auto easy_setopt = (easy_setopt_t)dlsym(lib, "curl_easy_setopt");
+    auto easy_perform = (easy_perform_t)dlsym(lib, "curl_easy_perform");
+    auto easy_getinfo = (easy_getinfo_t)dlsym(lib, "curl_easy_getinfo");
+    auto easy_cleanup = (easy_cleanup_t)dlsym(lib, "curl_easy_cleanup");
+    auto easy_strerror = (easy_strerror_t)dlsym(lib, "curl_easy_strerror");
+    auto slist_append = (slist_append_t)dlsym(lib, "curl_slist_append");
+    auto slist_free = (slist_free_t)dlsym(lib, "curl_slist_free_all");
+    auto global_init = (global_init_t)dlsym(lib, "curl_global_init");
+    if (!easy_init || !easy_setopt || !easy_perform || !easy_getinfo || !easy_cleanup || !easy_strerror ||
+        !slist_append || !slist_free || !global_init) {
+        err = "libcurl lacks a function the launcher uses";
+        return false;
+    }
+    static std::once_flag once;   // curl_global_init is not thread-safe: once, from whichever thread asks first
+    std::call_once(once, [&] { global_init(3); });   // CURL_GLOBAL_DEFAULT
+    enum { URL = 10002, WRITEDATA = 10001, WRITEFUNCTION = 20011, USERAGENT = 10018, HTTPHEADER = 10023,
+           FOLLOWLOCATION = 52, FAILONERROR = 45, CONNECTTIMEOUT = 78, NOSIGNAL = 99 };
+    enum { RESPONSE_CODE = 0x200002, CONTENT_LENGTH_DOWNLOAD_T = 0x60000F };
+    struct Ctx { Sink *sink; uint64_t *total; void *h; easy_getinfo_t getinfo; bool stopped; } ctx = {&sink, total, nullptr, easy_getinfo, false};
+    void *h = easy_init();
+    if (!h) {
+        err = "libcurl did not start";
+        return false;
+    }
+    ctx.h = h;
+    if (total)
+        *total = 0;
+    void *headers = slist_append(nullptr, "Accept: application/vnd.github+json");
+    size_t (*write)(char *, size_t, size_t, void *) = [](char *p, size_t size, size_t n, void *u) -> size_t {
+        Ctx *c = (Ctx *)u;
+        if (c->total && !*c->total) {   // the final answer's length, known with its headers (after redirects)
+            int64_t len = -1;
+            c->getinfo(c->h, CONTENT_LENGTH_DOWNLOAD_T, &len);
+            *c->total = len > 0 ? (uint64_t)len : 0;
+        }
+        if (!(*c->sink)(p, size * n)) {
+            c->stopped = true;
+            return 0;   // ends the transfer
+        }
+        return size * n;
+    };
+    easy_setopt(h, URL, url.c_str());
+    easy_setopt(h, USERAGENT, "UltraTears-Launcher");
+    easy_setopt(h, HTTPHEADER, headers);
+    easy_setopt(h, FOLLOWLOCATION, 1L);
+    easy_setopt(h, FAILONERROR, 1L);
+    easy_setopt(h, CONNECTTIMEOUT, 20L);
+    easy_setopt(h, NOSIGNAL, 1L);   // on a thread of its own
+    easy_setopt(h, WRITEFUNCTION, write);
+    easy_setopt(h, WRITEDATA, &ctx);
+    int rc = easy_perform(h);
+    long status = 0;
+    easy_getinfo(h, RESPONSE_CODE, &status);
+    bool ok = rc == 0;
+    if (!ok)
+        err = ctx.stopped ? "stopped" : status >= 400 ? "HTTP " + std::to_string(status) : std::string(easy_strerror(rc));
+    slist_free(headers);
+    easy_cleanup(h);
+    return ok;
 #endif
 }
 
@@ -238,9 +314,62 @@ struct Sha256 {
     }
 };
 #else
-struct Sha256 {   // [temporary] Linux: with its HTTP client
-    void add(const void *, size_t) {}
-    std::string hex() { return ""; }
+struct Sha256 {   // FIPS 180-4, for the downloaded package's digest
+    uint32_t s[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    unsigned char buf[64];
+    size_t used = 0;
+    uint64_t bytes = 0;
+    static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void block(const unsigned char *p) {
+        static const uint32_t K[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
+            0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
+            0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
+            0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2};
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+        for (int i = 16; i < 64; i++)
+            w[i] = w[i - 16] + (ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3)) + w[i - 7] +
+                   (ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10));
+        uint32_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = h + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            h = g, g = f, f = e, e = d + t1, d = c, c = b, b = a, a = t1 + t2;
+        }
+        s[0] += a, s[1] += b, s[2] += c, s[3] += d, s[4] += e, s[5] += f, s[6] += g, s[7] += h;
+    }
+    void add(const void *data, size_t n) {
+        const unsigned char *p = (const unsigned char *)data;
+        bytes += n;
+        while (n) {
+            size_t k = SDL_min(n, 64 - used);
+            SDL_memcpy(buf + used, p, k);
+            used += k, p += k, n -= k;
+            if (used == 64)
+                block(buf), used = 0;
+        }
+    }
+    std::string hex() {
+        uint64_t bits = bytes * 8;
+        unsigned char pad = 0x80, zero = 0;
+        add(&pad, 1);
+        while (used != 56)
+            add(&zero, 1);
+        unsigned char len[8];
+        for (int i = 0; i < 8; i++)
+            len[i] = (unsigned char)(bits >> (56 - 8 * i));
+        add(len, 8);
+        char out[65];
+        for (int i = 0; i < 32; i++)
+            SDL_snprintf(out + 2 * i, 3, "%02x", (s[i / 4] >> (24 - 8 * (i % 4))) & 0xff);
+        return out;
+    }
 };
 #endif
 

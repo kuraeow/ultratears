@@ -62,7 +62,8 @@ struct Settings {
 };
 Settings settings_load();
 void settings_save(const Settings &s);
-bool start_game(const std::string &folder);                // UltraTears.exe in folder, detached
+std::string game_exe(const std::string &folder);           // the game built in folder ("" none): UltraTears.exe / ultratears
+bool start_game(const std::string &folder);                // the game in folder, detached
 void single_instance_release();
 bool restart_self();                                       // a new launcher started (after an update)
 

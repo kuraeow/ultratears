@@ -171,6 +171,11 @@ SetupProc *setup_start(const std::vector<std::string> &args, const std::string &
         p->eof = true;
         return p;
     }
+    // made before fork: the child of a process with threads may only make async-signal-safe calls until exec (no malloc)
+    std::vector<char *> argv;
+    for (const std::string &a : args)
+        argv.push_back((char *)a.c_str());
+    argv.push_back(nullptr);
     p->pid = fork();
     if (p->pid == 0) {
         setsid();   // its own process group: kill() reaches the tools it starts
@@ -180,10 +185,6 @@ SetupProc *setup_start(const std::vector<std::string> &args, const std::string &
         close(o[0]), close(o[1]), close(i[0]), close(i[1]);
         if (chdir(cwd.c_str()) != 0)
             _exit(127);
-        std::vector<char *> argv;
-        for (const std::string &a : args)
-            argv.push_back((char *)a.c_str());
-        argv.push_back(nullptr);
         execvp(argv[0], argv.data());
         _exit(127);
     }

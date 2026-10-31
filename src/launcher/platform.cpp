@@ -229,12 +229,45 @@ bool restart_self() {
     CloseHandle(pi.hProcess);
     return true;
 #else
-    return false;   // [temporary] Linux: execv(/proc/self/exe) once there is a Linux launcher
+    // an AppImage runs from a mount that goes when it exits: the new launcher starts from the AppImage file itself
+    const char *appimage = SDL_getenv("APPIMAGE");
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (!appimage && n <= 0)
+        return false;
+    if (n > 0)
+        self[n] = 0;
+    std::string exe = appimage ? appimage : self;
+    single_instance_release();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl(exe.c_str(), exe.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    return pid > 0;
+#endif
+}
+
+std::string game_exe(const std::string &folder) {
+#ifdef _WIN32
+    std::string exe = path_join(folder, "UltraTears.exe");
+    return path_is_file(exe) ? exe : "";
+#else
+    // the Steam Deck's tar has the game beside its data; a build on Linux links it into linux/ (tools/build_game.py)
+    for (const char *name : {"ultratears", "linux/ultratears"}) {
+        std::string exe = path_join(folder, name);
+        if (path_is_file(exe))
+            return exe;
+    }
+    return "";
 #endif
 }
 
 bool start_game(const std::string &folder) {
-    std::string exe = path_join(folder, "UltraTears.exe");
+    std::string exe = game_exe(folder);
+    if (exe.empty())
+        return false;
 #ifdef _WIN32
     std::wstring cmd = L"\"" + wide(exe) + L"\"";
     STARTUPINFOW si = {sizeof si};
@@ -245,9 +278,11 @@ bool start_game(const std::string &folder) {
     CloseHandle(pi.hProcess);
     return true;
 #else
+    std::string dir = exe.substr(0, exe.find_last_of('/'));   // the game reads its folder itself (/proc/self/exe)
     pid_t pid = fork();
     if (pid == 0) {
-        if (chdir(folder.c_str()) == 0)
+        setsid();   // not a child of the launcher's session: closing the launcher leaves the game running
+        if (chdir(dir.c_str()) == 0)
             execl(exe.c_str(), exe.c_str(), (char *)nullptr);
         _exit(127);
     }

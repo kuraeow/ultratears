@@ -205,11 +205,12 @@ static struct {
     // the build
     SetupProc *build = nullptr;
     SetupProc *copy = nullptr;   // tools/install_to.py: the package into the install folder, before the build
-    Row rows[6] = {{"check", "step_check"}, {"romfs", "step_romfs"}, {"lift", "step_lift"},
-                   {"compile", "step_compile"}, {"shaders", "step_shaders"}, {"textures", "step_textures"}};
-    double weight[8] = {};
-    const char *weight_id[8] = {"tools", "check", "romfs", "lift", "compile", "shaders", "textures", "finish"};
-    double frac[8] = {};      // each setup step's share done, 0..1
+    Row rows[7] = {{"check", "step_check"}, {"romfs", "step_romfs"}, {"lift", "step_lift"},
+                   {"compile", "step_compile"}, {"shaders", "step_shaders"}, {"textures", "step_textures"},
+                   {"deck", "step_deck"}};   // deck: shown in a build for the Steam Deck only
+    double weight[9] = {};
+    const char *weight_id[9] = {"tools", "check", "romfs", "lift", "compile", "shaders", "textures", "finish", "deck"};
+    double frac[9] = {};      // each setup step's share done, 0..1
     double eta = -1;          // of the running step, from its progress events
     bool failed = false, done = false, cancel_q = false, close_after_cancel = false;
     std::string fail_text;
@@ -221,6 +222,8 @@ static struct {
     int picked_for = 0;       // 1 the dump, 2 the install folder
     bool stopping = false;    // Stop pressed: the build is being killed
     bool full = false;        // the next build is a full rebuild (setup.py --full)
+    std::string platform;     // what is built: windows, linux (the Steam Deck: a tar to carry there) or both
+    bool can_build = true;    // a builder beside the launcher (not so in the Steam Deck's tar)
     // updates
     UpdateInfo upd;
     bool has_upd = false;
@@ -231,8 +234,16 @@ static struct {
 } U;
 
 static std::string log_path() { return path_join(U.install, "ultratears-setup.log"); }
-static bool installed() { return path_is_file(path_join(U.install, "UltraTears.exe")) && path_is_file(path_join(U.install, "ultratears.cfg")); }
-static bool started_before() { return path_is_file(path_join(U.install, "data/setup.json")) && !installed(); }
+static bool installed() { return !game_exe(U.install).empty() && path_is_file(path_join(U.install, "ultratears.cfg")); }
+#ifdef _WIN32
+static bool for_deck() { return U.platform == "linux" || U.platform == "both"; }
+#else
+static bool for_deck() { return false; }   // on Linux the game is built in place, for this machine: nothing to carry
+#endif
+static std::string deck_tar() { return path_join(U.install, "UltraTears-SteamDeck.tar"); }
+static bool deck_built() { return path_is_file(deck_tar()); }   // a build for the Steam Deck alone has no exe here
+static bool started_before() { return path_is_file(path_join(U.install, "data/setup.json")) && !installed() && !deck_built(); }
+static int n_rows() { return for_deck() ? 7 : 6; }
 static Json setup_state() {   // data/setup.json of the install folder: setup.py's record of the build
     Json st;
     size_t n = 0;
@@ -279,6 +290,10 @@ static bool needs_copy() {
         return false;
     return !has_package(U.install) || version_newer(package_version(U.home), package_version(U.install));
 }
+
+// GB a build needs free: the game, the package copy when it goes elsewhere, and for the Steam Deck its game, objects,
+// shaders and the ~25 GB tar (tools/hw_check.py LINUX_GB)
+static double need_gb() { return (needs_copy() ? 41 : 40) + (for_deck() ? 31 : 0); }
 
 static void check_dump(const std::string &path);
 
@@ -345,7 +360,7 @@ static void pick_folder(int which, const std::string &start) {
 
 // ---------------------------------------------------------------- the build
 static int setup_index(const std::string &id) {
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 9; i++)
         if (id == U.weight_id[i])
             return i;
     return -1;
@@ -366,15 +381,23 @@ static Row *row_of(const std::string &id) {   // tools and check share the first
 // data/setup.json "full_secs"), else the design's 30-40 minutes (a clean build took 34 on 8 CPUs, 2026-10-30): a guess
 // from the CPU count alone promised 15-30 where a slow disk or an antivirus can make it 50. One rule for the install
 // screen, the full rebuild and the steps' "may take".
-static double measured_secs() { return setup_state()["full_secs"].num(0); }
-static double est_total_secs() { return measured_secs() > 0 ? measured_secs() : 35 * 60; }
+// A build for the Steam Deck as well: the game compiled twice, the Deck's shaders, the tar (setup.py step_weights:
+// 162 of 100 for both platforms, 106 for the Deck alone); measured on this PC for a Windows build
+static double deck_factor() { return !for_deck() ? 1 : U.platform == "both" ? 1.62 : 1.06; }
+static double measured_secs() {
+    Json st = setup_state();
+    double secs = st["full_secs"].num(0);
+    bool deck = false;   // measured for a build with the Deck already
+    for (size_t i = 0; i < st["platforms"].size(); i++)
+        deck |= st["platforms"][i].str() == "linux";
+    return deck ? secs : secs * deck_factor();
+}
+static double est_total_secs() { return measured_secs() > 0 ? measured_secs() : 35 * 60 * deck_factor(); }
 
 static void wait_range(long *lo, long *hi) {   // in minutes, rounded to 5
     double m = measured_secs() / 60;
-    if (m <= 0) {
-        *lo = 30, *hi = 40;
-        return;
-    }
+    if (m <= 0)
+        m = 35 * deck_factor();
     *lo = SDL_max((long)(m * 0.9 / 5) * 5, 5L);
     *hi = SDL_max(((long)(m * 1.15) + 4) / 5 * 5, *lo + 5);
 }
@@ -382,8 +405,8 @@ static void wait_range(long *lo, long *hi) {   // in minutes, rounded to 5
 static void start_build_state() {
     for (Row &r : U.rows)
         r.st = R_PENDING, r.secs = -1, r.skipped = false, r.err.clear();
-    static const double defaults[8] = {2, 1, 7, 4, 47, 9, 30, 0};   // setup.py's STEP_WEIGHTS, until its plan arrives
-    for (int i = 0; i < 8; i++)
+    static const double defaults[9] = {2, 1, 7, 4, 47, 9, 30, 0, 0};   // setup.py's STEP_WEIGHTS, until its plan arrives
+    for (int i = 0; i < 9; i++)
         U.weight[i] = defaults[i], U.frac[i] = 0;
     U.eta = -1, U.failed = U.done = U.cancel_q = U.hw_asked = U.stopping = false;
     U.fail_text.clear();
@@ -405,6 +428,7 @@ static void run_setup() {
         args.insert(args.end(), {"--dump", U.dump});
     if (U.full)   // the Debug tab's full rebuild: once
         args.push_back("--full");
+    args.insert(args.end(), {"--platform", U.platform});
     U.full = false;
     U.build = setup_start(args, U.root, log_path());
     U.screen = SCR_BUILD;
@@ -451,7 +475,7 @@ static void on_event(const Json &e) {
             }
         }
     } else if (ev == "progress") {
-        for (int k = 0; k < 8; k++) {
+        for (int k = 0; k < 9; k++) {
             Row *r = row_of(U.weight_id[k]);
             if (r && r->st == R_RUN && U.frac[k] < 1 && (k != 0 || U.rows[0].st != R_DONE)) {
                 double total = e["total"].num();
@@ -656,7 +680,7 @@ static void poll() {
 
 static double overall() {
     double sum = 0, done = 0;
-    for (int k = 0; k < 8; k++)
+    for (int k = 0; k < 9; k++)
         sum += U.weight[k], done += U.weight[k] * U.frac[k];
     return sum > 0 ? done / sum : 0;
 }
@@ -789,7 +813,7 @@ static void screen_dump() {
     path_text(g_media.regular, 52, y + 38, 748 - cw - 52 - 16, U.install);
     if (button("inst_change", T("change"), 748 - cw, y + 12, cw, 40, DARK))
         pick_folder(2, U.install);
-    double need = needs_copy() ? 41 : 40, free = disk_free_gb(U.install);
+    double need = need_gb(), free = disk_free_gb(U.install);
     long lo, hi;
     wait_range(&lo, &hi);
     std::string need_s = Tf("need_free", {{"need", gb(need)}, {"free", free < 0 ? "?" : gb(free)}});
@@ -821,6 +845,8 @@ static void version_label() {   // the port's version (the launcher's is the sam
     text(g_media.small, 400 - text_w(g_media.small, v.c_str()) / 2, 440, C_DIM, v.c_str());
 }
 
+static float platform_choice(float x_right, bool note);
+
 static void screen_dump_footer() {
     if (U.dump_st != D_OK && U.dump_st != D_DATA) {
         version_label();
@@ -830,16 +856,17 @@ static void screen_dump_footer() {
     const char *label = rebuild ? T("rebuild") : resume ? T("resume") : T("prepare");
     float w = SDL_max(196.0f, text_w(g_media.medium, label) + 48);
     double free = disk_free_gb(U.install);
-    bool space = free < 0 || free >= (needs_copy() ? 41 : 40) || installed() || resume;
+    bool space = free < 0 || free >= need_gb() || installed() || resume;
+    float left = platform_choice(764 - w - 8, !(resume || rebuild));   // the design: for which platform, beside the button
     if (resume || rebuild)
-        rich(g_media.small, 36, 418, 764 - w - 36 - 24, {{T(rebuild ? "rebuild_hint" : "resume_hint"), C_SUB}}, 17);
+        rich(g_media.small, 36, 418, left - 36 - 24, {{T(rebuild ? "rebuild_hint" : "resume_hint"), C_SUB}}, 17);
     if (button("prepare", label, 764 - w, 408, w, 48, PRIMARY, space))
         start_build();
 }
 
 static void step_rows(float y) {
     double est = est_total_secs();
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < n_rows(); i++) {
         Row &r = U.rows[i];
         float ry = y + 26 * i, cx = 44, cy = ry + 8;
         ImU32 name_col = C_TEXT;
@@ -912,13 +939,32 @@ static void screen_build() {
     y += 34;
     step_rows(y);
     if (U.failed && !U.fail_text.empty())
-        rich(g_media.small, 36, y + 26 * 6 + 4, 728, {{U.fail_text.c_str(), C_ERR}});
+        rich(g_media.small, 36, y + 26 * n_rows() + 4, 728, {{U.fail_text.c_str(), C_ERR}});
 }
 
 static void screen_build_footer() {
     if (U.done) {
-        if (button("done", T("done_btn"), 649, 408, 115, 48, PRIMARY))
-            U.screen = SCR_PLAY;
+        if (for_deck() && deck_built()) {   // what to carry to the Deck, and where it is
+            const char *show = T("show_file");
+            float sw = text_w(g_media.medium, show) + 40;
+            SDL_PathInfo info;
+            double size = SDL_GetPathInfo(deck_tar().c_str(), &info) ? info.size / 1073741824.0 : 0;
+            char gbs[16];
+            SDL_snprintf(gbs, sizeof gbs, "%.1f", size);
+            std::string t = Tf("deck_carry", {{"file", deck_tar()}, {"gb", gbs}});
+            rich(g_media.small, 36, 410, 649 - 12 - sw - 12 - 36, {{t.c_str(), C_TEXT}}, 17);
+            if (button("show_tar", show, 649 - 12 - sw, 408, sw, 48, DARK))
+                reveal_in_folder(deck_tar());
+        }
+        if (button("done", T("done_btn"), 649, 408, 115, 48, PRIMARY)) {
+            // built for the Steam Deck alone: nothing to play on this PC, back to the folders and the platform choice
+            if (installed())
+                U.screen = SCR_PLAY;
+            else {
+                dump_state();
+                U.screen = SCR_DUMP;
+            }
+        }
         return;
     }
     if (U.failed) {
@@ -1118,33 +1164,37 @@ template <size_t N> static int segmented(const char *id, float x_right, float cy
     return chosen;
 }
 
-// A drop-down list: the box right-aligned at x_right, its list in a popup (scrolls when long).
-template <size_t N> static int dropdown(const char *id, float x_right, float cy, float w, const Opt (&opts)[N], int sel) {
+// A drop-down list: the box right-aligned at x_right, its list in a popup (scrolls when long). shown: the box says
+// this instead of the choice (a button that opens a list, as the Debug tab's full rebuild); h: the box's height.
+template <size_t N> static int dropdown(const char *id, float x_right, float cy, float w, const Opt (&opts)[N], int sel,
+                                        const char *shown = nullptr, float h = 32) {
     if (w <= 0) {   // as wide as its longest choice, at least the design's 126
-        w = 126;
+        w = SDL_max(126.0f, shown ? text_w(g_media.medium, shown) + 52 : 0);
         for (size_t i = 0; i < N; i++)
             w = SDL_max(w, text_w(g_media.control, opt_label(opts[i])) + 52);
     }
-    float x = x_right - w, y = cy - 16;
+    float x = x_right - w, y = cy - h / 2;
     bool hov, down;
     char pid[64];
     SDL_snprintf(pid, sizeof pid, "dd_%s", id);
     extern const char *g_demo_open;   // development: a list opened for a screenshot (ui_demo)
-    if (hit(id, x, y, w, 32, &hov, &down) || (g_demo_open && !SDL_strcmp(g_demo_open, id))) {
+    if (hit(id, x, y, w, h, &hov, &down) || (g_demo_open && !SDL_strcmp(g_demo_open, id))) {
         ImGui::OpenPopup(pid);
         g_demo_open = nullptr;
     }
     bool open = ImGui::IsPopupOpen(pid);
-    DL->AddRectFilled(P(x, y), P(x_right, y + 32), hov || open ? C_FIELD_HOVER : C_FIELD, 6 * S);
-    text(g_media.control, x + 12, cy - g_media.control->FontSize / S / 2, C_TEXT, sel >= 0 ? opt_label(opts[sel]) : "");
+    DL->AddRectFilled(P(x, y), P(x_right, y + h), hov || open ? C_FIELD_HOVER : C_FIELD, (h > 32 ? 8 : 6) * S);
+    ImFont *bf = shown || h > 32 ? g_media.medium : g_media.control;   // a button's words, as the design's buttons
+    const char *bl = shown ? shown : sel >= 0 ? opt_label(opts[sel]) : "";
+    text(bf, shown || h > 32 ? x + (w - 26 - text_w(bf, bl)) / 2 - 2 : x + 12, cy - bf->FontSize / S / 2, C_TEXT, bl);
     icon(g_media.chevron, x_right - 12 - 14, cy - 7, 14);
     int chosen = -1;
     // The list stays inside the window (SDL_Renderer draws no windows of its own outside it): it opens on the side with
     // more room, as tall as that room allows, and scrolls the rest.
     float lh = 30, want = N * lh + 8, wh = ImGui::GetIO().DisplaySize.y;
-    float below = (wh - P(x, y + 36).y) / S - 8, above = P(x, y - 4).y / S - 8;
+    float below = (wh - P(x, y + h + 4).y) / S - 8, above = P(x, y - 4).y / S - 8;
     bool open_down = below >= want || below >= above;
-    float ph = SDL_min(want, SDL_max(lh + 8, open_down ? below : above)), py = open_down ? y + 36 : y - 4 - ph;
+    float ph = SDL_min(want, SDL_max(lh + 8, open_down ? below : above)), py = open_down ? y + h + 4 : y - 4 - ph;
     ImGui::SetNextWindowPos(P(x, py));
     ImGui::SetNextWindowSize(ImVec2(w * S, ph * S));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -1179,6 +1229,39 @@ template <size_t N> static int dropdown(const char *id, float x_right, float cy,
     return chosen;
 }
 
+// For which platform the game is built (setup.py --platform): this PC, the Steam Deck (a tar to carry there; the Linux
+// kit is downloaded for it), or both. The launcher's own choice, remembered in its settings.
+static const Opt PLATFORM_OPTS[] = {{"windows", "plat_windows"}, {"linux", "plat_linux"}, {"both", "plat_both"}};
+
+// The design's platform list right-aligned at x_right on the footer's line, and with note the words that the Linux kit is
+// downloaded when it is not there yet; returns where the list (or the note) begins.
+static float platform_choice(float x_right, bool note) {
+#ifndef _WIN32
+    (void)note;
+    return x_right;   // on Linux the game is built for this machine: no choice (the design)
+#endif
+    float w = 0;
+    for (const Opt &o : PLATFORM_OPTS)
+        w = SDL_max(w, text_w(g_media.medium, opt_label(o)) + 56);
+    int k = dropdown("platform", x_right, 432, w, PLATFORM_OPTS, opt_index(PLATFORM_OPTS, U.platform), nullptr, 48);
+    if (k >= 0) {
+        U.platform = PLATFORM_OPTS[k].value;
+        U.set.set("platform", U.platform);
+        settings_save(U.set);
+    }
+    float left = x_right - w;
+    if (note && for_deck() && !path_is_dir(path_join(U.root, "deps/linux/sysroot"))) {
+        std::string t = T("linux_kit_note");
+        size_t nl = t.find('\n');
+        std::string l1 = t.substr(0, nl), l2 = nl == std::string::npos ? "" : t.substr(nl + 1);
+        float r = left - 16;
+        text(g_media.small, r - text_w(g_media.small, l1.c_str()), 413, C_SUB, l1.c_str());
+        text(g_media.small, r - text_w(g_media.small, l2.c_str()), 431, C_SUB, l2.c_str());
+        left = r - SDL_max(text_w(g_media.small, l1.c_str()), text_w(g_media.small, l2.c_str()));
+    }
+    return left;
+}
+
 static bool toggle(const char *id, float x_right, float cy, bool on) {   // the design's switch, 38 x 22
     float x = x_right - 38, y = cy - 11;
     bool hov, down;
@@ -1191,6 +1274,7 @@ static bool toggle(const char *id, float x_right, float cy, bool on) {   // the 
 
 static int g_tab = 0;   // 0 general, 1 the game's language, 2 debug
 static bool g_full_q = false;   // "Rebuild completely" pressed: asking whether to
+static std::string g_full_platform = "windows";   // for which platform (its list)
 
 static void play_tabs() {   // instead of the header on the Play screen (the design)
     static const char *const TABS[] = {"tab_main", "tab_lang", "tab_debug"};
@@ -1247,6 +1331,8 @@ static void screen_debug() {
     DL->AddRectFilled(P(36, top), P(764, bottom), C_CARD, 10 * S);
     DL->ChannelsSetCurrent(1);
 
+    if (!U.can_build)
+        return;   // the Steam Deck's tar: the PC rebuilds it
     top = 320;   // the full rebuild: its own card, just above Play (the design) whichever way Debug mode is
     long lo, hi;
     wait_range(&lo, &hi);
@@ -1254,9 +1340,18 @@ static void screen_debug() {
     text(g_media.label, 52, top + 22 - g_media.label->FontSize / S / 2, C_TEXT, T("full_title"));
     if (!g_full_q) {
         text(g_media.small, 52, top + 47 - g_media.small->FontSize / S / 2, C_SUB, range.c_str());
-        float w = text_w(g_media.medium, T("full_btn")) + 34;
-        if (button("full", T("full_btn"), 748 - w, top + 15, w, 38, DARK))
+#ifdef _WIN32
+        // the design: the button opens the list of platforms to rebuild for
+        int k = dropdown("full", 748, top + 34, 0, PLATFORM_OPTS, -1, T("full_btn"), 38);
+        if (k >= 0) {
+            g_full_platform = PLATFORM_OPTS[k].value;
             g_full_q = true;
+        }
+#else
+        float w = text_w(g_media.medium, T("full_btn")) + 34;   // on Linux: this machine only, a plain button
+        if (button("full", T("full_btn"), 748 - w, top + 15, w, 38, DARK))
+            g_full_platform = "linux", g_full_q = true;
+#endif
     } else {   // the question, with the time it takes, in place of the button
         std::string q = Tf("full_q", {{"lo", std::to_string(lo)}, {"hi", std::to_string(hi)}});
         float w1 = text_w(g_media.medium, T("full_go")) + 34, w2 = text_w(g_media.medium, T("cancel")) + 34;
@@ -1266,6 +1361,9 @@ static void screen_debug() {
         if (button("full_go", T("full_go"), 748 - w1, top + 15, w1, 38, PRIMARY)) {
             g_full_q = false;
             U.full = true;
+            U.platform = g_full_platform;
+            U.set.set("platform", U.platform);
+            settings_save(U.set);
             start_build();
         }
     }
@@ -1464,6 +1562,19 @@ void ui_init(SDL_Window *w) {
 #endif
     std::string inst = U.set.get("install");
     use_install(inst.empty() ? U.home : inst);
+    // the platform chosen last; else what the folder was built for (data/setup.json "platforms"), else this PC
+    U.platform = U.set.get("platform");
+#ifndef _WIN32
+    U.platform = "linux";   // the Linux launcher builds for its own machine
+#endif
+    if (opt_index(PLATFORM_OPTS, U.platform) < 0) {
+        Json st = setup_state();
+        const Json &p = st["platforms"];
+        bool win = false, lin = false;
+        for (size_t i = 0; i < p.size(); i++)
+            win |= p[i].str() == "windows", lin |= p[i].str() == "linux";
+        U.platform = win && lin ? "both" : lin ? "linux" : "windows";
+    }
     update_cleanup(U.root);
     // updates: one question to GitHub a day at most; a release found stays offered until it is installed
     U.upd.version = U.set.get("update_version");
@@ -1477,7 +1588,8 @@ void ui_init(SDL_Window *w) {
     SDL_Time now = 0;
     SDL_GetCurrentTime(&now);
     long long secs = (long long)(now / SDL_NS_PER_SECOND);
-    if (U.set.get("updates") != "off" && !U.version.empty() && (secs - checked > 24 * 3600 || secs < checked)) {
+    if (U.set.get("updates") != "off" && !U.version.empty() && !python_path(U.root).empty() &&
+        (secs - checked > 24 * 3600 || secs < checked)) {
         U.set.set("update_checked", std::to_string(secs));
         settings_save(U.set);
         update_check_start(U.version);
@@ -1497,9 +1609,12 @@ void ui_init(SDL_Window *w) {
     st.Colors[ImGuiCol_NavCursor] = ImVec4(0, 0, 0, 0);   // the focus frame is drawn by hit()
     st.PopupRounding = 6;
     st.WindowRounding = 6;
-    if (python_path(U.root).empty())
+    // the game carried to a Steam Deck in the tar from the PC (tools/make_deck_tar.py): no builder beside it, only Play
+    // and the settings; the PC's launcher builds and updates it
+    U.can_build = !python_path(U.root).empty();
+    if (!U.can_build && !installed())
         U.screen = SCR_BROKEN;
-    else if (installed() && (!U.dump.empty() || data_ready()) && !stale())
+    else if (!U.can_build || (installed() && (!U.dump.empty() || data_ready()) && !stale()))
         U.screen = SCR_PLAY;
     else
         dump_state();

@@ -16,6 +16,8 @@ and objects tell which parts of clang64 the build reads) and tools/build_xlate.p
     the packages the build imports (lz4, capstone, unicorn) from this project's .venv;
   - deps/shaders/ultrs-shaders.exe, the shader translator (tools/build_xlate.py);
   - UltraTears Launcher.exe (tools/build_launcher.py), the window that builds and starts the game; no .bat;
+  - bin-linux/ultratears-launcher: the launcher for Linux the Steam Deck's tar carries (build_launcher.py --platform
+    linux, with the Linux kit: deps/linux or dev-local/linux-cross);
   - VERSION.txt, THIRD-PARTY-NOTICES.md and package-files.txt (every file of the package: what
     tools/apply_update.py replaces and removes when the launcher updates it).
 Refuses a dirty working tree: the package must be the commit it names.
@@ -59,6 +61,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | deps/clang64 | Parts of MSYS2 CLANG64: LLVM clang, lld, libc++, libunwind, compiler-rt (Apache-2.0 WITH LLVM-exception); mingw-w64 headers, CRT and winpthreads (ZPL / MIT / public domain); ninja (Apache-2.0); SDL3 (zlib); opus, libvpx, zstd (BSD); libiconv (LGPL-2.1+, linked statically: the objects to relink are made on your PC by the build itself); zlib, xz, libffi, libxml2 (their DLLs, loaded by clang); Vulkan headers (Apache-2.0 / MIT) | as listed | licenses/msys2/<package>/ |
 | deps/python | Python 3.14 (PSF License) with lz4 (BSD), capstone (BSD), unicorn (GPL-2.0) | as listed | licenses/Python.txt; each package's *.dist-info in deps/python/Lib/site-packages |
 | UltraTears Launcher.exe | The launcher (GPL-3.0-or-later) with SDL3 (zlib), Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libc++ (Apache-2.0 WITH LLVM-exception) | as listed | licenses/msys2/SDL3, licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-Inter.txt, licenses/OFL-MontserratAlternates.txt |
+| bin-linux/ultratears-launcher | The launcher for Linux / Steam Deck, put into the Deck's tar (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) beside it in the tar | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
 
 Source code. The launcher and the shader translator come built; their source, like all of this project's, is at
@@ -245,6 +248,15 @@ def main():
     launcher = ROOT / 'dev-local/build/launcher-release'
     subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--out', str(launcher)], check=True)
     shutil.copy2(launcher / 'UltraTears Launcher.exe', out / 'UltraTears Launcher.exe')
+    # the launcher for Linux, which the Steam Deck's tar carries (tools/make_deck_tar.py), built with the Linux kit and
+    # without its debug information
+    launcher = ROOT / 'dev-local/build/launcher-linux-release'
+    subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--platform', 'linux', '--out', str(launcher)],
+                   check=True)
+    (out / 'bin-linux').mkdir()
+    objcopy = next(p for p in (CLANG64 / 'llvm-objcopy.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-objcopy.exe')) if p.is_file())
+    subprocess.run([str(objcopy), '--strip-debug', str(launcher / 'ultratears-launcher'),
+                    str(out / 'bin-linux/ultratears-launcher')], check=True)
     files = sorted(f.relative_to(out).as_posix() for f in out.rglob('*') if f.is_file()) + ['package-files.txt']
     (out / 'package-files.txt').write_text('\n'.join(sorted(files)) + '\n', encoding='utf-8')
     size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
