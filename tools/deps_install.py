@@ -1,8 +1,7 @@
 """The build tools of a source build: what is missing on this PC is downloaded into deps/ from where it is published.
 
-tools/deps.json pins every download (URL, size, hash); nothing of it is in git, and only the Linux kit (a build for
-Linux / Steam Deck) comes from an UltraTears release. Each part is used from the PC when it is already there, else
-installed into deps/:
+tools/deps.json pins every download (URL, size, hash); nothing of it is in git and nothing comes from an UltraTears
+release. Each part is used from the PC when it is already there, else installed into deps/:
   - Python 3.14 with lz4, capstone and unicorn: the Python running setup.py when it is 3.14+ and has them, else
     deps/python (python.org's NuGet package, the wheels from PyPI unpacked into it; no pip, no compiler);
   - clang, lld, ninja and the libraries the port links (MSYS2 CLANG64): deps/clang64, ULTRS_CLANG64 or
@@ -394,23 +393,32 @@ def launcher_libs(home=ROOT):
 # ---------------------------------------------------------------- the Linux kit
 # A build for Linux / Steam Deck (setup.py --platform linux or both) needs the Linux kit in deps/linux: the files of
 # Valve's Steam Runtime "sniper" sysroot a compile and link of the game read, and a static zstd (tools/make_linux_kit.py,
-# ~18 MB). It is the one part published with UltraTears' releases, pinned in tools/deps.json "linux_kit".
-# ULTRS_LINUX_KIT_ZIP=<a local kit zip> installs that one instead, unchecked (development, before a kit is published).
+# ~18 MB). A builder package carries it; a build from the source makes it here from the pinned sysroot (1.2 GB, once)
+# and zstd's source (tools/deps.json "linux_kit_sources"). ULTRS_LINUX_KIT_ZIP=<a kit zip> installs that one instead.
 def linux_kit_for(home):
-    """deps/linux when installed from the current pin or from a local zip (a developer's: kept until deps/linux is
-    deleted), else None."""
+    """deps/linux when it is the package's, made from the current pins or from a given zip (a developer's: kept until
+    deps/linux is deleted), else None."""
     key = installed(home).get('linux_kit')
-    want = key_of(manifest()['linux_kit'])
-    if (home / 'deps/linux/sysroot').is_dir() and key in (want, 'local'):
+    want = key_of(manifest()['linux_kit_sources'])
+    if (home / 'deps/linux/sysroot').is_dir() and key in (want, 'package', 'local'):
         return home / 'deps/linux'
     return None
 
 
 def install_linux_kit(home):
-    item = manifest()['linux_kit']
+    src = manifest()['linux_kit_sources']
     local = os.environ.get('ULTRS_LINUX_KIT_ZIP')
-    say(f'  the Linux kit ({item["size"] / 2**20:.0f} MiB) -> deps\\linux')
-    path = pathlib.Path(local) if local else fetch(item, home / 'deps/downloads', 'the Linux kit')
+    if local:
+        path = pathlib.Path(local)
+        say(f'  the Linux kit {path} -> deps\\linux')
+    else:
+        total = src['sniper']['size'] + src['zstd']['size']
+        say(f'  the Linux kit: Steam Runtime sysroot {src["sniper"]["version"]} and zstd {src["zstd"]["version"]} '
+            f'({total / 2**20:.0f} MiB, once) -> deps\\linux')
+        cache = home / 'deps/downloads'
+        sniper, zst = fetch_all([src['sniper'], src['zstd']], cache, 'the Linux kit')
+        import make_linux_kit   # after CLANG64 is installed: it builds zstd with it
+        path = make_linux_kit.build(sniper, zst, cache / 'ultrs-linux-kit.zip')
     wipe(home, 'linux')
     own = (home / 'deps/linux').resolve()
     with zipfile.ZipFile(path) as z:
@@ -421,9 +429,10 @@ def install_linux_kit(home):
         z.extractall(own)
     if not (own / 'sysroot/usr/include/stdio.h').is_file():
         raise DepsError('the installed deps\\linux lacks the sysroot')
-    mark(home, 'linux_kit', 'local' if local else key_of(item))
+    mark(home, 'linux_kit', 'local' if local else key_of(src))
     if not local:
-        path.unlink(missing_ok=True)
+        for f in (path, sniper, zst):
+            f.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- entry points

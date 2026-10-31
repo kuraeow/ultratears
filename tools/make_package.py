@@ -15,6 +15,7 @@ and objects tell which parts of clang64 the build reads) and tools/build_xlate.p
   - deps/python: Python 3.14 (the given install, default the one running this) without its tests, docs and Tk, with
     the packages the build imports (lz4, capstone, unicorn) from this project's .venv;
   - deps/shaders/ultrs-shaders.exe, the shader translator (tools/build_xlate.py);
+  - deps/linux: the Linux kit for builds for the Steam Deck (tools/make_linux_kit.py, --linux-kit);
   - UltraTears Launcher.exe (tools/build_launcher.py), the window that builds and starts the game; no .bat;
   - bin-linux/ultratears-launcher: the launcher for Linux the Steam Deck's tar carries (build_launcher.py --platform
     linux, with the Linux kit: deps/linux or dev-local/linux-cross);
@@ -42,7 +43,9 @@ import public_tree  # noqa: E402
 import version  # noqa: E402
 
 PREFIX = CLANG64.parent if CLANG64 else None   # .../clang64
-PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.exe', 'llvm-rc.exe', 'ninja.exe']
+# llvm-objcopy: the game for the Steam Deck without its debug information (tools/make_deck_tar.py)
+PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.exe', 'llvm-rc.exe', 'llvm-objcopy.exe',
+            'ninja.exe']
 # MSYS2 package (share/licenses/<name>) of each part of clang64 the package carries
 LICENSES = ['clang', 'clang-libs', 'compiler-rt', 'crt', 'headers', 'libc++', 'libunwind', 'libwinpthread', 'winpthreads',
             'lld', 'llvm', 'llvm-libs', 'llvm-tools', 'ninja', 'SDL3', 'opus', 'libvpx', 'zstd', 'libiconv', 'zlib', 'xz',
@@ -62,6 +65,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | deps/python | Python 3.14 (PSF License) with lz4 (BSD), capstone (BSD), unicorn (GPL-2.0) | as listed | licenses/Python.txt; each package's *.dist-info in deps/python/Lib/site-packages |
 | UltraTears Launcher.exe | The launcher (GPL-3.0-or-later) with SDL3 (zlib), Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libc++ (Apache-2.0 WITH LLVM-exception) | as listed | licenses/msys2/SDL3, licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-Inter.txt, licenses/OFL-MontserratAlternates.txt |
 | bin-linux/ultratears-launcher | The launcher for Linux / Steam Deck, put into the Deck's tar (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) beside it in the tar | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
+| deps/linux | The Linux kit for builds for the Steam Deck (tools/make_linux_kit.py): files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
 
 Source code. The launcher and the shader translator come built; their source, like all of this project's, is at
@@ -182,6 +186,8 @@ def main():
     ap.add_argument('--python', type=pathlib.Path, default=pathlib.Path(sys.base_prefix))
     ap.add_argument('--no-zip', action='store_true')
     ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'dist')   # tools/setup.py's default output
+    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip',
+                    help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
     ap.add_argument('--test', action='store_true',
                     help='a package of an untagged commit, named after git describe: for testing, never for Releases')
     a = ap.parse_args()
@@ -191,9 +197,9 @@ def main():
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate):
+    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit):
         if not need.is_file():
-            sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py)')
+            sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
     name = f'UltraTears-builder-{a.version}-windows-x86_64'
     out = ROOT / 'dev-local/dist' / name
     if out.exists():
@@ -237,9 +243,14 @@ def main():
     if not stamp.is_file() or stamp.read_text().strip() != deps_install.xlate_stamp(ROOT):
         sys.exit(f'{xlate} was not built from this source: run tools/build_xlate.py again')
     shutil.copy2(stamp, out / 'deps/shaders/source.txt')
+    # deps/linux: the Linux kit, for a build for the Steam Deck (setup.py --platform linux / both); ~18 MB in the zip,
+    # so no download of its own
+    with zipfile.ZipFile(a.linux_kit) as z:
+        z.extractall(out / 'deps/linux')
+    shutil.copytree(out / 'deps/linux/licenses', lic / 'linux-kit')
     # the package's own tools: a build from it installs nothing (tools/deps_install.py)
-    (out / 'deps/installed.json').write_text(json.dumps({'python': 'package', 'clang64': 'package', 'shaders': 'package'},
-                                                        indent=1))
+    (out / 'deps/installed.json').write_text(json.dumps({'python': 'package', 'clang64': 'package', 'shaders': 'package',
+                                                         'linux_kit': 'package'}, indent=1))
     shutil.copy2(ROOT / 'third_party/maxwell_shader/LICENSE.txt', lic / 'Ryujinx.txt')
     shutil.copy2(a.python / 'LICENSE.txt', lic / 'Python.txt')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))

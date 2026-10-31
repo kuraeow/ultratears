@@ -1,11 +1,12 @@
 """Make the Linux kit: what a Windows PC needs to build UltraTears for Linux / Steam Deck (tools/build_game.py
---platform linux), as one zip published beside a builder package and installed into deps/linux (tools/deps_install.py).
+--platform linux), as one zip: a builder package carries it in deps/linux (tools/make_package.py --linux-kit); a build
+from the source makes it from the same pinned downloads (tools/deps_install.py).
 
 From the Steam Runtime 3 "sniper" SDK sysroot (Valve's, glibc 2.31: the game runs on SteamOS and any newer distribution)
 only the files a compile and link of the game read: the C and C++ headers, glibc's link files, the GCC runtime and
 libstdc++ (linked static), SDL3 (shared, it goes beside the game), Opus and libvpx (static), with their copyright files;
-and zstd built static from its source. Nothing of the game is in it. Developer tool: needs clang for the zstd build and
-llvm-ar (MSYS2 CLANG64).
+and zstd built static from its source. Nothing of the game is in it. Needs clang for the zstd build and llvm-ar
+(CLANG64: deps/clang64 of a source build has both).
 usage: python tools/make_linux_kit.py --sniper <sniper sysroot .tar.gz> --zstd <zstd-1.5.7.tar.gz> --out <kit.zip>
 """
 import argparse
@@ -23,7 +24,7 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from toolchain import CLANG64  # noqa: E402
+import deps_install  # noqa: E402
 
 SNIPER = '3.0.20261021.266025'   # the SDK snapshot the kit is made from (tools/deps.json pins the result)
 ZSTD = '1.5.7'
@@ -116,6 +117,10 @@ def zstd(tar_path, out, work):
     with tarfile.open(tar_path, 'r:gz') as t:
         t.extractall(work, filter='data')
     src = work / f'zstd-{ZSTD}/lib'
+    clang64 = deps_install.clang64_for(ROOT)   # asked now: a source build may have just installed it
+    if clang64 is None:
+        sys.exit('no CLANG64 to build zstd with: run tools/setup.py first')
+    bin_ = clang64 / 'bin'
     objs = []
     flags = ['--target=x86_64-linux-gnu', f'--sysroot={out / "sysroot"}', '-O2', '-fPIC', '-DZSTD_LEGACY_SUPPORT=0',
              '-DZSTD_DISABLE_ASM', '-DXXH_NAMESPACE=ZSTD_']
@@ -123,31 +128,27 @@ def zstd(tar_path, out, work):
         for c in sorted((src / sub).glob('*.c')):
             o = work / 'obj' / (c.stem + '.o')
             o.parent.mkdir(exist_ok=True)
-            subprocess.run([str(CLANG64 / 'clang.exe'), *flags, '-c', str(c), '-o', str(o)], check=True)
+            subprocess.run([str(bin_ / 'clang.exe'), *flags, '-c', str(c), '-o', str(o)], check=True)
             objs.append(str(o))
     (out / 'lib').mkdir()
     (out / 'include').mkdir()
-    ar = next(p for p in (CLANG64 / 'llvm-ar.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-ar.exe')) if p.is_file())
+    ar = next(p for p in (bin_ / 'llvm-ar.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-ar.exe')) if p.is_file())
     subprocess.run([str(ar), 'rcs', str(out / 'lib/libzstd.a'), *objs], check=True)
     for h in ('zstd.h', 'zstd_errors.h', 'zdict.h'):
         shutil.copyfile(src / h, out / 'include' / h)
     shutil.copyfile(work / f'zstd-{ZSTD}/LICENSE', out / 'licenses/zstd.txt')
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--sniper', required=True)
-    ap.add_argument('--zstd', required=True)
-    ap.add_argument('--out', required=True)
-    a = ap.parse_args()
-    out_zip = pathlib.Path(a.out).resolve()
+def build(sniper_tar, zstd_tar, out_zip):
+    """The kit from the two pinned downloads (tools/deps.json "linux_kit_sources") into out_zip."""
+    out_zip = pathlib.Path(out_zip).resolve()
     with tempfile.TemporaryDirectory(prefix='ultrs-kit-', dir=out_zip.parent) as tmp:
         kit = pathlib.Path(tmp) / 'kit'
         kit.mkdir()
-        print('sysroot files ...', flush=True)
-        sysroot(a.sniper, kit)
-        print('zstd ...', flush=True)
-        zstd(a.zstd, kit, pathlib.Path(tmp) / 'zstd')
+        print('  the Linux kit: the sysroot files ...', flush=True)
+        sysroot(sniper_tar, kit)
+        print('  the Linux kit: zstd ...', flush=True)
+        zstd(zstd_tar, kit, pathlib.Path(tmp) / 'zstd')
         (kit / 'kit.json').write_text(json.dumps({'sniper': SNIPER, 'zstd': ZSTD}, indent=1) + '\n')
         (kit / 'licenses/README.txt').write_text(
             'The UltraTears Linux kit: files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged, and zstd\n'
@@ -162,6 +163,16 @@ def main():
                 if p.is_file():
                     z.write(p, p.relative_to(kit).as_posix())
         part.replace(out_zip)
+    return out_zip
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--sniper', required=True)
+    ap.add_argument('--zstd', required=True)
+    ap.add_argument('--out', required=True)
+    a = ap.parse_args()
+    out_zip = build(a.sniper, a.zstd, a.out)
     h = hashlib.sha256(out_zip.read_bytes()).hexdigest()
     print(f'{out_zip.name}: {out_zip.stat().st_size} bytes, sha256 {h}')
 

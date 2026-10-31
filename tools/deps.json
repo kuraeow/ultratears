@@ -218,11 +218,20 @@
   "sha512": "ae4fd528cb7e9f6af6aaf7de36715a69f761f183744f1bb3025d19f5a92447090ec561410e46266c1d10a63781ed6f3de771760bc76c876d87daabc367b898cd",
   "size": 300755826
  },
- "linux_kit": {
-  "comment": "tools/make_linux_kit.py from the Steam Runtime sniper SDK sysroot 3.0.20261021.266025 and zstd 1.5.7; [temporary] not published yet: ULTRS_LINUX_KIT_ZIP names a local one",
-  "url": "https://github.com/kuraeow/ultratears/releases/download/linux-kit-1/ultrs-linux-kit-1.zip",
-  "size": 17947261,
-  "sha256": "2dfaf70a1e61d119a9f51209c7908501d73ccefe7b7aa240f235ca4f208e9ec1"
+ "linux_kit_sources": {
+  "comment": "What tools/make_linux_kit.py makes the Linux kit from, in a build from the source (a builder package carries the kit): Valve's Steam Runtime 3 sniper SDK sysroot and zstd's source",
+  "sniper": {
+   "version": "3.0.20261021.266025",
+   "url": "https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/com.valvesoftware.SteamRuntime.Sdk-amd64%2Ci386-sniper-sysroot.tar.gz",
+   "size": 1234880637,
+   "sha256": "8f71947035f97925a311b2ed753f22efcf2f13d6f1631945b8e537f8903ce2cf"
+  },
+  "zstd": {
+   "version": "1.5.7",
+   "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+   "size": 2434947,
+   "sha256": "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+  }
  },
  "launcher": {
   "imgui": {
