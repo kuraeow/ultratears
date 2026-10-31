@@ -1079,7 +1079,7 @@ static const Opt RES_OPTS[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}
 static const Opt SCALE_OPTS[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
                                  {"", "scale_game"}, {"100", "scale_native"}, {"150", "scale_150"}, {"200", "scale_200"}};
 // sharpness= (src/vk/fsr.c): the RCAS pass of the present's FSR 1, when the window is larger than the game's output
-static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25 %"}, {"", "sharp_default"}, {"75", "75 %"}, {"100", "100 %"}};
+static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
 
 template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
     std::string value = v == same_as_default ? "" : v;
