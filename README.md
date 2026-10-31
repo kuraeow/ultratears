@@ -217,7 +217,8 @@ UltraTears\
 Keyboard: WASD moves, arrow keys move the camera, J = A, K / Space = B, I = X, U = Y, Q / E = L / R, left Alt /
 Shift = ZL / ZR, Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, and F11 or Alt+Enter toggles
 full screen. Xbox, DualSense, Switch Pro and other controllers work through SDL3. The face-button layout follows the
-Switch: A is the right button.
+Switch: A is the right button. The game window keeps the mouse cursor hidden in it; Ctrl or switching windows lets it
+go, a click into the window takes it again (the mouse does not control the game yet).
 
 A Releases build updates itself: once a day the launcher asks GitHub Releases for a newer version and offers it.
 **Update** downloads the new builder, checks its size and SHA-256, puts it in place of the old one (`data`, `build`
@@ -239,6 +240,9 @@ options.
 - `encrypted packages are not accepted` — `.nsp`, `.xci` or `.nca` was supplied instead of ordinary `exefs` and
   `romfs` folders.
 - A Vulkan error or black window — update the graphics driver; Vulkan 1.3 with `VK_EXT_shader_object` is required.
+- For a bug report, attach `ultratears.log` from the game folder. For a performance report, first turn on **Debug
+  mode** (launcher, Play screen, Debug tab): the log then also has frame timing and memory. The same tab has
+  **Rebuild completely**, for when something seems built wrong.
 - After correcting the cause, start the launcher again (Releases) or run the same command (Git). You do not need to
   repeat successful steps manually.
 

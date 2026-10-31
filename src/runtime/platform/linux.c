@@ -116,6 +116,8 @@ static void require_cpu(void) {
 static void require_cpu(void) {}
 #endif
 
+void plat_debug_console(int debug) { (void)debug; }   // a terminal, if any, is the user's: nothing to open or hide
+
 void plat_init(void) {
     log_to_file_without_terminal();
     require_cpu();

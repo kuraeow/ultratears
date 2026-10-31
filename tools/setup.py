@@ -3,7 +3,7 @@
 From a Git checkout the build goes to dist\\, or to --output <folder>: the tracked source files are copied there. In a
 builder package or a source folder without Git setup runs in place. Build tools this PC lacks are downloaded into
 deps\\ from where they are published (tools/deps_install.py, pinned in tools/deps.json); a builder package has them.
-usage: python tools/setup.py [--output <build folder>] [--dump <folder with exefs\\ and romfs\\>] [--cpus N]
+usage: python tools/setup.py [--output <build folder>] [--dump <folder with exefs\\ and romfs\\>] [--cpus N] [--full]
        python tools/setup.py --check-dump <folder> [--json]   (is it a usable dump? for the launcher's folder screens)
 --json (the launcher): events on stdout, one JSON object a line, among the plain log lines: {"ev": "plan", "steps":
 [{"id", "weight"}]} (the share of a build from nothing, in %), {"ev": "step", "id", "state": "run" / "done" / "skip",
@@ -58,14 +58,9 @@ ROMFS_BYTES = 17026725026
 ROMFS_CONTENT = 'b2a2e966a06158e098c03e564f77fd72809bc57275f04eb0725bcde14d522056'
 ENCRYPTED = ('.nsp', '.nsz', '.xci', '.xcz', '.nca', '.ncz')
 KEEP = {'game', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 'dev-local'}
-# Starts the game with the statistics lines in ultratears.log (UltraTears.exe --debug): what a player runs when asked
-# for a performance log.
+# Written by builds before the launcher (UltraTears.exe --debug); the launcher's Debug mode (debug=1 in ultratears.cfg)
+# replaces it: removed when found.
 DEBUG_BAT = 'UltraTears (debug).bat'
-DEBUG_BAT_TEXT = '''@echo off
-rem UltraTears with the statistics lines in ultratears.log (frame timing, memory): for bug and performance reports.
-cd /d "%~dp0"
-start "" UltraTears.exe --debug
-'''
 OUTPUT_OWN = {'setup.bat', 'VERSION.txt', 'THIRD-PARTY-NOTICES.md', 'licenses', 'ultratears.cfg', 'UltraTears.exe',
               'UltraTears.pdb', 'setup-files.txt', DEBUG_BAT}
 
@@ -197,6 +192,8 @@ def build_from_checkout(a):
         cmd += ['--keep-shader-work']
     if a.json:
         cmd += ['--json']
+    if a.full:
+        cmd += ['--full']
     return subprocess.run(cmd, cwd=home, env=dict(os.environ, PYTHONNOUSERSITE='1')).returncode
 
 
@@ -483,7 +480,7 @@ def step_finish(dump, state, cpus):
             if '=' in l and not l.startswith('#') and l.split('=', 1)[0] not in ours:
                 lines.append(l)
     cfg.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    (ROOT / DEBUG_BAT).write_bytes(DEBUG_BAT_TEXT.replace('\n', '\r\n').encode())
+    (ROOT / DEBUG_BAT).unlink(missing_ok=True)
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
     if (dump / 'romfs').is_dir():
         say(f'  The game reads data\\romfs and data\\exefs now: {dump} (16 GB) is no longer needed.')
@@ -534,6 +531,8 @@ def main():
     ap.add_argument('--in-place', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--json', action='store_true', help='events for the launcher on stdout (see the top of this file)')
     ap.add_argument('--check-dump', type=pathlib.Path, metavar='FOLDER', help='only say whether FOLDER is a usable dump')
+    ap.add_argument('--full', action='store_true',
+                    help='forget what was built and make every step again (the RomFS too while the dump is there)')
     a = ap.parse_args()
     global KEEP_SHADER_WORK
     KEEP_SHADER_WORK = a.keep_shader_work
@@ -577,6 +576,10 @@ def main():
     if not state.get('dump'):
         state['dump'] = str(ROOT / 'game')
     dump = pathlib.Path(state['dump'])
+    if a.full:
+        full_rebuild(state, dump)
+    # a build of everything (the first, or --full) is timed for the launcher's estimates on this PC (full_secs)
+    from_nothing = not a.only and (a.full or not any(state.get(k) for k in ('lift', 'shaders-pack', 'textures')))
     say(f'UltraTears setup: dump {dump}, {a.cpus} CPUs')
     t_all = time.time()
     kept = keep_source_dates()
@@ -603,6 +606,9 @@ def main():
         if progress.JSON:
             skipped = result in ('up to date', 'already packed')   # the step had nothing to do (an update, a resume)
             progress.emit('step', id=name, state='skip' if skipped else 'done', secs=round(secs), note=result or '')
+    if from_nothing:
+        state['full_secs'], state['full_cpus'] = round(time.time() - t_all - ASKED), a.cpus
+        save_state(state)
     say(f'\nDone in {progress.clock(time.time() - t_all - ASKED)}. Start the game: UltraTears.exe in {ROOT}')
     if progress.JSON:
         progress.emit('done', secs=round(time.time() - t_all - ASKED))
@@ -612,6 +618,25 @@ def main():
 # 1:19, compile 15:39, shaders 2:54, textures 10:08; tools: a source build's first download). The launcher's overall bar
 # weighs each step's own progress by these; steps already done count in full.
 STEP_WEIGHTS = {'tools': 2, 'check': 1, 'romfs': 7, 'lift': 4, 'compile': 47, 'shaders': 9, 'textures': 30, 'finish': 0}
+
+
+def full_rebuild(state, dump):
+    """--full (the launcher's "Rebuild completely"): nothing built before is trusted. The records of every step go, and
+    what the steps made: objects, the translated code, the shaders (with the game's compiled.bin), the textures; every
+    step then runs as on a first build. The RomFS image is packed again from the dump while the dump is there; a
+    player who deleted it keeps the packed one (there is nothing to pack it from). Saves and settings stay."""
+    keep_romfs = not (dump / 'romfs').is_dir()
+    for k in list(state):
+        if k != 'dump' and not (keep_romfs and k == 'romfs'):
+            del state[k]
+    root = ROOT.resolve()
+    for p in (ROOT / 'build/obj', ROOT / 'build/game', DATA / 'generated', DATA / 'shaders', DATA / 'textures'):
+        if p.is_dir() and root in p.resolve().parents:
+            shutil.rmtree(p)
+    SOURCE_DATES.unlink(missing_ok=True)
+    save_state(state)
+    say('Full rebuild: everything built before is made again' +
+        (' (the RomFS stays as packed: the dump is gone)' if keep_romfs else ''))
 
 
 def fail_tools(e):

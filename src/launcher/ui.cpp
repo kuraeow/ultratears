@@ -220,6 +220,7 @@ static struct {
     std::string picked;
     int picked_for = 0;       // 1 the dump, 2 the install folder
     bool stopping = false;    // Stop pressed: the build is being killed
+    bool full = false;        // the next build is a full rebuild (setup.py --full)
     // updates
     UpdateInfo upd;
     bool has_upd = false;
@@ -361,10 +362,21 @@ static Row *row_of(const std::string &id) {   // tools and check share the first
     return nullptr;
 }
 
-static double est_total_secs() {   // a clean build: 34 min on 8 logical CPUs (2026-10-30); hyperthreads count half
-    int n = logical_cpus();
-    double eff = n <= 8 ? n : 8 + (n - 8) * 0.5;
-    return 34 * 60 * 8 / SDL_max(eff, 1.0);
+// The time of a build from nothing: measured on this PC once it built the game from nothing (setup.py records it,
+// data/setup.json "full_secs"), else the design's 30-40 minutes (a clean build took 34 on 8 CPUs, 2026-10-30): a guess
+// from the CPU count alone promised 15-30 where a slow disk or an antivirus can make it 50. One rule for the install
+// screen, the full rebuild and the steps' "may take".
+static double measured_secs() { return setup_state()["full_secs"].num(0); }
+static double est_total_secs() { return measured_secs() > 0 ? measured_secs() : 35 * 60; }
+
+static void wait_range(long *lo, long *hi) {   // in minutes, rounded to 5
+    double m = measured_secs() / 60;
+    if (m <= 0) {
+        *lo = 30, *hi = 40;
+        return;
+    }
+    *lo = SDL_max((long)(m * 0.9 / 5) * 5, 5L);
+    *hi = SDL_max(((long)(m * 1.15) + 4) / 5 * 5, *lo + 5);
 }
 
 static void start_build_state() {
@@ -391,6 +403,9 @@ static void run_setup() {
                                      "--cpus", cpus && *cpus ? cpus : std::to_string(logical_cpus())};
     if (U.dump_st != D_DATA)   // with the data already in place setup.py needs no dump (a deleted one is fine)
         args.insert(args.end(), {"--dump", U.dump});
+    if (U.full)   // the Debug tab's full rebuild: once
+        args.push_back("--full");
+    U.full = false;
     U.build = setup_start(args, U.root, log_path());
     U.screen = SCR_BUILD;
 }
@@ -775,10 +790,10 @@ static void screen_dump() {
     if (button("inst_change", T("change"), 748 - cw, y + 12, cw, 40, DARK))
         pick_folder(2, U.install);
     double need = needs_copy() ? 41 : 40, free = disk_free_gb(U.install);
-    double est = est_total_secs() / 60;
-    long lo = (long)(est * 0.85 / 5) * 5, hi = ((long)(est * 1.15) + 4) / 5 * 5;
+    long lo, hi;
+    wait_range(&lo, &hi);
     std::string need_s = Tf("need_free", {{"need", gb(need)}, {"free", free < 0 ? "?" : gb(free)}});
-    std::string wait_s = Tf("wait_time", {{"lo", std::to_string(SDL_max(lo, 5L))}, {"hi", std::to_string(SDL_max(hi, 10L))}});
+    std::string wait_s = Tf("wait_time", {{"lo", std::to_string(lo)}, {"hi", std::to_string(hi)}});
     bool space = free < 0 || free >= need || installed() || started_before();
     y += 64;
     if (data) {   // built here before: only what changed is built again
@@ -1157,12 +1172,13 @@ static bool toggle(const char *id, float x_right, float cy, bool on) {   // the 
     return clicked;
 }
 
-static int g_tab = 0;   // 0 general, 1 the game's language
+static int g_tab = 0;   // 0 general, 1 the game's language, 2 debug
+static bool g_full_q = false;   // "Rebuild completely" pressed: asking whether to
 
 static void play_tabs() {   // instead of the header on the Play screen (the design)
-    static const char *const TABS[] = {"tab_main", "tab_lang"};
+    static const char *const TABS[] = {"tab_main", "tab_lang", "tab_debug"};
     float x = 36;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         const char *l = T(TABS[i]);
         float w = text_w(g_media.control, l) + 24;
         bool hov, down;
@@ -1180,7 +1196,64 @@ static void row_label(float cy, const char *key) {
     text(g_media.label, 52, cy - g_media.label->FontSize / S / 2, C_TEXT, T(key));
 }
 
+// Debug: the game's Debug mode (debug=1: the statistics lines in the log and a console window with it) and the full
+// rebuild (setup.py --full), asked first as Cancel during a build is.
+
+static void screen_debug() {
+    float top = 80, cy = top + 28;
+    row_label(cy, "row_debug");
+    bool on = !cfg_get("debug").empty() && cfg_get("debug") != "0";
+    if (toggle("debug", 748, cy, on)) {
+        cfg_set("debug", on ? "" : "1");
+        if (on)   // Debug mode off: its own settings go with it
+            cfg_set("snapshots", "");
+    }
+    float bottom = top + 56;
+    if (on) {   // the settings that only mean something in Debug mode
+        cy += 44;
+        row_label(cy, "row_snapshots");
+        bool shots = cfg_get("snapshots") == "1";
+        if (toggle("snapshots", 748, cy, shots))
+            cfg_set("snapshots", shots ? "" : "1");
+        text(g_media.small, 52, cy + 29 - g_media.small->FontSize / S / 2, C_SUB, T("snapshots_note"));
+        bottom = cy + 50;
+    }
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(764, bottom), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
+
+    top = 320;   // the full rebuild: its own card, just above Play (the design) whichever way Debug mode is
+    long lo, hi;
+    wait_range(&lo, &hi);
+    std::string range = Tf("full_time", {{"lo", std::to_string(lo)}, {"hi", std::to_string(hi)}});
+    text(g_media.label, 52, top + 22 - g_media.label->FontSize / S / 2, C_TEXT, T("full_title"));
+    if (!g_full_q) {
+        text(g_media.small, 52, top + 47 - g_media.small->FontSize / S / 2, C_SUB, range.c_str());
+        float w = text_w(g_media.medium, T("full_btn")) + 34;
+        if (button("full", T("full_btn"), 748 - w, top + 15, w, 38, DARK))
+            g_full_q = true;
+    } else {   // the question, with the time it takes, in place of the button
+        std::string q = Tf("full_q", {{"lo", std::to_string(lo)}, {"hi", std::to_string(hi)}});
+        float w1 = text_w(g_media.medium, T("full_go")) + 34, w2 = text_w(g_media.medium, T("cancel")) + 34;
+        rich(g_media.small, 52, top + 38, 748 - w1 - w2 - 8 - 52 - 16, {{q.c_str(), C_TEXT}}, 16);
+        if (button("full_no", T("cancel"), 748 - w1 - 8 - w2, top + 15, w2, 38, DARK))
+            g_full_q = false;
+        if (button("full_go", T("full_go"), 748 - w1, top + 15, w1, 38, PRIMARY)) {
+            g_full_q = false;
+            U.full = true;
+            start_build();
+        }
+    }
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(764, top + 68), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
+}
+
 static void screen_play() {
+    if (g_tab == 2) {
+        screen_debug();
+        return;
+    }
     float top = 80, y = top + 20;
     text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_lang"));
     float cy = top + 52;
@@ -1483,10 +1556,11 @@ void ui_demo(const char *name) {
     } else if (n == "run") {   // a real build at once, as if Prepare was pressed
         U.dump_st = D_OK;
         start_build();
-    } else if (n == "play" || n == "play_upd" || n == "play_lang") {
+    } else if (n == "play" || n == "play_upd" || n == "play_lang" || n == "play_debug" || n == "play_full") {
         U.screen = SCR_PLAY;
-        g_tab = n == "play_lang" ? 1 : 0;
-        if (n != "play") {
+        g_tab = n == "play_lang" ? 1 : n == "play_debug" || n == "play_full" ? 2 : 0;
+        g_full_q = n == "play_full";
+        if (n == "play_upd" || n == "play_lang") {
             U.upd.version = "0.3.0", U.upd.page = ULTRS_REPO "/releases";
             U.has_upd = true;
         }

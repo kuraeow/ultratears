@@ -72,7 +72,7 @@ The steps, what they write and how long they take on an 8-core PC:
 | `compile` | `UltraTears.exe` (~0.4 GB) and `build\` (objects ~1.8 GB, debug symbols); code for x86-64-v3 (AVX2), or x86-64-v2 (SSE4.2) on a CPU without AVX2 | ~15 min (seconds when little changed) | sources changed (ninja) |
 | `shaders` | `data\shaders\translated.pack`: the ~28,700 shaders as SPIR-V in one file (translated in `data\shaders\work`, removed afterwards) | ~3 min | the finder or the translator changed |
 | `textures` | `data\textures` (BC7 / BC1 of every ASTC texture, ~7.4 GB) | ~7 min | textures not yet in the cache |
-| `finish` | `ultratears.cfg`, `UltraTears (debug).bat` | seconds | always |
+| `finish` | `ultratears.cfg` (the player's keys in it are kept) | seconds | always |
 
 On its first start the game also compiles every shader for your graphics driver in the background (a few minutes,
 `data\shaders\compiled.bin`, ~0.8 GB); after a driver update it does so again.
@@ -105,7 +105,10 @@ starts, but loading reads many small files, which is slower; the packed image is
 - The game starts with a black window or a Vulkan error: update the graphics driver (Vulkan 1.3 with
   `VK_EXT_shader_object` is needed).
 - For a bug report, attach `ultratears.log` from the game folder (`ultratears-previous.log` is the run before). For a
-  performance report, start the game with `UltraTears (debug).bat`: the log then also has frame timing and memory.
+  performance report, turn on Debug mode (the launcher's Play screen, Debug tab, or `debug=1` in `ultratears.cfg`):
+  the log then also has frame timing and memory, and a console window shows it as it is written.
+- `python tools/setup.py --full` (the launcher: Debug, "Rebuild completely") forgets what was built and makes every
+  step again; the RomFS is packed again only while the dump is still there.
 
 ## Making the builder package (maintainers)
 

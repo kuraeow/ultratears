@@ -70,8 +70,11 @@ static const char *default_exefs(void) {
                 {"romfs", "TOTK_ROMFS"}, {"shaders", "TOTK_SHADER_DIR"}, {"compiled", "TOTK_SHADER_BIN"}, {"shaderpack", "TOTK_SHADER_PACK"}, {"textures", "TOTK_BC7_DIR"},
                 {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
                 // the player's settings (the launcher's Play screen writes them)
-                {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}};
+                {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
+            else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
+                if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
+            }
             else if (!strncmp(line, "TOTK_", 5)) setenv(line, eq + 1, 0);
             else
                 for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++)
@@ -88,13 +91,14 @@ static const char *default_exefs(void) {
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
-    // --debug: the statistics lines in the log (TOTK_STATS=1; "UltraTears (debug).bat" that setup.py writes)
+    // --debug: the statistics lines in the log (TOTK_STATS=1; the launcher's Debug mode writes debug=1 instead)
     const char *arg = NULL;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--debug")) setenv("TOTK_STATS", "1", 1);
         else if (!arg) arg = argv[i];
         else { fprintf(stderr, "usage: UltraTears [--debug] [exefs dir]\n"); return 2; }
     const char *exefs = arg ? arg : default_exefs();
+    plat_debug_console(getenv("TOTK_STATS") != NULL);   // after ultratears.cfg (debug=1)
     plat_init();
     plat_crash_handler_install();
     if (!g_window) {

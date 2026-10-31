@@ -255,6 +255,43 @@ __attribute__((constructor(102))) static void log_to_file_without_console(void) 
     _putenv("TOTK_LOG_APPEND=1");
 }
 
+// The console window only in Debug mode (the launcher's, debug=1 / --debug: TOTK_STATS; the user's choice 2026-10-31).
+// Without it a console the game was given (a double click: UltraTears.exe is a console program) is let go; with it one
+// is opened if there is none, and the log file is followed onto it a few times a second. The file stays the log: a
+// crash loses nothing that the console had not shown yet.
+static DWORD WINAPI follow_log(void *arg) {
+    (void)arg;
+    HANDLE con = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE log = CreateFileA(g_log_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                             OPEN_EXISTING, 0, NULL);
+    if (con == INVALID_HANDLE_VALUE || log == INVALID_HANDLE_VALUE) return 0;
+    char buf[16384];
+    for (;;) {
+        DWORD n = 0, w;
+        if (ReadFile(log, buf, sizeof buf, &n, NULL) && n) {
+            WriteFile(con, buf, n, &w, NULL);
+            continue;
+        }
+        Sleep(200);
+    }
+}
+
+void plat_debug_console(int debug) {
+    DWORD pids[2];
+    bool own = GetConsoleWindow() && GetConsoleProcessList(pids, 2) == 1;   // ours alone (a double click), not a terminal's
+    if (!debug) {
+        if (own) FreeConsole();
+        return;
+    }
+    if (!g_log_path[0]) return;   // the log is not in our file (captured, or kept on the console by TOTK_LOG_FILE=0)
+    if (!GetConsoleWindow()) {
+        if (!AllocConsole()) return;
+        SetConsoleTitleA("UltraTears - log (Debug mode)");
+        SetConsoleOutputCP(CP_UTF8);
+    }
+    CloseHandle(CreateThread(NULL, 0, follow_log, NULL, 0, NULL));
+}
+
 // The code is built for the CPU of the PC that built it (tools/build_game.py --arch: x86-64-v3 with AVX2, FMA and BMI2,
 // or x86-64-v2 with SSE4.2 where those are missing, issue #19): say so instead of crashing with an illegal instruction
 // when the folder moved to an older CPU.
@@ -263,7 +300,7 @@ static void require_cpu(void) {
 #ifdef __AVX2__
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
     MessageBoxA(NULL, "This copy of UltraTears was built for a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / "
-                "Zen or newer). Run setup.bat again on this PC: it builds the game for this CPU.", "UltraTears", MB_ICONERROR | MB_OK);
+                "Zen or newer). Prepare the game again on this PC (UltraTears Launcher): it builds the game for this CPU.", "UltraTears", MB_ICONERROR | MB_OK);
 #else
     if (__builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("ssse3")) return;
     MessageBoxA(NULL, "UltraTears needs a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer or newer).",
