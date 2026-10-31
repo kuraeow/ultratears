@@ -25,12 +25,14 @@ import progress  # noqa: E402
 from toolchain import CLANG64  # noqa: E402
 
 TOP = 'UltraTears'
-# the player's settings that mean the same on the Deck; paths and the PC's display settings are written anew
-KEEP = ('lang', 'fps', 'vsync', 'debug', 'sharpness', 'scale', 'fps_overlay', 'snapshots')
+# the player's settings that mean the same on the Deck; paths and the display settings are the Deck's own (its screen
+# 1280x800, 16:10, fullscreen, 40 fps: as the game's Deck defaults, src/host/boot.c deck_defaults), changed in the
+# launcher on the Deck
+KEEP = ('lang', 'debug', 'fps_overlay', 'snapshots', 'gpu_marks')
 DECK_CFG = ['# Written by tools/make_deck_tar.py: UltraTears for Linux / Steam Deck (paths relative to this folder).',
             'exefs=data/exefs', 'romfs=data/romfs', 'shaderpack=data/shaders/translated.pack',
             'compiled=data/shaders/compiled.bin', 'textures=data/textures', 'saves=userdata', 'fonts=data/fonts',
-            'window=fullscreen', 'resolution=1280x720']
+            'window=fullscreen', 'resolution=1280x800', 'fps=40']
 
 
 def deck_cfg():

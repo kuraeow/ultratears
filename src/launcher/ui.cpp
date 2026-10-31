@@ -1122,8 +1122,65 @@ static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de"
 // The game's resolution (src/host/render_res.c): resolution= the size the game composes its frame in (its output),
 // scale= its 3D scene in % of that (unset: the game's own 5/6); the game's FSR 1 scales the scene to the output, and the
 // present's FSR 1 the output to a larger window.
-static const Opt RES_OPTS[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
+// Another shape than 16:9 (src/host/render_res.c totk_aspect): the camera takes the output's ratio and the UI is laid out
+// for it (src/host/ui_aspect.c); the sizes are totk-pc-recomp's (installer/steps.py ASPECT_SIZES), 16:10 with the Steam
+// Deck's 1280x800. "display": the screen's own size, whatever its shape.
+static const Opt RES_16_9[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
                                {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};
+static const Opt RES_16_10[] = {{"1280x800", "1280 × 800"}, {"1680x1050", "1680 × 1050"}, {"1920x1200", "1920 × 1200"},
+                                {"2560x1600", "2560 × 1600"}, {"display", "res_display"}};
+static const Opt RES_21_9[] = {{"2560x1080", "2560 × 1080"}, {"3440x1440", "3440 × 1440"}, {"3840x1600", "3840 × 1600"},
+                               {"5120x2160", "5120 × 2160"}, {"display", "res_display"}};
+static const Opt RES_32_9[] = {{"3840x1080", "3840 × 1080"}, {"5120x1440", "5120 × 1440"}, {"display", "res_display"}};
+static const Opt ASPECT_OPTS[] = {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"32:9", "32:9"}};
+#define RES_LIST(a) RES_##a, sizeof RES_##a / sizeof *RES_##a
+static const struct { const Opt *opts; size_t n; double ratio; } RES_BY_ASPECT[] = {
+    {RES_LIST(16_9), 16.0 / 9}, {RES_LIST(16_10), 16.0 / 10}, {RES_LIST(21_9), 64.0 / 27}, {RES_LIST(32_9), 32.0 / 9}};
+
+static int res_index(int a, const std::string &v) {
+    for (size_t i = 0; i < RES_BY_ASPECT[a].n; i++)
+        if (v == RES_BY_ASPECT[a].opts[i].value)
+            return (int)i;
+    return -1;
+}
+
+// The shape of a resolution= value: the nearest of the four ("" is the game's 1920x1080; display: the screen's).
+static int res_aspect(const std::string &res) {
+    int w = 1920, h = 1080;
+    if (res == "display") {
+        const SDL_DisplayMode *m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+        if (m && m->h > 0)
+            w = m->w, h = m->h;
+    } else if (!res.empty() && SDL_sscanf(res.c_str(), "%dx%d", &w, &h) != 2) {
+        w = 1920, h = 1080;
+    }
+    double r = (double)w / SDL_max(h, 1);
+    int best = 0;
+    for (int i = 1; i < 4; i++)
+        if (SDL_fabs(r - RES_BY_ASPECT[i].ratio) < SDL_fabs(r - RES_BY_ASPECT[best].ratio))
+            best = i;
+    return best;
+}
+
+// Another shape chosen: the size of that shape nearest in height to the present one (display stays display).
+static std::string res_for_aspect(int a, const std::string &res) {
+    if (res == "display")
+        return res;
+    int w = 1920, h = 1080;
+    if (!res.empty())
+        SDL_sscanf(res.c_str(), "%dx%d", &w, &h);
+    const Opt *opts = RES_BY_ASPECT[a].opts;
+    int best = 0, best_d = SDL_MAX_SINT32;
+    for (int i = 0; i < (int)RES_BY_ASPECT[a].n; i++) {
+        int ow = 1920, oh = 1080;
+        if (!SDL_strcmp(opts[i].value, "display") || (*opts[i].value && SDL_sscanf(opts[i].value, "%dx%d", &ow, &oh) != 2))
+            continue;
+        int d = SDL_abs(oh - h);
+        if (d < best_d)
+            best = i, best_d = d;
+    }
+    return opts[best].value;
+}
 // FSR 1's own modes (AMD: performance 2x, balanced 1.7x, quality 1.5x, ultra quality 1.3x per axis), the game's 5/6,
 // none, and supersampling
 static const Opt SCALE_OPTS[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
@@ -1170,8 +1227,15 @@ template <size_t N> static int segmented(const char *id, float x_right, float cy
 
 // A drop-down list: the box right-aligned at x_right, its list in a popup (scrolls when long). shown: the box says
 // this instead of the choice (a button that opens a list, as the Debug tab's full rebuild); h: the box's height.
+static int dropdown_n(const char *id, float x_right, float cy, float w, const Opt *opts, size_t N, int sel,
+                      const char *shown, float h);
 template <size_t N> static int dropdown(const char *id, float x_right, float cy, float w, const Opt (&opts)[N], int sel,
                                         const char *shown = nullptr, float h = 32) {
+    return dropdown_n(id, x_right, cy, w, opts, N, sel, shown, h);
+}
+
+static int dropdown_n(const char *id, float x_right, float cy, float w, const Opt *opts, size_t N, int sel,
+                      const char *shown, float h) {
     if (w <= 0) {   // as wide as its longest choice, at least the design's 126
         w = SDL_max(126.0f, shown ? text_w(g_media.medium, shown) + 52 : 0);
         for (size_t i = 0; i < N; i++)
@@ -1395,9 +1459,19 @@ static void screen_play() {
         if (k >= 0)
             cfg_set("window", WINDOW_OPTS[k].value);
         cy += ROW;
-        row_label(cy, "row_res");
-        if ((k = dropdown("res", 748, cy, 0, RES_OPTS, opt_index(RES_OPTS, cfg_get("resolution")))) >= 0)
-            cfg_set("resolution", RES_OPTS[k].value);
+        row_label(cy, "row_res");   // the design: the shape, then the size of that shape
+        std::string res = cfg_get("resolution");
+        int a = res_aspect(res);
+        if ((k = dropdown_n("res", 748, cy, 0, RES_BY_ASPECT[a].opts, RES_BY_ASPECT[a].n, res_index(a, res), nullptr, 32)) >= 0)
+            cfg_set("resolution", RES_BY_ASPECT[a].opts[k].value);
+        float rw = 126;
+        for (size_t i = 0; i < RES_BY_ASPECT[a].n; i++)
+            rw = SDL_max(rw, text_w(g_media.control, opt_label(RES_BY_ASPECT[a].opts[i])) + 52);
+        float aw = 0;   // the design: as narrow as its longest shape
+        for (const Opt &o : ASPECT_OPTS)
+            aw = SDL_max(aw, text_w(g_media.control, o.label) + 50);
+        if ((k = dropdown("aspect", 748 - rw - 8, cy, aw, ASPECT_OPTS, a)) >= 0 && k != a)
+            cfg_set("resolution", res_for_aspect(k, res));
         cy += ROW;
         row_label(cy, "row_scale");
         if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
