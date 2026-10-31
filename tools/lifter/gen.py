@@ -163,6 +163,7 @@ class Module:
 
     def jump_table(self, br_pc, entry, end):
         """Resolve `br xN` targets from a bounds-checked jump table, or None."""
+        self._table_count = 0   # the bounds-checked number of entries, set by the emulations below
         r = self._jump_table_fallthrough(br_pc, entry, end)
         if r is None:
             r = self._jump_table_taken(br_pc, entry, end)
@@ -172,6 +173,10 @@ class Module:
         # replaced by the entries read from the image. (Adding the scanned entries to every table instead put
         # trailing data that looks like entries into 1619 of main's 2367 tables.)
         if r is not None and len(set(r)) > 1:
+            more = self._jump_table_other_bases(br_pc, entry, end) - set(r)
+            if more:
+                self.stats['jumptables_other_bases'] += 1
+                return sorted(set(r) | more)
             return r
         s = self._jump_table_scan(br_pc, entry, end)
         if r is not None and s is not None:
@@ -287,6 +292,86 @@ class Module:
         self.stats['jumptables_scanned'] += 1
         return sorted(targets)
 
+    def _jump_table_other_bases(self, br_pc, entry, end):
+        """[TOTK] Targets of the other tables the table register can hold. A function may choose its table before a
+        loop, on one of several paths (main 0x8015b8d30: x20 is 0x802cfe74a or 0x802cfe6d2, and 0x60 further on, for
+        its brs at 0x8015b9400 and 0x8015be6bc); the emulation replays every adrp/add from the entry in order and so
+        reads only the last table. The game took another one at the bats of the prologue: "no function at 8015b9fb0"
+        (GitHub issue #4). Every constant the register gets in the function (adrp, adrp+add, then adds on itself) is
+        a candidate; one is kept only if all its entries for the bounds-checked count land in the function, aligned."""
+        count = getattr(self, '_table_count', 0)
+        if not count:
+            return set()
+        import capstone
+        if not hasattr(self, '_cs'):
+            self._cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+            self._cs.detail = True
+        cs = self._cs
+        # br xD <- add xD, xB, wO, lsl #k <- ldr{b,h,sw} wO, [xT, xI, ...]; xB from adr: all near the br
+        rn = bits(self.word(br_pc), 5, 5)
+        insns = []
+        for x in range(br_pc - 4, max(entry, br_pc - 4 * 24) - 4, -4):
+            got = list(cs.disasm(struct.pack('<I', self.word(x)), x))
+            if not got:
+                return set()
+            insns.append(got[0])
+        add = next((i for i in insns if i.mnemonic == 'add' and len(i.operands) == 3
+                    and i.operands[0].type == capstone.arm64.ARM64_OP_REG and i.reg_name(i.operands[0].reg) == f'x{rn}'
+                    and i.operands[2].type == capstone.arm64.ARM64_OP_REG), None)
+        if add is None:
+            return set()
+        base_reg, off_reg = add.reg_name(add.operands[1].reg), add.reg_name(add.operands[2].reg)
+        shift = add.operands[2].shift.value if add.operands[2].shift.type else 0
+        before = [i for i in insns if i.address < add.address]
+        adr = next((i for i in before if i.operands and i.operands[0].type == capstone.arm64.ARM64_OP_REG
+                    and i.reg_name(i.operands[0].reg) == base_reg), None)
+        load = next((i for i in before if i.operands and i.operands[0].type == capstone.arm64.ARM64_OP_REG
+                     and i.reg_name(i.operands[0].reg)[1:] == off_reg[1:]), None)
+        if adr is None or adr.mnemonic != 'adr' or load is None \
+                or load.mnemonic not in ('ldrb', 'ldrh', 'ldrsb', 'ldrsh', 'ldrsw', 'ldr'):
+            return set()
+        mem = load.operands[1]
+        if mem.type != capstone.arm64.ARM64_OP_MEM or not mem.mem.index:
+            return set()
+        size = {'ldrb': 1, 'ldrsb': 1, 'ldrh': 2, 'ldrsh': 2, 'ldrsw': 4, 'ldr': 4}[load.mnemonic]
+        signed = load.mnemonic.startswith('ldrs')
+        treg = int(load.reg_name(mem.mem.base)[1:]) if load.reg_name(mem.mem.base)[1:].isdigit() else -1
+        if treg < 0:
+            return set()
+        consts, adds, paired = set(), [], set()
+        for a in range(entry, load.address, 4):
+            w = self.word(a)
+            if (w & 31) != treg:
+                continue
+            if (w & 0x9F000000) == 0x90000000:   # adrp xT (+ add xT, xT, #lo12 right after it)
+                imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
+                if imm & (1 << 20):
+                    imm -= 1 << 21
+                page = (a & ~0xFFF) + (imm << 12)
+                nxt = self.word(a + 4) if a + 4 < load.address else 0
+                if (nxt & 0xFFC00000) == 0x91000000 and (nxt & 31) == treg and bits(nxt, 5, 5) == treg:
+                    consts.add(page + bits(nxt, 10, 12))
+                    paired.add(a + 4)
+            elif (w & 0xFFC00000) == 0x91000000 and bits(w, 5, 5) == treg and a not in paired:   # add xT, xT, #imm
+                adds.append(bits(w, 10, 12))
+        cands = set(consts) | {c + k for c in consts for k in adds}
+        lo, hi = self.base, self.base + len(self.nso.image)
+        out = set()
+        for table in cands:
+            got = []
+            for k in range(count):
+                at = table + k * size
+                if at < lo or at + size > hi:
+                    break
+                raw = int.from_bytes(self.nso.image[at - self.base:at - self.base + size], 'little', signed=signed)
+                t = adr.operands[1].imm + (raw << shift)
+                if not (entry <= t < end) or t % 4:
+                    break
+                got.append(t)
+            if len(got) == count:
+                out |= set(got)
+        return out
+
     def _index_regs(self, start, at, idx):
         """The index register plus registers holding the same value in start..at: sources it was
         copied/masked from, and copies of those (the table lookup sometimes recomputes the index
@@ -378,6 +463,7 @@ class Module:
             count = limit + 1 if bits(w, 0, 4) == 9 else limit
             if count <= 0 or count > 4096:
                 continue
+            self._table_count = count
             return self._emulate_table(br_pc, entry, end, s, bits(cw, 5, 5), count, s)
         return None
 
@@ -421,6 +507,7 @@ class Module:
         while start - 4 >= entry and cmp - (start - 4) <= 4 * 12 and self.lift(start - 4).kind in ('op', 'asm'):
             start -= 4
         idx_regs = self._index_regs(start, cmp, idx)
+        self._table_count = count
         mu = self.emu()
         targets = []
 
