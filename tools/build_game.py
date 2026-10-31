@@ -16,7 +16,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from toolchain import CLANG64, env as tool_env  # noqa: E402
+from toolchain import CLANG64, exe, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
 RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c', 'src/runtime/logcost.c', 'src/runtime/envcache.c']
@@ -109,7 +109,7 @@ def cpu_arch():
     """x86-64-v3 where this CPU has AVX2, FMA and BMI2 (Intel Haswell / 2013, AMD Excavator / Zen and newer), else
     x86-64-v2 (SSE4.2): the code is built on the player's PC, so for its CPU (issue #19: i7-3770, Xeon E3-1230 v2).
     clang -march=native says which features the CPU has."""
-    r = subprocess.run([str(CLANG64 / 'clang.exe'), '-march=native', '-dM', '-E', '-x', 'c', os.devnull], capture_output=True,
+    r = subprocess.run([str(CLANG64 / exe('clang')), '-march=native', '-dM', '-E', '-x', 'c', os.devnull], capture_output=True,
                        text=True, env=tool_env())
     if r.returncode:
         print('cannot ask clang about this CPU: building for x86-64-v3', flush=True)
@@ -126,15 +126,18 @@ def main():
     ap.add_argument('--cpus', type=int, default=8, help='logical CPUs the build may use (affinity); the rest stay free for the user')
     ap.add_argument('--arch', default='auto', choices=['auto', 'x86-64-v3', 'x86-64-v2'],
                     help='instruction set of the code (auto: x86-64-v3 where this CPU has AVX2, FMA and BMI2, else x86-64-v2)')
-    ap.add_argument('--platform', default='windows', choices=['windows', 'linux'],
+    ap.add_argument('--platform', default='windows' if os.name == 'nt' else 'linux', choices=['windows', 'linux'],
                     help='linux: cross-compile the game for Linux / Steam Deck (the Linux kit, LINUX_KIT)')
     ap.add_argument('--runtime-only', action='store_true', help='compile our runtime only, not the game code (porting)')
     a = ap.parse_args()
     linux = a.platform == 'linux'
     if linux and not (LINUX_KIT / 'sysroot').is_dir():
         sys.exit(f'the Linux kit is missing ({LINUX_KIT})')
-    # Linux: the Steam Deck's Zen 2 has AVX2, FMA and BMI2 (this PC's CPU does not decide)
-    arch = 'x86-64-v3' if linux else cpu_arch() if a.arch == 'auto' else a.arch
+    if not linux and os.name != 'nt':
+        sys.exit('the game for Windows is built on Windows')
+    # Linux cross-compiled on Windows: for the Steam Deck, whose Zen 2 has AVX2, FMA and BMI2 (this PC's CPU does not
+    # decide); built on Linux: for this machine's CPU, as on Windows
+    arch = a.arch if a.arch != 'auto' else 'x86-64-v3' if linux and os.name == 'nt' else cpu_arch()
     cflags, game_cflags = CFLAGS.replace('x86-64-v3', arch), GAME_CFLAGS.replace('x86-64-v3', arch)
     if linux:
         cflags = cflags.replace(' -gcodeview', '') + ' ' + linux_flags()
@@ -233,7 +236,7 @@ def main():
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
     # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free.
-    ninja = [str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', f'{bd}/build.ninja', f'-j{a.j}', '-k', '0']
+    ninja = [str(CLANG64 / exe('ninja')), '-C', str(ROOT), '-f', f'{bd}/build.ninja', f'-j{a.j}', '-k', '0']
     on_line = None
     import progress
     if progress.JSON:   # setup.py --json: ninja's [n/m] as progress events, its lines on to the log
@@ -253,10 +256,23 @@ def main():
 
 
 def run_limited(cmd, env, mask, on_line=None):
-    """cmd at below-normal priority on the CPUs in mask; on_line(line): its output line by line instead of the console."""
+    """cmd at below-normal priority on the CPUs in mask; on_line(line): its output line by line instead of the console.
+    Linux: nice 10 and the CPUs set in the child before it starts, which every clang it starts inherits (as PR #42)."""
+    pipe = subprocess.PIPE if on_line else None
+    if os.name != 'nt':
+        def limit():
+            os.nice(10)
+            cpus = {i for i in range(64) if mask >> i & 1} & os.sched_getaffinity(0)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+        p = subprocess.Popen(cmd, env=env, preexec_fn=limit, stdout=pipe, stderr=subprocess.STDOUT if on_line else None,
+                             text=bool(on_line), errors='replace')
+        if on_line:
+            for line in p.stdout:
+                on_line(line.rstrip('\n'))
+        return p.wait()
     import ctypes
     CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY_CLASS = 0x4, 0x4000
-    pipe = subprocess.PIPE if on_line else None
     p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, stdout=pipe,
                          stderr=subprocess.STDOUT if on_line else None, text=bool(on_line), errors='replace')
     handle = int(p._handle)

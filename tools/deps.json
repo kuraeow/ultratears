@@ -218,6 +218,61 @@
   "sha512": "ae4fd528cb7e9f6af6aaf7de36715a69f761f183744f1bb3025d19f5a92447090ec561410e46266c1d10a63781ed6f3de771760bc76c876d87daabc367b898cd",
   "size": 300755826
  },
+ "linux_host": {
+  "comment": "The build's tools on Linux (tools/deps_install.py; a Linux builder package carries them, tools/make_package.py --linux): the same pins as totk-pc-recomp's tools/make_release_linux.py where it has them",
+  "python": {
+   "version": "3.14.10",
+   "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.14.10%2B20261026-x86_64-unknown-linux-gnu-install_only.tar.gz",
+   "size": 76564514,
+   "sha256": "1b38024924eb7f4cf0cab45d7b871d1f1991354190fccd2625ac7529a43786e2"
+  },
+  "wheels": [
+   {
+    "name": "lz4",
+    "version": "4.4.5",
+    "url": "https://files.pythonhosted.org/packages/f1/01/d52c7b11eaa286d49dae619c0eec4aabc0bf3cda7a7467eb77c62c4471f3/lz4-4.4.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "size": 1368661,
+    "sha256": "0bba042ec5a61fa77c7e380351a61cb768277801240249841defd2ff0a10742f"
+   },
+   {
+    "name": "capstone",
+    "version": "5.0.7",
+    "url": "https://files.pythonhosted.org/packages/15/3e/3a4f45dd4eda6fc8051f76bf3ed50ead6040d827000371211fbaaf057625/capstone-5.0.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "size": 1482184,
+    "sha256": "b809a9654844ce0d35099121a851ddd2ab2689df1ff6687037babcedcaae6391"
+   },
+   {
+    "name": "unicorn",
+    "version": "2.1.4",
+    "url": "https://files.pythonhosted.org/packages/e7/df/ded5e3684c2d7600b30cc8a7530277b8cb36644a1a9d34cade7ebb45604c/unicorn-2.1.4-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "size": 16436886,
+    "sha256": "9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239"
+   }
+  ],
+  "llvm": {
+   "version": "23.1.4",
+   "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-Linux-X64.tar.xz",
+   "size": 2017061664,
+   "sha256": "25d814fda50d5fb0084b42be09605d8b1595d49d5e2e03a3345d7e112ff6f9f3",
+   "members": ["bin/clang-23", "bin/clang", "bin/clang++", "bin/lld", "bin/ld.lld", "bin/llvm-ar", "bin/llvm-ranlib",
+               "bin/llvm-objcopy", "bin/llvm-strip", "lib/clang/23/include"],
+   "license": {
+    "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/LICENSE.TXT",
+    "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+   }
+  },
+  "ninja": {
+   "version": "1.13.2",
+   "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip",
+   "size": 134040,
+   "sha256": "5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6"
+  },
+  "dotnet": {
+   "version": "10.0.402",
+   "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-linux-x64.tar.gz",
+   "sha512": "1904a98dda2db34ba78ba3c4fb1b224455329af91c341d83547843c1839e112b04ae699ee92fa2449a8f62249196a938723078c0c60b9f65c88539d5687729c2"
+  }
+ },
  "linux_kit_sources": {
   "comment": "What tools/make_linux_kit.py makes the Linux kit from, in a build from the source (a builder package carries the kit): Valve's Steam Runtime 3 sniper SDK sysroot and zstd's source",
   "sniper": {

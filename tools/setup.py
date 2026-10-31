@@ -251,7 +251,7 @@ def step_check(dump, state):
     toolchain.env()
     hardware(state.get('platforms', ['windows']))
     if toolchain.XLATE is None:
-        raise Fail('the shader translator deps\\shaders\\ultrs-shaders.exe is missing: run setup again to build it')
+        raise Fail('the shader translator (deps/shaders) is missing: run setup again to build it')
     if packed(state) and all(ok_module(DATA / 'exefs' / n, h) for n, h in EXEFS.items()):
         return 'Tears of the Kingdom 1.4.3, already taken in (data\\exefs, data\\romfs): the dump is no longer needed'
     check_dump(dump)
@@ -445,6 +445,8 @@ def shader_packs(state):
     [temporary] The Deck's own pack is translated here until the Linux launcher translates it on the Deck at its first
     start (dev-local/docs/linux-deck.md)."""
     plats, host = state['platforms'], host_bias()
+    if os.name != 'nt':   # built on Linux (a Steam Deck, a Linux PC): for this machine's own card
+        return [(DATA / 'shaders', host, 'shaders')]
     if 'windows' not in plats:
         return [(DATA / 'shaders', DECK_BIAS, 'shaders')]
     packs = [(DATA / 'shaders', host, 'shaders')]
@@ -567,7 +569,7 @@ def step_deck(dump, state, cpus):
     """A build for Linux / Steam Deck: the game, its data and settings as UltraTears-SteamDeck.tar in this folder, which
     the player carries to the Deck (tools/make_deck_tar.py). Made again when anything in it is newer."""
     tar = ROOT / DECK_TAR
-    if 'linux' not in state['platforms']:
+    if 'linux' not in state['platforms'] or os.name != 'nt':   # on Linux the game is built where it is played
         return 'not for the Steam Deck'
     pack = deck_pack(state)
     inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', ROOT / 'ultratears.cfg', pack,
@@ -641,6 +643,10 @@ def main():
     if a.platform:
         state['platforms'] = PLATFORMS[a.platform]
     state.setdefault('platforms', ['windows'])
+    if os.name != 'nt':   # Linux builds the game for Linux, here
+        if a.platform and a.platform != 'linux':
+            fail_tools(deps_install.DepsError('on Linux UltraTears is built for Linux: --platform linux'))
+        state['platforms'] = ['linux']
     if progress.JSON and not os.environ.get('ULTRATEARS_SETUP_OWN_PYTHON'):
         progress.emit('plan', steps=[{'id': s, 'weight': w} for s, w in step_weights(state['platforms']).items()])
         progress.emit('step', id='tools', state='run')
@@ -702,7 +708,9 @@ def main():
         save_state(state)
     say(f'\nDone in {progress.clock(time.time() - t_all - ASKED)}.' +
         (f' Start the game: UltraTears.exe in {ROOT}.' if 'windows' in state['platforms'] else '') +
-        (f' For the Steam Deck: carry {ROOT / DECK_TAR} to it and unpack it there.' if 'linux' in state['platforms'] else ''))
+        (f' For the Steam Deck: carry {ROOT / DECK_TAR} to it and unpack it there.' if 'linux' in state['platforms'] and
+         os.name == 'nt' else '') +
+        (f' Start the game: ultratears-launcher or linux/ultratears in {ROOT}.' if os.name != 'nt' else ''))
     if progress.JSON:
         progress.emit('done', secs=round(time.time() - t_all - ASKED))
 

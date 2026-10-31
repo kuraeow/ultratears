@@ -20,6 +20,14 @@ import progress  # noqa: E402
 
 
 def start_pinned(cmd, mask, env):
+    if os.name != 'nt':   # Linux: nice 10 and the CPUs set in the child before it starts (as PR #42)
+        def limit():
+            os.nice(10)
+            cpus = {i for i in range(64) if mask >> i & 1} & os.sched_getaffinity(0)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+        return subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, preexec_fn=limit)
     CREATE_SUSPENDED, BELOW_NORMAL = 0x4, 0x4000
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, creationflags=CREATE_SUSPENDED | BELOW_NORMAL)
@@ -42,7 +50,7 @@ def main():
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1',
                DOTNET_CLI_HOME=str(ROOT / 'third_party/dotnet-home'))
     if XLATE is None:
-        sys.exit('the shader translator ultrs-shaders.exe is missing: python tools/build_xlate.py')
+        sys.exit('the shader translator ultrs-shaders is missing: python tools/build_xlate.py')
     cmd = [str(XLATE)]   # tools/build_xlate.py, or the builder package's deps/shaders
     results, lock = [], threading.Lock()
     shards = [lines[i::a.workers] for i in range(a.workers)]

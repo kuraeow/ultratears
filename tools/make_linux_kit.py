@@ -13,6 +13,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import pathlib
 import posixpath
 import shutil
@@ -25,6 +26,10 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import deps_install  # noqa: E402
+
+
+def exe(name):
+    return name + '.exe' if os.name == 'nt' else name
 
 SNIPER = '3.0.20261021.266025'   # the SDK snapshot the kit is made from (tools/deps.json pins the result)
 ZSTD = '1.5.7'
@@ -128,11 +133,11 @@ def zstd(tar_path, out, work):
         for c in sorted((src / sub).glob('*.c')):
             o = work / 'obj' / (c.stem + '.o')
             o.parent.mkdir(exist_ok=True)
-            subprocess.run([str(bin_ / 'clang.exe'), *flags, '-c', str(c), '-o', str(o)], check=True)
+            subprocess.run([str(bin_ / exe('clang')), *flags, '-c', str(c), '-o', str(o)], check=True)
             objs.append(str(o))
     (out / 'lib').mkdir()
     (out / 'include').mkdir()
-    ar = bin_ / 'llvm-ar.exe'   # CLANG64 of a builder package or a source build has it
+    ar = bin_ / exe('llvm-ar')   # CLANG64 / LLVM of a builder package or a source build has it
     subprocess.run([str(ar), 'rcs', str(out / 'lib/libzstd.a'), *objs], check=True)
     for h in ('zstd.h', 'zstd_errors.h', 'zdict.h'):
         shutil.copyfile(src / h, out / 'include' / h)
