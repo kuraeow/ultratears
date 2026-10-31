@@ -1222,8 +1222,10 @@ static void screen_debug() {
     bool on = !cfg_get("debug").empty() && cfg_get("debug") != "0";
     if (toggle("debug", 748, cy, on)) {
         cfg_set("debug", on ? "" : "1");
-        if (on)   // Debug mode off: its own settings go with it
+        if (on) {   // Debug mode off: its own settings go with it
             cfg_set("snapshots", "");
+            cfg_set("gpu_marks", "");
+        }
     }
     float bottom = top + 56;
     if (on) {   // the settings that only mean something in Debug mode
@@ -1233,6 +1235,12 @@ static void screen_debug() {
         if (toggle("snapshots", 748, cy, shots))
             cfg_set("snapshots", shots ? "" : "1");
         text(g_media.small, 52, cy + 29 - g_media.small->FontSize / S / 2, C_SUB, T("snapshots_note"));
+        cy += 64;
+        row_label(cy, "row_gpu_marks");
+        bool marks = cfg_get("gpu_marks") == "1";
+        if (toggle("gpu_marks", 748, cy, marks))
+            cfg_set("gpu_marks", marks ? "" : "1");
+        text(g_media.small, 52, cy + 29 - g_media.small->FontSize / S / 2, C_SUB, T("gpu_marks_note"));
         bottom = cy + 50;
     }
     DL->ChannelsSetCurrent(0);
