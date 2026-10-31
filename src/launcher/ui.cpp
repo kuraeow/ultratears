@@ -1074,8 +1074,10 @@ static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de"
 // present's FSR 1 the output to a larger window.
 static const Opt RES_OPTS[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
                                {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};
-static const Opt SCALE_OPTS[] = {{"50", "50 %"}, {"67", "67 %"}, {"75", "75 %"}, {"", "scale_game"}, {"100", "100 %"},
-                                 {"150", "150 %"}, {"200", "200 %"}};
+// FSR 1's own modes (AMD: performance 2x, balanced 1.7x, quality 1.5x, ultra quality 1.3x per axis), the game's 5/6,
+// none, and supersampling
+static const Opt SCALE_OPTS[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
+                                 {"", "scale_game"}, {"100", "scale_native"}, {"150", "scale_150"}, {"200", "scale_200"}};
 // sharpness= (src/vk/fsr.c): the RCAS pass of the present's FSR 1, when the window is larger than the game's output
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25 %"}, {"", "sharp_default"}, {"75", "75 %"}, {"100", "100 %"}};
 

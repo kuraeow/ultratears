@@ -1,5 +1,6 @@
 // AMD FidelityFX Super Resolution 1 on the present (present.c): when the window is larger than the game's output, EASU
-// scales the game's picture to the window's size and RCAS sharpens it, in place of the bilinear blit. As
+// scales the game's picture to the window's size and RCAS sharpens it, in place of the bilinear blit; at the game's own
+// size RCAS alone sharpens it (the game's FSR 1 scaled its scene there, unsharpened). As
 // totk-pc-recomp's runtime/vk_fsr.c (MIT, Copyright (c) 2026 Valiantsin Dzerakh), whose shaders it uses
 // (third_party/fsr1: fsr_easu.comp / fsr_rcas.comp around AMD's ffx_fsr1.h, MIT, and their SPIR-V); here the two passes
 // are compute shader objects (as the rest of the backend), with one descriptor set each: the present thread waits for
@@ -159,13 +160,16 @@ static void pass(VkCommandBuffer cb, int which, VkShaderEXT sh, VkImageView in, 
 }
 
 // Records the upscale of src (BGRA8, in TRANSFER_SRC_OPTIMAL; its crop rectangle crop = x, y, w, h) into dst (the
-// swapchain image, in TRANSFER_DST_OPTIMAL) at dx, dy, size dw x dh. 0: not done (off, not larger, or no resources) -
-// the caller blits. The present waits for this frame's work before it records the next (present.c), so the source's
+// swapchain image, in TRANSFER_DST_OPTIMAL) at dx, dy, size dw x dh. A window of the game's own size gets RCAS alone (the
+// game's FSR 1 scaled its scene to that size without sharpening; the sharpness setting applies there too). 0: not done
+// (off, smaller, or no resources) - the caller blits. The present waits for this frame's work before it records the next (present.c), so the source's
 // view and the descriptor sets are free to replace.
 int vk_fsr_record(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImage dst, int dx, int dy,
                   uint32_t dw, uint32_t dh) {
     if (!F.tried) init();
-    if (!F.ok || (dw <= (uint32_t)crop[2] && dh <= (uint32_t)crop[3]) || !ensure_images(dw, dh)) return 0;
+    int up = dw > (uint32_t)crop[2] || dh > (uint32_t)crop[3];
+    int sharpen_only = !up && dw == (uint32_t)crop[2] && dh == (uint32_t)crop[3] && !crop[0] && !crop[1] && F.sharp > 0;
+    if (!F.ok || (!up && !sharpen_only) || !ensure_images(dw, dh)) return 0;
     if (F.src != src) {   // an output image of another size (the game changed it): a view of the new one
         if (F.src_view) vk.vkDestroyImageView(vkc.device, F.src_view, NULL);
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = src, .viewType = VK_IMAGE_VIEW_TYPE_2D,
@@ -181,7 +185,8 @@ int vk_fsr_record(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, con
     }
     if (!F.logged) {
         F.logged = 1;
-        LOG("FSR upscales %dx%d to %ux%u (sharpness %d)", crop[2], crop[3], dw, dh, F.sharp);
+        if (up) LOG("FSR upscales %dx%d to %ux%u (sharpness %d)", crop[2], crop[3], dw, dh, F.sharp);
+        else LOG("FSR sharpens the game's %ux%u picture (RCAS, sharpness %d)", dw, dh, F.sharp);
     }
     const VkPipelineStageFlags2 CS = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, XF = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -190,15 +195,20 @@ int vk_fsr_record(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, con
         barrier(cb, F.img[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, CS | XF, 0, CS,
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     uint32_t gx = (dw + 15) / 16, gy = (dh + 15) / 16;
-    float easu[8] = {(float)crop[2], (float)crop[3], (float)sw, (float)sh, (float)dw, (float)dh, (float)crop[0], (float)crop[1]};
-    pass(cb, 0, F.easu, F.src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, F.view[0], easu, gx, gy);
+    float rcas[8] = {(float)dw, (float)dh, (float)(100 - F.sharp) / 50.0f, 0, 0, 0, 0, 0};
     int last = 0;
-    if (F.sharp > 0) {
-        barrier(cb, F.img[0], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, CS,
-                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        float rcas[8] = {(float)dw, (float)dh, (float)(100 - F.sharp) / 50.0f, 0, 0, 0, 0, 0};
-        pass(cb, 1, F.rcas, F.view[0], VK_IMAGE_LAYOUT_GENERAL, F.view[1], rcas, gx, gy);
+    if (sharpen_only) {   // RCAS straight from the game's picture
+        pass(cb, 1, F.rcas, F.src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, F.view[1], rcas, gx, gy);
         last = 1;
+    } else {
+        float easu[8] = {(float)crop[2], (float)crop[3], (float)sw, (float)sh, (float)dw, (float)dh, (float)crop[0], (float)crop[1]};
+        pass(cb, 0, F.easu, F.src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, F.view[0], easu, gx, gy);
+        if (F.sharp > 0) {
+            barrier(cb, F.img[0], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, CS,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            pass(cb, 1, F.rcas, F.view[0], VK_IMAGE_LAYOUT_GENERAL, F.view[1], rcas, gx, gy);
+            last = 1;
+        }
     }
     barrier(cb, F.img[last], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, CS, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, XF,
             VK_ACCESS_2_TRANSFER_READ_BIT);
