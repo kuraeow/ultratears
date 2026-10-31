@@ -193,6 +193,9 @@ static const Text TEXTS[] = {
     {"dump_not_totk.d", {"The romfs folder has none of this game's files.", "В папке romfs нет файлов этой игры."}},
     {"romfs_version", {"the RomFS is not of version 1.4.3", "RomFS не от версии 1.4.3"}},
     {"tools", {"the build tools could not be prepared", "не удалось подготовить инструменты сборки"}},
+    {"linux_kit_missing", {"the Linux kit (deps\\linux) is missing: download the release again and extract it over this folder",
+                           "нет набора для Linux (deps\\linux): скачайте релиз заново и распакуйте поверх этой папки"}},
+    {"linux_kit_gone", {"No Linux kit in this folder:\ndownload the release again", "Нет набора для Linux:\nскачайте релиз заново"}},
     {"disk_space", {"not enough disk space: {need_gb} GB needed on {drive}, {free_gb} GB free",
                     "не хватает места: нужно {need_gb} GB на {drive}, свободно {free_gb} GB"}},
 

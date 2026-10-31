@@ -748,7 +748,7 @@ def full_rebuild(state, dump):
 def fail_tools(e):
     say(f'\nERROR preparing the build tools: {e}')
     if progress.JSON:
-        progress.emit('error', id='tools', code='tools', args={}, message=str(e))
+        progress.emit('error', id='tools', code=getattr(e, 'code', 'tools'), args={}, message=str(e))
     sys.exit(1)
 
 

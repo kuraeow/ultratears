@@ -36,7 +36,10 @@ XLATE_SOURCES = ('third_party/shader_translator', 'third_party/maxwell_shader', 
 
 
 class DepsError(Exception):
-    pass
+    def __init__(self, message, code='tools'):
+        """code: for the launcher, which words the failure in the player's language (setup.py --json)."""
+        super().__init__(message)
+        self.code = code
 
 
 def say(msg):
@@ -408,6 +411,10 @@ def linux_kit_for(home):
 def install_linux_kit(home):
     src = manifest()['linux_kit_sources']
     local = os.environ.get('ULTRS_LINUX_KIT_ZIP')
+    if not local and (home / 'package-files.txt').is_file():
+        # a builder package came with it: gone from it means a damaged package, not a 1.2 GB download to make it again
+        raise DepsError('the Linux kit (deps\\linux) is missing from this builder package: download the release again '
+                        'and extract it over this folder', 'linux_kit_missing')
     if local:
         path = pathlib.Path(local)
         say(f'  the Linux kit {path} -> deps\\linux')
