@@ -141,6 +141,7 @@ static void index_folder(const char *dir) {
             (runtime_now_ns() - t0) / 1e6);
 }
 
+static void heapdef_overlay(void);
 void runtime_fs_init(void) {
     if (image_fd >= 0 || rom_folder) return;
     const char *dir = getenv("TOTK_ROMFS");
@@ -152,6 +153,7 @@ void runtime_fs_init(void) {
         need(snprintf(rom_dir, sizeof rom_dir, "%s", dir) < (int)sizeof rom_dir, "RomFS folder path");
         rom_folder = 1;
         index_folder(rom_dir);
+        heapdef_overlay();
         return;
     }
     snprintf(path, sizeof path, "%s/runtime-index.bin", dir);
@@ -172,6 +174,7 @@ void runtime_fs_init(void) {
     image_fd = open(path, O_RDONLY | O_BINARY);
     need(image_fd >= 0, "RomFS image missing");
     fprintf(stderr, "[totk] RomFS: %llu files from %s\n", (unsigned long long)file_count, dir);
+    heapdef_overlay();
 }
 /* First entry whose path is >= p */
 static uint64_t lower(const char *p) {
@@ -182,6 +185,39 @@ static uint64_t lower(const char *p) {
 static uint64_t file_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
+}
+/* The HeapDef table a bigger game resolution needs (render_res.c): its render-target heap and that heap's parent grown,
+   served from memory in place of the RomFS file (as totk-pc-recomp's romfs.c heapdef_overlay, MIT). */
+#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
+static uint64_t ovr_index = UINT64_MAX;
+static uint8_t *ovr_data;
+static uint64_t ovr_size;
+static void heapdef_overlay(void) {
+    uint64_t totk_heap_extra_kib(void);
+    int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
+    void totk_resolution_log(void);
+    uint64_t i = totk_heap_extra_kib() ? file_index(HEAPDEF) : UINT64_MAX;
+    if (i != UINT64_MAX) {
+        Entry e = entry(i);
+        void *in = e.size && e.size < (16u << 20) ? malloc((size_t)e.size) : NULL;
+        int ok = in != NULL;
+        if (ok && rom_folder) {
+            char full[8192];
+            snprintf(full, sizeof full, "%s/%s", rom_dir, HEAPDEF);
+            int fd = open(full, O_RDONLY | O_BINARY);
+            ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
+            if (fd >= 0) close(fd);
+        } else if (ok)
+            ok = pread(image_fd, in, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
+        void *out = NULL;
+        size_t out_n = 0;
+        if (ok && totk_heapdef_build(in, (size_t)e.size, &out, &out_n)) {
+            ovr_index = i, ovr_data = out, ovr_size = out_n;
+            fprintf(stderr, "[totk] RomFS: %s served grown (%zu bytes)\n", HEAPDEF, out_n);
+        }
+        free(in);
+    }
+    totk_resolution_log();
 }
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
@@ -239,6 +275,14 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
     Entry e = entry(i - 1);
+    if (i - 1 == ovr_index) {   /* the grown HeapDef, from memory */
+        if ((uint64_t)offset > ovr_size) return R_ROM_INVALID;
+        uint64_t n = size < ovr_size - (uint64_t)offset ? size : ovr_size - (uint64_t)offset;
+        guest_prepare_write(buffer, n);
+        memcpy(buffer, ovr_data + offset, (size_t)n);
+        *out = n;
+        return 0;
+    }
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
@@ -253,7 +297,7 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    *out = (int64_t)entry(i - 1).size;
+    *out = i - 1 == ovr_index ? (int64_t)ovr_size : (int64_t)entry(i - 1).size;
     return 0;
 }
 static void romfs_close(uint64_t h) {

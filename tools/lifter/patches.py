@@ -50,6 +50,37 @@ def get_s(reg):
     return f'({{ uint32_t u_ = (uint32_t)c->v[{reg}]; float f_; __builtin_memcpy(&f_, &u_, 4); f_; }})'
 
 
+# ---- Scene (render) resolution. Where and what from MacNativeGames games/totk/runtime/game_patches_v143.c
+# (patch_render_res, MIT, Copyright (c) 2026 MacNativeGames contributors): every path that picks the scene size goes
+# through main+0x585e48, which converts the graphics-parameter entry's size (docked 1600x900) to floats and stores them
+# as the renderer's width (+0xcc4) and height (+0xcc8); the game derives its scene targets (and their half and quarter
+# sizes) from these, and its own FSR 1 (EASU) draws the scene onto its canvas. Here the two stores take the size
+# src/host/render_res.c chose instead, when there is one. The output (canvas, UI, swapchain): the swapchain size nnMain
+# writes (main+0xbdb584) and, as the display configuration publishes its active output (main+0x3dcb28), its canvas
+# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res), as
+# totk-pc-recomp's patches-v143.txt carries them.
+def scene_size(axis):   # str s0, [x19, #0xcc4 / #0xcc8]
+    orig = {0: 0xbd0cc660, 1: 0xbd0cca60}[axis]
+
+    def f(gen, addr):
+        expect(gen, addr, orig, 'scene_size')
+        return ('{ extern int totk_scene_size(float *w, float *h); float w_, h_; '
+                f'if (totk_scene_size(&w_, &h_)) {set_s(0, "w_" if axis == 0 else "h_")} }} {gen.c_of(orig, addr)}')
+    return f
+
+
+def output_size(gen, addr):   # movk x8, #0x438, lsl #32: the swapchain size the game asks for (1920x1080)
+    expect(gen, addr, 0xf2c08708, 'output_size')
+    return ('{ extern int totk_output_size(uint64_t *packed); uint64_t s_; '
+            f'if (totk_output_size(&s_)) c->x[8] = s_; else {{ {gen.c_of(0xf2c08708, addr)} }} }}')
+
+
+def output_canvas(gen, addr):   # before lsr x4, x3, #32: the display configuration's canvas (+0x10) and active output (+0x508)
+    expect(gen, addr, 0xd360fc64, 'output_canvas')
+    return ('{ extern int totk_output_size(uint64_t *packed); uint64_t s_; '
+            'if (totk_output_size(&s_)) { c->x[3] = s_; ST64(c->x[19] + 0x10, s_); } }')
+
+
 # fps60: the adaptive present-interval controller (main+0x2db174) gets the minimum interval 1 (60 Hz ticks) instead of
 # the shipping data's 2. The controller still raises the interval when a frame does not fit.
 FPS60 = [(0x2db204, 0x6b08015f, 0x7100055f),   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
@@ -135,6 +166,9 @@ def fade(reg):
 
 PATCHES = {
     0x8005843e0: drs_off,
+    MAIN + 0x585e50: scene_size(0),
+    MAIN + 0x585e60: scene_size(1),
+    MAIN + 0xbdb584: output_size,
     **{MAIN + a: fps60(o, r) for a, o, r in FPS60},
     MAIN + 0x2daa54: rt_ratio_load,
     MAIN + 0x2daa6c: rt_ratio_skip(0x5e21d800),   # scvtf s0, s0
@@ -148,4 +182,5 @@ PRE_PATCHES = {
     MAIN + 0x3e5658: rt_step_ticks,
     MAIN + 0x24944c: cloth_call, MAIN + 0x28bc98: cloth_call,
     MAIN + 0x562a68: bounce,
+    MAIN + 0x3dcb28: output_canvas,
 }

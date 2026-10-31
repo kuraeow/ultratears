@@ -1069,10 +1069,13 @@ static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de"
                                 {"fr", "Français"}, {"it", "Italiano"}, {"nl", "Nederlands"}, {"pt", "Português"},
                                 {"pt-BR", "Português (Brasil)"}, {"ru", "Русский"}, {"ja", "lang_ja"}, {"ko", "lang_ko"},
                                 {"zh-Hans", "lang_zh"}};
-// [temporary] hidden until the game renders at another resolution (dev-local/docs/plan.md): the rows are ready
-static const bool SHOW_RESOLUTION = false;
-static const Opt RES_OPTS[] = {{"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"}, {"3840x2160", "3840 × 2160"}};
-static const Opt SCALE_OPTS[] = {{"", "scale_none"}, {"fsr1", "FSR 1"}};
+// The game's resolution (src/host/render_res.c): resolution= the size the game composes its frame in (its output),
+// scale= its 3D scene in % of that (unset: the game's own 5/6); the game's FSR 1 scales the scene to the output, and the
+// present's FSR 1 the output to a larger window.
+static const Opt RES_OPTS[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
+                               {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};
+static const Opt SCALE_OPTS[] = {{"50", "50 %"}, {"67", "67 %"}, {"75", "75 %"}, {"", "scale_game"}, {"100", "100 %"},
+                                 {"150", "150 %"}, {"200", "200 %"}};
 
 template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
     std::string value = v == same_as_default ? "" : v;
@@ -1262,16 +1265,14 @@ static void screen_play() {
         int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_get("window")));
         if (k >= 0)
             cfg_set("window", WINDOW_OPTS[k].value);
-        if (SHOW_RESOLUTION) {
-            cy += 40;
-            row_label(cy, "row_res");
-            if ((k = dropdown("res", 748, cy, 126, RES_OPTS, opt_index(RES_OPTS, cfg_get("resolution")))) >= 0)
-                cfg_set("resolution", RES_OPTS[k].value);
-            cy += 40;
-            row_label(cy, "row_scale");
-            if ((k = dropdown("scale", 748, cy, 126, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("upscale")))) >= 0)
-                cfg_set("upscale", SCALE_OPTS[k].value);
-        }
+        cy += 40;
+        row_label(cy, "row_res");
+        if ((k = dropdown("res", 748, cy, 0, RES_OPTS, opt_index(RES_OPTS, cfg_get("resolution")))) >= 0)
+            cfg_set("resolution", RES_OPTS[k].value);
+        cy += 40;
+        row_label(cy, "row_scale");
+        if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
+            cfg_set("scale", SCALE_OPTS[k].value);
         cy += 40;
         row_label(cy, "row_fps");
         if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_get("fps"), "60"))) >= 0)
