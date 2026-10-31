@@ -1,10 +1,15 @@
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 // The shared Vulkan instance and device (see vk.h).
 #include "vk.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <pthread.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,10 +57,16 @@ static int create_instance(SDL_Window *window) {
     PFN_vkGetInstanceProcAddr gipa = NULL;
     if (window) gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     else {   // no window (TOTK_HEADLESS): SDL's video subsystem is not up, so the loader is loaded here
+#ifdef _WIN32
         HMODULE m = LoadLibraryA("vulkan-1.dll");
         if (m) gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(m, "vkGetInstanceProcAddr");
+#else
+        void *m = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!m) m = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (m) gipa = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+#endif
     }
-    if (!gipa) { LOG("no Vulkan loader (vulkan-1.dll)"); return 0; }
+    if (!gipa) { LOG("no Vulkan loader"); return 0; }
 #define LOAD(f) vk.f = (PFN_##f)gipa(NULL, #f);
     VK_FN_GLOBAL(LOAD)
 #undef LOAD

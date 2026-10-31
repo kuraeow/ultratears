@@ -71,6 +71,9 @@ typedef struct vkb_image {
     int cpu_written;               // WriteTexels changed its game memory: upload before the next use (any pool)
     int not_uploadable;            // contents in game memory that the upload cannot take (depth / 3-component formats)
     uint64_t vpool_gen;            // in a virtual pool: the mapping generation of the last upload (0: not in one)
+    uint64_t content_hash;         // game memory without a write watch: its contents at the last upload (0: not hashed)
+    uint64_t hash_sub;             // the submission in which content_hash was last compared
+    int hash_hot;                  // its contents changed before (the font atlas): compared every submission, budget or not
     const uint8_t *storage;        // the texture's storage in game memory (block-linear / linear)
     uint64_t write_seq;            // vkb_image_written: when the GPU last wrote it (0 = never)
     uint64_t write_frame;          // ...and in which present

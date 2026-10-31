@@ -4,11 +4,14 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "host.h"
 #include "version.h"   // build/version.h (tools/build_game.py, tools/version.py)
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 static void loader_ready(Cpu *c) { (void)c; fprintf(stderr, "[totk] rtld callback: modules linked\n"); }
@@ -44,21 +47,33 @@ static void *game_main(void *unused);
 static char g_exefs[4096];
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
+    char path[4096];
+    char *slash = NULL;
 #ifdef _WIN32
-    char path[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
-    char *slash = n && n < sizeof path ? strrchr(path, '\\') : NULL;
+    slash = n && n < sizeof path ? strrchr(path, '\\\') : NULL;
+#else
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n > 0) {
+        path[n] = '\0';
+        slash = strrchr(path, '/');
+    }
+#endif
     if (!slash) return exefs;
     *slash = 0;
-    char cfg[MAX_PATH + 32];
-    snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
+    char cfg[4096 + 32];
+    snprintf(cfg, sizeof cfg, "%s/ultratears.cfg", path);
     FILE *f = fopen(cfg, "r");
-    if (!f && (slash = strrchr(path, '\\')) && !_stricmp(slash, "\\build")) {   // build\\UltraTears.exe: the folder above
+    if (!f && (slash = strrchr(path, '/')) && !strcmp(slash, "/build")) {
         *slash = 0;
-        snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
+        snprintf(cfg, sizeof cfg, "%s/ultratears.cfg", path);
         f = fopen(cfg, "r");
     }
+#ifdef _WIN32
     if (!SetCurrentDirectoryA(path)) fprintf(stderr, "[totk] cannot enter %s\n", path);
+#else
+    if (chdir(path) != 0) fprintf(stderr, "[totk] cannot enter %s\n", path);
+#endif
     if (f) {
         char line[4600];
         while (fgets(line, sizeof line, f)) {
@@ -77,9 +92,9 @@ static const char *default_exefs(void) {
         }
         fclose(f);
         fprintf(stderr, "[totk] game folder %s (%s)\n", path, cfg);
-    } else
+    } else {
         fprintf(stderr, "[totk] game folder %s (no ultratears.cfg: setup.py's layout)\n", path);
-#endif
+    }
     return exefs;
 }
 

@@ -10,8 +10,10 @@
 //    own layout): +0 Ryujinx support buffer, +1..17 constant buffers c0-c16, +18..33 storage buffers, +34..57 combined
 //    textures, +58..61 images. The translator numbers bindings densely per shader; they are rewritten in the SPIR-V
 //    when it is loaded, so any vertex shader combines with any fragment shader under one pipeline layout.
+#ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>   // after windows.h (its types)
+#endif
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +115,7 @@ static char *read_file(const char *path, size_t *n) {
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;   // the entries, their objects and variants, the programs
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;     // an entry no longer busy
 
+#ifdef _WIN32
 static BCRYPT_ALG_HANDLE g_sha;   // opened once (opening it per hash cost more than the hash)
 static void sha_open(void) { if (BCryptOpenAlgorithmProvider(&g_sha, BCRYPT_SHA256_ALGORITHM, NULL, 0)) die("SHA-256 provider"); }
 static void sha256_hex(const void *a, size_t na, const void *b, size_t nb, char out[65]) {
@@ -130,6 +133,111 @@ static void sha256_hex(const void *a, size_t na, const void *b, size_t nb, char 
     for (int i = 0; i < 32; i++) { out[2 * i] = hex[md[i] >> 4]; out[2 * i + 1] = hex[md[i] & 15]; }
     out[64] = 0;
 }
+#else
+typedef struct {
+    uint32_t state[8];
+    uint64_t count;
+    uint8_t buffer[64];
+} sha256_ctx;
+
+static inline uint32_t ror32_s(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void sha256_transform(uint32_t state[8], const uint8_t data[64]) {
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+    uint32_t W[64];
+    for (int i = 0; i < 16; i++) {
+        W[i] = ((uint32_t)data[i*4] << 24) | ((uint32_t)data[i*4 + 1] << 16) |
+               ((uint32_t)data[i*4 + 2] << 8) | ((uint32_t)data[i*4 + 3]);
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ror32_s(W[i-15], 7) ^ ror32_s(W[i-15], 18) ^ (W[i-15] >> 3);
+        uint32_t s1 = ror32_s(W[i-2], 17) ^ ror32_s(W[i-2], 19) ^ (W[i-2] >> 10);
+        W[i] = W[i-16] + s0 + W[i-7] + s1;
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ror32_s(e, 6) ^ ror32_s(e, 11) ^ ror32_s(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t temp1 = h + S1 + ch + K[i] + W[i];
+        uint32_t S0 = ror32_s(a, 2) ^ ror32_s(a, 13) ^ ror32_s(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = S0 + maj;
+        h = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+static void sha256_init_s(sha256_ctx *ctx) {
+    ctx->state[0] = 0x6a09e667; ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372; ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f; ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab; ctx->state[7] = 0x5be0cd19;
+    ctx->count = 0;
+}
+
+static void sha256_update_s(sha256_ctx *ctx, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    size_t idx = (size_t)(ctx->count & 63);
+    ctx->count += len;
+    while (len > 0) {
+        size_t take = 64 - idx;
+        if (take > len) take = len;
+        memcpy(&ctx->buffer[idx], p, take);
+        p += take;
+        len -= take;
+        idx += take;
+        if (idx == 64) {
+            sha256_transform(ctx->state, ctx->buffer);
+            idx = 0;
+        }
+    }
+}
+
+static void sha256_final_s(sha256_ctx *ctx, uint8_t hash[32]) {
+    size_t idx = (size_t)(ctx->count & 63);
+    ctx->buffer[idx++] = 0x80;
+    if (idx > 56) {
+        memset(&ctx->buffer[idx], 0, 64 - idx);
+        sha256_transform(ctx->state, ctx->buffer);
+        idx = 0;
+    }
+    memset(&ctx->buffer[idx], 0, 56 - idx);
+    uint64_t bits = ctx->count * 8;
+    for (int i = 0; i < 8; i++) {
+        ctx->buffer[56 + i] = (uint8_t)(bits >> ((7 - i) * 8));
+    }
+    sha256_transform(ctx->state, ctx->buffer);
+    for (int i = 0; i < 8; i++) {
+        hash[i*4 + 0] = (uint8_t)(ctx->state[i] >> 24);
+        hash[i*4 + 1] = (uint8_t)(ctx->state[i] >> 16);
+        hash[i*4 + 2] = (uint8_t)(ctx->state[i] >> 8);
+        hash[i*4 + 3] = (uint8_t)(ctx->state[i]);
+    }
+}
+
+static void sha256_hex(const void *a, size_t na, const void *b, size_t nb, char out[65]) {
+    sha256_ctx ctx;
+    sha256_init_s(&ctx);
+    if (a && na) sha256_update_s(&ctx, a, na);
+    if (b && nb) sha256_update_s(&ctx, b, nb);
+    uint8_t md[32];
+    sha256_final_s(&ctx, md);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) { out[2 * i] = hex[md[i] >> 4]; out[2 * i + 1] = hex[md[i] & 15]; }
+    out[64] = 0;
+}
+#endif
 
 // The translated shaders: data/shaders/translated.pack (vkb_shpack.c); without it, a folder of <key>.res.json + <key>.spv
 // (TOTK_SHADER_DIR, development: the translator's output before it is packed).
@@ -142,8 +250,13 @@ static int from_pack(void) {   // a folder only when TOTK_SHADER_DIR names one t
     static int v = -1;
     if (v < 0) {
         const char *d = getenv("TOTK_SHADER_DIR");
+#ifdef _WIN32
         DWORD a = d ? GetFileAttributesA(d) : INVALID_FILE_ATTRIBUTES;
         v = vkb_shpack_on() && !(a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY));
+#else
+        struct stat st;
+        v = vkb_shpack_on() && !(d && stat(d, &st) == 0 && S_ISDIR(st.st_mode));
+#endif
     }
     return v;
 }
@@ -322,8 +435,13 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
         char path[1024];
         snprintf(path, sizeof path, "%s/%s.res.json", cache_dir(), key);
         j = read_file(path, NULL);
+#ifdef _WIN32
         struct _stat64 st;
         s->stamp = _stat64(path, &st) == 0 ? stamp_of((uint64_t)st.st_mtime, (uint64_t)st.st_size) : 0;
+#else
+        struct stat st;
+        s->stamp = stat(path, &st) == 0 ? stamp_of((uint64_t)st.st_mtime, (uint64_t)st.st_size) : 0;
+#endif
         snprintf(path, sizeof path, "%s/%s.spv", cache_dir(), key);
         spv = (uint32_t *)read_file(path, &nspv);
     }
@@ -520,7 +638,9 @@ static pthread_cond_t g_cq_cv = PTHREAD_COND_INITIALIZER;
 static void *creator_thread(void *unused) {
     (void)unused;
     pthread_setname_np("totk-shader-make");
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     pthread_mutex_lock(&g_mu);
     for (;;) {
         while (g_cq_out == g_cq_in) pthread_cond_wait(&g_cq_cv, &g_mu);
@@ -683,8 +803,14 @@ static void ahead_pack(void) {
 static void *ahead_thread(void *unused) {
     (void)unused;
     pthread_setname_np("totk-shader-ahead");
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
     if (from_pack()) { ahead_pack(); return NULL; }
+#ifndef _WIN32
+    VLOG("shaders compiled ahead: only from the shader pack on this system (setup makes it)");
+    return NULL;
+#else
     char pattern[1024];
     snprintf(pattern, sizeof pattern, "%s/*.res.json", cache_dir());
     WIN32_FIND_DATAA fd;
@@ -729,6 +855,7 @@ static void *ahead_thread(void *unused) {
          (runtime_now_ns() - t0) / 1e9);
     vkb_shbin_compact();
     return NULL;
+#endif
 }
 static void ahead_start(void) {
     const char *e = getenv("TOTK_SHADER_AHEAD");

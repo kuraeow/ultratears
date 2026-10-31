@@ -1,3 +1,26 @@
+#define _GNU_SOURCE
+#include <stdint.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#define MEM_RESERVE 0x2000
+#define MEM_COMMIT 0x1000
+#define MEM_RELEASE 0x8000
+#define PAGE_READWRITE 0x04
+#define PAGE_NOACCESS 0x01
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+static inline void *VirtualAlloc(void *addr, size_t size, int type, int prot) {
+    int p = (prot == PAGE_NOACCESS) ? PROT_NONE : (PROT_READ | PROT_WRITE);
+    void *res = mmap(addr, size, p, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (res == MAP_FAILED) ? NULL : res;
+}
+static inline int VirtualFree(void *addr, size_t size, int type) {
+    (void)size; (void)type;
+    return munmap(addr, size);
+}
+static inline unsigned long GetLastError(void) { return 0; }
+#endif
 // [Windows port] NVN physical / virtual memory pools (the API of MacNativeGames' totk_vpool.h).
 // MacNativeGames maps a virtual pool's 64 KiB pages onto physical pools' pages a second time (mach_vm_remap). Windows
 // cannot alias ordinary private memory, and a virtual pool is a GPU address range: the game reaches the physical memory
@@ -9,7 +32,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include "../host/hle.h"
 #include "nvn_dirty.h"

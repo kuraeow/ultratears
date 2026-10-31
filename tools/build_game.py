@@ -1,7 +1,7 @@
-"""Write build/build.ninja for the runtime + the generated game code, and run ninja (MSYS2 CLANG64 clang/ninja).
+"""Write build/build.ninja for the runtime + the generated game code, and run ninja.
 
 usage: python tools/build_game.py [--generated data/generated] [--target probe_cpu] [-j N] [--cpus N]
-The ultratears target links UltraTears.exe in the game folder itself (its debug symbols: build/UltraTears.pdb).
+The ultratears target links the game executable in the game folder itself.
 Run in the game folder (tools/setup.py does): the generated C is in data/ (derived from the game), objects and
 executables go to build/; neither is ever in git.
 """
@@ -13,10 +13,12 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from toolchain import CLANG64, env as tool_env  # noqa: E402
+from toolchain import CLANG64, LINUX_TOOLS, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
-RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c']
+LINUX = sys.platform == 'linux'
+RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c',
+           'src/runtime/platform/linux.c' if LINUX else 'src/runtime/platform/windows.c']
 TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
            'ultratears': ['src/host/boot.c', 'src/host/guest.c', 'src/host/svc.c', 'src/host/threads.c', 'src/host/ipc.c',
                     'src/host/services_lm.c', 'src/host/overrides_oe.c',
@@ -36,9 +38,12 @@ GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_e
        'src/gfx/vkb_draw.c', 'src/gfx/tex/nvn_deswizzle.c', 'src/gfx/tex/astc.c', 'src/gfx/vkb_bc7.c',
        'src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/tex/bc7enc/rgbcx.cpp', 'src/gfx/tex/bc7key.c']
 GFX_INCLUDES = '-Isrc/gfx -Isrc/gfx/nvn -Isrc/gfx/nvn/include -Isrc/gfx/compat'
-LIBS = '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -liconv' \
-       ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++'
-CFLAGS = '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64'
+LIBS = ('-Lbuild/lib -L../../build/third_party/sdl3 -lSDL3 -lopus -lvpx -lzstd -lpthread -ldl -lm -lstdc++' if LINUX else
+        '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -liconv'
+        ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++')
+CFLAGS = ('-O2 -march=x86-64-v3 -g -fno-strict-aliasing -D_FILE_OFFSET_BITS=64' if LINUX else
+          '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64')
+CFLAGS += ' -I../../third_party/sdl3/include -I../../third_party/vulkan-headers/include'
 GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 
 
@@ -51,12 +56,41 @@ def write_if_changed(path, text):   # an unchanged file keeps its time: nothing 
         path.write_text(text, encoding='utf-8')
 
 
+
+def unpatch_lifted_sead_allocators(gen):
+    """Take out the heap fallbacks that earlier builds injected into the lifted C. 0x802bb74c0 is the stub of
+    nn::os::GetTlsValue, not HeapMgr::getCurrentHeap, and the fake heaps they returned crashed the game."""
+    hooks = {
+        'void f_80006a920(Cpu *c) {': (
+            '    if (c->x[1] == 0 || c->x[1] < 0x10000ULL || c->x[1] >= (1ULL << 48)) {\n'
+            '        extern void *sead_fallback_heap_alloc(uint64_t size, uint64_t align);\n'
+            '        c->x[0] = (uint64_t)(uintptr_t)sead_fallback_heap_alloc(c->x[0], c->x[2]);\n'
+            '        return;\n'
+            '    }'),
+        'void f_8008ac138(Cpu *c) {': (
+            '    if (c->x[0] == 0 || c->x[0] < 0x10000ULL || c->x[0] >= (1ULL << 48)) {\n'
+            '        extern void *sead_fallback_root_heap(void);\n'
+            '        c->x[0] = (uint64_t)(uintptr_t)sead_fallback_root_heap();\n'
+            '        return;\n'
+            '    }'),
+    }
+    for module in ('main', 'subsdk0', 'sdk'):
+        for c in sorted((gen / module).glob('*.c')):
+            text = c.read_text(encoding='utf-8')
+            if 'sead_fallback_' not in text:
+                continue
+            for head, body in hooks.items():
+                text = text.replace(head + '\n' + body, head, 1)
+            c.write_text(text, encoding='utf-8')
+
+
 def version_files(build):
-    """build/version.h (the version and commit, tools/version.py) and the exe's resources: icon and version info."""
+    """Write build/version.h and, on Windows, the executable's icon and version resources."""
     v, commit = version.current()
     n = ','.join(str(x) for x in version.numbers(v))
     write_if_changed(build / 'version.h', f'#define ULTRS_VERSION "{v}"\n#define ULTRS_COMMIT "{commit}"\n')
-    write_if_changed(build / 'ultratears.rc', f'''1 ICON "assets/icon.ico"
+    if not LINUX:
+        write_if_changed(build / 'ultratears.rc', f'''1 ICON "assets/icon.ico"
 1 VERSIONINFO
 FILEVERSION {n}
 PRODUCTVERSION {n}
@@ -87,7 +121,8 @@ def cpu_arch():
     """x86-64-v3 where this CPU has AVX2, FMA and BMI2 (Intel Haswell / 2013, AMD Excavator / Zen and newer), else
     x86-64-v2 (SSE4.2): the code is built on the player's PC, so for its CPU (issue #19: i7-3770, Xeon E3-1230 v2).
     clang -march=native says which features the CPU has."""
-    r = subprocess.run([str(CLANG64 / 'clang.exe'), '-march=native', '-dM', '-E', '-x', 'c', os.devnull], capture_output=True,
+    clang = LINUX_TOOLS['clang'] if LINUX else CLANG64 / 'clang.exe'
+    r = subprocess.run([str(clang), '-march=native', '-dM', '-E', '-x', 'c', os.devnull], capture_output=True,
                        text=True, env=tool_env())
     if r.returncode:
         print('cannot ask clang about this CPU: building for x86-64-v3', flush=True)
@@ -134,10 +169,10 @@ def main():
         '  command = clang -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
         '  depfile = $out.d',
         '  deps = gcc',
-        'rule rc',
-        '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
+        *([] if LINUX else ['rule rc', '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out']),
         'rule link',
-        f'  command = clang -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}',
+        (f'  command = clang -g -o $out @$out.rsp {LIBS}' if LINUX else
+         f'  command = clang -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}'),
         '  rspfile = $out.rsp',
         '  rspfile_content = $in',
         '',
@@ -148,16 +183,18 @@ def main():
         lines.append(f'build {obj}: cc {src}')
         objs.append(obj)
     if a.target == 'ultratears':
-        # the port's icon (assets/icon.ico, the author's own drawing: README.md, Legal) and version in the resources
+        # Windows resources: the port's icon (assets/icon.ico) and version information.
         print(f'UltraTears {version_files(build)}', flush=True)
-        lines.append('build build/obj/ultratears_res.o: rc build/ultratears.rc | assets/icon.ico')
-        objs.append('build/obj/ultratears_res.o')
+        if not LINUX:
+            lines.append('build build/obj/ultratears_res.o: rc build/ultratears.rc | assets/icon.ico')
+            objs.append('build/obj/ultratears_res.o')
         for src in GFX:
             cxx = src.endswith('.cpp')
             obj = f'build/obj/{src.rsplit(".", 1)[0].replace("/", "_")}.o'
             lines.append(f'build {obj}: {"gfxcxx" if cxx else "gfxcc"} {src}')
             objs.append(obj)
     game_objs = []
+    unpatch_lifted_sead_allocators(gen)
     for module in ('main', 'subsdk0', 'sdk'):
         for c in sorted((gen / module).glob('*.c')):
             obj = f'build/game/{module}/{c.stem}.o'
@@ -171,16 +208,20 @@ def main():
             game_objs.append(obj)
     if not game_objs:
         sys.exit(f'no generated C in {gen}: run tools/gen_game.py first')
-    exe = 'UltraTears.exe' if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
+    exe = (('ultratears' if LINUX else 'UltraTears.exe') if a.target == 'ultratears' else
+           f'build/{a.target}' + ('' if LINUX else '.exe'))   # the game: in the game folder
     lines.append(f'build {exe}: link {" ".join(objs + game_objs)}')
-    lines.append(f'  pdb = build/{pathlib.Path(exe).stem}.pdb')
+    if not LINUX:
+        lines.append(f'  pdb = build/{pathlib.Path(exe).stem}.pdb')
     lines.append(f'default {exe}')
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
     env = tool_env()
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
-    # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free.
-    ninja = [str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', 'build/build.ninja', f'-j{a.j}', '-k', '0']
+    # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free (Windows;
+    # Linux uses ninja's -j limit).
+    ninja = (['ninja'] if LINUX else [str(CLANG64 / 'ninja.exe')]) + [
+        '-C', str(ROOT), '-f', 'build/build.ninja', f'-j{a.j}', '-k', '0']
     on_line = None
     import progress
     if progress.JSON:   # setup.py --json: ninja's [n/m] as progress events, its lines on to the log
@@ -201,6 +242,13 @@ def main():
 
 def run_limited(cmd, env, mask, on_line=None):
     """cmd at below-normal priority on the CPUs in mask; on_line(line): its output line by line instead of the console."""
+    if LINUX:   # (no affinity or priority here)
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE if on_line else None,
+                             stderr=subprocess.STDOUT if on_line else None, text=bool(on_line), errors='replace')
+        if on_line:
+            for line in p.stdout:
+                on_line(line.rstrip('\n'))
+        return p.wait()
     import ctypes
     CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY_CLASS = 0x4, 0x4000
     pipe = subprocess.PIPE if on_line else None

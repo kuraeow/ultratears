@@ -167,7 +167,9 @@ static void toggle_fullscreen(void) {
     SDL_SetWindowFullscreen(window, !on);   // borderless desktop fullscreen (no display mode change)
 }
 
-// Game frame rate and shown frame rate in the title, twice a second.
+// Game frame rate and shown frame rate in the title, twice a second; in the log every 5 s, with the time spent comparing
+// texture contents (vkb_tex.c, memory without a write watch).
+void vkb_tex_hash_stats(uint64_t *checks, uint64_t *bytes, uint64_t *ns, uint64_t *changed);
 static void title_update(void) {
     static uint64_t t0, game0, shown0;
     uint64_t now = runtime_now_ns(), game = vkp_frames(), shown = vkp_presented();
@@ -177,6 +179,16 @@ static void title_update(void) {
     char title[128];
     snprintf(title, sizeof title, "UltraTears  |  game %.1f fps  |  shown %.1f fps", (game - game0) / s, (shown - shown0) / s);
     SDL_SetWindowTitle(window, title);
+    static int n;
+    static uint64_t hc0, hb0, hn0;
+    if (++n % 10 == 0) {
+        uint64_t hc, hb, hn, hch;
+        vkb_tex_hash_stats(&hc, &hb, &hn, &hch);
+        fprintf(stderr, "[totk] game %.1f fps, shown %.1f fps; texture hashing %.1f MiB in %.1f ms (%llu checks, %llu changed)\n",
+                (game - game0) / s, (shown - shown0) / s, (hb - hb0) / 1048576.0, (hn - hn0) / 1e6,
+                (unsigned long long)(hc - hc0), (unsigned long long)hch);
+        hc0 = hc; hb0 = hb; hn0 = hn;
+    }
     t0 = now; game0 = game; shown0 = shown;
 }
 

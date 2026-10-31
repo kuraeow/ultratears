@@ -7,7 +7,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define _mkdir(path) mkdir(path, 0777)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -923,6 +929,59 @@ void vkb_tex_release(const tex_t *t) {
 // check per texture per submission is enough; a texture found changed is uploaded before its next use (the pass ends
 // for it). Without this, textures the CPU updates while drawn every frame (the font atlas: new glyphs, the save slot
 // thumbnails) kept their first contents.
+// Game memory without a write watch (Linux: imported into Vulkan, amdgpu re-maps it for writing after every
+// protection change, so userfaultfd / soft-dirty report every page written all the time): CPU updates of a texture are
+// found by comparing its contents with a hash taken at the upload: at most every other submission (about once a
+// frame), within a byte budget per submission (TOTK_TEX_HASH_MB, default 16); textures over the budget wait for a later
+// submission, and the ones just compared make room for them, so the cost stays bounded however many textures there are. The font atlas (new glyphs)
+// and the save slot thumbnails need this.
+enum { HASH_MAX = 16 << 20, HASH_EVERY = 2 };
+static uint64_t tex_hash(const uint8_t *p, size_t n) {
+    const uint64_t K = 0x9e3779b97f4a7c15ull;
+    uint64_t a = n, b = K, c = ~(uint64_t)n, d = K ^ 0x5bd1e995ull, w[4];
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * K; b = (b ^ w[1]) * K; c = (c ^ w[2]) * K; d = (d ^ w[3]) * K;
+        a ^= a >> 29; b ^= b >> 29; c ^= c >> 29; d ^= d >> 29;
+    }
+    for (; i < n; i++) a = (a ^ p[i]) * K;
+    uint64_t h = (a ^ (b * 3) ^ (c * 5) ^ (d * 7)) * K;
+    h ^= h >> 32;
+    return h ? h : 1;
+}
+static uint64_t g_hash_budget;
+static uint64_t g_hash_sub, g_hash_bytes;
+static uint64_t g_hash_checks, g_hash_changed, g_hash_bytes_total, g_hash_ns;
+void vkb_tex_hash_stats(uint64_t *checks, uint64_t *bytes, uint64_t *ns, uint64_t *changed) {
+    *checks = __atomic_load_n(&g_hash_checks, __ATOMIC_RELAXED); *bytes = __atomic_load_n(&g_hash_bytes_total, __ATOMIC_RELAXED);
+    *ns = __atomic_load_n(&g_hash_ns, __ATOMIC_RELAXED); *changed = g_hash_changed;
+}
+static int tex_content_changed(vkb_image *im, size_t size, uint64_t sub) {
+    if (!im->content_hash) return 0;
+    if (im->hash_sub == sub || (!im->hash_hot && im->hash_sub && sub - im->hash_sub < HASH_EVERY)) return 0;
+    if (!g_hash_budget) {
+        const char *e = getenv("TOTK_TEX_HASH_MB");
+        g_hash_budget = (uint64_t)(e ? atoi(e) : 16) << 20;
+        if (!g_hash_budget) g_hash_budget = 1;
+    }
+    uint64_t at = __atomic_load_n(&g_hash_sub, __ATOMIC_ACQUIRE);
+    if (at != sub && __atomic_compare_exchange_n(&g_hash_sub, &at, sub, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&g_hash_bytes, 0, __ATOMIC_RELEASE);
+    if (__atomic_add_fetch(&g_hash_bytes, size, __ATOMIC_ACQ_REL) > g_hash_budget && !im->hash_hot) return 0;   // next time
+    im->hash_sub = sub;
+    uint64_t t0 = runtime_now_ns(), h = tex_hash(im->storage, size);
+    __atomic_add_fetch(&g_hash_ns, runtime_now_ns() - t0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_hash_bytes_total, size, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_hash_checks, 1, __ATOMIC_RELAXED);
+    if (h == im->content_hash) return 0;
+    im->hash_hot = 1;
+    if (g_hash_changed++ < 16)
+        VLOG("texture %llu (format %#x %ux%u): contents changed in game memory; uploading again", (unsigned long long)im->serial,
+             im->d.format, im->width, im->height);
+    return 1;
+}
+
 int vkb_tex_stale(vkb_image *im) {
     uint64_t sub = mtl_last_fence() + 1;
     if (!im->upload_stamp || im->gpu_written || !im->storage) return 0;
@@ -939,7 +998,9 @@ int vkb_tex_stale(vkb_image *im) {
         // a virtual pool: the physical pages behind it; [temporary] untracked memory (CPU-no-access pools hold GPU data)
         // counts as unchanged: uploaded once
         int v = im->vpool_gen ? totk_vpool_dirty_since((uintptr_t)im->storage, L.size, im->upload_stamp) : -1;
-        im->stale = v >= 0 ? v : nvn_dirty_tracked(im->storage, L.size) && nvn_dirty_since(im->storage, L.size, im->upload_stamp);
+        im->stale = v >= 0 ? v
+                  : nvn_dirty_tracked(im->storage, L.size) ? nvn_dirty_since(im->storage, L.size, im->upload_stamp)
+                  : tex_content_changed(im, L.size, sub);
         static long long log_serial = -1;   // TOTK_VK_STALE_LOG=<texture serial>: the check's answers (development)
         if (log_serial == -1) { const char *e = getenv("TOTK_VK_STALE_LOG"); log_serial = e ? atoll(e) : 0; }
         if (log_serial && (long long)im->serial == log_serial)
@@ -1287,6 +1348,9 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     // again at once ("first", then "pages written": 37 of 119 slow uploads in a session, 2026-10-29).
     if (!im->vpool_gen) nvn_dirty_protect(im->storage, L.size);
     __atomic_store_n(&im->upload_stamp, nvn_dirty_now(), __ATOMIC_RELEASE);   // before reading: a write during the upload shows as dirty next time
+    // the same for the contents hash (untracked memory only; a virtual pool's addresses are not readable as such)
+    im->content_hash = !im->vpool_gen && L.size <= HASH_MAX && !nvn_dirty_tracked(im->storage, L.size) ? tex_hash(im->storage, L.size) : 0;
+    im->hash_sub = 0;
     // A texture in a virtual pool (TOTK streams world textures this way): its addresses are only reserved, the bytes
     // are in physical pools' pages mapped through the page table — gathered into a copy first. It uploads again when
     // the pages behind it are written or the mapping changes ([temporary]: any MapVirtual; Vulkan sparse binding later).

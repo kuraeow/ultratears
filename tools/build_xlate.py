@@ -29,7 +29,8 @@ def main():
     env = dict(os.environ, NUGET_PACKAGES=str(a.cache / 'nuget'), DOTNET_CLI_HOME=str(a.cache / 'dotnet-home'),
                DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1')
     proj = ROOT / 'third_party/shader_translator/ultrs-shaders.csproj'
-    rc = subprocess.run([a.dotnet, 'publish', str(proj), '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true',
+    rid = 'linux-x64' if sys.platform.startswith('linux') else 'win-x64'
+    rc = subprocess.run([a.dotnet, 'publish', str(proj), '-c', 'Release', '-r', rid, '--self-contained', 'true',
                          '-p:PublishSingleFile=true', '-p:InvariantGlobalization=true',
                          '-p:IncludeNativeLibrariesForSelfExtract=true',
                          f'-p:RyuSrc={ROOT / "third_party/maxwell_shader"}',
@@ -37,10 +38,11 @@ def main():
                          '--disable-build-servers'], env=env).returncode   # no MSBuild / compiler servers left running
     if rc:
         sys.exit(rc)
-    exe = out / 'ultrs-shaders.exe'
+    exe = out / ('ultrs-shaders.exe' if rid.startswith('win') else 'ultrs-shaders')
     for f in out.iterdir():   # one program; the debug symbols are not needed
         if f.suffix == '.pdb':
             f.unlink()
+    exe.chmod(0o755)
     sys.path.insert(0, str(ROOT / 'tools'))
     import deps_install
     (out / 'source.txt').write_text(deps_install.xlate_stamp(ROOT) + '\n')

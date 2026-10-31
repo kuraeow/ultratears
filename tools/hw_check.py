@@ -70,11 +70,21 @@ class MemoryStatus(ctypes.Structure):
 
 
 def ram_bytes():
+    if sys.platform != 'win32':
+        try:
+            return os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+        except (ValueError, OSError):
+            return 0
     m = MemoryStatus(ctypes.sizeof(MemoryStatus))
     return m.ullTotalPhys if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else 0
 
 
 def avx2():
+    if sys.platform != 'win32':   # Linux: the CPU's flags as the kernel reports them
+        try:
+            return any(line.startswith('flags') and ' avx2' in line for line in open('/proc/cpuinfo'))
+        except OSError:
+            return True
     return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))   # PF_AVX2_INSTRUCTIONS_AVAILABLE
 
 

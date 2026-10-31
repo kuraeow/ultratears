@@ -10,6 +10,8 @@ release. Each part is used from the PC when it is already there, else installed 
     holds none made from it (deps/shaders/source.txt), with the .NET 10 SDK on PATH or else one downloaded into
     deps/dotnet from Microsoft. A builder package carries a translator stamped with its own source.
 deps/installed.json records what was installed from which pins: a changed pin installs that part again.
+On Linux nothing is downloaded: the build uses this system's clang, lld and ninja, the Python running setup (3.14+
+with the packages: a venv) and a .NET 10 SDK on PATH for the translator (deps/shaders/ultrs-shaders).
 ULTRS_NO_SYSTEM_TOOLS=1 (testing what a clean PC gets): nothing installed on this PC is used.
 """
 import hashlib
@@ -32,6 +34,9 @@ CLANG64_NEEDS = ('bin/clang.exe', 'bin/clang++.exe', 'bin/ld.lld.exe', 'bin/ninj
                  'include/SDL3/SDL.h', 'include/opus/opus.h', 'include/vpx/vpx_decoder.h', 'include/vulkan/vulkan.h',
                  'include/zstd.h', 'lib/libSDL3.a', 'lib/libopus.a', 'lib/libvpx.a')
 SYSTEM = not os.environ.get('ULTRS_NO_SYSTEM_TOOLS')
+LINUX = sys.platform.startswith('linux')
+XLATE_EXE = 'ultrs-shaders' if LINUX else 'ultrs-shaders.exe'
+LINUX_TOOLS = ('clang', 'clang++', 'ld.lld', 'ninja')
 XLATE_SOURCES = ('third_party/shader_translator', 'third_party/maxwell_shader', 'tools/build_xlate.py')
 
 
@@ -203,6 +208,8 @@ def python_for(home):
     """The Python the build runs on: deps/python when installed from the current pins, else this one when it will do,
     else None (install_python must run first)."""
     m = manifest()
+    if LINUX:
+        return pathlib.Path(sys.executable) if python_ok(sys.executable) else None
     own = home / 'deps/python/python.exe'
     if own.is_file() and installed(home).get('python') in (key_of([m['python'], m['wheels']]), 'package'):
         return own
@@ -213,6 +220,9 @@ def python_for(home):
 
 def install_python(home):
     """deps/python: python.org's interpreter with the wheels unpacked into it. Runs on any Python 3."""
+    if LINUX:
+        raise DepsError(f'setup needs Python 3.14+ with {", ".join(PACKAGES)}: run it from a venv that has them '
+                        f'(python3 -m venv .venv && .venv/bin/pip install {" ".join(PACKAGES)})')
     m = manifest()
     own = (home / 'deps/python').resolve()
     if pathlib.Path(sys.executable).resolve().is_relative_to(own):
@@ -328,7 +338,7 @@ def xlate_stamp(root=ROOT):
 def xlate_ok(home):
     """A builder package carries the translator built from its commit, without the translator's sources (the link to
     them is in THIRD-PARTY-NOTICES.md): taken as it is. A source tree: rebuilt whenever its sources changed."""
-    exe, stamp = home / 'deps/shaders/ultrs-shaders.exe', home / 'deps/shaders/source.txt'
+    exe, stamp = home / 'deps/shaders' / XLATE_EXE, home / 'deps/shaders/source.txt'
     if installed(home).get('shaders') == 'package':
         return exe.is_file()
     return exe.is_file() and stamp.is_file() and stamp.read_text().strip() == xlate_stamp(home)
@@ -348,6 +358,9 @@ def system_dotnet():
 def build_xlate(home):
     m = manifest()
     dotnet = system_dotnet()
+    if dotnet is None and LINUX:
+        raise DepsError('building the shader translator needs the .NET 10 SDK on PATH (dotnet): install it with the '
+                        'system\'s package manager')
     if dotnet is None:
         own = home / 'deps/dotnet'
         if installed(home).get('dotnet') != key_of(m['dotnet']) or not (own / 'dotnet.exe').is_file():
@@ -391,13 +404,20 @@ def launcher_libs(home=ROOT):
 
 
 # ---------------------------------------------------------------- entry points
+def linux_missing():
+    return [t for t in LINUX_TOOLS if not shutil.which(t)]
+
+
 def ensure_tools(home):
     """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing."""
-    if clang64_for(home) is None:
+    if LINUX and linux_missing():
+        raise DepsError(f'missing build tools: {", ".join(linux_missing())} (install clang, lld and ninja)')
+    if not LINUX and clang64_for(home) is None:
         install_clang64(home)
     if not xlate_ok(home):
         build_xlate(home)
 
 
 def ready(home):
-    return python_for(home) is not None and clang64_for(home) is not None and xlate_ok(home)
+    tools = not linux_missing() if LINUX else clang64_for(home) is not None
+    return python_for(home) is not None and tools and xlate_ok(home)

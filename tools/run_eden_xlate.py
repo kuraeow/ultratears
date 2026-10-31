@@ -26,10 +26,14 @@ def main():
     t0 = time.time()
     procs = []
     for s in (range(1) if a.only else range(shards)):
-        p = subprocess.Popen([str(exe), str(a.dir / 'shaders.tsv'), str(a.dir / 'raw'), str(a.dir / 'eden'), str(s), str(shards)],
-                             env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=0x4 | 0x4000)
-        ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
-        ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+        if sys.platform == "win32":
+            p = subprocess.Popen([str(exe), str(a.dir / "shaders.tsv"), str(a.dir / "raw"), str(a.dir / "eden"), str(s), str(shards)],
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=0x4 | 0x4000)
+            ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(0xFF))
+            ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+        else:
+            p = subprocess.Popen([str(exe), str(a.dir / "shaders.tsv"), str(a.dir / "raw"), str(a.dir / "eden"), str(s), str(shards)],
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         procs.append(p)
     rows = []
     for p in procs:

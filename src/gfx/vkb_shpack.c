@@ -4,7 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <stdint.h>
+const void *plat_map_file(const char *path, uint64_t len, uint64_t *size);   // platform/linux.c (mmap: not reachable here)
+void plat_unmap_file(const void *p, uint64_t size);
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -21,6 +27,7 @@ static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void open_pack(void) {
     const char *path = getenv("TOTK_SHADER_PACK");
     if (!path || !*path) path = "data/shaders/translated.pack";
+#ifdef _WIN32
     HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER sz;
@@ -28,6 +35,13 @@ static void open_pack(void) {
     CloseHandle(f);
     const uint8_t *p = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : NULL;
     if (m) CloseHandle(m);   // the view keeps the mapping
+#else
+    uint64_t n = 0;
+    const uint8_t *p = plat_map_file(path, 0, &n);
+    struct { int64_t QuadPart; } sz = {(int64_t)n};
+    if (p && n < 32) { plat_unmap_file(p, n); p = NULL; }
+#define UnmapViewOfFile(p) plat_unmap_file(p, (uint64_t)sz.QuadPart)
+#endif
     if (!p) { VLOG("shader pack %s: cannot map it", path); return; }
     uint32_t version, count;
     uint64_t at;

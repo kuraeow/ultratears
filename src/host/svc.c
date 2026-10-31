@@ -10,7 +10,9 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 #include "host.h"
@@ -27,11 +29,11 @@
 #define STACK_SIZE    0x10000000ULL
 #define STACK_START   (LOW_START + STACK_OFF)
 #define HEAP_START    (LOW_START + STACK_OFF + STACK_SIZE + 0x10000000ULL)
-#define HEAP_CAP      (4ULL << 30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
+#define HEAP_CAP      (LOW_SIZE - (HEAP_START - LOW_START))
 #define ASLR_START    LOW_START
 #define ASLR_SIZE     ((1ULL << 39) - LOW_START)
 #define SYSTEM_RESOURCE_BUDGET (32ULL << 20)
-#define APP_POOL      0xcd500000ULL  /* retail application pool, 3.2 GiB (MacNativeGames' default without 2K heaps) */
+#define APP_POOL      (6ULL << 30)   /* desktop application pool */
 
 static uint64_t heap_size;
 static unsigned char alias_pages[ALIAS_SIZE / 4096];
@@ -320,10 +322,22 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, uint64_t pc) {
     }
     case 0x01: {   /* SetHeapSize */
         uint64_t size = r[1];
-        if (size > HEAP_CAP || size % 0x200000 || size + runtime_image_bytes() > APP_POOL) { r[0] = 0xd401; return r[0]; }
+        if (!size) {
+            if (heap_size && !plat_reset_guest(HEAP_START, HEAP_START + heap_size)) runtime_fail("reset guest heap");
+            heap_size = 0;
+            r[0] = 0;
+            r[1] = HEAP_START;
+            return 0;
+        }
+        uint64_t image_bytes = runtime_image_bytes();
+        if (size > HEAP_CAP || (size & 0xfff) || image_bytes > APP_POOL || size > APP_POOL - image_bytes) {
+            r[0] = 0xd401;
+            return r[0];
+        }
         if (size < heap_size) decommit(HEAP_START + size, heap_size - size);
         heap_size = size;
-        r[0] = 0; r[1] = HEAP_START;
+        r[0] = 0;
+        r[1] = HEAP_START;
         return 0;
     }
     case 0x26: {   /* Break */

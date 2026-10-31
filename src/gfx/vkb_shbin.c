@@ -12,8 +12,17 @@
 // Records are only appended: a shader translated again, or a change to the rewrites at load (its stamp), leaves the
 // old binaries behind (836 -> 1214 MiB after the depth compare clamp, 2026-10-29). After the compile-ahead pass has
 // told every shader's current stamp (vkb_shbin_mark), vkb_shbin_compact writes the file again without them.
+#ifdef _WIN32
 #include <windows.h>   // MoveFileExA
+#else
+#include <stdio.h>
+#define MoveFileExA(from, to, flags) (rename(from, to) == 0)   // (replaces the file: POSIX rename)
+#define _fseeki64(f, off, how) fseeko(f, off, how)
+#define _fileno(f) fileno(f)
+#endif
+#ifdef _WIN32
 #include <io.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

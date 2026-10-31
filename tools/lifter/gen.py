@@ -163,6 +163,7 @@ class Module:
 
     def jump_table(self, br_pc, entry, end):
         """Resolve `br xN` targets from a bounds-checked jump table, or None."""
+        self._jt_count = 0   # entries the bounds check allows (set by the emulations)
         r = self._jump_table_fallthrough(br_pc, entry, end)
         if r is None:
             r = self._jump_table_taken(br_pc, entry, end)
@@ -172,6 +173,10 @@ class Module:
         # replaced by the entries read from the image. (Adding the scanned entries to every table instead put
         # trailing data that looks like entries into 1619 of main's 2367 tables.)
         if r is not None and len(set(r)) > 1:
+            more = self._other_tables(br_pc, entry, end, self._jt_count)
+            if more - set(r):
+                self.stats['jumptables_other_bases'] += 1
+                return sorted(set(r) | more)
             return r
         s = self._jump_table_scan(br_pc, entry, end)
         if r is not None and s is not None:
@@ -186,11 +191,48 @@ class Module:
             return None
         return r if r is not None else s
 
-    def _jump_table_scan(self, br_pc, entry, end):
-        """[TOTK] A table whose bounds check the compiler hoisted far from the br (main: functions with thousands of
-        cases): `adr xB, base; adrp/add xT, table; ldr{b,h,sw} wO, [xT, xI, ...]; add xD, xB, wO, {lsl,sxt*} #k; br xD`.
-        The entries are read from the image until one points outside the function or is misaligned; trailing bytes
-        that happen to look like entries only add labels (an index the table never had is never taken)."""
+    def _other_tables(self, br_pc, entry, end, count):
+        """[TOTK] The emulation replays every adrp / adr / add-imm from the function entry in a straight line, so a table
+        register set on more than one path ends up with the last value, or a sum of them: main 0x8015b9400 indexes the
+        table in x20, which one path sets to 0x802cfe74a and another to 0x802cfe6d2, and an `add x20, x20, #0x60`
+        further down made the emulation read 0x802cfe732, half another table. The game took entry 11 of the real one
+        and stopped with "no function at 8015b9fb0" (the Great Sky Island temple). Every adrp + add of the table
+        register in the function is read as a table of `count` entries, kept if all of them are targets in the
+        function."""
+        shape = self._table_shape(br_pc, entry)
+        if shape is None or not count:
+            return set()
+        base, shift, size, signed, table_reg, _ = shape
+        if not table_reg.startswith('x') or not table_reg[1:].isdigit():
+            return set()
+        reg = int(table_reg[1:])
+        lo, hi = self.base, self.base + len(self.nso.image)
+        found = set()
+        for a in range(entry, end, 4):
+            w = self.word(a)
+            if (w & 0x9F00001F) != (0x90000000 | reg):   # ADRP xT
+                continue
+            page = (a & ~0xFFF) + (sext((bits(w, 5, 19) << 2) | bits(w, 29, 2), 21) << 12)
+            for y in range(a + 4, min(a + 4 * 8, end), 4):   # the next write of xT: ADD xT, xT, #imm
+                v = self.word(y)
+                if (v & 31) != reg:
+                    continue
+                if (v & 0xFFC00000) == 0x91000000 and bits(v, 5, 5) == reg:
+                    table = page + bits(v, 10, 12)
+                    if lo <= table and table + count * size <= hi:
+                        ts = []
+                        for k in range(count):
+                            at = table + k * size
+                            raw = int.from_bytes(self.nso.image[at - self.base:at - self.base + size], 'little', signed=signed)
+                            ts.append(base + (raw << shift))
+                        if all(entry <= t < end and t % 4 == 0 for t in ts):
+                            found.update(ts)
+                break
+        return found
+
+    def _table_shape(self, br_pc, entry):
+        """`adr xB, base; ...; ldr{b,h,sw} wO, [xT, xI, ...]; add xD, xB, wO, {lsl,sxt*} #k; br xD` near the br:
+        (base, k, entry size, signed, xT, address of the load), or None."""
         import capstone
         if not hasattr(self, '_cs'):
             self._cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
@@ -250,7 +292,19 @@ class Module:
             return None
         size = {'ldrb': 1, 'ldrsb': 1, 'ldrh': 2, 'ldrsh': 2, 'ldrsw': 4, 'ldr': 4}[i.mnemonic]
         signed = i.mnemonic.startswith('ldrs')
-        table_reg = i.reg_name(mem.mem.base)
+        return base, shift, size, signed, i.reg_name(mem.mem.base), x
+
+    def _jump_table_scan(self, br_pc, entry, end):
+        """[TOTK] A table whose bounds check the compiler hoisted far from the br (main: functions with thousands of
+        cases): `adr xB, base; adrp/add xT, table; ldr{b,h,sw} wO, [xT, xI, ...]; add xD, xB, wO, {lsl,sxt*} #k; br xD`.
+        The entries are read from the image until one points outside the function or is misaligned; trailing bytes
+        that happen to look like entries only add labels (an index the table never had is never taken)."""
+        shape = self._table_shape(br_pc, entry)
+        if shape is None:
+            return None
+        base, shift, size, signed, table_reg, x = shape
+        import capstone
+        cs = self._cs
         # table address: adrp + add on table_reg, near the br or (hoisted out of a loop) anywhere earlier in the
         # function: the closest earlier write of table_reg must be that add, and the write before it the adrp.
         def writer_before(reg, before):
@@ -378,6 +432,7 @@ class Module:
             count = limit + 1 if bits(w, 0, 4) == 9 else limit
             if count <= 0 or count > 4096:
                 continue
+            self._jt_count = count
             return self._emulate_table(br_pc, entry, end, s, bits(cw, 5, 5), count, s)
         return None
 
@@ -421,6 +476,7 @@ class Module:
         while start - 4 >= entry and cmp - (start - 4) <= 4 * 12 and self.lift(start - 4).kind in ('op', 'asm'):
             start -= 4
         idx_regs = self._index_regs(start, cmp, idx)
+        self._jt_count = count
         mu = self.emu()
         targets = []
 

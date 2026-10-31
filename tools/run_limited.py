@@ -17,13 +17,24 @@ def main():
         cpus, args = int(args[1]), args[2:]
     if args[:1] == ['--']:
         args = args[1:]
-    env = dict(os.environ, PATH=r'C:\msys64\clang64\bin' + os.pathsep + os.environ['PATH'])
-    p = subprocess.Popen(args, env=env, creationflags=0x4 | 0x4000)   # CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS
-    if not ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t((1 << cpus) - 1)):
-        p.kill()
-        sys.exit('SetProcessAffinityMask failed')
-    ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
-    sys.exit(p.wait())
+    if sys.platform == "win32":
+        env = dict(os.environ, PATH=r"C:\msys64\clang64\bin" + os.pathsep + os.environ.get("PATH", ""))
+        p = subprocess.Popen(args, env=env, creationflags=0x4 | 0x4000)   # CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS
+        if not ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t((1 << cpus) - 1)):
+            p.kill()
+            sys.exit("SetProcessAffinityMask failed")
+        ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+        sys.exit(p.wait())
+    else:
+        def preexec():
+            try:
+                os.nice(10)
+                if hasattr(os, "sched_setaffinity"):
+                    os.sched_setaffinity(0, set(range(cpus)))
+            except Exception:
+                pass
+        p = subprocess.Popen(args, preexec_fn=preexec)
+        sys.exit(p.wait())
 
 
 if __name__ == '__main__':
