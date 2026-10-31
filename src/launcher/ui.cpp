@@ -1255,7 +1255,7 @@ static void screen_play() {
         return;
     }
     float top = 80, y = top + 20;
-    text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_lang"));
+    text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_ui_lang"));
     float cy = top + 52;
     if (g_tab == 0) {
         row_label(cy, "row_window");
@@ -1282,9 +1282,22 @@ static void screen_play() {
         bool on = !(vs == "0" || vs == "off");
         if (toggle("vsync", 748, cy, on))
             cfg_set("vsync", on ? "off" : "");
-    } else {
+    } else {   // the launcher's language (it was the header's button on the other screens), then the game's
+        static const Opt UI_LANGS[] = {{"ru", "Русский"}, {"en", "English"}};
+        row_label(cy, "row_ui_text");
+        int k = dropdown("ui_lang", 748, cy, 0, UI_LANGS, g_lang == LANG_RU ? 0 : 1);
+        if (k >= 0) {
+            g_lang = lang_from_code(UI_LANGS[k].value);
+            save();
+        }
+        DL->ChannelsSetCurrent(0);
+        DL->AddRectFilled(P(36, top), P(764, cy + 28), C_CARD, 10 * S);
+        DL->ChannelsSetCurrent(1);
+        top = cy + 36;
+        text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T("sec_game_lang"));
+        cy = top + 52;
         row_label(cy, "row_text");
-        int k = dropdown("lang", 748, cy, 0, LANG_OPTS, opt_index(LANG_OPTS, cfg_get("lang")));
+        k = dropdown("lang", 748, cy, 0, LANG_OPTS, opt_index(LANG_OPTS, cfg_get("lang")));
         if (k >= 0)
             cfg_set("lang", LANG_OPTS[k].value);
     }
