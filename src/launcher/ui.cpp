@@ -1129,18 +1129,28 @@ template <size_t N> static int dropdown(const char *id, float x_right, float cy,
     bool hov, down;
     char pid[64];
     SDL_snprintf(pid, sizeof pid, "dd_%s", id);
-    if (hit(id, x, y, w, 32, &hov, &down))
+    extern const char *g_demo_open;   // development: a list opened for a screenshot (ui_demo)
+    if (hit(id, x, y, w, 32, &hov, &down) || (g_demo_open && !SDL_strcmp(g_demo_open, id))) {
         ImGui::OpenPopup(pid);
+        g_demo_open = nullptr;
+    }
     bool open = ImGui::IsPopupOpen(pid);
     DL->AddRectFilled(P(x, y), P(x_right, y + 32), hov || open ? C_FIELD_HOVER : C_FIELD, 6 * S);
     text(g_media.control, x + 12, cy - g_media.control->FontSize / S / 2, C_TEXT, sel >= 0 ? opt_label(opts[sel]) : "");
     icon(g_media.chevron, x_right - 12 - 14, cy - 7, 14);
     int chosen = -1;
-    float lh = 30, ph = SDL_min(N * lh + 8, 248.0f), py = cy + 20 + ph > 470 ? y - 4 - ph : cy + 20;
+    // The list stays inside the window (SDL_Renderer draws no windows of its own outside it): it opens on the side with
+    // more room, as tall as that room allows, and scrolls the rest.
+    float lh = 30, want = N * lh + 8, wh = ImGui::GetIO().DisplaySize.y;
+    float below = (wh - P(x, y + 36).y) / S - 8, above = P(x, y - 4).y / S - 8;
+    bool open_down = below >= want || below >= above;
+    float ph = SDL_min(want, SDL_max(lh + 8, open_down ? below : above)), py = open_down ? y + 36 : y - 4 - ph;
     ImGui::SetNextWindowPos(P(x, py));
     ImGui::SetNextWindowSize(ImVec2(w * S, ph * S));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (ImGui::BeginPopup(pid)) {
+        if (ImGui::IsWindowAppearing() && sel >= 0 && want > ph)   // the chosen item in view
+            ImGui::SetScrollY(SDL_max(0.0f, (4 + lh * sel - (ph - lh) / 2) * S));
         ImDrawList *keep = DL;
         ImVec2 keep_o = O;
         DL = ImGui::GetWindowDrawList();
@@ -1529,6 +1539,8 @@ void ui_frame(float scale) {
 
 // Development: a screen with sample data, for screenshots (ULTRS_LAUNCHER_DEMO=<name>, main.cpp): dump, dump_bad,
 // dump_ok, build, hw, failed, done, play.
+const char *g_demo_open;
+
 void ui_demo(const char *name) {
     std::string n = name;
     auto events = [](std::initializer_list<const char *> lines) {
@@ -1582,6 +1594,7 @@ void ui_demo(const char *name) {
         U.screen = SCR_PLAY;
         g_tab = n == "play_lang" ? 1 : n == "play_debug" || n == "play_full" ? 2 : 0;
         g_full_q = n == "play_full";
+        if (n == "play_lang") g_demo_open = SDL_getenv("ULTRS_LAUNCHER_DEMO_OPEN");
         if (n == "play_upd" || n == "play_lang") {
             U.upd.version = "0.3.0", U.upd.page = ULTRS_REPO "/releases";
             U.has_upd = true;
