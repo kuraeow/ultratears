@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is boot.c's; SDL only gets SDL_SetMainReady
 #include <SDL3/SDL_main.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,24 @@ static int32_t stick(Sint16 v, int invert) {
     int32_t x = invert ? -(int32_t)v : v;
     return x > 32767 ? 32767 : x < -32767 ? -32767 : x;
 }
+/* The stick dead zone (GitHub #39: with an Xbox One pad Link walked right on his own): on the Switch the HID service
+   takes a resting stick's offset off before the game sees it, SDL gives the raw position. A radial dead zone of
+   TOTK_STICK_DEADZONE percent of the travel (default 10, 0..50) reads as centred, and the rest is scaled so the stick
+   still goes from 0 to full beyond it, without a jump at its edge. */
+static void dead_zone(int32_t *x, int32_t *y) {
+    static double dz = -1;
+    if (dz < 0) {
+        const char *e = getenv("TOTK_STICK_DEADZONE");
+        double v = e ? atof(e) : 10;
+        dz = (v >= 0 && v <= 50 ? v : 10) / 100 * 32767;
+        if (e) fprintf(stderr, "[totk] stick dead zone %.0f %% (TOTK_STICK_DEADZONE)\n", dz * 100 / 32767);
+    }
+    double r = sqrt((double)*x * *x + (double)*y * *y);
+    if (r <= dz) { *x = *y = 0; return; }
+    double k = r >= 32767 ? 32767 / r : (r - dz) / (32767 - dz) * 32767 / r;
+    *x = (int32_t)(*x * k);
+    *y = (int32_t)(*y * k);
+}
 static void pad_update(void) {
     RuntimeGamepadState s = {0};
     if (pad) {
@@ -63,6 +82,8 @@ static void pad_update(void) {
         s.ly = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), 1);
         s.rx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), 0);
         s.ry = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY), 1);
+        dead_zone(&s.lx, &s.ly);
+        dead_zone(&s.rx, &s.ry);
         s.connected = 1;
     }
     runtime_gamepad_set(&s);
