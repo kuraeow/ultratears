@@ -418,7 +418,12 @@ def step_shaders(dump, state, cpus):
     out = DATA / 'shaders'
     pack = out / 'translated.pack'
     export = tree_hash([ROOT / 'tools/shaders/inventory.py', ROOT / 'tools/export_shaders.py'])
-    xlate = sha256(toolchain.XLATE)[:16]
+    # Gathers on AMD and Intel round the other way from Maxwell: the translator biases their coordinates
+    # (TOTK_GATHER_BIAS, its QueryHostGatherBiasPrecision); a changed card translates again.
+    if 'TOTK_GATHER_BIAS' not in os.environ:
+        import hw_check
+        os.environ['TOTK_GATHER_BIAS'] = '0' if hw_check.game_gpu_vendor() in (None, 0x10de) else '8'
+    xlate = sha256(toolchain.XLATE)[:16] + ('' if os.environ['TOTK_GATHER_BIAS'] == '0' else '-g' + os.environ['TOTK_GATHER_BIAS'])
     if state.get('shaders-pack') == f'{export}/{xlate}' and pack.is_file():
         return 'up to date'
     old = out / 'ryujinx'

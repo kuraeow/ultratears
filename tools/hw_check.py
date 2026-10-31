@@ -34,6 +34,14 @@ AMD = 0x1002
 RANK = {'discrete': 0, 'integrated': 1, 'virtual': 2, 'other': 3, 'CPU': 9}
 
 
+def game_gpu_vendor():
+    """The PCI vendor id of the card the game takes (as gpu_cases picks it), or None."""
+    details = []
+    found = gpu_check.gpus(details=details)
+    ok = [(f, d) for f, d in zip(found or [], details) if f[1] != 'CPU' and not f[3]]
+    return min(ok, key=lambda c: RANK.get(c[0][1], 5))[1]['vendor'] if ok else None
+
+
 def gpu_cases():
     details = []
     found = gpu_check.gpus(details=details)
