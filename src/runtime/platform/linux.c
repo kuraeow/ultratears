@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/ucontext.h>
@@ -206,6 +207,14 @@ static void log_to_file(void) {
     dir[n] = 0;
     char *slash = strrchr(dir, '/');
     if (slash) *slash = 0;
+    // linux/ultratears beside the data (a build on a PC or with the AppImage; host/boot.c): the game folder above, where
+    // ultratears.cfg is and where the log is on Windows
+    struct stat cfg;
+    char up[1100];
+    if ((slash = strrchr(dir, '/')) && !strcmp(slash + 1, "linux")) {
+        snprintf(up, sizeof up, "%.*s/ultratears.cfg", (int)(slash - dir), dir);
+        if (stat(up, &cfg) == 0) *slash = 0;
+    }
     if (force && strcmp(force, "1") != 0) snprintf(g_log_path, sizeof g_log_path, "%s", force);
     else snprintf(g_log_path, sizeof g_log_path, "%s/ultratears.log", dir);
     bool append = getenv("TOTK_LOG_APPEND") != NULL;
@@ -240,6 +249,10 @@ void plat_debug_console(int debug) { (void)debug; }   // a terminal, if any, is 
 void plat_init(void) {
     log_to_file();
     require_cpu();
+    // The timer slack (how late the kernel may wake a sleeping thread to batch wakeups, 50 us by default) down to 1 us:
+    // the frame pacing sleeps to a deadline (plat_sleep_until_ns), as Windows' 1 ms timer resolution does. Threads
+    // started afterwards inherit it. (As totk-pc-recomp's platform/linux.c plat_timer_1ms, MIT.)
+    prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0);
 }
 
 // (inside an AppImage: the binary in its mount, which stays mounted while this process lives - re-exec included)
@@ -340,6 +353,16 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     if (headless && *headless && strcmp(headless, "0") != 0) {
         _exit(1);
     }
+}
+
+// A signal stack for the calling thread (a signal stack is per thread), so the fault and crash handlers still run when
+// its own stack is exhausted. Never freed: threads that end are few, and a stack freed while a handler might run on it
+// would be worse. (As totk-pc-recomp's platform/linux.c alt_stack, MIT.)
+void plat_thread_start(void) {
+    stack_t cur;
+    if (!sigaltstack(NULL, &cur) && !(cur.ss_flags & SS_DISABLE)) return;
+    stack_t ss = {.ss_sp = malloc(1 << 16), .ss_size = 1 << 16};
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
 }
 
 void plat_crash_handler_install(void) {

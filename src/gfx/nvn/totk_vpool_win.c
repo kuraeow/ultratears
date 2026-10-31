@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #ifndef _WIN32
+#include <errno.h>
 #include <sys/mman.h>
 #define MEM_RESERVE 0x2000
 #define MEM_COMMIT 0x1000
@@ -19,7 +20,7 @@ static inline int VirtualFree(void *addr, size_t size, int type) {
     (void)size; (void)type;
     return munmap(addr, size);
 }
-static inline unsigned long GetLastError(void) { return 0; }
+static inline unsigned long GetLastError(void) { return (unsigned long)errno; }   // (the errno of the mmap)
 #endif
 // [Windows port] NVN physical / virtual memory pools (the API of MacNativeGames' totk_vpool.h).
 // MacNativeGames maps a virtual pool's 64 KiB pages onto physical pools' pages a second time (mach_vm_remap). Windows

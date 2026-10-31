@@ -1361,7 +1361,13 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (!im->vpool_gen) nvn_dirty_protect(im->storage, L.size);
     __atomic_store_n(&im->upload_stamp, nvn_dirty_now(), __ATOMIC_RELEASE);   // before reading: a write during the upload shows as dirty next time
     // the same for the contents hash (untracked memory only; a virtual pool's addresses are not readable as such)
-    im->content_hash = !im->vpool_gen && L.size <= HASH_MAX && !nvn_dirty_tracked(im->storage, L.size) ? tex_hash(im->storage, L.size) : 0;
+    // Only game memory (the guest window, runtime/rt.h GUEST_LO..GUEST_HI): a pool the CPU cannot access has its storage
+    // in our own memory, which the game never writes, and its layout's size may run past that allocation's end (a
+    // texture at the end of the pool: the first Linux run read past it and faulted, 2026-11-01).
+    uintptr_t at = (uintptr_t)im->storage;
+    int game_memory = at >= 0x0800000000ull && at + L.size <= 0x8000000000ull;
+    im->content_hash = game_memory && !im->vpool_gen && L.size <= HASH_MAX && !nvn_dirty_tracked(im->storage, L.size)
+                       ? tex_hash(im->storage, L.size) : 0;
     im->hash_sub = 0;
     // A texture in a virtual pool (TOTK streams world textures this way): its addresses are only reserved, the bytes
     // are in physical pools' pages mapped through the page table — gathered into a copy first. It uploads again when

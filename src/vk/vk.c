@@ -1,5 +1,6 @@
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 // The shared Vulkan instance and device (see vk.h).
 #include "vk.h"
@@ -56,7 +57,24 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeve
     return VK_FALSE;
 }
 
+// Mesa's drivers (RADV on the Steam Deck) keep a shader cache of their own beside ours, by default in ~/.cache and up to
+// 1 GB. A Deck's /home is small and the game usually sits on the SD card: unless MESA_SHADER_CACHE_DIR names a folder,
+// it goes to mesa-cache in the game folder. Read by the driver when the device is made, so set before the instance.
+// (As totk-pc-recomp's vk_device.c mesa_cache_beside_exe, MIT.)
+static void mesa_cache_beside_game(void) {
+#ifndef _WIN32
+    if (getenv("MESA_SHADER_CACHE_DIR")) return;
+    char dir[4096];
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 16);
+    char *cut = n > 0 ? (dir[n] = 0, strrchr(dir, '/')) : NULL;
+    if (!cut) return;
+    strcpy(cut + 1, "mesa-cache");
+    setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+#endif
+}
+
 static int create_instance(SDL_Window *window) {
+    mesa_cache_beside_game();
     PFN_vkGetInstanceProcAddr gipa = NULL;
     if (window) gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     else {   // no window (TOTK_HEADLESS): SDL's video subsystem is not up, so the loader is loaded here

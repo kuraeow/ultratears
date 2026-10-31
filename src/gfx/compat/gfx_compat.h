@@ -1,4 +1,5 @@
-// Windows stand-ins for the macOS APIs MacNativeGames' graphics front end (d2r_gfx/gfx/nvn) uses.
+// Windows (and, where Linux lacks them, Linux) stand-ins for the macOS APIs MacNativeGames' graphics front end
+// (d2r_gfx/gfx/nvn) uses. The POSIX ones (mmap, sigsetjmp, getrusage) are stand-ins on Windows only.
 // - Mach time: mach_absolute_time() is the runtime's monotonic nanoseconds (timebase 1/1), mach_wait_until() sleeps
 //   precisely until such a time.
 // - Mach thread/task statistics and real-time thread policies: unavailable (KERN_FAILURE); MacNativeGames only logs
@@ -91,6 +92,14 @@ static inline int pthread_attr_set_qos_class_np(pthread_attr_t *a, qos_class_t q
 static inline int pthread_set_qos_class_self_np(qos_class_t q, int r) { (void)q; (void)r; return 0; }
 static inline int pthread_get_qos_class_np(pthread_t t, qos_class_t *q, int *r) { (void)t; *q = QOS_CLASS_UNSPECIFIED; *r = 0; return 0; }
 
+#ifdef __linux__
+// Linux has the POSIX calls themselves: the stand-ins below are Windows'. (They were applied on Linux too: every mmap
+// of the graphics code failed there, a physical pool's storage among them, and siglongjmp out of a fault handler left
+// SIGSEGV blocked, so the next fault would end the game; found on the first Linux run, 2026-11-01.)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#define malloc_size(p) malloc_usable_size(p)
+#else
 // ---- signals and guarded reads
 #ifndef SIGBUS
 #define SIGBUS 10
@@ -105,11 +114,7 @@ struct rusage { struct { long tv_sec, tv_usec; } ru_utime, ru_stime; long ru_max
 static inline int getrusage(int who, struct rusage *r) { (void)who; memset(r, 0, sizeof *r); return -1; }
 
 // ---- memory
-#ifdef __linux__
-#define malloc_size(p) malloc_usable_size(p)
-#else
 #define malloc_size(p) _msize(p)
-#endif
 #define PROT_NONE 0
 #define PROT_READ 1
 #define PROT_WRITE 2
@@ -119,7 +124,6 @@ static inline int getrusage(int who, struct rusage *r) { (void)who; memset(r, 0,
 static inline void *mmap(void *a, size_t n, int p, int f, int fd, long o) { (void)a; (void)n; (void)p; (void)f; (void)fd; (void)o; return MAP_FAILED; }
 static inline int munmap(void *a, size_t n) { (void)a; (void)n; return -1; }
 static inline int mprotect(void *a, size_t n, int p) { (void)a; (void)n; (void)p; return -1; }
-#ifndef __linux__
 static inline int getpagesize(void) { return 4096; }
 #endif
 

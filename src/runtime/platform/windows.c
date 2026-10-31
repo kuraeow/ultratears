@@ -206,6 +206,8 @@ void plat_sleep_until_ns(uint64_t t) {
 // game's audio threads stay above it.
 void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 
+void plat_thread_start(void) {}   // the vectored exception handler needs no stack of its own
+
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
