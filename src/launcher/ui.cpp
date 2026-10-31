@@ -387,21 +387,34 @@ static Row *row_of(const std::string &id) {   // tools and check share the first
 // screen, the full rebuild and the steps' "may take".
 // A build for the Steam Deck as well: the game compiled twice, the Deck's shaders, the tar (setup.py step_weights:
 // 162 of 100 for both platforms, 106 for the Deck alone); measured on this PC for a Windows build
-static double deck_factor() { return !for_deck() ? 1 : U.platform == "both" ? 1.62 : 1.06; }
-static double measured_secs() {
+// for a platform choice; "" the one chosen (U.platform)
+static double deck_factor(const std::string &p = "") {
+#ifndef _WIN32
+    (void)p;
+    return 1;   // on Linux the game is built for this machine alone
+#else
+    const std::string &q = p.empty() ? U.platform : p;
+    return q == "both" ? 1.62 : q == "linux" ? 1.06 : 1;
+#endif
+}
+// The measured time as a build for Windows alone (a build with the Deck divided back by its factor)
+static double windows_secs() {
     Json st = setup_state();
     double secs = st["full_secs"].num(0);
-    bool deck = false;   // measured for a build with the Deck already
+    bool win = false, lin = false;
     for (size_t i = 0; i < st["platforms"].size(); i++)
-        deck |= st["platforms"][i].str() == "linux";
-    return deck ? secs : secs * deck_factor();
+        win |= st["platforms"][i].str() == "windows", lin |= st["platforms"][i].str() == "linux";
+    return secs / deck_factor(lin ? (win ? "both" : "linux") : "windows");
 }
+static double measured_secs(const std::string &p = "") { return windows_secs() * deck_factor(p); }
 static double est_total_secs() { return measured_secs() > 0 ? measured_secs() : 35 * 60 * deck_factor(); }
 
-static void wait_range(long *lo, long *hi) {   // in minutes, rounded to 5
-    double m = measured_secs() / 60;
+// In minutes, rounded to 5, of a build from nothing for platform p ("" the one chosen; the Debug tab's card: "windows",
+// the platform being picked after it in its list).
+static void wait_range(long *lo, long *hi, const std::string &p = "") {
+    double m = measured_secs(p) / 60;
     if (m <= 0)
-        m = 35 * deck_factor();
+        m = 35 * deck_factor(p);
     *lo = SDL_max((long)(m * 0.9 / 5) * 5, 5L);
     *hi = SDL_max(((long)(m * 1.15) + 4) / 5 * 5, *lo + 5);
 }
@@ -1406,8 +1419,8 @@ static void screen_debug() {
     if (!U.can_build)
         return;   // the Steam Deck's tar: the PC rebuilds it
     top = 320;   // the full rebuild: its own card, just above Play (the design) whichever way Debug mode is
-    long lo, hi;
-    wait_range(&lo, &hi);
+    long lo, hi;   // the card: for this PC; the question: for the platform picked from the list
+    wait_range(&lo, &hi, g_full_q ? g_full_platform : "windows");
     std::string range = Tf("full_time", {{"lo", std::to_string(lo)}, {"hi", std::to_string(hi)}});
     text(g_media.label, 52, top + 22 - g_media.label->FontSize / S / 2, C_TEXT, T("full_title"));
     if (!g_full_q) {
