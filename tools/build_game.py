@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import CLANG64, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
-RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c', 'src/runtime/logcost.c']
+RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c', 'src/runtime/logcost.c', 'src/runtime/envcache.c']
 TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
            'ultratears': ['src/host/boot.c', 'src/host/guest.c', 'src/host/svc.c', 'src/host/threads.c', 'src/host/ipc.c',
                     'src/host/services_lm.c', 'src/host/overrides_oe.c',
@@ -36,8 +36,9 @@ GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_e
        'src/gfx/vkb_draw.c', 'src/gfx/tex/nvn_deswizzle.c', 'src/gfx/tex/astc.c', 'src/gfx/vkb_bc7.c',
        'src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/tex/bc7enc/rgbcx.cpp', 'src/gfx/tex/bc7key.c']
 GFX_INCLUDES = '-Isrc/gfx -Isrc/gfx/nvn -Isrc/gfx/nvn/include -Isrc/gfx/compat'
-# --wrap: the log's writes go through src/runtime/logcost.c, which times them for the long-frame line
-LIBS = '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -lzstd -liconv' \
+# --wrap: the log's writes go through src/runtime/logcost.c, which times them for the long-frame line; getenv
+# answers from src/runtime/envcache.c's table
+LIBS = '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc,--wrap=getenv -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -lzstd -liconv' \
        ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++'
 CFLAGS = '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64'
 GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'

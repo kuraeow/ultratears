@@ -253,6 +253,7 @@ __attribute__((constructor(102))) static void log_to_file_without_console(void) 
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("TOTK_LOG_APPEND=1");
+    { void runtime_env_changed(void); runtime_env_changed(); }
 }
 
 // The console window only in Debug mode (the launcher's, debug=1 / --debug: TOTK_STATS; the user's choice 2026-10-31).

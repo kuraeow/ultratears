@@ -2336,12 +2336,17 @@ uint64_t mtl_sub_commit(void) {
 // command buffer (GPU start time, captured uniforms, the move into the prologue's layouts), the prologue, and for each
 // chunk its move and itself, then the end (copies back).
 // [temporary] Mirrors of written storage buffers are not made (one thread only); TOTK_VK_RECORD_THREADS=1 records as before.
-// A pass longer than MT_SPLIT draws (the Great Sky Island's G-buffer pass: ~2100 draws, one chunk of 12 of the
+// A pass longer than 5/4 of the chunk size (the Great Sky Island's G-buffer pass: ~2100 draws, one chunk of 12 of the
 // submission's 14 ms while the other threads waited) is cut inside: the chunk ends its pass and the next one begins it
 // again with LOAD (every pass loads its targets), after the barrier between chunks. Depth-only passes (the shadow maps,
 // ~1100 draws) are not cut: with them cut the sun's shadows went missing in one autotest of two (2026-10-27, not
 // understood yet).
-enum { MT_DRAWS = 400, MT_SPLIT = 500 };
+// The chunk size follows the threads: a submission waits for its longest chunk, so about four chunks a thread of the
+// previous submission's draws (2026-10-31, the Depths run: chunks of ~490 draws, the longest 8.5 ms of a 10 ms
+// submission while three threads waited), between MT_MIN and MT_DRAWS; TOTK_VK_CHUNK_DRAWS=<n> sets it.
+enum { MT_DRAWS = 400, MT_MIN = 96 };
+static int g_chunk_draws = MT_DRAWS;   // this submission's: a chunk ends at a render target change after it, inside a pass after 5/4 of it
+static uint64_t g_prev_draws;          // the draws of the previous submission
 struct mt_chunk {
     int h0, h1; const uint8_t *p0, *p1;   // its first command, and the one after its last (h1 == the handle count: the end)
     uint64_t seq;                         // the position before its first command
@@ -2524,8 +2529,8 @@ static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends b
 static int walk_op(const uint8_t *p, int hidx) {   // before a command at depth 0: a new chunk at a render target change
     op_hdr h;
     memcpy(&h, p, sizeof h);
-    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= MT_SPLIT && g_rt.n > 0;   // inside a pass with colour targets
-    if (((h.op == OP_SET_RT && g_mt_draws >= MT_DRAWS) || split) && g_nch < MT_MAXCH - 1) {
+    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= (uint64_t)g_chunk_draws * 5 / 4 && g_rt.n > 0;   // inside a pass with colour targets
+    if (((h.op == OP_SET_RT && g_mt_draws >= (uint64_t)g_chunk_draws) || split) && g_nch < MT_MAXCH - 1) {
         chunk_close(hidx, p);
         chunk_open(hidx, p);
     }
@@ -2595,7 +2600,7 @@ static void glue(VkCommandBuffer cb, vkb_trk *t) {
 
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits
     uint64_t t0 = runtime_now_ns();
-    static uint64_t walk_ns, wall_ns, subs, chunks, said_at, glue_images, longest_ns, longest_draws;
+    static uint64_t walk_ns, wall_ns, subs, chunks, said_at, glue_images, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
     static int started;
     if (!started) {
         started = 1;
@@ -2606,6 +2611,12 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
         }
     }
     g_mt_h = h; g_mt_n = n;
+    {
+        static int fixed = -1;
+        if (fixed < 0) { const char *e = getenv("TOTK_VK_CHUNK_DRAWS"); fixed = e ? atoi(e) : 0; if (fixed < 0) fixed = 0; }
+        uint64_t want = g_prev_draws / (uint64_t)(g_mt_threads * 4);
+        g_chunk_draws = fixed ? fixed : want < MT_MIN ? MT_MIN : want > MT_DRAWS ? MT_DRAWS : (int)want;
+    }
     pthread_mutex_lock(&g_mt_mu);
     g_mt_avail = g_mt_next = g_mt_done = 0;
     g_nch = 0;
@@ -2620,6 +2631,7 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     shadow_presync();
     t_recording = 0;
     uint64_t tw = runtime_now_ns();
+    pro_ns += tw - t0;
     // the walk, from where the last one ended
     if (g_walk_have) { vkb_state_load(g_walk_state); g_rt = g_walk_rt; g_render_off = g_walk_off; vkb_copy_stride(g_walk_stride); }
     g_in_pass = 0;
@@ -2629,12 +2641,15 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     if (!g_walk_state && !(g_walk_state = malloc(vkb_state_size()))) die("walk state");
     vkb_state_save(g_walk_state);
     g_walk_rt = g_rt; g_walk_off = g_render_off; g_walk_stride = vkb_copy_stride_get(); g_walk_have = 1;
-    walk_ns += runtime_now_ns() - tw;
+    uint64_t tr = runtime_now_ns();
+    walk_ns += tr - tw;
     // this thread records chunks too, then waits for the others
     for (int k; (k = mt_take()) >= 0;) { mt_record(&g_ch[k]); mt_recorded(); }
     pthread_mutex_lock(&g_mt_mu);
     while (g_mt_done < g_nch) pthread_cond_wait(&g_mt_done_cv, &g_mt_mu);
     pthread_mutex_unlock(&g_mt_mu);
+    uint64_t tt = runtime_now_ns();
+    rec_ns += tt - tr;
     // in order: the slot's command buffer moves images into the prologue's layouts, then each chunk's move and the chunk
     vk.vkEndCommandBuffer(g_pro_cb);
     glue(g_slots[g_cur].cb, &g_pro_trk);
@@ -2651,11 +2666,14 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     g_mt_list[g_mt_nlist++] = wp_get(g_cur, VKB_MAXREC);   // the end
     mtl_sub_commit();
     g_mt_nlist = 0;
-    wall_ns += runtime_now_ns() - t0;
+    uint64_t te = runtime_now_ns();
+    tail_ns += te - tt;
+    wall_ns += te - t0;
     subs++; chunks += (uint64_t)g_nch;
     {   // the longest chunk: the submission waits for it
-        uint64_t mx = 0, md = 0;
-        for (int i = 0; i < g_nch; i++) if (g_ch[i].ns > mx) { mx = g_ch[i].ns; md = g_ch[i].draws; }
+        uint64_t mx = 0, md = 0, all = 0;
+        for (int i = 0; i < g_nch; i++) { all += g_ch[i].draws; if (g_ch[i].ns > mx) { mx = g_ch[i].ns; md = g_ch[i].draws; } }
+        if (all > 200) g_prev_draws = all;   // small submissions (a copy, a clear) keep the size of the frame's
         longest_ns += mx; longest_draws += md;
     }
     if (dm_stats() && subs >= said_at + 600) {   // the log line: where a submission's recording time goes
@@ -2665,7 +2683,9 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
         VLOG("recording threads: per submission %.1f ms until submitted (walk %.1f ms), chunks %.1f, chunk recording %.1f ms in all "
              "threads, the longest chunk %.1f ms (%.0f draws), images moved between chunks %.0f", wall_ns / 1e6 / 600, walk_ns / 1e6 / 600,
              chunks / 600.0, (rec - prev_rec) / 1e6 / 600, longest_ns / 1e6 / 600, longest_draws / 600.0, glue_images / 600.0);
-        prev_rec = rec; wall_ns = walk_ns = chunks = glue_images = longest_ns = longest_draws = 0;
+        VLOG("recording threads: phases per submission: prologue %.1f ms, walk %.1f, chunks until the last is recorded %.1f, "
+             "glue and submit %.1f", pro_ns / 1e6 / 600, walk_ns / 1e6 / 600, rec_ns / 1e6 / 600, tail_ns / 1e6 / 600);
+        prev_rec = rec; wall_ns = walk_ns = chunks = glue_images = longest_ns = longest_draws = pro_ns = rec_ns = tail_ns = 0;
     }
 }
 

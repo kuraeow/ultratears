@@ -14,11 +14,14 @@
 ssize_t pread(int fd, void *buf, size_t n, off_t off);
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off);
 
+void runtime_env_changed(void);   // runtime/envcache.c: getenv's table forgets what it kept
 static inline int setenv(const char *k, const char *v, int overwrite) {
     if (!overwrite && getenv(k)) return 0;
-    return _putenv_s(k, v);
+    int r = _putenv_s(k, v);
+    runtime_env_changed();
+    return r;
 }
-static inline int unsetenv(const char *k) { return _putenv_s(k, ""); }
+static inline int unsetenv(const char *k) { int r = _putenv_s(k, ""); runtime_env_changed(); return r; }
 
 static inline int fsync(int fd) { return _commit(fd); }
 
