@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import sys
+import tarfile
 import zipfile
 import zlib
 
@@ -69,6 +70,41 @@ def remove(path, moved):
         d.rmdir()
 
 
+class Package:
+    """The builder package's files, from the Windows zip or the Linux tar.gz alike: infos (filename, file_size, CRC,
+    mode, link: a link's target or None) and read(info)."""
+    class Info:
+        def __init__(self, filename, size, crc, mode, link, member):
+            self.filename, self.file_size, self.CRC, self.mode, self.link, self.member = filename, size, crc, mode, link, member
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        if str(self.path).endswith('.tar.gz'):
+            self.t = tarfile.open(self.path, 'r:gz')
+            self.z = None
+            self.infos = []
+            for m in self.t.getmembers():   # the CRC the zip carries: computed here, the files are read anyway
+                if m.isfile():
+                    data = self.t.extractfile(m).read()
+                    self.infos.append(self.Info(m.name, m.size, zlib.crc32(data), m.mode, None, data))
+                elif m.issym():
+                    self.infos.append(self.Info(m.name, 0, 0, m.mode, m.linkname, None))
+        else:
+            self.t = None
+            self.z = zipfile.ZipFile(self.path)
+            self.infos = [self.Info(i.filename, i.file_size, i.CRC, i.external_attr >> 16, None, i)
+                          for i in self.z.infolist() if not i.is_dir()]
+        return self
+
+    def read(self, info):
+        return info.member if self.t else self.z.read(info.member)
+
+    def __exit__(self, *exc):
+        (self.t or self.z).close()
+
+
 def main():
     global ROOT
     ap = argparse.ArgumentParser()
@@ -79,8 +115,8 @@ def main():
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     moved = []
     try:
-        with zipfile.ZipFile(a.zip) as z:
-            infos = [i for i in z.infolist() if not i.is_dir()]
+        with Package(a.zip) as z:
+            infos = z.infos
             top = {i.filename.split('/', 1)[0] for i in infos}
             if len(top) != 1 or not any(i.filename.endswith('/tools/setup.py') for i in infos):
                 raise ValueError('not an UltraTears builder package')
@@ -94,8 +130,17 @@ def main():
             total, done, changed = sum(i.file_size for i in files.values()), 0, 0
             for rel, info in sorted(files.items()):
                 dst = ROOT / rel
-                if not same(dst, info):
+                if info.link is not None:   # a link of the Linux package (deps/llvm/bin/clang -> clang-23)
+                    if not (dst.is_symlink() and os.readlink(dst) == info.link):
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        if dst.is_symlink() or dst.exists():
+                            dst.unlink()
+                        os.symlink(info.link, dst)
+                        changed += 1
+                elif not same(dst, info):
                     put(dst, z.read(info), moved)
+                    if info.mode & 0o111:   # the Linux package's programs keep their executable bit
+                        dst.chmod(info.mode & 0o777)
                     changed += 1
                 done += info.file_size
                 emit('progress', label='update', done=done, total=total, eta=None)
@@ -109,7 +154,7 @@ def main():
                 removed += 1
         if LISTING not in files:   # a package from before the listing: keep one for the next update
             old.write_text('\n'.join(sorted(files)) + '\n', encoding='utf-8')
-    except (OSError, ValueError, zipfile.BadZipFile) as e:
+    except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as e:
         emit('error', id='update', code='update', args={}, message=str(e))
         return 1
     finally:

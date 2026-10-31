@@ -244,7 +244,12 @@ static int check_thread(void *) {
             const Json &assets = r["assets"];
             for (size_t k = 0; k < assets.size(); k++) {
                 std::string name = assets[k]["name"].str(), digest = assets[k]["digest"].str();
-                if (name.find("-builder-") == std::string::npos || name.find("windows-x86_64.zip") == std::string::npos ||
+#ifdef _WIN32
+                const char *mine = "windows-x86_64.zip";
+#else
+                const char *mine = "linux-x86_64.tar.gz";   // the Linux builder package (tools/make_package_linux.py)
+#endif
+                if (name.find("-builder-") == std::string::npos || name.find(mine) == std::string::npos ||
                     digest.rfind("sha256:", 0) != 0)   // no hash, no update
                     continue;
                 int v[3];
