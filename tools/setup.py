@@ -723,7 +723,11 @@ def step_deck(dump, state, cpus):
         return 'not for the Steam Deck'
     pack = deck_pack(state)
     appimage = deps_install.linux_package(ROOT)
-    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, appimage,
+    if appimage is None:   # a build from the source without ULTRS_LINUX_PACKAGE (an AppImage): the game is built, no tar
+        say('  WARNING: no AppImage (ULTRS_LINUX_PACKAGE=<folder with UltraTears-*-x86_64.AppImage>): the Steam Deck\'s '
+            'tar is not made; the game for Linux is built (linux/ultratears)')
+        return 'no AppImage: no tar'
+    inputs =[ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, appimage,
               DATA / 'romfs/romfs.bin', DATA / 'textures/bc7.idx']
     key = f'{pack}|{appimage.name}'
     if tar.is_file() and state.get('deck-tar') == key and all(p.stat().st_mtime <= tar.stat().st_mtime for p in inputs if p.exists()):
@@ -860,7 +864,7 @@ def main():
         say(f'  {result or "ok"} ({progress.clock(secs)})')
         if progress.JSON:
             # the step had nothing to do (an update, a resume, no Deck)
-            skipped = result in ('up to date', 'already packed', 'not for the Steam Deck', 'no game for this PC')
+            skipped = result in ('up to date', 'already packed', 'not for the Steam Deck', 'no game for this PC', 'no AppImage: no tar')
             progress.emit('step', id=name, state='skip' if skipped else 'done', secs=round(secs), note=result or '')
     if from_nothing:
         state['full_secs'], state['full_cpus'] = round(time.time() - t_all - ASKED), a.cpus

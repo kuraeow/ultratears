@@ -570,19 +570,17 @@ LINUX_PACKAGE = 'deps/linux-package.json'
 
 def linux_package(home):
     """The AppImage of this release, which the Steam Deck's tar carries (the builder on the Deck: its launcher builds and
-    updates there with the tools inside it), downloaded into deps/downloads when not there yet."""
+    updates there with the tools inside it), downloaded into deps/downloads when not there yet. None in a build from the
+    source with no AppImage at hand (ULTRS_LINUX_PACKAGE unset, or a folder without one): the game is built for Linux
+    all the same and only the tar is not made (setup.py step deck) - the AppImage of a release is made after such a
+    build (release.md), so requiring one here was circular."""
     local = os.environ.get('ULTRS_LINUX_PACKAGE')
     if local:
         d = pathlib.Path(local)
-        image = max(d.glob('UltraTears-*-x86_64.AppImage'), key=lambda p: p.stat().st_mtime, default=None)
-        if not image:
-            raise DepsError(f'ULTRS_LINUX_PACKAGE={d}: no AppImage there', 'linux_package_missing')
-        return image
+        return max(d.glob('UltraTears-*-x86_64.AppImage'), key=lambda p: p.stat().st_mtime, default=None)
     pins = home / LINUX_PACKAGE
     if not pins.is_file():
-        raise DepsError('this builder has no AppImage to put into the Steam Deck\'s tar (deps\\linux-package.json): a '
-                        'release package has it; for a build from the source set ULTRS_LINUX_PACKAGE to a folder with '
-                        'UltraTears-*-x86_64.AppImage', 'linux_package_missing')
+        return None
     item = json.loads(pins.read_text(encoding='utf-8'))['appimage']
     if not (home / 'deps/downloads' / item['name']).is_file():
         say(f'  the AppImage of this release ({item["size"] / 2**20:.0f} MiB, once) -> deps\\downloads')
@@ -593,7 +591,8 @@ def linux_package(home):
 # ---------------------------------------------------------------- entry points
 def ensure_tools(home, linux=False):
     """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing; linux: the Linux kit too,
-    and on Windows the Linux builder for the Steam Deck's tar (before an hour of building, not after)."""
+    and on Windows a release package's AppImage for the Steam Deck's tar (downloaded before an hour of building, not
+    after)."""
     if clang64_for(home) is None:
         install_clang64(home)
     if not xlate_ok(home):
