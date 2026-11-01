@@ -50,8 +50,8 @@ static int start_failed(const std::string &log, const char *what) {
 
 int main(int argc, char **argv) {
 #ifndef _WIN32
-    // Steam starts games with SIGCHLD ignored, which the launcher inherits: its children are then reaped by the kernel
-    // and waitpid cannot tell how the builder ended (a failed build read as done). Back to the default.
+    // Started with SIGCHLD ignored (a parent may leave it so; Steam's start was suspected, tools/appimage_runtime), the
+    // launcher's children are reaped by the kernel and waitpid cannot tell how the builder ended. Back to the default.
     signal(SIGCHLD, SIG_DFL);
 #endif
     std::string log = log_open();
