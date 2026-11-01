@@ -424,7 +424,8 @@ def xlate_stamp(root=ROOT):
     for s in XLATE_SOURCES:
         p = root / s
         files += [p] if p.is_file() else [f for f in p.rglob('*') if f.is_file() and not {'bin', 'obj'} & set(f.relative_to(p).parts)]
-    for f in sorted(files):
+    # by the path as text: Windows sorts paths without case, Linux with it (one source, two stamps until 2026-11-01)
+    for f in sorted(files, key=lambda f: f.relative_to(root).as_posix()):
         h.update(f.relative_to(root).as_posix().encode() + b'\0' + f.read_bytes().replace(b'\r\n', b'\n'))
     return h.hexdigest()[:16]
 
