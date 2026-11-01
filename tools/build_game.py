@@ -213,13 +213,13 @@ def main():
     if not game_objs:
         sys.exit(f'no generated C in {gen}: run tools/gen_game.py first')
     if linux:   # the game for Linux in linux/, beside the game folder's data
-        exe = 'linux/ultratears' if a.target == 'ultratears' else f'{bd}/{a.target}'
+        out = 'linux/ultratears' if a.target == 'ultratears' else f'{bd}/{a.target}'
     else:
-        exe = 'UltraTears.exe' if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
-    lines.append(f'build {exe}: link {" ".join(objs + game_objs)}')
+        out = 'UltraTears.exe' if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
+    lines.append(f'build {out}: link {" ".join(objs + game_objs)}')
     if not linux:
-        lines.append(f'  pdb = build/{pathlib.Path(exe).stem}.pdb')
-    lines.append(f'default {" ".join(objs) if a.runtime_only else exe}')
+        lines.append(f'  pdb = build/{pathlib.Path(out).stem}.pdb')
+    lines.append(f'default {" ".join(objs) if a.runtime_only else out}')
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
     if linux:   # SDL3 beside the game (rpath $ORIGIN)
         import shutil
