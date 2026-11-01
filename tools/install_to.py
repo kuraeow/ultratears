@@ -4,6 +4,7 @@ make_package.py writes; without it every file outside the player's folders) and 
 file is left as it is, so a copy that stopped midway continues.
 usage: deps\\python\\python.exe tools/install_to.py <folder>   (events as setup.py --json: progress, done, error)
 """
+import filecmp
 import json
 import os
 import pathlib
@@ -48,7 +49,13 @@ def main():
                     os.replace(tmp, dst)
                 continue
             st = src.stat()
-            if not (dst.is_file() and dst.stat().st_size == st.st_size and int(dst.stat().st_mtime) == int(st.st_mtime)):
+            # The same bytes stay as they are, with their time: a package's files carry its commit's time, and a header
+            # of the runtime copied anew would make ninja compile every file of the game again at each update.
+            same = dst.is_file() and dst.stat().st_size == st.st_size and (
+                int(dst.stat().st_mtime) == int(st.st_mtime) or filecmp.cmp(src, dst, shallow=False))
+            if same and dst.stat().st_mode != st.st_mode:
+                os.chmod(dst, st.st_mode)
+            if not same:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 tmp = dst.with_name(dst.name + '.copying')
                 shutil.copy2(src, tmp)   # with its mode: the Linux package's programs stay executable
