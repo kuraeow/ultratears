@@ -44,7 +44,7 @@ To play on a Steam Deck, choose **For Linux (Steam Deck)** or **Both platforms**
 
 1. Download `UltraTears-<version>-x86_64.AppImage` from [Releases](https://github.com/kuraeow/ultratears/releases). On a
    Steam Deck, do this in Desktop Mode.
-2. Make it executable (Properties → Permissions) and start it.
+2. In the file's Properties, on the **Permissions** tab, turn on **Allow executing file as program**, then start it.
 3. Choose the folder with `exefs` and `romfs` and click **Prepare the game**.
 4. Click **Play**. For Gaming Mode, add `UltraTears.AppImage` from the game folder to Steam as a non-Steam game and put
    `--play` into its launch options.
