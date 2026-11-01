@@ -1,18 +1,21 @@
 diff --git a/src/runtime/runtime.c b/src/runtime/runtime.c
-index 2ebb3c8..d80bb3a 100644
+index 2ebb3c8..5fc4f09 100644
 --- a/src/runtime/runtime.c
 +++ b/src/runtime/runtime.c
-@@ -414,7 +414,35 @@ int appimage_print_binary(char* fname, unsigned long offset, unsigned long lengt
+@@ -414,7 +414,50 @@ int appimage_print_binary(char* fname, unsigned long offset, unsigned long lengt
  	return 0;
  }
  
 +static char* find_fusermount_checked(bool verbose, char** fallback);
 +
-+/* UltraTears: Steam starts games with SIGCHLD ignored, and then the kernel reaps the "--version" child itself: waitpid
-+ * fails with ECHILD, the status is never set, and every working fusermount was rejected ("No suitable fusermount
-+ * binary found on the $PATH", from Steam only: the same AppImage started from a file manager worked). The check now
-+ * runs with SIGCHLD at its default, and a setuid root fusermount3 (else fusermount) found on the way is used when no
-+ * candidate passed it. */
++/* UltraTears: started by Steam on a Steam Deck (Game Mode and desktop), the AppImage printed "No suitable fusermount
++ * binary found on the $PATH" with /usr/bin/fusermount3 setuid root there, while FUSERMOUNT_PROG=/usr/bin/fusermount3
++ * made it start (2026-11-01). Why the search fails under Steam's launch wrapper is not known (not SIGCHLD ignored,
++ * not an unmapped user namespace: tried in WSL). So: the check runs with SIGCHLD at its default and looks at
++ * waitpid's result; when no candidate passes, a setuid root fusermount3 (else fusermount) seen on the way is used;
++ * when none was seen, the usual absolute paths (as FUSERMOUNT_PROG named it). What it saw goes to stderr then. */
++static const char* const fusermount_known[] = {"/usr/bin/fusermount3", "/bin/fusermount3", "/usr/bin/fusermount", "/bin/fusermount", NULL};
++
  char* find_fusermount(bool verbose) {
 +    struct sigaction dfl, old;
 +    memset(&dfl, 0, sizeof dfl);
@@ -28,17 +31,29 @@ index 2ebb3c8..d80bb3a 100644
 +        free(fallback);
 +        return found;
 +    }
-+    if (fallback != NULL && verbose) {
-+        printf("No fusermount passed --version: using %s\n", fallback);
++    if (fallback != NULL) {
++        fprintf(stderr, "UltraTears runtime: no fusermount on PATH passed --version (PATH=%s): using %s\n",
++                getenv("PATH") ? getenv("PATH") : "(none)", fallback);
++        return fallback;
 +    }
-+    return fallback;
++    for (int i = 0; fusermount_known[i] != NULL; i++) {
++        struct stat sb;
++        int st = stat(fusermount_known[i], &sb);
++        fprintf(stderr, "UltraTears runtime: no fusermount found on PATH=%s; %s: %s, uid %d, mode %o\n",
++                getenv("PATH") ? getenv("PATH") : "(none)", fusermount_known[i], st == 0 ? "there" : strerror(errno),
++                st == 0 ? (int)sb.st_uid : -1, st == 0 ? (unsigned)sb.st_mode : 0u);
++        if (st == 0 && access(fusermount_known[i], X_OK) == 0) {
++            return strdup(fusermount_known[i]);
++        }
++    }
++    return NULL;
 +}
 +
 +static char* find_fusermount_checked(bool verbose, char** fallback) {
      char* fusermount_base = "fusermount";
  
      char* fusermount_path = getenv("PATH");
-@@ -468,6 +496,11 @@ char* find_fusermount(bool verbose) {
+@@ -468,6 +511,11 @@ char* find_fusermount(bool verbose) {
                          printf("Found setuid root executable: %s\n", fusermount_full_path);
                      }
  
@@ -50,7 +65,7 @@ index 2ebb3c8..d80bb3a 100644
                      pid_t pid = fork();
                      if (pid == -1) {
                          perror("fork");
-@@ -490,10 +523,13 @@ char* find_fusermount(bool verbose) {
+@@ -490,10 +538,13 @@ char* find_fusermount(bool verbose) {
                          exit(1);
                      } else {
                          // Parent process
