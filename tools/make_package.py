@@ -122,12 +122,30 @@ def clang64_files_used(home):
             p = p.replace('\\', '/')
             if p.lower().startswith(str(PREFIX).replace('\\', '/').lower()):
                 used.add(pathlib.Path(p))
-    # libraries: what lld reads in the two links (--verbose)
+    # the launcher's headers: tools/setup.py builds it in a game folder made from the source (build_launcher_into), and
+    # such a folder may be one unpacked from this package, with only these tools
+    import build_launcher
+    deps_install.launcher_libs(ROOT)
+    build_launcher.resources(tmp)   # its version.h
+    inc = [f'-I{ROOT / d}' for d in ('deps/launcher/imgui', 'deps/launcher/imgui/backends', 'deps/launcher/nanosvg',
+                                      'deps/launcher/stb')] + [f'-I{tmp}', '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS', '-DUNICODE',
+                                                               '-D_UNICODE', '-march=x86-64-v2']
+    for src in build_launcher.SOURCES:
+        cxx = src.endswith('.cpp')
+        cmd = [str(CLANG64 / ('clang++.exe' if cxx else 'clang.exe')), '-M', *inc, str(ROOT / src)] + (['-std=c++17'] if cxx else [])
+        r = subprocess.run(cmd, capture_output=True, text=True, env=tool_env())
+        if r.returncode:
+            sys.exit(f'the launcher header probe of {src} failed:\n{r.stderr[-2000:]}')
+        for p in re.split(r'\s+', r.stdout.replace('\\\n', ' ')):
+            p = p.replace('\\', '/')
+            if p.lower().startswith(str(PREFIX).replace('\\', '/').lower()):
+                used.add(pathlib.Path(p))
+    # libraries: what lld reads in the links of the game, the texture encoder and the launcher (--verbose)
     ninja = (home / 'build/build.ninja').read_text()
     rsp = re.search(r'^build UltraTears\.exe: link (.*)$', ninja, re.M).group(1).split()   # ninja deletes the .rsp
     link = re.search(r'command = clang (.*) -o \$out @\$out.rsp (.*)', ninja)
     flags = link.group(1).split() + link.group(2).split()
-    for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++'])):
+    for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++']), ([], build_launcher.LIBS.split())):
         probe = tmp / 'probe.c'
         probe.write_text('int main(void) { return 0; }\n')
         cmd = [str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-Wl,--verbose', '-o', str(tmp / 'probe.exe')]

@@ -12,6 +12,7 @@ usage: python tools/linux_used.py --home ../release-test [--out release/linux-us
 """
 import argparse
 import pathlib
+import posixpath
 import re
 import shutil
 import subprocess
@@ -30,12 +31,12 @@ ALWAYS = ('linux/licenses/', 'linux/README', 'linux/kit.json', 'linux/sysroot/us
 def classify(path, used):
     p = path.strip().strip('"')
     m = KIT.search(p)
-    if m:
-        used.add('linux/' + m.group(1).replace('\\', '/'))
+    if m:   # normalized: libstdc++'s headers come as lib/gcc/x86_64-linux-gnu/10/../../../../include/c++/10/...
+        used.add('linux/' + posixpath.normpath(m.group(1).replace('\\', '/')))
         return
     m = RESOURCE.search(p)
     if m:
-        used.add('clang/' + m.group(1).replace('\\', '/'))
+        used.add('clang/' + posixpath.normpath(m.group(1).replace('\\', '/')))
 
 
 def tool(name):
@@ -72,7 +73,26 @@ def measure(home):
                 sys.exit(f'the header probe of {s} failed:\n{out.stderr[-2000:]}')
             for p in re.split(r'\s+', out.stdout.replace('\\\n', ' ')):
                 classify(p, used)
-        # what lld reads linking the game (its link line, the objects of build-linux) and the encoder
+        # the launcher's headers: tools/setup.py builds it in a game folder made from the source (build_launcher_into),
+        # which may take its tools from a package (the AppImage's deps/)
+        import build_launcher
+        import deps_install
+        deps_install.launcher_libs(ROOT)
+        build_launcher.resources(tmp)   # its version.h
+        inc = [f'-I{ROOT / d}' for d in ('deps/launcher/imgui', 'deps/launcher/imgui/backends', 'deps/launcher/nanosvg',
+                                          'deps/launcher/stb')] + [f'-I{tmp}', '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS',
+                                                                   '-march=x86-64-v2']
+        for s in build_launcher.SOURCES:
+            cxx = s.endswith('.cpp')
+            cmd = [tool('clang++' if cxx else 'clang'), '-M', *flags, *inc, str(ROOT / s)]
+            if cxx:
+                cmd += ['-std=c++17', '-stdlib=libstdc++']
+            out = subprocess.run(cmd, capture_output=True, text=True, env=tool_env())
+            if out.returncode:
+                sys.exit(f'the header probe of {s} failed:\n{out.stderr[-2000:]}')
+            for p in re.split(r'\s+', out.stdout.replace('\\\n', ' ')):
+                classify(p, used)
+        # what lld reads linking the game (its link line, the objects of build-linux), the encoder and the launcher
         link = re.search(r'^rule link\n  command = clang (.*) -o \$out @\$out\.rsp (.*)$', text, re.M)
         objs = re.search(r'^build linux/ultratears: link (.*)$', text, re.M).group(1).split()
         probe = tmp / 'probe.cpp'
@@ -83,7 +103,10 @@ def measure(home):
                  '@' + str(rsp), *link.group(2).split()],
                 [tool('clang++'), *flags, '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
                  '-static-libstdc++', '-o', str(tmp / 'bc7build'), str(probe), f'-L{kit}/lib', '-l:libzstd.a', '-pthread',
-                 '-lm']]
+                 '-lm'],
+                [tool('clang++'), *flags, '--rtlib=libgcc', '--unwindlib=libgcc', '-no-pie', f'-L{kit}/lib', '-fuse-ld=lld',
+                 '-o', str(tmp / 'launcher'), str(probe),
+                 *build_launcher.LINUX_LIBS.replace("'$$ORIGIN'", '$ORIGIN').replace('$$ORIGIN', '$ORIGIN').split()]]
         for cmd in runs:
             cmd = [c for c in cmd if c != '-g'] + ['-Wl,--verbose']
             r = subprocess.run(cmd, capture_output=True, text=True, env=tool_env(), cwd=home)
