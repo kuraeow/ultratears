@@ -50,9 +50,11 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static uint64_t gpu_ticks(void) { return runtime_now_ns() * 12 / 625; }   // the Switch's 19.2 MHz counter
 
 // ---------------- memory pools ----------------
-// sh..defer_pass: the pool's copy in device memory (below, "copies of the pools in device memory")
+// sh..defer_pass: the pool's copy in device memory (below, "copies of the pools in device memory"); cmap..cstamp: the
+// pool itself as a copy of game memory (Linux, "pool copies")
 typedef struct { uintptr_t lo, hi, base; VkBuffer buf; VkDeviceMemory mem; const void *key; VkDeviceSize bytes;
-                 VkBuffer sbuf; VkDeviceSize soff; uint32_t sh; uint8_t no_shadow, filled; uint64_t stamp, sync_sub, used_sub, defer_pass, wb_sub; } pool_ent;
+                 VkBuffer sbuf; VkDeviceSize soff; uint32_t sh; uint8_t no_shadow, filled; uint64_t stamp, sync_sub, used_sub, defer_pass, wb_sub;
+                 uint8_t *cmap; uint32_t ch; uint8_t cfilled; uint64_t cstamp; } pool_ent;
 static pool_ent *g_pools;
 static int g_npools, g_capools;
 static vkb_rw g_pool_mu;   // recording threads look pools up for every draw (read); changes write
@@ -305,14 +307,150 @@ static int import_host(uintptr_t a, uintptr_t b, VkBuffer *out_buf, VkDeviceMemo
     return 1;
 }
 
+// ---------------- pool copies (Linux) ----------------
+// amdgpu checks every imported host range (a userptr) at every submission, page by page: on the Steam Deck the two
+// vkQueueSubmit2 calls of a frame took ~15 ms each with TOTK's ~1.1 GiB of imported pools (2026-11-01), and with
+// imports the write watch cannot work (runtime/platform/linux.c). So on Linux, as totk-pc-recomp does it
+// (runtime/vk_memory.c, "shadow storage"), each pool is a host-visible buffer of our own holding a copy of its game
+// memory at the same offsets, and the two are kept the same around the GPU's work:
+//  - CPU -> copy: right before a submission is submitted (pc_sync), the pools it uses get the pages written since their
+//    copy was last brought up to date (the write watch, nvn_dirty_runs); a pool not tracked gets all of it.
+//  - GPU -> game memory: the GPU writes recorded in a submission (vkb_pool_use) are copied from the copy into game
+//    memory when it has completed (pc_writeback, on the retire thread, before its events and counters let the game
+//    see it done). Until then the CPU's copies leave those bytes out (pc_put), so that the GPU's results in the copy are
+//    not replaced by game memory's older bytes; the ranges of the submission being synced itself are not left out
+//    (the GPU writes them after the copy, and the draws before the write read what the CPU wrote, as with an import).
+// TOTK_POOL_IMPORT=1 imports instead (development); TOTK_POOL_COPY=1 copies on Windows too (development).
+int vkb_pool_copies(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *imp = getenv("TOTK_POOL_IMPORT"), *cp = getenv("TOTK_POOL_COPY");
+#ifdef _WIN32
+        v = cp && !strcmp(cp, "1");
+#else
+        v = !(imp && !strcmp(imp, "1"));
+        (void)cp;
+#endif
+        if (imp && !strcmp(imp, "1")) v = 0;
+        VLOG("memory pools: %s", v ? "copies of game memory in host-visible memory, kept current by the write watch" : "game memory imported");
+    }
+    return v;
+}
+static const pool_ent *pool_find(uintptr_t addr, uint64_t len);
+// A GPU write into the copy of the pool whose buffer is buf (a pool made again at the same address is another one);
+// fence 0: in the submission being recorded.
+typedef struct { uint64_t lo, hi, fence; VkBuffer buf; } pc_range;
+static pc_range *g_pc_pend;   // g_pc_mu: GPU writes not yet in game memory
+static int g_npc_pend, g_cappc_pend;
+static pthread_mutex_t g_pc_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_pc_in_bytes, g_pc_whole, g_pc_back_bytes, g_pc_ns;   // the per-frame log line (g_pc_mu)
+static void pc_pend_add(VkBuffer buf, uint64_t addr, uint64_t len) {
+    pthread_mutex_lock(&g_pc_mu);
+    for (int k = g_npc_pend - 1; k >= 0 && k >= g_npc_pend - 8; k--)   // written again in this submission
+        if (!g_pc_pend[k].fence && g_pc_pend[k].buf == buf && g_pc_pend[k].lo == addr && g_pc_pend[k].hi == addr + len) { pthread_mutex_unlock(&g_pc_mu); return; }
+    if (g_npc_pend == g_cappc_pend) {
+        g_cappc_pend = g_cappc_pend ? g_cappc_pend * 2 : 1024;
+        if (!(g_pc_pend = realloc(g_pc_pend, sizeof *g_pc_pend * (size_t)g_cappc_pend))) die("pool copies: GPU writes");
+    }
+    g_pc_pend[g_npc_pend++] = (pc_range){addr, addr + len, 0, buf};
+    pthread_mutex_unlock(&g_pc_mu);
+}
+// g_pc_mu held: game memory [a, b) into p's copy, but for the GPU writes of earlier submissions not back yet
+// (from index i on).
+static void pc_put(const pool_ent *p, uint64_t a, uint64_t b, int i) {
+    for (; i < g_npc_pend; i++)
+        if (g_pc_pend[i].fence && g_pc_pend[i].lo < b && g_pc_pend[i].hi > a) {
+            if (g_pc_pend[i].lo > a) pc_put(p, a, g_pc_pend[i].lo, i + 1);
+            if (g_pc_pend[i].hi < b) pc_put(p, g_pc_pend[i].hi, b, i + 1);
+            return;
+        }
+    memcpy(p->cmap + (a - p->base), (const void *)(uintptr_t)a, b - a);
+    g_pc_in_bytes += b - a;
+}
+static void pc_run(void *ctx, size_t off, size_t n) {   // nvn_dirty_runs: off from the pool's start
+    const pool_ent *p = ctx;
+    pc_put(p, p->lo + off, p->lo + off + n, 0);
+}
+// Before submission `fence` is submitted (g_pool_mu read, g_pc_mu held): the pools it used brought up to date.
+static void pc_sync_pool(pool_ent *p) {
+    if (!p->cfilled) {   // the first use: all of it (writes up to now are in it)
+        nvn_dirty_since((const void *)p->lo, p->hi - p->lo, UINT64_MAX);
+        p->cstamp = nvn_dirty_now();
+        pc_put(p, p->lo, p->hi, 0);
+        p->cfilled = 1;
+        return;
+    }
+    // The stamp before the look: a page another thread's scan stamps meanwhile is copied again next time, not missed
+    // (the pages this look finds written are newer than it too: copied twice, a few MiB a frame).
+    uint64_t stamp = nvn_dirty_now();
+    int r = nvn_dirty_runs((const void *)p->lo, p->hi - p->lo, p->cstamp, 0, pc_run, p);
+    p->cstamp = stamp;
+    // Not tracked: in the guest window anything may have written it, so all of it; outside (a pool whose storage is
+    // ours, totk_vpool_win.c) the game cannot write it, and its first copy holds what the CPU gave it.
+    if (r < 0 && p->lo >= GUEST_LO && p->hi <= GUEST_HI) { pc_put(p, p->lo, p->hi, 0); g_pc_whole++; }
+}
+static void pc_sync(uint64_t fence) {
+    if (!vkb_pool_copies()) return;
+    uint64_t t0 = runtime_now_ns();
+    vkb_rw_read(&g_pool_mu, LK_POOLS);
+    pthread_mutex_lock(&g_pc_mu);
+    for (int i = 0; i < g_npools; i++)
+        if (g_pools[i].cmap && __atomic_load_n(&g_pools[i].used_sub, __ATOMIC_RELAXED) == fence) pc_sync_pool(&g_pools[i]);
+    for (int k = 0; k < g_npc_pend; k++) if (!g_pc_pend[k].fence) g_pc_pend[k].fence = fence;
+    g_pc_ns += runtime_now_ns() - t0;
+    pthread_mutex_unlock(&g_pc_mu);
+    vkb_rw_read_end(&g_pool_mu);
+}
+// Retire thread, submission `fence` complete: its GPU writes from the copies into game memory. They are writes to game
+// memory like the CPU's (the write watch counts them, and the next sync copies those pages in again: the same bytes,
+// and the CPU's own writes in the same pages are not lost).
+static void pc_writeback(uint64_t fence) {
+    if (!vkb_pool_copies()) return;
+    vkb_rw_read(&g_pool_mu, LK_POOLS);
+    pthread_mutex_lock(&g_pc_mu);
+    for (int k = 0; k < g_npc_pend;) {
+        pc_range r = g_pc_pend[k];
+        if (!r.fence || r.fence > fence) { k++; continue; }
+        const pool_ent *p = pool_find((uintptr_t)r.lo, r.hi - r.lo);
+        if (p && p->buf == r.buf && p->cmap) {   // else the pool is gone, and with it what its GPU writes meant
+            guest_prepare_write((void *)(uintptr_t)r.lo, r.hi - r.lo);
+            memcpy((void *)(uintptr_t)r.lo, p->cmap + (r.lo - p->base), r.hi - r.lo);
+            g_pc_back_bytes += r.hi - r.lo;
+        }
+        g_pc_pend[k] = g_pc_pend[--g_npc_pend];
+    }
+    pthread_mutex_unlock(&g_pc_mu);
+    vkb_rw_read_end(&g_pool_mu);
+}
+// A pool as a host-visible copy of [a, b) (pc_sync fills it at its first use). 0: no memory.
+static int pc_alloc(uintptr_t a, uintptr_t b, VkBuffer *out_buf, uint8_t **map, uint32_t *h) {
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = b - a,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer buf;
+    if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &buf), "pool copy buffer")) return 0;
+    if (!(*h = vkb_poolmem_alloc(buf, map))) {
+        VLOG("memory %#llx..%#llx: no memory for its copy", (unsigned long long)a, (unsigned long long)b);
+        vk.vkDestroyBuffer(vkc.device, buf, NULL);
+        return 0;
+    }
+    *out_buf = buf;
+    return 1;
+}
+
 void mtl_pool_add(const void *mem, uint64_t size) {
     backend_init();
     if (!g_ok || !mem || !size) return;
-    uintptr_t align = vkc.host_pointer_alignment ? vkc.host_pointer_alignment : 4096;
+    int copy = vkb_pool_copies();
+    uintptr_t align = copy ? 4096 : vkc.host_pointer_alignment ? vkc.host_pointer_alignment : 4096;
     uintptr_t lo = (uintptr_t)mem, hi = lo + size, a = lo & ~(align - 1), b = (hi + align - 1) & ~(align - 1);
     VkBuffer buf;
-    VkDeviceMemory dm;
-    if (!import_host(a, b, &buf, &dm)) return;
+    VkDeviceMemory dm = VK_NULL_HANDLE;
+    uint8_t *cmap = NULL;
+    uint32_t ch = 0;
+    if (copy ? !pc_alloc(a, b, &buf, &cmap, &ch) : !import_host(a, b, &buf, &dm)) return;
     vkb_rw_write(&g_pool_mu, LK_POOLS);
     if (g_npools == g_capools) {
         g_capools = g_capools ? g_capools * 2 : 64;
@@ -322,6 +460,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     int i = g_npools;
     while (i > 0 && g_pools[i - 1].lo > lo) { g_pools[i] = g_pools[i - 1]; i--; }
     g_pools[i] = (pool_ent){lo, hi, a, buf, dm, mem, b - a};
+    g_pools[i].cmap = cmap; g_pools[i].ch = ch;
     g_npools++;
     for (int j = i - 4; j <= i + 4; j++)   // overlapping pools: one copy each would diverge, so neither is copied
         if (j >= 0 && j < g_npools && j != i && g_pools[j].lo < hi && lo < g_pools[j].hi) {
@@ -354,6 +493,7 @@ void mtl_pool_del(const void *mem) {
             break;
         }
     if (e.sh) vkb_shadow_free(e.sh);
+    if (e.ch) vkb_poolmem_free(e.ch);   // reused after the submission being recorded, as the buffer goes (below)
     if (e.buf) wb_forget(e.buf);
     vkb_rw_write_end(&g_pool_mu);
     if (!e.buf) return;
@@ -777,7 +917,19 @@ static pool_ent *pool_find_mut(uintptr_t addr, uint64_t len);
 static pthread_mutex_t g_wb_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_pool_use_n[3];   // the per-frame log line: write lock to update a copy / for a write / writes under the read lock
 void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
-    if (g_ok != 1 || !addr || !len || !vkb_shadow_on()) return;
+    if (g_ok != 1 || !addr || !len) return;
+    if (vkb_pool_copies()) {   // the pool is synced before the submission (pc_sync); a GPU write goes back after it
+        vkb_rw_read(&g_pool_mu, LK_POOLS);
+        // a range running on past its pool's end (GPU addresses, vkb_span_addr): the pool it starts in, up to its end
+        pool_ent *p = pool_find_mut((uintptr_t)addr, len);
+        if (!p) p = pool_find_mut((uintptr_t)addr, 1);
+        VkBuffer b = p ? p->buf : VK_NULL_HANDLE;
+        uint64_t n = p && addr + len > p->hi ? p->hi - addr : len;
+        if (p) __atomic_store_n(&p->used_sub, g_fence + 1, __ATOMIC_RELAXED);
+        vkb_rw_read_end(&g_pool_mu);
+        if (p && write) pc_pend_add(b, addr, n);
+    }
+    if (!vkb_shadow_on()) return;
     uint64_t sub = g_fence + 1;
     vkb_rw_read(&g_pool_mu, LK_POOLS);   // the common cases: a pool already current in this submission, or not copied
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
@@ -903,8 +1055,9 @@ int vkb_span_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off)
 typedef struct { span_t *s; VkCommandBuffer cb; int whole; uint64_t bytes; } span_fill;
 static void span_run(void *ctx, size_t off, size_t n) {   // nvn_dirty_runs inside one piece: ctx carries the piece
     struct piece { span_fill *f; uint64_t cpu, soff; } *pc = ctx;
-    const pool_ent *p = pool_find((uintptr_t)(pc->cpu + off), n);   // g_pool_mu held (span_presync)
+    pool_ent *p = pool_find_mut((uintptr_t)(pc->cpu + off), n);   // g_pool_mu held (span_presync)
     if (p) {
+        if (vkb_pool_copies()) __atomic_store_n(&p->used_sub, g_fence + 1, __ATOMIC_RELAXED);   // the copy reads it in this submission (pc_sync)
         VkBufferCopy c = {(pc->cpu + off) - p->base, pc->soff + off, n};
         vk.vkCmdCopyBuffer(pc->f->cb, p->buf, pc->f->s->buf, 1, &c);
         pc->f->bytes += n;
@@ -953,8 +1106,11 @@ static void span_presync(void) {
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (g_ok != 1) { *buf = NULL; *off = 0; return 0; }
     vkb_rw_read(&g_pool_mu, LK_POOLS);
-    const pool_ent *p = pool_find((uintptr_t)addr, len);
-    if (p) { *buf = (void *)p->buf; *off = addr - p->base; }
+    pool_ent *p = pool_find_mut((uintptr_t)addr, len);
+    if (p) {
+        *buf = (void *)p->buf; *off = addr - p->base;
+        if (vkb_pool_copies()) __atomic_store_n(&p->used_sub, g_fence + 1, __ATOMIC_RELAXED);   // read by the GPU in this submission (pc_sync)
+    }
     vkb_rw_read_end(&g_pool_mu);
     return p != NULL;
 }
@@ -1162,6 +1318,7 @@ static void *retire_thread(void *unused) {
         VkResult r = vk.vkWaitSemaphores(vkc.device, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) { vk_check(r, "vkWaitSemaphores"); checkpoint_report(); die("GPU submission %llu lost", (unsigned long long)j->fence); }
         if (totk_tl_on()) gpu_span(j->slot, j->fence);   // TOTK_TIMELINE: when the GPU ran this command buffer
+        pc_writeback(j->fence);   // pool copies: GPU writes into game memory, before the game is told
         if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps); free(j->wb); }   // GPU writes into game memory
         for (int k = 0; k < j->nsnaps; k++) if (((wb_snap_t *)j->snaps)[k].owned) free(((wb_snap_t *)j->snaps)[k].data);
         free(j->snaps);
@@ -2070,6 +2227,18 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                      (double)(b - pb) / 1048576.0 / f, (double)(c - pc) / f, (double)(ns - pn) / 1e6 / f, (double)(h - ph) / f, (double)(d - pd) / f);
                 pc = c; pb = b; pn = ns; ph = h; pd = d;
             }
+            if (vkb_pool_copies()) {
+                static uint64_t pci, pcw, pcb, pcn;
+                pthread_mutex_lock(&g_pc_mu);
+                uint64_t ci = g_pc_in_bytes, cw = g_pc_whole, cb = g_pc_back_bytes, cn = g_pc_ns;
+                int pend = g_npc_pend;
+                pthread_mutex_unlock(&g_pc_mu);
+                VLOG("per frame: pool copies (%.1f MiB of host-visible memory) brought up to date %.2f MiB (%.1f pools untracked: whole) "
+                     "in %.2f ms before the submits, GPU writes into game memory %.3f MiB; %d GPU writes not back yet",
+                     (double)vkb_poolmem_bytes() / 1048576.0, (double)(ci - pci) / 1048576.0 / f, (double)(cw - pcw) / f,
+                     (double)(cn - pcn) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f, pend);
+                pci = ci; pcw = cw; pcb = cb; pcn = cn;
+            }
             if (vkb_shadow_on()) {
                 static uint64_t pin, pib, pob, pdf, psc, pwp, pwk, pwb, pu0, pu1, pu2;
                 VLOG("per frame: pool copies (holding %.1f MiB of video memory in all) in %.0f copies %.2f MiB, back %.2f MiB, "
@@ -2325,6 +2494,7 @@ uint64_t mtl_sub_commit(void) {
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)ncbi, .pCommandBufferInfos = cbi,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    pc_sync(fence);   // pool copies: the CPU's writes into the pools this submission uses
     uint64_t ts0 = runtime_now_ns();
     vk_queue_lock();
     VkResult r = vk.vkQueueSubmit2(vkc.queue, 1, &si, VK_NULL_HANDLE);

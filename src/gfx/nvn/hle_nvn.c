@@ -329,7 +329,13 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { o->magic = 0; return 0; }
     int gpu_visible = !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
-    if (o->mem && gpu_visible) { x_pool_reuse(o->mem, o->size); mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    // A virtual pool's storage is a reserved, inaccessible range (totk_vpool_win.c): nothing to import or copy (an import
+    // of it fails; a copy would fault reading it); the GPU reaches its pages through the physical pools.
+    if (o->mem && gpu_visible) {
+        x_pool_reuse(o->mem, o->size);
+        if (!(o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) mtl_pool_add(o->mem, o->size);
+        nvn_dirty_add_range(o->mem, o->size);
+    }
     o->va = o->mem && gpu_visible ? va_assign((uint64_t)(uintptr_t)o->mem, o->size) : (uint64_t)(uintptr_t)o->mem;
     if (!o->mem) LOG("[error] MemoryPoolInitialize has no storage, flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);

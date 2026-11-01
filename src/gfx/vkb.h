@@ -124,6 +124,11 @@ int vkb_shadow_on(void);
 uint32_t vkb_shadow_alloc(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off);   // 0: none
 void vkb_shadow_free(uint32_t h);   // reused after the submission being recorded
 uint64_t vkb_shadow_bytes(void);
+// Pool copies (Linux): every pool is a host-visible copy of its game memory instead of an import (backend_vk.c)
+int vkb_pool_copies(void);
+uint32_t vkb_poolmem_alloc(VkBuffer buf, uint8_t **map);   // binds buf; 0: no memory
+void vkb_poolmem_free(uint32_t h);   // reused after the submission being recorded
+uint64_t vkb_poolmem_bytes(void);
 
 // ---- vkb_ucap.c: uniform contents as of the submit call
 int vkb_ucap_on(void);

@@ -39,6 +39,9 @@ struct pm_scan_arg {
 };
 #define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
 #define PAGE_IS_WRITTEN (1 << 1)
+#define PAGE_IS_PRESENT (1 << 3)
+#define PAGE_IS_SWAPPED (1 << 4)
+#define PAGE_IS_PFNZERO (1 << 5)
 #define PM_SCAN_WP_MATCHING (1 << 0)
 #define PM_SCAN_CHECK_WPASYNC (1 << 1)
 #endif
@@ -99,15 +102,18 @@ void plat_unmap_file(const void *p, uint64_t size) { munmap((void *)p, size); }
 // userfaultfd for asynchronous write protection (the kernel lifts a page's protection on its first write, without
 // stopping anyone), and PAGEMAP_SCAN reports the pages written since their last scan and protects them again in the
 // same call. The kernel's own writes (file reads into game memory) count too; GPU writes do not, as on Windows.
-// Opt-in (TOTK_WRITE_WATCH=1; Linux 6.7): on the Steam Deck it cannot work, because game memory is imported into
-// Vulkan and amdgpu re-maps that memory for writing after every protection change, so every page reads as written on
-// every scan (4 fps in the title menu). Without it nvn_dirty treats pools as untracked and vkb_tex.c compares texture
-// contents instead.
+// On by default (Linux 6.7), as totk-pc-recomp's platform/linux.c does it: the memory pools are copies in Vulkan memory
+// on Linux (gfx/backend_vk.c, "pool copies"), so nothing imports game memory. Imported (TOTK_POOL_IMPORT=1,
+// development) it cannot work: amdgpu re-maps imported memory for writing after every protection change, so every
+// page reads as written on every scan (4 fps in the title menu); then it is off, nvn_dirty treats pools as untracked
+// and vkb_tex.c compares texture contents instead. TOTK_WRITE_WATCH=0 turns it off.
 static int g_uffd = -1, g_pagemap = -1;
 static uint64_t g_watch_lo, g_watch_hi;
 
 static void watch_register(uint64_t lo, uint64_t hi) {
     if (g_uffd < 0 || lo < g_watch_lo || hi > g_watch_hi) return;
+    // transparent huge pages would populate (and count as written) 2 MiB at the first write of one page
+    madvise((void *)(uintptr_t)lo, hi - lo, MADV_NOHUGEPAGE);
     struct uffdio_register reg = {.range = {.start = lo, .len = hi - lo}, .mode = UFFDIO_REGISTER_MODE_WP};
     if (ioctl(g_uffd, UFFDIO_REGISTER, &reg)) {
         fprintf(stderr, "[totk] write watch: registering %llx-%llx failed (%s); writes there are not tracked\n",
@@ -117,11 +123,13 @@ static void watch_register(uint64_t lo, uint64_t hi) {
 }
 
 static void watch_init(uint64_t lo, uint64_t hi) {
-    const char *e = getenv("TOTK_WRITE_WATCH");
-    if (!e || strcmp(e, "1")) return;
+    const char *e = getenv("TOTK_WRITE_WATCH"), *imp = getenv("TOTK_POOL_IMPORT");
+    if (e && !strcmp(e, "0")) return;
+    if (imp && !strcmp(imp, "1") && !(e && !strcmp(e, "1"))) return;
     // UFFD_USER_MODE_ONLY: allowed without privileges; asynchronous write faults never reach the userfaultfd anyway.
+    // WP_UNPOPULATED: pages not touched yet are protected too, so their first write is seen like any other.
     int uffd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
-    struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC};
+    struct uffdio_api api = {.api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
     int pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
     if (uffd < 0 || pagemap < 0 || ioctl(uffd, UFFDIO_API, &api)) {
         fprintf(stderr, "[totk] write watch: not available (%s); CPU-written textures keep their first contents\n",
@@ -144,9 +152,13 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
     int n = 0;
     while (at < end && n < max) {
         // max_pages: the pages past it stay unreported and unprotected, so the next call reports them
+        // Written: protection lifted, on a populated page (present or swapped out) that is not the shared zero page.
+        // A page never touched counts as written to the kernel and a read maps the zero page there: neither is a write,
+        // as on Windows (totk-pc-recomp's platform/linux.c plat_mem_written).
         struct pm_scan_arg a = {.size = sizeof a, .flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC, .start = at, .end = end,
                                 .vec = (uint64_t)(uintptr_t)r, .vec_len = 64, .max_pages = (uint64_t)(max - n),
-                                .category_mask = PAGE_IS_WRITTEN, .return_mask = PAGE_IS_WRITTEN};
+                                .category_inverted = PAGE_IS_PFNZERO, .category_mask = PAGE_IS_WRITTEN | PAGE_IS_PFNZERO,
+                                .category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED, .return_mask = PAGE_IS_WRITTEN};
         long k = ioctl(g_pagemap, PAGEMAP_SCAN, &a);
         if (k < 0) return -1;
         for (long i = 0; i < k; i++)
