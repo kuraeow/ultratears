@@ -16,6 +16,9 @@
 
 #include "host.h"
 #include "../vk/present.h"
+#ifndef _WIN32
+#include "icon_png.h"   // build-linux/: tools/build_game.py
+#endif
 
 static SDL_Window *window;
 static SDL_Gamepad *pad;
@@ -116,6 +119,12 @@ int window_init(void) {
     pad_lock = SDL_CreateMutex();
     window = SDL_CreateWindow("UltraTears", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) { fprintf(stderr, "[totk] window: %s\n", SDL_GetError()); return 0; }
+#ifndef _WIN32
+    {   // the port's icon (assets/icon.ico's 256 px PNG, build/icon_png.h); on Windows the exe's resource gives it
+        SDL_Surface *icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(ultrs_icon_png, sizeof ultrs_icon_png), true);
+        if (icon) SDL_SetWindowIcon(window, icon), SDL_DestroySurface(icon);
+    }
+#endif
     // window= in ultratears.cfg (TOTK_WINDOW): window (default), borderless (the desktop's size, no mode change) or
     // fullscreen (exclusive, at the desktop's resolution and refresh rate); F11 / Alt+Enter still switch
     const char *mode = getenv("TOTK_WINDOW");

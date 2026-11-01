@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
     SDL_Log("window %dx%d at scale %.2f, renderer %s", (int)(W * scale), (int)(H * scale), scale, SDL_GetRendererName(ren));
     SDL_SetRenderVSync(ren, 1);
     window_dark_title(win);
+    window_icon(win);
     float real = window_scale(win);   // the display the window opened on may have another scale
     if (real != scale) {
         scale = real;

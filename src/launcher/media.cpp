@@ -27,6 +27,20 @@ static const launcher_asset *asset(const char *name) {
     return nullptr;
 }
 
+// The port's icon on the window (Linux: the desktop's title bar and task list; on Windows the exe's icon resource)
+void window_icon(SDL_Window *w) {
+#ifndef _WIN32
+    const launcher_asset *a = asset("icon.png");
+    SDL_Surface *s = a ? SDL_LoadPNG_IO(SDL_IOFromConstMem(a->data, a->size), true) : nullptr;
+    if (s) {
+        SDL_SetWindowIcon(w, s);
+        SDL_DestroySurface(s);
+    }
+#else
+    (void)w;
+#endif
+}
+
 static SDL_Texture *texture(SDL_Renderer *r, const unsigned char *rgba, int w, int h) {
     SDL_Texture *t = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);   // RGBA bytes
     if (!t)
