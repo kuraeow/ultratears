@@ -188,19 +188,18 @@ void plat_thread_realtime(uint64_t period_ns) {
 
 // ---- process
 // As on Windows (platform/windows.c): stdout / stderr go to ultratears.log next to the game, the last run's kept as
-// ultratears-previous.log, unless they are already captured (a pipe or a file: "| tee x.log"). A terminal keeps the
-// lines too: the log is the player's to send, wherever the game was started from (the launcher, Steam's Game Mode, a
-// terminal). TOTK_LOG_FILE=0: the log stays where stderr goes (development); a path: that file. Processes started by
-// this one append to the same log.
+// ultratears-previous.log, even when stderr is a pipe: Steam starts a game with its output in a pipe (Game Mode on the
+// Deck: no log at all while a pipe meant "already captured", 2026-11-01). A terminal keeps the lines too: the log is the
+// player's to send, wherever the game was started from (the launcher, Steam, a terminal). TOTK_LOG_FILE=0: the log
+// stays where stderr goes ("| tee x.log" in development); a path: that file. Processes started by this one append to
+// the same log.
 static char g_log_path[1024];
 
 static void log_to_file(void) {
     const char *force = getenv("TOTK_LOG_FILE");
     if (force && !*force) force = NULL;
     if (force && !strcmp(force, "0")) return;
-    struct stat st;
     bool tty = isatty(STDERR_FILENO);
-    if (!force && !tty && fstat(STDERR_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode))) return;
     char dir[900];
     ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
     if (n <= 0) return;
