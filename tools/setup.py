@@ -123,7 +123,7 @@ KEEP = {'game', 'dump', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 're
 # replaces it: removed when found.
 DEBUG_BAT = 'UltraTears (debug).bat'
 OUTPUT_OWN = {'setup.bat', 'VERSION.txt', 'THIRD-PARTY-NOTICES.md', 'licenses', 'ultratears.cfg', 'UltraTears.exe',
-              'UltraTears.pdb', 'setup-files.txt', DEBUG_BAT}
+              'UltraTears.pdb', 'setup-files.txt', DEBUG_BAT, 'UltraTears Launcher.exe', 'ultratears-launcher', 'libSDL3.so.0'}
 
 
 class Fail(Exception):
@@ -259,7 +259,35 @@ def build_from_checkout(a):
         cmd += ['--full']
     if a.platform:
         cmd += ['--platform', a.platform]
-    return subprocess.run(cmd, cwd=home, env=dict(os.environ, PYTHONNOUSERSITE='1')).returncode
+    env = dict(os.environ, PYTHONNOUSERSITE='1')
+    rc = subprocess.run(cmd, cwd=home, env=env).returncode
+    if rc or a.only:
+        return rc
+    return build_launcher_into(home, py, env)
+
+
+def build_launcher_into(home, py, env):
+    """The launcher beside the game, as a builder package has it (it comes built there): so a game folder made from the
+    source is the same as a player's, Play, settings and updates included (tools/build_launcher.py; its intermediate
+    files in build/launcher), for this system. With the checkout's own compiler when it has one (a developer's MSYS2):
+    an output folder may hold a builder package's compiler, trimmed to what the game reads, without the C++ headers the
+    launcher needs; else with the output folder's, which a source build installs whole."""
+    linux = os.name != 'nt'
+    out = home / ('build-linux/launcher' if linux else 'build/launcher')
+    say('\nThe launcher')
+    own = toolchain.CLANG64 is not None
+    base, python = (ROOT, sys.executable) if own else (home, str(py))
+    cmd = [python, str(base / 'tools/build_launcher.py'), '--out', str(out)] + (['--platform', 'linux'] if linux else [])
+    if subprocess.run(cmd, cwd=base, env=env).returncode:
+        say('  WARNING: the launcher was not built; the game itself is ready (UltraTears.exe / linux/ultratears)')
+        return 1
+    names = ['ultratears-launcher'] if linux else ['UltraTears Launcher.exe']
+    for name in names:
+        shutil.copy2(out / name, home / name)
+    if linux:   # the SDL3 it loads (rpath $ORIGIN), as the Linux package has it
+        shutil.copy2(home / 'linux/libSDL3.so.0', home / 'libSDL3.so.0')
+    say(f'  {home / names[0]}')
+    return 0
 
 
 def sha256(path):

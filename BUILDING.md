@@ -48,7 +48,9 @@ python tools/setup.py
 
 The command copies tracked source files (including uncommitted edits) to `build\`, installs missing tools and performs
 every game-build step. It reads the original dump from `dump\` in the checkout, or from the folder given with `--dump`,
-without moving or modifying it. The result is `build\UltraTears.exe`, supported by the converted files in `build\data`.
+without moving or modifying it. The result is `build\UltraTears.exe`, supported by the converted files in `build\data`,
+and `build\UltraTears Launcher.exe` beside it, as a builder package has it (`tools/build_launcher.py`, built with the
+checkout's own compiler when it has one, else with the output folder's).
 
 Path selection is explicit and predictable:
 
