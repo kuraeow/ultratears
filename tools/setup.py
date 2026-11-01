@@ -61,6 +61,62 @@ EXEFS = {
 ROMFS_FILES = 304243
 ROMFS_BYTES = 17026725026
 ROMFS_CONTENT = 'b2a2e966a06158e098c03e564f77fd72809bc57275f04eb0725bcde14d522056'
+# Each top-level folder of that RomFS: its file count and the first 16 hex digits of the SHA-256 over its files' SHA-256
+# (tools/pack_romfs.py): a RomFS that differs says where, so a player can tell a missing update from a mod or a bad copy.
+ROMFS_FOLDERS = {
+    'AI': (64, 'c035f4f738d81fad'),
+    'AISchedule': (5, '1d46453b7aed591e'),
+    'AS': (1034, '204fb80cf730fed0'),
+    'ActorSystem': (6, '1d3867f33dd70e89'),
+    'AnimationEvent': (921, 'bd574aae552a598e'),
+    'BSA': (24, '6dab4e2923f6e487'),
+    'Bake': (10943, 'c89d7a87ae3a8cf8'),
+    'Banc': (137685, '1f986d2d4a47fb95'),
+    'CameraAnimation': (193, '9328b7ca4a540be6'),
+    'Cave': (3939, '36ee73a65f1cfbaa'),
+    'CaveBounding': (219, '8f4d163db50339f2'),
+    'Chemical': (16, 'c90428faea06cae8'),
+    'Component': (1007, 'ae19ad4dfec2d900'),
+    'Cooking': (2, 'f83b3aff9d7de8e6'),
+    'Cull': (856, 'ff4a96007701c7ba'),
+    'ELink2': (1, '32bdfdb0f7cc7e5e'),
+    'Ecosystem': (10, '771b098a08b60d8a'),
+    'Effect': (1976, '000f6696e260faef'),
+    'Env': (1, '7073ddf5b0110627'),
+    'Event': (2619, 'e6e794cb21acbc0e'),
+    'Font': (4, '4a11bc7ac1afa62f'),
+    'Forest': (20, '0ec3197c86c19657'),
+    'Game': (418, '57db42d4059a53a4'),
+    'GameBalance': (3, '169acb88adec2cee'),
+    'GameData': (2, 'fd3ab9974e326d28'),
+    'GameParameter': (27, '72079d643ec0b896'),
+    'GrassStats': (2671, 'f7955622d7007a2e'),
+    'Lib': (4, '85811e5f7b5632c9'),
+    'Life': (14, '5e8eaaa234743ef3'),
+    'Logic': (3204, '1078fb82c78f6d2f'),
+    'Mals': (15, '9fbf72f91d067dd4'),
+    'Model': (13876, 'fdf49084c1e80b9e'),
+    'Pack': (15080, 'cb2049efdbf58496'),
+    'Perception': (1, '62dd8a6425a656d3'),
+    'Phive': (13238, 'b29dbc9a81a4d1a1'),
+    'Preload': (175, 'f83a6dc3e8277975'),
+    'PrequelSaveData': (1, '133553bd66d2fe2a'),
+    'RSDB': (21, 'a96c2b6468d2fd65'),
+    'Rumble': (1, '676c205f9520a8a4'),
+    'SLink2': (1, 'd70a6075cf23f101'),
+    'Scene': (166, 'afa72637d4a694df'),
+    'Sequence': (200, '9db5d92da114c41d'),
+    'Shader': (13, '76af703897221bb0'),
+    'Sound': (23590, '791347a293dade7a'),
+    'System': (145, 'fc1726ec5d981e35'),
+    'TerrainArc': (10682, '75ddaf9ae639a814'),
+    'TexToGo': (29356, '4f8796dfcf721d4c'),
+    'UI': (15084, '472b6bb5bacac4dc'),
+    'UMii': (1, 'c00943fc8f406fed'),
+    'Voice': (13607, '98968775785869cb'),
+    'VolumeStats': (1096, '379222973678882b'),
+    'WorldMgr': (6, '7dade0ea2eeca301'),
+}
 ENCRYPTED = ('.nsp', '.nsz', '.xci', '.xcz', '.nca', '.ncz')
 KEEP = {'game', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 'dev-local'}
 # Written by builds before the launcher (UltraTears.exe --debug); the launcher's Debug mode (debug=1 in ultratears.cfg)
@@ -330,11 +386,15 @@ def step_romfs(dump, state, cpus):
     if packed(state):
         return 'already packed'
     from pack_romfs import pack
-    n, size, content = pack(dump / 'romfs', out, threads=16, progress=say)
+    folders = {}
+    n, size, content = pack(dump / 'romfs', out, threads=16, progress=say, folders=folders)
     if n != ROMFS_FILES or size < ROMFS_BYTES or content != ROMFS_CONTENT:
-        raise Fail(f'the RomFS is not the one of Tears of the Kingdom 1.4.3 ({n} files, expected {ROMFS_FILES}; '
-                   'content differs). Extract the RomFS again with update 1.4.3 applied; mods do not go here',
-                   'romfs_version')
+        diff = [f'{t} ({folders.get(t, (0, ""))[0]} files, expected {want[0]})' for t, want in ROMFS_FOLDERS.items()
+                if folders.get(t) != want] + [f'{t} (not in 1.4.3)' for t in folders if t not in ROMFS_FOLDERS]
+        raise Fail(f'the RomFS is not the one of Tears of the Kingdom 1.4.3 ({n} files, expected {ROMFS_FILES}; content '
+                   f'differs in {len(diff)} of its {len(ROMFS_FOLDERS)} folders: {", ".join(diff[:12])}'
+                   f'{", ..." if len(diff) > 12 else ""}). Extract the RomFS again with update 1.4.3 applied; mods do not '
+                   'go here', 'romfs_version')
     state['romfs'] = content
     return f'{n} files, {size / 2**30:.1f} GiB, content verified'
 

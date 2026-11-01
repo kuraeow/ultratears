@@ -25,8 +25,10 @@ BATCH = 2000
 ALIGN = 16
 
 
-def pack(folder, out, threads=16, progress=print):
-    """-> (file count, bytes, content hash). Writes <out>/romfs.bin, index.json, runtime-index.bin.
+def pack(folder, out, threads=16, progress=print, folders=None):
+    """-> (file count, bytes, content hash). Writes <out>/romfs.bin, index.json, runtime-index.bin. folders (a dict):
+    filled with each top-level folder's (file count, the first 16 hex digits of the SHA-256 over its files' SHA-256), so
+    a RomFS that differs from the expected one can say where (tools/setup.py ROMFS_FOLDERS).
     The console shows a progress line (tools/progress.py); progress is kept for callers and no longer used."""
     import progress as bars
     with bars.Ticker('listing the RomFS files'):
@@ -58,6 +60,11 @@ def pack(folder, out, threads=16, progress=print):
                 img.write(data)
                 offset += len(data)
                 content.update(digest)
+                if folders is not None:
+                    top = p.split('/', 1)[0]
+                    n, h = folders.get(top) or (0, hashlib.sha256())
+                    h.update(digest)
+                    folders[top] = (n + 1, h)
                 bar.add(len(data))
     bar.finish()
     (out / 'romfs.bin').unlink(missing_ok=True)
@@ -66,6 +73,9 @@ def pack(folder, out, threads=16, progress=print):
                                                     files=rows)))
     subprocess.run([sys.executable, str(ROOT / 'tools/make_romfs_index.py'), str(out)], check=True,
                    stdout=subprocess.DEVNULL)
+    if folders is not None:
+        for top, (n, h) in folders.items():
+            folders[top] = (n, h.hexdigest()[:16])
     return len(rows), offset, content.hexdigest()
 
 
