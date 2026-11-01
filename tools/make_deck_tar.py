@@ -1,11 +1,9 @@
 """The Steam Deck's tar, made in the game folder on the PC (tools/setup.py --platform linux or both runs this as its step
-deck): UltraTears-SteamDeck.tar, holding UltraTears/ - the folder a build on the Deck itself makes (the AppImage of the
-same release, tools/setup.py there) - and the release's AppImage in it:
+deck): UltraTears-SteamDeck.tar, holding UltraTears/ - the game and its data, and the release's AppImage, which is the
+builder on the Deck (its launcher copies the source in and links deps/ to its own tools when it builds or updates
+there, tools/install_to.py); no builder of its own:
 
-  - the Linux builder package of this release (--builder: UltraTears-builder-<v>-linux-x86_64.tar.gz,
-    tools/make_package_linux.py; deps_install.linux_package downloads it), its modes and links as they are: the
-    launcher, the tools, the source and deps/ (Python, LLVM, ninja, the translator, the Linux kit);
-  - what the build adds: linux/ultratears (with its debug information, as linked) and linux/libSDL3.so.0, data/ (the
+  - what the build makes: linux/ultratears (with its debug information, as linked) and linux/libSDL3.so.0, data/ (the
     ExeFS, the RomFS, the BC7 texture cache, the fonts, the game's C in data/generated, the shader pack for the Deck's
     AMD GPU as data/shaders/translated.pack, data/setup.json as a build on the Deck records it) and ultratears.cfg
     (setup.py cfg_lines, which writes it on the Deck too);
@@ -18,7 +16,7 @@ its first update, the PC's are another compiler's), the driver's shader cache (m
 not a zip: it keeps the modes and the links, which a zip made on Windows loses. Everything made from the game here was
 made on this PC from the player's own copy of the game, for their own Deck: nothing of it is ever published.
 
-usage: python tools/make_deck_tar.py --builder <tar.gz> --appimage <AppImage> [--pack data/shaders-deck/translated.pack]
+usage: python tools/make_deck_tar.py --appimage <AppImage> [--pack data/shaders-deck/translated.pack]
                                      [--out UltraTears-SteamDeck.tar]
 """
 import argparse

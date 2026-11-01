@@ -1,16 +1,17 @@
-"""Make the Linux builder package and the AppImage for a release (run on Linux: WSL or a Linux PC):
-dev-local/dist/UltraTears-builder-<version>-linux-x86_64.tar.gz and UltraTears-<version>-x86_64.AppImage.
+"""Make the AppImage for a release (run on Linux: WSL or a Linux PC): dev-local/dist/UltraTears-<version>-x86_64.AppImage,
+from the Linux builder package folder dev-local/dist/UltraTears-builder-<version>-linux-x86_64 (kept for checks such as
+dev-local/wsl/build_test.sh; not published: the release is the Windows zip and this AppImage).
 
 usage: python3 tools/make_package_linux.py --xlate <linux ultrs-shaders> --launcher <linux ultratears-launcher>
                                            [--linux-kit dev-local/dist/ultrs-linux-kit.zip] [--test] [--no-appimage]
 The same as the Windows builder package (tools/make_package.py) with the Linux tools: the source (the public tree of
 HEAD, without NOT_IN_PACKAGE), deps/python (python-build-standalone with the build's wheels) and deps/llvm (clang, lld,
-llvm-ar, llvm-objcopy, the clang resource headers, ninja) from the pins of tools/deps.json "linux_host"
+the clang resource headers for x86, ninja) from the pins of tools/deps.json "linux_host"
 (tools/deps_install.py installs them here as on a source build; their debug symbols stripped), deps/linux (the Linux
 kit: the sysroot every Linux build compiles against), deps/shaders/ultrs-shaders (tools/build_xlate.py --rid
 linux-x64), ultratears-launcher with libSDL3.so.0 beside it. Every ELF file is checked against glibc 2.34, the floor the
-official LLVM binaries set (as totk-pc-recomp's make_release_linux.py check_glibc). The tar keeps the executable bits
-and the links; the Windows builder downloads it for a Steam Deck's tar, the Linux launcher for its updates.
+official LLVM binaries set (as totk-pc-recomp's make_release_linux.py check_glibc). The Windows builder puts the
+AppImage into a Steam Deck's tar, the Linux launcher downloads it for its updates.
 
 The AppImage: the same folder with AppRun (the launcher) and a desktop entry, packed by appimagetool (pinned by hash as
 totk-pc-recomp pins it) with the static type-2 runtime (no libfuse2 on the host) built with this project's patch
@@ -240,10 +241,6 @@ def main():
     (out / 'package-files.txt').write_text('\n'.join(sorted(files)) + '\n', encoding='utf-8')
     size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file() and not f.is_symlink())
     print(f'{out}: {size / 2**20:.0f} MiB', flush=True)
-    tgz = dist / (name + '.tar.gz')
-    with tarfile.open(tgz, 'w:gz', compresslevel=6) as t:
-        t.add(out, arcname=name)
-    print(f'{tgz}: {tgz.stat().st_size / 2**20:.0f} MiB', flush=True)
     if a.no_appimage:
         return
     # the AppImage: the same folder with AppRun, a desktop entry and its icon

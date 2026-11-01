@@ -560,12 +560,11 @@ def install_linux_kit(home):
             f.unlink(missing_ok=True)
 
 
-# ---------------------------------------------------------------- the Linux builder (for the Steam Deck's tar)
-# The tar a Windows build makes for the Steam Deck holds the folder a build on the Deck makes: the Linux builder package
-# of the same release (UltraTears-builder-<v>-linux-x86_64.tar.gz, tools/make_package_linux.py) with the game and its
-# data, and the release's AppImage. The Windows builder package names both files with their hashes in
-# deps/linux-package.json (tools/make_package.py); they are downloaded once, when a build is for the Deck.
-# ULTRS_LINUX_PACKAGE=<folder>: the newest of both found there instead (development: dev-local/dist).
+# ---------------------------------------------------------------- the AppImage (for the Steam Deck's tar)
+# The tar a Windows build makes for the Steam Deck holds the game, its data and the release's AppImage (the builder on
+# the Deck). The Windows builder package names it with its hash in deps/linux-package.json (tools/make_package.py); it is
+# downloaded once, when a build is for the Deck. ULTRS_LINUX_PACKAGE=<folder>: the newest AppImage there instead
+# (development: dev-local/dist).
 LINUX_PACKAGE = 'deps/linux-package.json'
 
 
