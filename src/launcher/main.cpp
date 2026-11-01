@@ -3,6 +3,8 @@
 #include "launcher.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
+#include <csignal>
+#include <cstdio>
 
 static const char *TITLE = "UltraTears";
 static const float W = 800, H = 480;
@@ -18,22 +20,64 @@ static float window_scale(SDL_Window *w) {
     return s > 0 ? s : 1;
 }
 
-int main(int, char **) {
+// The launcher's log, ultratears-launcher.log beside its settings (own_dir(): beside the AppImage file on Linux), the
+// last run's kept as ultratears-launcher-previous.log: SDL_Log lines, with the time since the start. Before
+// 2026-11-01 the launcher logged nothing, and a start that failed (Steam Deck, Game Mode) left no trace.
+static FILE *g_log;
+static void log_out(void *, int, SDL_LogPriority, const char *msg) {
+    double t = SDL_GetTicks() / 1000.0;
+    if (g_log) {
+        fprintf(g_log, "[%8.3f] %s\n", t, msg);
+        fflush(g_log);
+    }
+    fprintf(stderr, "%s\n", msg);
+}
+static std::string log_open() {
+    std::string path = path_join(own_dir(), "ultratears-launcher.log");
+    std::string prev = path_join(own_dir(), "ultratears-launcher-previous.log");
+    SDL_RemovePath(prev.c_str());
+    SDL_RenamePath(path.c_str(), prev.c_str());
+    g_log = fopen(path.c_str(), "w");
+    SDL_SetLogOutputFunction(log_out, nullptr);
+    return path;
+}
+static int start_failed(const std::string &log, const char *what) {
+    std::string err = std::string(what) + ": " + SDL_GetError();
+    SDL_Log("cannot start: %s", err.c_str());
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, TITLE, Tf("start_failed", {{"err", err}, {"log", log}}).c_str(), nullptr);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+#ifndef _WIN32
+    // Steam starts games with SIGCHLD ignored, which the launcher inherits: its children are then reaped by the kernel
+    // and waitpid cannot tell how the builder ended (a failed build read as done). Back to the default.
+    signal(SIGCHLD, SIG_DFL);
+#endif
+    std::string log = log_open();
+    g_lang = system_lang();   // the settings' language comes with ui_init; messages before it in the system's
+    SDL_Log("UltraTears Launcher, %s", package_version_line(exe_dir()).c_str());
+    SDL_Log("launcher %s, settings in %s", argc > 0 ? argv[0] : "?", own_dir().c_str());
+    for (const char *v : {"APPIMAGE", "SteamDeck", "SteamGameId", "XDG_CURRENT_DESKTOP", "WAYLAND_DISPLAY", "DISPLAY"}) {
+        const char *s = SDL_getenv(v);
+        if (s && *s)
+            SDL_Log("  %s=%s", v, s);
+    }
     const char *dev_shot = SDL_getenv("ULTRS_LAUNCHER_SHOT");   // development screenshots run beside a real launcher
     if (!(dev_shot && *dev_shot) && !single_instance(TITLE))
         return 0;
     SDL_SetHint(SDL_HINT_APP_NAME, "UltraTears Launcher");
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, TITLE, SDL_GetError(), nullptr);
-        return 1;
-    }
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+        return start_failed(log, "SDL_Init");
+    SDL_Log("video driver %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
     float scale = window_scale(nullptr);
     SDL_Window *win = SDL_CreateWindow(TITLE, (int)(W * scale), (int)(H * scale), SDL_WINDOW_HIDDEN);
-    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, nullptr) : nullptr;
-    if (!ren) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, TITLE, SDL_GetError(), nullptr);
-        return 1;
-    }
+    if (!win)
+        return start_failed(log, "SDL_CreateWindow");
+    SDL_Renderer *ren = SDL_CreateRenderer(win, nullptr);
+    if (!ren)
+        return start_failed(log, "SDL_CreateRenderer");
+    SDL_Log("window %dx%d at scale %.2f, renderer %s", (int)(W * scale), (int)(H * scale), scale, SDL_GetRendererName(ren));
     SDL_SetRenderVSync(ren, 1);
     window_dark_title(win);
     float real = window_scale(win);   // the display the window opened on may have another scale
@@ -115,5 +159,6 @@ int main(int, char **) {
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
+    SDL_Log("closed");
     return 0;
 }

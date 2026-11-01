@@ -572,8 +572,19 @@ static void poll_update() {
             U.upd_st = 3, U.upd_err = res;
         } else if (st == 2) {   // checked: put it in place with the package's Python, the launcher restarts after
             U.upd_st = 2, U.apply_frac = 0;
+#ifdef _WIN32
             U.apply = setup_start({python_path(U.root), path_join(U.root, "tools/apply_update.py"), res, "--root", U.root},
                                   U.root, path_join(U.root, "update/update.log"));
+#else
+            std::string err;   // the new AppImage in the game folder, started: it updates the folder itself
+            if (appimage_update(res, U.root, err)) {
+                SDL_Event q = {};
+                q.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&q);
+            } else {
+                U.upd_st = 3, U.upd_err = err;
+            }
+#endif
         }
     }
     if (U.apply) {

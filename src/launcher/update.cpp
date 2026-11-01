@@ -1,6 +1,7 @@
 // Updates of the builder package from GitHub Releases: at most one question a day (ultratears-launcher.ini, updates=off
-// turns it off), the newest release's builder zip downloaded into update\ of the package, its size and SHA-256 (the
-// digest GitHub keeps for every release file) checked before tools/apply_update.py puts it in place.
+// turns it off), the newest release's builder zip (Windows) or AppImage (Linux) downloaded into update\ of the package,
+// its size and SHA-256 (the digest GitHub keeps for every release file) checked before tools/apply_update.py puts the
+// zip in place, or the AppImage takes UltraTears.AppImage's place (platform.cpp appimage_update).
 // HTTP: WinHTTP on Windows, the system's libcurl on Linux; SHA-256: BCrypt on Windows, its own on Linux.
 #include "launcher.h"
 #include <atomic>
@@ -245,12 +246,13 @@ static int check_thread(void *) {
             for (size_t k = 0; k < assets.size(); k++) {
                 std::string name = assets[k]["name"].str(), digest = assets[k]["digest"].str();
 #ifdef _WIN32
-                const char *mine = "windows-x86_64.zip";
+                bool mine = name.find("-builder-") != std::string::npos && name.find("windows-x86_64.zip") != std::string::npos;
 #else
-                const char *mine = "linux-x86_64.tar.gz";   // the Linux builder package (tools/make_package_linux.py)
+                // the AppImage (decision 2026-11-01): put in the game folder in place of UltraTears.AppImage and
+                // started, it brings the folder up to date itself (appimage_update)
+                bool mine = name.rfind("UltraTears-", 0) == 0 && name.size() > 16 && name.compare(name.size() - 16, 16, "-x86_64.AppImage") == 0;
 #endif
-                if (name.find("-builder-") == std::string::npos || name.find(mine) == std::string::npos ||
-                    digest.rfind("sha256:", 0) != 0)   // no hash, no update
+                if (!mine || digest.rfind("sha256:", 0) != 0)   // no hash, no update
                     continue;
                 int v[3];
                 parse_version(tag, v);
@@ -473,7 +475,7 @@ void update_cleanup(const std::string &root) {
         SDL_RemovePath(list.c_str());
         SDL_EnumerateDirectory(dir.c_str(), [](void *d, const char *, const char *name) {
             std::string f = path_join(*(std::string *)d, name);
-            if (path_is_file(f) && (SDL_strstr(name, ".zip") || SDL_strstr(name, ".log")))
+            if (path_is_file(f) && (SDL_strstr(name, ".zip") || SDL_strstr(name, ".AppImage") || SDL_strstr(name, ".log")))
                 SDL_RemovePath(f.c_str());
             return SDL_ENUM_CONTINUE;
         }, &dir);

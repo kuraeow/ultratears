@@ -68,6 +68,8 @@ std::string game_exe(const std::string &folder);           // the game built in 
 bool start_game(const std::string &folder);                // the game in folder, detached
 void single_instance_release();
 bool restart_self();                                       // a new launcher started (after an update)
+// Linux: the downloaded AppImage made UltraTears.AppImage of the game folder root, and started (false: err says why)
+bool appimage_update(const std::string &downloaded, const std::string &root, std::string &err);
 
 // ---- update.cpp: new builder packages from GitHub Releases
 struct UpdateInfo { std::string version, name, url, sha256, page; uint64_t size = 0; };

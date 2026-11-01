@@ -9,6 +9,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -16,6 +17,9 @@
 #include <unistd.h>
 #endif
 
+#ifndef _WIN32
+static int g_instance_fd = -1;   // the one-instance lock (flock), close-on-exec: the game and the builder do not hold it
+#endif
 #ifdef _WIN32
 static HANDLE g_instance;   // the one-instance mutex
 
@@ -149,11 +153,22 @@ bool single_instance(const char *title) {
     }
     return false;
 #else
-    (void)title;
+    // The lock held by another process: a launcher is running (its window is not raised here: no portable way).
+    // Before 2026-11-01 the descriptor was inherited by the game and the builder the launcher starts, so a game still
+    // running (or a build) kept the next launcher from starting at all, silently (Steam Deck, Game Mode).
     const char *run = SDL_getenv("XDG_RUNTIME_DIR");
     std::string lock = std::string(run ? run : "/tmp") + "/ultratears-launcher.lock";
-    int fd = open(lock.c_str(), O_CREAT | O_RDWR, 0600);
-    return fd < 0 || flock(fd, LOCK_EX | LOCK_NB) == 0;   // the descriptor stays open while the launcher runs
+    int fd = open(lock.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return true;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        SDL_Log("another launcher is running (%s is locked): this one ends", lock.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, title, T("already_running"), nullptr);
+        return false;
+    }
+    g_instance_fd = fd;   // stays open while the launcher runs
+    return true;
 #endif
 }
 
@@ -239,6 +254,10 @@ void single_instance_release() {
     if (g_instance)
         CloseHandle(g_instance);
     g_instance = nullptr;
+#else
+    if (g_instance_fd >= 0)
+        close(g_instance_fd);
+    g_instance_fd = -1;
 #endif
 }
 
@@ -278,6 +297,39 @@ bool restart_self() {
 #endif
 }
 
+bool appimage_update(const std::string &downloaded, const std::string &root, std::string &err) {
+#ifdef _WIN32
+    (void)downloaded, (void)root;
+    err = "not on Windows";
+    return false;
+#else
+    // The game folder's UltraTears.AppImage is what Steam starts (--play) and what the launcher is: the new one takes its
+    // place (a rename on the same disk: update/ is inside the folder; a running old one keeps its own file until it
+    // exits) and is started, without arguments. Newer than the folder's package, it copies its builder into the folder
+    // (tools/install_to.py) and offers to update the game, rebuilding what changed.
+    std::string dst = path_join(root, "UltraTears.AppImage");
+    if (chmod(downloaded.c_str(), 0755) != 0 || rename(downloaded.c_str(), dst.c_str()) != 0) {
+        err = "UltraTears.AppImage: " + std::string(strerror(errno));
+        SDL_Log("update: %s -> %s failed: %s", downloaded.c_str(), dst.c_str(), strerror(errno));
+        return false;
+    }
+    SDL_Log("update: %s is the new UltraTears.AppImage, starting it", downloaded.c_str());
+    single_instance_release();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (chdir(root.c_str()) == 0)
+            execl(dst.c_str(), dst.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    if (pid < 0) {
+        err = "fork: " + std::string(strerror(errno));
+        return false;
+    }
+    return true;
+#endif
+}
+
 std::string game_exe(const std::string &folder) {
 #ifdef _WIN32
     std::string exe = path_join(folder, "UltraTears.exe");
@@ -296,14 +348,17 @@ std::string game_exe(const std::string &folder) {
 
 bool start_game(const std::string &folder) {
     std::string exe = game_exe(folder);
+    SDL_Log("play: %s", exe.empty() ? "no game in the folder" : exe.c_str());
     if (exe.empty())
         return false;
 #ifdef _WIN32
     std::wstring cmd = L"\"" + wide(exe) + L"\"";
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, wide(folder).c_str(), &si, &pi))
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, wide(folder).c_str(), &si, &pi)) {
+        SDL_Log("play: CreateProcess failed (%lu)", GetLastError());
         return false;
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;

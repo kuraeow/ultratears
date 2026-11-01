@@ -114,6 +114,10 @@ std::string python_path(const std::string &root) {
 SetupProc *setup_start(const std::vector<std::string> &args, const std::string &cwd, const std::string &log_path) {
     SetupProc *p = new SetupProc;
     p->lock = SDL_CreateMutex();
+    std::string line;
+    for (const std::string &a : args)
+        line += (line.empty() ? "" : " ") + a;
+    SDL_Log("builder: %s (in %s, its log %s)", line.c_str(), cwd.c_str(), log_path.c_str());
     if (!log_path.empty()) {
         std::string prev = log_path.substr(0, log_path.size() - 4) + "-previous.log";
         SDL_RemovePath(prev.c_str());
@@ -239,9 +243,11 @@ bool setup_finished(SetupProc *p, int *exit_code) {
 #else
     if (p->pid > 0) {
         int st = 0;
-        if (waitpid(p->pid, &st, WNOHANG) == 0)
+        pid_t w = waitpid(p->pid, &st, WNOHANG);
+        if (w == 0)
             return false;
-        p->exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+        p->exit_code = w == p->pid && WIFEXITED(st) ? WEXITSTATUS(st) : 1;   // -1: its status is lost, not a success
+        SDL_Log("builder ended: exit %d%s", p->exit_code, w == p->pid ? "" : " (status lost)");
         p->pid = -1;
     }
 #endif
