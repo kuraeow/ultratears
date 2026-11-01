@@ -1656,7 +1656,7 @@ void ui_init(SDL_Window *w) {
             c = '\\';
 #endif
     std::string inst = U.set.get("install");
-    use_install(inst.empty() ? U.home : inst);
+    use_install(inst.empty() ? (root && *root ? U.home : default_install()) : inst);
     // the platform chosen last; else what the folder was built for (data/setup.json "platforms"), else this PC
     U.platform = U.set.get("platform");
 #ifndef _WIN32

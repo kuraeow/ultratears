@@ -15,6 +15,7 @@ nothing of it is ever published.
 """
 import argparse
 import io
+import json
 import os
 import pathlib
 import subprocess
@@ -46,6 +47,19 @@ def deck_cfg():
             if key in KEEP:
                 lines.append(line)
     return ('\n'.join(lines) + '\n').encode()
+
+
+def deck_state():
+    """data/setup.json as the Deck's own build sees it (an AppImage pointed at the folder updates it, tools/setup.py):
+    built for Linux, its shader pack the Deck's (on an NVIDIA PC the one made with the AMD gather bias), no PC paths."""
+    path = ROOT / 'data/setup.json'
+    state = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+    if state.get('deck-shaders-pack'):
+        state['shaders-pack'] = state['deck-shaders-pack']
+    for k in ('deck-shaders-pack', 'deck-tar', 'dump', 'shaders-xlate', 'work-xlate'):
+        state.pop(k, None)
+    state['platforms'] = ['linux']
+    return (json.dumps(state, indent=1) + '\n').encode()
 
 
 def main():
@@ -80,7 +94,7 @@ def main():
         files.append((launcher, 'ultratears-launcher', 0o755))
     else:
         print('  no launcher for Linux (bin-linux/ultratears-launcher): the Deck starts the game directly', flush=True)
-    for name in ('data/setup.json', 'VERSION.txt', 'LICENSE', 'THIRD-PARTY-NOTICES.md'):
+    for name in ('VERSION.txt', 'LICENSE', 'THIRD-PARTY-NOTICES.md'):
         if (ROOT / name).is_file():
             files.append((ROOT / name, name, 0o644))
     if (ROOT / 'licenses').is_dir():
@@ -95,10 +109,10 @@ def main():
     tmp = out.with_suffix('.tar.part')
     bar = progress.Bar('packing for the Steam Deck', sum(p.stat().st_size for p, _, _ in files), 'GiB', 2**30, rate=True)
     with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
-        data = deck_cfg()
-        info = tarfile.TarInfo(f'{TOP}/ultratears.cfg')
-        info.size, info.mode = len(data), 0o644
-        t.addfile(info, io.BytesIO(data))
+        for name, data in (('ultratears.cfg', deck_cfg()), ('data/setup.json', deck_state())):
+            info = tarfile.TarInfo(f'{TOP}/{name}')
+            info.size, info.mode = len(data), 0o644
+            t.addfile(info, io.BytesIO(data))
         # Steam's "Add a Non-Steam Game" lists only .sh / .AppImage files: a script for the game and one for the launcher
         for name, exe_name in (('UltraTears.sh', 'ultratears'), ('UltraTears-Launcher.sh', 'ultratears-launcher')):
             data = f'#!/bin/sh\ncd "$(dirname "$(readlink -f "$0")")" && exec ./{exe_name} "$@"\n'.encode()
@@ -114,7 +128,7 @@ def main():
             bar.add(st.st_size)
     bar.finish()
     os.replace(tmp, out)
-    print(f'{out.name}: {len(files) + 1} files, {out.stat().st_size / 2**30:.1f} GiB', flush=True)
+    print(f'{out.name}: {len(files) + 4} files, {out.stat().st_size / 2**30:.1f} GiB', flush=True)
 
 
 if __name__ == '__main__':

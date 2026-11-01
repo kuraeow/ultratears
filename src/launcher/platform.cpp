@@ -35,6 +35,35 @@ std::string exe_dir() {
     return d;
 }
 
+// Started from an AppImage the launcher's folder is the image's read-only mount (gone when it exits): its settings and
+// the game go beside the AppImage file instead ($APPIMAGE, set by the AppImage runtime).
+static std::string appimage_dir() {
+#ifdef _WIN32
+    return "";
+#else
+    const char *a = SDL_getenv("APPIMAGE");
+    if (!a || !*a)
+        return "";
+    std::string d = a;
+    size_t cut = d.find_last_of('/');
+    return cut == std::string::npos ? std::string(".") : cut == 0 ? std::string("/") : d.substr(0, cut);
+#endif
+}
+std::string own_dir() {
+    std::string d = appimage_dir();
+    return d.empty() ? exe_dir() : d;
+}
+// The package's own folder; from an AppImage: the folder of a game beside it (the AppImage put in a game folder to
+// update it, as one from a Steam Deck's tar), else a new UltraTears folder there.
+std::string default_install() {
+    std::string d = appimage_dir();
+    if (d.empty())
+        return exe_dir();
+    if (path_is_file(path_join(d, "ultratears.cfg")))
+        return d;
+    return path_join(d, "UltraTears");
+}
+
 std::string path_join(const std::string &a, const std::string &b) {
 #ifdef _WIN32
     const char sep = '\\';
@@ -155,7 +184,7 @@ Lang system_lang() {
 int logical_cpus() { return SDL_max(1, SDL_GetNumLogicalCPUCores()); }
 
 // ---- settings: ultratears-launcher.ini next to the launcher, key=value lines in UTF-8
-static std::string settings_path() { return path_join(exe_dir(), "ultratears-launcher.ini"); }
+static std::string settings_path() { return path_join(own_dir(), "ultratears-launcher.ini"); }
 
 Settings settings_load() {
     Settings s;
@@ -254,8 +283,9 @@ std::string game_exe(const std::string &folder) {
     std::string exe = path_join(folder, "UltraTears.exe");
     return path_is_file(exe) ? exe : "";
 #else
-    // the Steam Deck's tar has the game beside its data; a build on Linux links it into linux/ (tools/build_game.py)
-    for (const char *name : {"ultratears", "linux/ultratears"}) {
+    // a build on Linux links it into linux/ (tools/build_game.py); the Steam Deck's tar has it beside its data, and a
+    // folder from the tar rebuilt on the Deck has both: the one built there is the current one
+    for (const char *name : {"linux/ultratears", "ultratears"}) {
         std::string exe = path_join(folder, name);
         if (path_is_file(exe))
             return exe;

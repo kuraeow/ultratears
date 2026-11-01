@@ -42,6 +42,8 @@ bool has_text(const char *key);
 
 // ---- platform.cpp
 std::string exe_dir();                                   // the launcher's folder, UTF-8, no trailing separator
+std::string own_dir();                                   // where its settings go: exe_dir(), the AppImage file's folder
+std::string default_install();                           // the install folder before one is chosen
 std::string path_join(const std::string &a, const std::string &b);
 bool path_is_dir(const std::string &p);
 bool path_is_file(const std::string &p);

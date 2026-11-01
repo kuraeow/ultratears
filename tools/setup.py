@@ -460,7 +460,10 @@ def deck_pack(state):
 
 def step_shaders(dump, state, cpus):
     export = tree_hash([ROOT / 'tools/shaders/inventory.py', ROOT / 'tools/export_shaders.py'])
-    xlate_id = sha256(toolchain.XLATE)[:16]
+    # the translator by the sources it is built from (deps/shaders/source.txt, tools/build_xlate.py): the Windows and the
+    # Linux build of one source are the same translation, so a Steam Deck's folder made on a PC keeps its pack
+    stamp = toolchain.XLATE.parent / 'source.txt'
+    xlate_id = 'src-' + stamp.read_text().strip() if stamp.is_file() else sha256(toolchain.XLATE)[:16]
     work = DATA / 'shaders/work'
     made = []
     keep_bias = os.environ.get('TOTK_GATHER_BIAS')

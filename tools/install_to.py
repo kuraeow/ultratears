@@ -22,7 +22,7 @@ def emit(ev, **fields):
 def package_files():
     listing = ROOT / 'package-files.txt'
     if listing.is_file():
-        return [f for f in listing.read_text(encoding='utf-8').splitlines() if f and (ROOT / f).is_file()]
+        return [f for f in listing.read_text(encoding='utf-8').splitlines() if f and ((ROOT / f).is_file() or (ROOT / f).is_symlink())]
     return sorted(p.relative_to(ROOT).as_posix() for p in ROOT.rglob('*')
                   if p.is_file() and p.relative_to(ROOT).parts[0] not in KEEP and not p.name.endswith(('.log', '.tar')))
 
@@ -34,14 +34,24 @@ def main():
         if dest == ROOT or ROOT in dest.parents:
             raise ValueError(f'{dest} is inside the package itself')
         files = package_files()
-        total, done = sum((ROOT / f).stat().st_size for f in files), 0
+        total, done = sum((ROOT / f).stat().st_size for f in files if not (ROOT / f).is_symlink()), 0
         for f in files:
             src, dst = ROOT / f, dest / f
+            if src.is_symlink():   # the Linux package's links (LLVM's clang -> clang-23) stay links, not copies
+                link = os.readlink(src)
+                if not (dst.is_symlink() and os.readlink(dst) == link):
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dst.with_name(dst.name + '.copying')
+                    if tmp.is_symlink() or tmp.exists():
+                        tmp.unlink()
+                    os.symlink(link, tmp)
+                    os.replace(tmp, dst)
+                continue
             st = src.stat()
             if not (dst.is_file() and dst.stat().st_size == st.st_size and int(dst.stat().st_mtime) == int(st.st_mtime)):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 tmp = dst.with_name(dst.name + '.copying')
-                shutil.copy2(src, tmp)
+                shutil.copy2(src, tmp)   # with its mode: the Linux package's programs stay executable
                 os.replace(tmp, dst)
             done += st.st_size
             emit('progress', label='copy', done=done, total=total, eta=None)
