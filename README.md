@@ -71,8 +71,9 @@ cd ultratears
 python tools/setup.py --dump D:\path\to\dump
 ```
 
-The setup downloads the tools it lacks and builds the game into `build\` (`build\UltraTears.exe`). Without `--dump` it
-takes the dump from `dump\` in the repository. Options, Linux and how it works: [BUILDING.md](BUILDING.md).
+The setup downloads the tools it lacks and makes the complete game folder in `build\`: `UltraTears.exe`, its data and
+what a quick rebuild needs. Start `build\UltraTears.exe`. Without `--dump` it takes the dump from `dump\` in the
+repository. Options, Linux and how it works: [BUILDING.md](BUILDING.md).
 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Legal
