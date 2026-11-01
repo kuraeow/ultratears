@@ -2,6 +2,7 @@
 // failure, and Play once the game is built. Layout in design pixels (800x480), multiplied by the window's scale.
 // Every clickable thing has a hover and a pressed look and the hand cursor; Tab / the gamepad move between them.
 #include "launcher.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -185,6 +186,7 @@ enum Screen { SCR_DUMP, SCR_BUILD, SCR_HW, SCR_PLAY, SCR_UPDATE, SCR_BROKEN };
 enum DumpState { D_NONE, D_CHECKING, D_BAD, D_OK, D_DATA };   // D_DATA: the game data already in data/
 enum RowState { R_PENDING, R_RUN, R_DONE, R_WARN, R_ERROR };
 
+enum { NSTEP = 10 };   // setup.py's steps (STEPS) and its tools
 struct Row { const char *id, *name; RowState st = R_PENDING; double secs = -1; bool skipped = false; std::string err; };
 
 static struct {
@@ -208,9 +210,10 @@ static struct {
     Row rows[7] = {{"check", "step_check"}, {"romfs", "step_romfs"}, {"lift", "step_lift"},
                    {"compile", "step_compile"}, {"shaders", "step_shaders"}, {"textures", "step_textures"},
                    {"deck", "step_deck"}};   // deck: shown in a build for the Steam Deck only
-    double weight[9] = {};
-    const char *weight_id[9] = {"tools", "check", "romfs", "lift", "compile", "shaders", "textures", "finish", "deck"};
-    double frac[9] = {};      // each setup step's share done, 0..1
+    // graphics: the shaders compiled by the driver (setup.py), in the shaders row ("Preparing the graphics") after them
+    double weight[NSTEP] = {};
+    const char *weight_id[NSTEP] = {"tools", "check", "romfs", "lift", "compile", "shaders", "graphics", "textures", "finish", "deck"};
+    double frac[NSTEP] = {};  // each setup step's share done, 0..1
     double eta = -1;          // of the running step, from its progress events
     bool failed = false, done = false, cancel_q = false, close_after_cancel = false;
     std::string fail_text;
@@ -374,13 +377,98 @@ static void SDLCALL folder_picked(void *which, const char *const *files, int) {
     SDL_UnlockMutex(U.lock);
 }
 
+// ---- folders chosen inside the launcher, with the pad: in the Steam Deck's Game Mode (gamescope) there is no desktop
+// to show the system's folder dialog (SDL asks xdg-desktop-portal). ULTRS_OWN_PICKER=1: this one elsewhere too (to try).
+static struct { bool open = false; int which = 0; std::string dir; std::vector<std::string> subs; } FP;
+static bool own_picker() {
+#ifdef _WIN32
+    return false;
+#else
+    const char *d = SDL_getenv("XDG_CURRENT_DESKTOP"), *f = SDL_getenv("ULTRS_OWN_PICKER");
+    return (f && *f == '1') || (d && SDL_strcasecmp(d, "gamescope") == 0);
+#endif
+}
+static SDL_EnumerationResult SDLCALL fp_entry(void *, const char *, const char *name) {
+    SDL_PathInfo i;
+    if (name[0] != '.' && SDL_GetPathInfo(path_join(FP.dir, name).c_str(), &i) && i.type == SDL_PATHTYPE_DIRECTORY)
+        FP.subs.push_back(name);
+    return SDL_ENUM_CONTINUE;
+}
+static void fp_enter(std::string dir) {
+    while (dir.size() > 1 && dir.back() == '/')
+        dir.pop_back();
+    FP.dir = dir.empty() ? "/" : dir;
+    FP.subs.clear();
+    SDL_EnumerateDirectory(FP.dir.c_str(), fp_entry, nullptr);
+    std::sort(FP.subs.begin(), FP.subs.end());
+}
+static std::string home_dir() {
+    const char *h = SDL_getenv("HOME");
+    return h && *h ? h : "/";
+}
+static void folder_picker_frame() {
+    if (!FP.open)
+        return;
+    if (!ImGui::IsPopupOpen("##folders"))
+        ImGui::OpenPopup("##folders");
+    ImGuiIO &io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(720 * S, 420 * S));
+    if (!ImGui::BeginPopupModal("##folders", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove))
+        return;
+    ImGui::PushFont(g_media.regular);
+    ImGui::TextUnformatted(T("pick_title"));
+    ImGui::PushStyleColor(ImGuiCol_Text, C_SUB);
+    ImGui::TextWrapped("%s", FP.dir.c_str());
+    ImGui::PopStyleColor();
+    std::string go;
+    if (ImGui::Button(T("pick_up")))
+        go = FP.dir == "/" ? "/" : FP.dir.substr(0, SDL_max(FP.dir.find_last_of('/'), (size_t)1));
+    ImGui::SameLine();
+    if (ImGui::Button(T("pick_home")))
+        go = home_dir();
+    ImGui::SameLine();
+    if (ImGui::Button(T("pick_media")))   // the SD card and USB drives (SteamOS mounts them there)
+        go = path_is_dir("/run/media/deck") ? "/run/media/deck" : "/run/media";
+    float bottom = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+    ImGui::BeginChild("subs", ImVec2(0, -bottom), ImGuiChildFlags_Borders);
+    if (FP.subs.empty())
+        ImGui::TextDisabled("%s", T("pick_empty"));
+    for (const std::string &n : FP.subs)
+        if (ImGui::Selectable(n.c_str()))   // A on the pad, a click: into it
+            go = path_join(FP.dir, n);
+    ImGui::EndChild();
+    if (ImGui::Button(T("pick_this"))) {
+        SDL_LockMutex(U.lock);
+        U.picked = FP.dir;
+        U.picked_for = FP.which;
+        SDL_UnlockMutex(U.lock);
+        FP.open = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(T("cancel")) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        FP.open = false;
+    ImGui::PopFont();
+    if (!FP.open)
+        ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    if (!go.empty())
+        fp_enter(go);
+}
+
 static void pick_folder(int which, const std::string &start) {
+    if (own_picker()) {
+        FP.open = true;
+        FP.which = which;
+        fp_enter(!start.empty() && path_is_dir(start) ? start : home_dir());
+        return;
+    }
     SDL_ShowOpenFolderDialog(folder_picked, (void *)(intptr_t)which, g_win, start.empty() ? nullptr : start.c_str(), false);
 }
 
 // ---------------------------------------------------------------- the build
 static int setup_index(const std::string &id) {
-    for (int i = 0; i < 9; i++)
+    for (int i = 0; i < NSTEP; i++)
         if (id == U.weight_id[i])
             return i;
     return -1;
@@ -391,6 +479,8 @@ static Row *row_of(const std::string &id) {   // tools and check share the first
         return &U.rows[0];
     if (id == "finish")
         return &U.rows[5];
+    if (id == "graphics")
+        return &U.rows[4];
     for (Row &r : U.rows)
         if (id == r.id)
             return &r;
@@ -438,8 +528,8 @@ static void wait_range(long *lo, long *hi, const std::string &p = "") {
 static void start_build_state() {
     for (Row &r : U.rows)
         r.st = R_PENDING, r.secs = -1, r.skipped = false, r.err.clear();
-    static const double defaults[9] = {2, 1, 7, 4, 47, 9, 30, 0, 0};   // setup.py's STEP_WEIGHTS, until its plan arrives
-    for (int i = 0; i < 9; i++)
+    static const double defaults[NSTEP] = {2, 1, 7, 4, 47, 9, 4, 30, 0, 0};   // setup.py's STEP_WEIGHTS, until its plan arrives
+    for (int i = 0; i < NSTEP; i++)
         U.weight[i] = defaults[i], U.frac[i] = 0;
     U.eta = -1, U.failed = U.done = U.cancel_q = U.hw_asked = U.stopping = false;
     U.fail_text.clear();
@@ -499,16 +589,20 @@ static void on_event(const Json &e) {
         } else {
             if (k >= 0)
                 U.frac[k] = 1;
-            if (r) {   // tools and finish only add their time: the row's own step (check, textures) says how it went
+            // tools, shaders and finish only add their time: the row's last step (check, graphics, textures) says how it
+            // went (skipped: when the shaders were too)
+            if (r) {
                 r->secs = (r->secs > 0 ? r->secs : 0) + e["secs"].num();
-                if (id != "tools" && id != "finish") {
-                    r->st = r->st == R_WARN ? R_WARN : R_DONE;
+                if (id == "shaders")
                     r->skipped = st == "skip";
+                else if (id != "tools" && id != "finish") {
+                    r->st = r->st == R_WARN ? R_WARN : R_DONE;
+                    r->skipped = st == "skip" && (id != "graphics" || r->skipped);
                 }
             }
         }
     } else if (ev == "progress") {
-        for (int k = 0; k < 9; k++) {
+        for (int k = 0; k < NSTEP; k++) {
             Row *r = row_of(U.weight_id[k]);
             if (r && r->st == R_RUN && U.frac[k] < 1 && (k != 0 || U.rows[0].st != R_DONE)) {
                 double total = e["total"].num();
@@ -724,7 +818,7 @@ static void poll() {
 
 static double overall() {
     double sum = 0, done = 0;
-    for (int k = 0; k < 9; k++)
+    for (int k = 0; k < NSTEP; k++)
         sum += U.weight[k], done += U.weight[k] * U.frac[k];
     return sum > 0 ? done / sum : 0;
 }
@@ -938,7 +1032,7 @@ static void step_rows(float y) {
         } else if (r.st == R_RUN && U.eta > 0) {
             note = Tf("left", {{"t", fmt_minutes(U.eta)}});
         } else if (r.st == R_PENDING && (i == 3 || i == 5)) {   // the long ones, as the design shows
-            note = Tf("may_take", {{"t", fmt_minutes(est * U.weight[i + 1] / 100)}});
+            note = Tf("may_take", {{"t", fmt_minutes(est * U.weight[setup_index(r.id)] / 100)}});
         }
         if (!note.empty())
             text(nf, nx, ry + (nf == g_media.small ? 1 : -1), note_col, note.c_str());
@@ -1630,10 +1724,89 @@ static void update_banner(float right) {
 }
 
 static bool g_play_failed = false;
-static void screen_play_footer() {
-    // Play; with a newer release found also Update, and what is new (the design: Play grey beside a green Update)
-    if (button("play", T("play"), 36, 408, 116, 48, U.has_upd ? DARK : PRIMARY))
+
+// ---- Play: first the shaders this graphics driver has not compiled yet (UltraTears --prepare-shaders, gfx/vkb_shader.c):
+// the Steam Deck's folder built on a PC, a driver update, a game update. With nothing to do the game says "ready" in
+// about a second. A driver crash kills it; it runs again (it skips what the driver crashed on), up to 3 times, and the
+// game starts whatever happened: what is not compiled now is compiled while playing. --play (Steam's launch option,
+// AppRun): the window stays hidden unless there is something to compile, and the game then takes the launcher's place.
+static struct {
+    SetupProc *p = nullptr;
+    int tries = 0;
+    double done = 0, total = 0;   // total 0: checking
+    bool play_mode = false, show = false, quit = false;
+} G;
+
+static void gfx_start() {
+    std::string exe = game_exe(U.install);
+    G.done = G.total = 0;
+    G.p = setup_start({exe, "--prepare-shaders"}, U.install, path_join(U.install, "ultratears-prepare.log"));
+}
+
+static void play_now() {
+    if (G.play_mode)   // main.cpp closes the window, then ui_play_finish starts the game
+        G.quit = true;
+    else
         g_play_failed = !start_game(U.install);
+}
+
+static void gfx_poll() {
+    if (!G.p)
+        return;
+    std::string line;
+    while (setup_line(G.p, line)) {
+        unsigned long long d, t;
+        if (SDL_sscanf(line.c_str(), "prepare-shaders: %llu of %llu", &d, &t) == 2)
+            G.done = (double)d, G.total = (double)t, G.show = true;
+        else if (!SDL_strncmp(line.c_str(), "prepare-shaders:", 16))
+            SDL_Log("%s", line.c_str());
+    }
+    int code = 0;
+    if (!setup_finished(G.p, &code))
+        return;
+    setup_free(G.p);
+    G.p = nullptr;
+    if (code != 0 && ++G.tries < 3) {
+        SDL_Log("prepare-shaders: exit code %d, again without the shaders it was on", code);
+        gfx_start();
+        return;
+    }
+    play_now();
+}
+
+void ui_play_mode() {   // main.cpp: --play
+    std::string here = default_install();   // the game the AppImage lies in (as AppRun took it before), whatever the settings say
+    if (path_is_file(path_join(here, "ultratears.cfg")))
+        use_install(here);
+    if (!installed() || stale())
+        return;   // nothing to play yet, or an update to finish: the launcher as usual
+    G.play_mode = true;
+    U.screen = SCR_PLAY;
+    gfx_start();
+}
+bool ui_window_wanted() { return !G.play_mode || G.show; }
+bool ui_quit_wanted() { return G.quit; }
+// --play, the window closed: on Linux the launcher's process becomes the game (Steam follows it; with the window open its
+// display connection would pass to the game and keep the window up), elsewhere the game is started
+bool ui_play_finish() { return G.quit && (exec_game(U.install) || start_game(U.install)); }
+
+static void screen_play_footer() {
+    if (G.p) {   // the graphics prepared, before the game starts
+        std::string t = G.total > 0 ? Tf("gfx_prep", {{"done", std::to_string((long long)G.done)}, {"total", std::to_string((long long)G.total)}})
+                                    : std::string(T("gfx_check"));
+        text(g_media.regular, 36, 404, C_TEXT, t.c_str());
+        DL->AddRectFilled(P(36, 432), P(764, 440), C_BAR, 4 * S);
+        if (G.total > 0)
+            DL->AddRectFilled(P(36, 432), P(36 + 728 * (float)SDL_min(1.0, G.done / G.total), 440), C_BAR_FILL, 4 * S);
+        text(g_media.small, 36, 448, C_SUB, T("gfx_note"));
+        return;
+    }
+    // Play; with a newer release found also Update, and what is new (the design: Play grey beside a green Update)
+    if (button("play", T("play"), 36, 408, 116, 48, U.has_upd ? DARK : PRIMARY)) {
+        g_play_failed = false;
+        G.tries = 0;
+        gfx_start();
+    }
     float x = 168;
     if (U.has_upd) {
         if (button("upd_open", T("upd_open"), 160, 408, 136, 48, PRIMARY))
@@ -1745,6 +1918,7 @@ void ui_init(SDL_Window *w) {
 void ui_frame(float scale) {
     S = scale;
     poll();
+    gfx_poll();
     ImGuiIO &io = ImGui::GetIO();
     background(ImGui::GetBackgroundDrawList(), io.DisplaySize);
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -1788,6 +1962,7 @@ void ui_frame(float scale) {
     else
         header(lang);   // last: the language list lies over the body
     ImGui::End();
+    folder_picker_frame();
 }
 
 // Development: a screen with sample data, for screenshots (ULTRS_LAUNCHER_DEMO=<name>, main.cpp): dump, dump_bad,
@@ -1838,7 +2013,8 @@ void ui_demo(const char *name) {
             events({R"({"ev":"error","id":"lift","code":"failed","args":{},"message":"x"})"});
         if (n == "done")
             events({R"({"ev":"step","id":"lift","state":"done","secs":80})", R"({"ev":"step","id":"compile","state":"done","secs":940})",
-                    R"({"ev":"step","id":"shaders","state":"skip","secs":1})", R"({"ev":"step","id":"textures","state":"done","secs":600})",
+                    R"({"ev":"step","id":"shaders","state":"skip","secs":1})", R"({"ev":"step","id":"graphics","state":"skip","secs":1})",
+                    R"({"ev":"step","id":"textures","state":"done","secs":600})",
                     R"({"ev":"done","secs":1900})"});
     } else if (n == "run") {   // a real build at once, as if Prepare was pressed
         U.dump_st = D_OK;

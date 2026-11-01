@@ -23,6 +23,7 @@ Steps (data\\ holds everything made from the dump; it never leaves this PC):
   lift      the game's code translated to C, data\\generated
   compile   the C compiled and linked: UltraTears.exe (objects in build\\)
   shaders   every shader of the game found and translated to SPIR-V, data\\shaders
+  graphics  the shaders compiled by this PC's graphics driver (UltraTears --prepare-shaders), data\\shaders\\compiled.bin
   textures  the ASTC textures re-encoded for PC graphics cards (BC7 / BC1), data\\textures
   finish    ultratears.cfg
   deck      --platform linux / both: UltraTears-SteamDeck.tar, the game for the Steam Deck to carry there (the game
@@ -35,6 +36,7 @@ import importlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -571,6 +573,53 @@ def step_finish(dump, state, cpus):
     return 'ultratears.cfg ready'
 
 
+PREPARED = re.compile(r'prepare-shaders: (\d+) of (\d+)$')
+
+
+def prepare_shaders(game, say_line=None):
+    """The game compiles every shader with this machine's graphics driver into data/shaders/compiled.bin
+    (UltraTears --prepare-shaders, src/gfx/vkb_shader.c), so the first play has no compile stalls. A driver crash kills
+    it: the next run skips the shaders it was compiling (prepare-skip.txt), so it runs again, up to 3 times. Returns
+    the last line it printed and its exit code."""
+    last, rc = '', 0
+    for _ in range(3):
+        p = subprocess.Popen([str(game), '--prepare-shaders'], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, encoding='utf-8', errors='replace')
+        bar = None
+        for line in p.stdout:
+            line = line.rstrip()
+            m = PREPARED.search(line)
+            if m:
+                if not bar:
+                    bar = progress.Bar('compiling the shaders for this graphics card', int(m.group(2)), 'shaders')
+                bar.update(int(m.group(1)))
+            elif line.startswith('prepare-shaders:'):
+                last = line[len('prepare-shaders:'):].strip()
+                (say_line or say)('  ' + last)
+        if bar:
+            bar.finish()
+        rc = p.wait()
+        if not rc:
+            break
+        say(f'  the game stopped while compiling the shaders (exit code {rc}): again, without the shaders it was on')
+    return last, rc
+
+
+def step_graphics(dump, state, cpus):
+    """The shaders compiled for this PC's graphics card (the game of this platform). The Steam Deck's tar is prepared
+    on the Deck: its launcher does it before the first play (another driver)."""
+    game = ROOT / ('UltraTears.exe' if os.name == 'nt' else 'linux/ultratears')
+    if not game.is_file():
+        return 'no game for this PC'
+    last, rc = prepare_shaders(game)
+    if last.startswith('ready'):   # every shader compiled before (an update that changed none)
+        return 'up to date'
+    if rc:   # not fatal: what is not compiled now is compiled while playing
+        say(f'  WARNING: the shaders are not all prepared (exit code {rc}); the game compiles the rest while it runs')
+        return 'partly: compiled while playing'
+    return last or 'done'
+
+
 DECK_TAR = 'UltraTears-SteamDeck.tar'
 
 
@@ -595,7 +644,8 @@ def step_deck(dump, state, cpus):
 
 
 STEPS = [('check', step_check), ('romfs', step_romfs), ('lift', step_lift), ('compile', step_compile),
-         ('shaders', step_shaders), ('textures', step_textures), ('finish', step_finish), ('deck', step_deck)]
+         ('shaders', step_shaders), ('graphics', step_graphics), ('textures', step_textures), ('finish', step_finish),
+         ('deck', step_deck)]
 
 
 def no_quick_edit():
@@ -719,7 +769,7 @@ def main():
         say(f'  {result or "ok"} ({progress.clock(secs)})')
         if progress.JSON:
             # the step had nothing to do (an update, a resume, no Deck)
-            skipped = result in ('up to date', 'already packed', 'not for the Steam Deck')
+            skipped = result in ('up to date', 'already packed', 'not for the Steam Deck', 'no game for this PC')
             progress.emit('step', id=name, state='skip' if skipped else 'done', secs=round(secs), note=result or '')
     if from_nothing:
         state['full_secs'], state['full_cpus'] = round(time.time() - t_all - ASKED), a.cpus
@@ -736,7 +786,8 @@ def main():
 # The share of each step in a build from nothing, in % (a clean 0.2.0 package on 8 CPUs, 2026-10-30: romfs 2:19, lift
 # 1:19, compile 15:39, shaders 2:54, textures 10:08; tools: a source build's first download). The launcher's overall bar
 # weighs each step's own progress by these; steps already done count in full.
-STEP_WEIGHTS = {'tools': 2, 'check': 1, 'romfs': 7, 'lift': 4, 'compile': 47, 'shaders': 9, 'textures': 30, 'finish': 0}
+STEP_WEIGHTS = {'tools': 2, 'check': 1, 'romfs': 7, 'lift': 4, 'compile': 47, 'shaders': 9, 'textures': 30, 'finish': 0,
+                'graphics': 4}   # graphics: not measured yet (driver compile of ~28 700 shaders on all CPUs)
 PLATFORMS = {'windows': ['windows'], 'linux': ['linux'], 'both': ['windows', 'linux']}
 
 

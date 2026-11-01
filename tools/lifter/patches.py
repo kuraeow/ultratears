@@ -179,6 +179,15 @@ def fade(reg):
     return f
 
 
+# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). Site from totk-pc-recomp 1a07a8d
+# (recomp/patches-v143.txt, MIT): 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
+# main+0x683604 (add w11, w11, #7); the rounded value is the width (+0x3d8) and, through the packed store at +0xf4, the
+# height (+0x3f8). The fixed size goes into w11 just before the rounding.
+def shadow_size(gen, addr):
+    expect(gen, addr, 0x11001d6b, 'shadow_size')   # add w11, w11, #7
+    return '{ extern int totk_shadow_size(uint32_t *n); uint32_t n_; if (totk_shadow_size(&n_)) c->x[11] = n_; }'
+
+
 PATCHES = {
     0x8005843e0: drs_off,
     MAIN + 0x585e50: scene_size(0),
@@ -200,4 +209,5 @@ PRE_PATCHES = {
     MAIN + 0x24944c: cloth_call, MAIN + 0x28bc98: cloth_call,
     MAIN + 0x562a68: bounce,
     MAIN + 0x3dcb28: output_canvas,
+    MAIN + 0x683604: shadow_size,
 }

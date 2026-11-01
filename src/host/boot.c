@@ -124,7 +124,7 @@ static const char *default_exefs(void) {
                 {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
                 // the player's settings (the launcher's Play screen writes them)
                 {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
-                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"},
+                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
                 {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"},
                 {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
                 {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
@@ -186,12 +186,16 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
     // --debug: the statistics lines in the log (TOTK_STATS=1; the launcher's Debug mode writes debug=1 instead)
+    // --prepare-shaders: every shader compiled by this GPU's driver ahead of play, then exit (gfx/vkb_shader.c)
     const char *arg = NULL;
+    int prepare = 0;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--debug")) setenv("TOTK_STATS", "1", 1);
+        else if (!strcmp(argv[i], "--prepare-shaders")) prepare = 1;
         else if (!arg) arg = argv[i];
-        else { fprintf(stderr, "usage: UltraTears [--debug] [exefs dir]\n"); return 2; }
+        else { fprintf(stderr, "usage: UltraTears [--debug] [--prepare-shaders] [exefs dir]\n"); return 2; }
     const char *exefs = arg ? arg : default_exefs();
+    if (prepare) { int vkb_prepare_shaders(void); return vkb_prepare_shaders(); }
     plat_debug_console(getenv("TOTK_STATS") != NULL);   // after ultratears.cfg (debug=1)
     plat_init();
     plat_crash_handler_install();

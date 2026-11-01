@@ -10,9 +10,16 @@
 //    own layout): +0 Ryujinx support buffer, +1..17 constant buffers c0-c16, +18..33 storage buffers, +34..57 combined
 //    textures, +58..61 images. The translator numbers bindings densely per shader; they are rewritten in the SPIR-V
 //    when it is loaded, so any vertex shader combines with any fragment shader under one pipeline layout.
+#ifndef _WIN32
+#define _GNU_SOURCE   // sched_getaffinity (cpu_count)
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>   // after windows.h (its types)
+#else
+#include <sched.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 #include <stdatomic.h>
 #include <stdio.h>
@@ -862,6 +869,191 @@ static void ahead_start(void) {
     if (e && *e == '0') return;
     pthread_t t;
     if (pthread_create(&t, NULL, ahead_thread, NULL) == 0) pthread_detach(t);
+}
+
+// ---- UltraTears --prepare-shaders: every translated shader compiled by this GPU's driver into the binary file before
+// the game starts (tools/setup.py step graphics, the launcher before Play), on every core, so the first play has no
+// compile stalls. Shaders already in the file cost a lookup each: with nothing to do it prints "ready" in about the
+// time Vulkan takes to start. Progress on stdout: "prepare-shaders: <done> of <total>", then a "done" line.
+// It outlives a driver crash (as totk-pc-recomp dbe8daf, MIT): while a worker hands a shader to the driver, its slot of
+// prepare-journal.bin (beside the binary file) holds the shader's key, cleared when the call returns. A run that finds
+// a journal moves the keys in it into prepare-skip.txt with the GPU and driver version, and preparation skips what
+// that file lists for them (they compile at their first draw, where the driver may crash again); another driver
+// version compiles them again, and so does deleting the file. The caller runs it again after a crash (up to 3 times).
+enum { PREP_SLOTS = 64, PREP_SLOT = 72 };   // journal: a 64-character key per worker, zeros between shaders
+static struct {
+    size_t *todo, n, next;
+    _Atomic size_t done, made, failed, skipped;
+    FILE *journal;
+    pthread_mutex_t jmu;
+    char (*skip)[65];
+    size_t nskip;
+} PR = {.jmu = PTHREAD_MUTEX_INITIALIZER};
+
+static void prep_path(char *out, size_t n, const char *name) {   // beside the binary file
+    const char *bin = getenv("TOTK_SHADER_BIN");
+    if (!bin || !*bin) bin = "data/shaders/compiled.bin";
+    const char *cut = strrchr(bin, '/'), *cut2 = strrchr(bin, '\\');
+    if (cut2 > cut) cut = cut2;
+    if (cut) snprintf(out, n, "%.*s/%s", (int)(cut - bin), bin, name);
+    else snprintf(out, n, "%s", name);
+}
+static void gpu_key(char *out, size_t n) {   // vendor:device:driver version, as the skip list names a GPU and driver
+    snprintf(out, n, "%04x:%04x:%08x", vkc.props.vendorID, vkc.props.deviceID, vkc.props.driverVersion);
+}
+// A journal a crashed run left into the skip list, then the list's keys for this GPU and driver into PR.skip.
+static void prep_skip_init(void) {
+    char jp[1024], sp[1024], gk[32];
+    prep_path(jp, sizeof jp, "prepare-journal.bin");
+    prep_path(sp, sizeof sp, "prepare-skip.txt");
+    gpu_key(gk, sizeof gk);
+    size_t jn = 0;
+    char *j = read_file(jp, &jn);
+    if (j) {
+        size_t had = 0;
+        free(read_file(sp, &had));
+        FILE *f = fopen(sp, "ab");
+        int added = 0;
+        if (f && !had)
+            fputs("# Shaders the graphics driver was compiling when UltraTears --prepare-shaders died (src/gfx/vkb_shader.c):\n"
+                  "# key, GPU vendor:device:driver version. Preparation skips them on that GPU and driver; delete this file\n"
+                  "# to compile them again.\n", f);
+        for (size_t o = 0; f && o + 64 <= jn; o += PREP_SLOT)
+            if (j[o]) { fprintf(f, "%.64s %s\n", j + o, gk); added++; }
+        if (f && fclose(f) == 0) {
+            remove(jp);
+            if (added) VLOG("prepare-shaders: the last preparation died while the driver compiled %d shaders; %s lists them, "
+                            "skipped on this GPU and driver (%s)", added, sp, gk);
+        } else VLOG("prepare-shaders: cannot write %s; %s stays", sp, jp);
+        free(j);
+    }
+    char *s = read_file(sp, NULL);
+    for (char *line = s, *next; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        char key[65], k[32];
+        if (line[0] == '#' || sscanf(line, "%64s %31s", key, k) != 2 || strlen(key) != 64 || strcmp(k, gk)) continue;
+        char (*grown)[65] = realloc(PR.skip, (PR.nskip + 1) * sizeof *PR.skip);
+        if (grown) memcpy(grown[PR.nskip++], key, 65), PR.skip = grown;
+    }
+    free(s);
+}
+static int prep_skipped(const char *key) {
+    for (size_t i = 0; i < PR.nskip; i++) if (!memcmp(PR.skip[i], key, 64)) return 1;
+    return 0;
+}
+static void prep_journal(int slot, const char *key) {   // key NULL: the driver call returned
+    if (!PR.journal || slot >= PREP_SLOTS) return;
+    char rec[PREP_SLOT] = {0};
+    if (key) memcpy(rec, key, 64);
+    pthread_mutex_lock(&PR.jmu);
+    if (!fseek(PR.journal, (long)slot * PREP_SLOT, SEEK_SET)) fwrite(rec, 1, sizeof rec, PR.journal), fflush(PR.journal);
+    pthread_mutex_unlock(&PR.jmu);
+}
+static void *prep_worker(void *arg) {
+    int slot = (int)(intptr_t)arg;
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    for (;;) {
+        size_t i = __atomic_fetch_add(&PR.next, 1, __ATOMIC_RELAXED);
+        if (i >= PR.n) return NULL;
+        char key[65];
+        uint32_t content;
+        vkb_shpack_key(PR.todo[i], key, &content);
+        vkb_shbin_variant v0 = {{0}, stamp_packed(content)};
+        char *j;
+        uint32_t *raw;
+        size_t nraw;
+        int stage = vkb_shpack_get(key, &j, &raw, &nraw, &content) ? stage_of(j) : -1;
+        if (stage >= 0) { free(j); free(raw); }
+        vkb_shader tmp;
+        memset(&tmp, 0, sizeof tmp);
+        uint32_t *spv;
+        size_t bytes;
+        VkShaderEXT obj;
+        if (stage >= 0 && load_module(&tmp, key, stage, &spv, &bytes)) {
+            prep_journal(slot, key);   // from here to its clearing, a crash names this shader
+            VkResult r = make_object(key, &v0, tmp.vk_stage, spv, bytes, &obj);
+            prep_journal(slot, NULL);
+            if (r == VK_SUCCESS) {
+                vk.vkDestroyShaderEXT(vkc.device, obj, NULL);
+                atomic_fetch_sub(&g_obj_live, 1);
+                atomic_fetch_add(&PR.made, 1);
+            } else atomic_fetch_add(&PR.failed, 1);
+            free(spv);
+        } else atomic_fetch_add(&PR.failed, 1);
+        atomic_fetch_add(&PR.done, 1);
+    }
+}
+static int cpu_count(void) {   // the CPUs this process may run on (a build pinned to some keeps to them)
+#ifdef _WIN32
+    DWORD_PTR mine, sys;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &mine, &sys) && mine) return __builtin_popcountll((unsigned long long)mine);
+    return (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0) return CPU_COUNT(&set);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+int vkb_prepare_shaders(void) {
+    setvbuf(stdout, NULL, _IOLBF, 1 << 12);
+    if (!vk_init(NULL)) { printf("prepare-shaders: no Vulkan device\n"); return 1; }
+    if (!from_pack()) { printf("prepare-shaders: no shader pack (data/shaders/translated.pack): nothing to prepare\n"); return 0; }
+    uint64_t t0 = runtime_now_ns();
+    prep_skip_init();
+    size_t total = vkb_shpack_count();
+    if (!(PR.todo = malloc((total ? total : 1) * sizeof *PR.todo))) return 1;
+    for (size_t i = 0; i < total; i++) {   // what this driver has not compiled yet
+        char key[65];
+        uint32_t content;
+        vkb_shpack_key(i, key, &content);
+        vkb_shbin_variant v0 = {{0}, stamp_packed(content)};
+        vkb_shbin_mark(key, v0.stamp);
+        if (vkb_shbin_has(key, &v0)) continue;
+        if (prep_skipped(key)) { PR.skipped++; continue; }
+        PR.todo[PR.n++] = i;
+    }
+    char gk[32];
+    gpu_key(gk, sizeof gk);
+    if (!PR.n) {
+        printf("prepare-shaders: ready, %zu shaders compiled for %s (%s)%s\n", total - PR.skipped, vkc.props.deviceName, gk,
+               PR.skipped ? ", some skipped after a driver crash" : "");
+        return 0;
+    }
+    char jp[1024];
+    prep_path(jp, sizeof jp, "prepare-journal.bin");
+    if (!(PR.journal = fopen(jp, "w+b"))) VLOG("prepare-shaders: cannot create %s: a driver crash will not be recorded", jp);
+    vkb_set_layout(0), vkb_set_layout(1);   // made once, before the workers
+    int k = 0, want = cpu_count();
+    pthread_t t[PREP_SLOTS];
+    for (int i = 0; i < want && i < PREP_SLOTS; i++)
+        if (pthread_create(&t[k], NULL, prep_worker, (void *)(intptr_t)k) == 0) k++;
+    printf("prepare-shaders: compiling %zu shaders of %zu for %s (%s) on %d threads\n", PR.n, total, vkc.props.deviceName, gk, k);
+    if (!k) prep_worker((void *)(intptr_t)0);
+    for (;;) {   // progress, while the workers compile
+        size_t d = atomic_load(&PR.done);
+        printf("prepare-shaders: %zu of %zu\n", d, PR.n);
+        if (d >= PR.n) break;
+#ifdef _WIN32
+        Sleep(250);
+#else
+        struct timespec ts = {0, 250000000};
+        nanosleep(&ts, NULL);
+#endif
+    }
+    for (int i = 0; i < k; i++) pthread_join(t[i], NULL);
+    if (PR.journal) fclose(PR.journal), PR.journal = NULL, remove(jp);   // every driver call returned
+    vkb_shbin_compact();
+    printf("prepare-shaders: done, %zu compiled in %.0f s%s", atomic_load(&PR.made), (runtime_now_ns() - t0) / 1e9,
+           atomic_load(&PR.failed) ? "" : "\n");
+    if (atomic_load(&PR.failed)) printf(", %zu not (they compile at their first draw)\n", atomic_load(&PR.failed));
+    if (PR.skipped)
+        printf("prepare-shaders: %zu skipped: the graphics driver crashed while compiling them before (prepare-skip.txt)\n",
+               (size_t)PR.skipped);
+    return 0;
 }
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {

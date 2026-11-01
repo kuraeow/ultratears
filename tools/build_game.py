@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import CLANG64, exe, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
-RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c', 'src/runtime/logcost.c', 'src/runtime/envcache.c']
+RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/windows.c', 'src/runtime/logcost.c', 'src/runtime/envcache.c',
+           'src/runtime/fma.c']   # fma.c: correctly rounded fma/fmaf where the CPU has no FMA3 (x86-64-v2)
 TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
            'ultratears': ['src/host/boot.c', 'src/host/guest.c', 'src/host/svc.c', 'src/host/threads.c', 'src/host/ipc.c',
                     'src/host/services_lm.c', 'src/host/overrides_oe.c',
@@ -49,7 +50,7 @@ GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 # Linux (--platform linux): the kit is deps/linux in a builder, else dev-local/linux-cross (ULTRS_LINUX_KIT overrides).
 LINUX_KIT = pathlib.Path(os.environ.get('ULTRS_LINUX_KIT') or next(
     (p for p in (ROOT / 'deps/linux', ROOT / 'dev-local/linux-cross') if (p / 'sysroot').is_dir()), ROOT / 'deps/linux'))
-LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c']
+LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c']
 
 
 # The rpath of the Linux programs, as ninja writes it into a command: on Linux ninja runs commands through sh, which

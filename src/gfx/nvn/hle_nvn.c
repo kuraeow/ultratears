@@ -2811,12 +2811,13 @@ static void present_cfg(const win_t *o) {
        real-time step patches (tools/lifter/patches.py): our own clock paces at the limit (0: no pacing, unlimited),
        one frame per period whatever interval the game chose (the step follows the frames as they take), and the
        window shows the newest frame. 30 keeps the shipping pacing by the game's interval. */
-    { extern int totk_fr_limit(void); extern float window_refresh_hz(void);
+    { extern int totk_fr_limit(void), totk_fr_limit_max(void); extern float window_refresh_hz(void);
       int lim = totk_fr_limit();
       g_uncapped = !e && realtime && lim != 30;
       if (g_uncapped) {
           float mon = window_refresh_hz();
           g_hz = lim > 0 ? lim : lim < 0 ? (mon >= 30 ? (int)(mon + 0.5f) : 60) : 0;
+          if (g_hz > totk_fr_limit_max()) g_hz = totk_fr_limit_max();   // a 280 Hz monitor: the game's shortest step
           atomic_store(&g_uncapped_interval, 1);
           LOG("[nvn] frame limit: own clock at %d fps%s (monitor %.2f Hz)", g_hz, g_hz ? "" : " = unlimited", mon);
       } }

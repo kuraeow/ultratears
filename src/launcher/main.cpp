@@ -63,6 +63,8 @@ int main(int argc, char **argv) {
         if (s && *s)
             SDL_Log("  %s=%s", v, s);
     }
+    // --play (Steam's launch option, through the AppImage's AppRun): the graphics prepared, then the game, in its place
+    bool play = argc > 1 && !SDL_strcmp(argv[1], "--play");
     const char *dev_shot = SDL_getenv("ULTRS_LAUNCHER_SHOT");   // development screenshots run beside a real launcher
     if (!(dev_shot && *dev_shot) && !single_instance(TITLE))
         return 0;
@@ -103,8 +105,10 @@ int main(int argc, char **argv) {
     Uint64 shot_at = shot_secs ? SDL_GetTicks() + (Uint64)(SDL_atof(shot_secs) * 1000) : 0;
     if (demo && *demo)
         ui_demo(demo);
+    if (play)
+        ui_play_mode();
     int frame = 0;
-    SDL_ShowWindow(win);
+    bool shown = false;
 
     bool running = true;
     while (running) {
@@ -134,6 +138,12 @@ int main(int argc, char **argv) {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         ui_frame(scale);   // also minimized: the build's events are read there
+        if (ui_quit_wanted())
+            running = false;
+        if (!shown && ui_window_wanted()) {
+            SDL_ShowWindow(win);
+            shown = true;
+        }
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED) {
             ImGui::EndFrame();
             continue;
@@ -160,5 +170,7 @@ int main(int argc, char **argv) {
     SDL_DestroyWindow(win);
     SDL_Quit();
     SDL_Log("closed");
+    if (play && ui_quit_wanted() && !ui_play_finish())
+        return 1;
     return 0;
 }

@@ -7,11 +7,14 @@
  * setting and switches, the last interval alone by default (TOTK_STEP_FRAMES below), read by the patched game code as functions.
  *
  * TOTK_FPS_LIMIT: 30 (the shipping code: the game presents every second 60 Hz tick and steps whole ticks), 40, 45, 60
- * (default), 120, 144 or any whole rate from 30 to 360, "display" (the refresh rate of the window's monitor) or
- * "unlimited". Above 30 the game may present every tick (fps60) and is stepped by the time frames really take
+ * (default), 120, 144 or any whole rate from 30 to 240, "display" (the refresh rate of the window's monitor, at most
+ * 240) or "unlimited" (240). Above 30 the game may present every tick (fps60) and is stepped by the time frames really take
  * (realtime); our pacer (gfx/nvn/hle_nvn.c present_cfg) holds frames to the limit. [temporary] Above ~63 fps the game
  * has known problems no port has fixed yet (MacNativeGames #1348: the camera turns too fast, Link does not climb
  * steps): such limits are a beta, said in the log.
+ * The step is at least 1/240 s and the limit at most 240 (as totk-pc-recomp cad5b0c, 065428c): with a shorter step 1.4.3
+ * aborts with Havok "Out of memory" in the physics pre-solve (main+0x1261630) seconds after some save loads, or crashes
+ * reading a body's shape in main+0x1292560 on the Depths load (their issues #241, #29, #92: 240-280 Hz monitors).
  * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0: the patches' shipping behaviour, for comparison.
  * TOTK_STEP_FRAMES=<1..8> (default 1; MacNativeGames uses 5): present intervals averaged into the step. With a variable
  * refresh display a frame is shown as long as it took, and an average of 5 lags 2-3 frames behind: after slow frames the
@@ -26,7 +29,7 @@
 #include "host.h"
 #include "../runtime/rt.h"
 
-enum { STEP_MAX = 8 };
+enum { STEP_MAX = 8, LIMIT_MAX = 240 };   // LIMIT_MAX: 1 / the shortest step the game survives
 static int g_steps = 5;    // TOTK_STEP_FRAMES: display intervals averaged into the step (5, as totk-pc-recomp)
 static int g_limit = -2;   // frames per second; 0 unlimited, -1 the monitor's rate; -2 not read yet
 static int g_realtime = 1, g_cloth = 1, g_highfps = 1;
@@ -43,11 +46,13 @@ static void config(void) {
     const char *e = getenv("TOTK_FPS_LIMIT");
     char *end = NULL;
     long n = e ? strtol(e, &end, 10) : 60;
-    /* "unlimited" (the launcher's "Unlimited") is 360, the highest limit, as totk-pc-recomp has no uncapped mode: with no
+    /* "unlimited" (the launcher's "Up to 240") is 240, the highest limit, as totk-pc-recomp has no uncapped mode: with no
        pacing at all the game's sound went silent ~10 s after the start (2026-10-31; 60, 120 and 165 kept it) */
-    g_limit = !e || !*e ? 60 : !strcmp(e, "display") ? -1 : !strcmp(e, "unlimited") || !strcmp(e, "0") ? 360
-            : (end && !*end && n >= 30 && n <= 360) ? (int)n : 60;
-    if (e && *e && g_limit == 60 && strcmp(e, "60")) LOG("[totk] TOTK_FPS_LIMIT=%s is not 30..360, display or unlimited: 60\n", e);
+    g_limit = !e || !*e ? 60 : !strcmp(e, "display") ? -1 : !strcmp(e, "unlimited") || !strcmp(e, "0") ? LIMIT_MAX
+            : (end && !*end && n > LIMIT_MAX) ? LIMIT_MAX : (end && !*end && n >= 30) ? (int)n : 60;
+    if (e && *e && end && !*end && n > LIMIT_MAX)
+        LOG("[totk] TOTK_FPS_LIMIT=%s is above %d, where the game's physics fails: %d\n", e, LIMIT_MAX, LIMIT_MAX);
+    else if (e && *e && g_limit == 60 && strcmp(e, "60")) LOG("[totk] TOTK_FPS_LIMIT=%s is not 30..%d, display or unlimited: 60\n", e, LIMIT_MAX);
     g_realtime = !off("TOTK_REALTIME");
     g_cloth = g_realtime && !off("TOTK_CLOTH_REALTIME");
     g_highfps = !off("TOTK_HIGHFPS_FIX");
@@ -68,8 +73,9 @@ static void config(void) {
             "climb steps; MacNativeGames #1348) - 60 is the tested limit\n");
 }
 
-// The limit for the pacer: frames per second, 0 unlimited, -1 the monitor's rate.
+// The limit for the pacer: frames per second, -1 the monitor's rate (the pacer holds it to totk_fr_limit_max).
 int totk_fr_limit(void) { config(); return g_limit; }
+int totk_fr_limit_max(void) { return LIMIT_MAX; }
 
 // Read by the patched game code (tools/lifter/patches.py).
 int totk_fr_fps60(void) { config(); return g_limit != 30; }
@@ -214,5 +220,6 @@ void runtime_frame_step_update(uint64_t now_ns) {
     if (g_count < (unsigned)g_steps) g_count++;
     double sum = 0;
     for (unsigned i = 0; i < g_count; i++) sum += g_samples[i];
-    step_store((float)(sum / g_count));
+    double step = sum / g_count;
+    step_store((float)(step < 1.0 / LIMIT_MAX ? 1.0 / LIMIT_MAX : step));   // the floor: shorter steps break the physics
 }

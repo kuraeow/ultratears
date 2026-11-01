@@ -66,6 +66,7 @@ Settings settings_load();
 void settings_save(const Settings &s);
 std::string game_exe(const std::string &folder);           // the game built in folder ("" none): UltraTears.exe / ultratears
 bool start_game(const std::string &folder);                // the game in folder, detached
+bool exec_game(const std::string &folder);                 // Linux: the game in this process's place (false: not done)
 void single_instance_release();
 bool restart_self();                                       // a new launcher started (after an update)
 // Linux: the downloaded AppImage made UltraTears.AppImage of the game folder root, and started (false: err says why)
@@ -110,4 +111,8 @@ void ui_frame(float scale);
 void ui_drop(const char *path);            // a folder dropped onto the window
 bool ui_close_request();                   // the window's close button: true to close now (a build asks first)
 void ui_demo(const char *name);             // development: a screen with sample data
+void ui_play_mode();                       // --play: the graphics prepared, then the game, the window only if needed
+bool ui_window_wanted();                   // false while --play has nothing to show
+bool ui_quit_wanted();                     // --play: the graphics prepared, the game to start
+bool ui_play_finish();                     // --play, after closing: the game started
 void ui_quit();                            // closing: stop the build (it resumes next time)

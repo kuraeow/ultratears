@@ -346,6 +346,24 @@ std::string game_exe(const std::string &folder) {
 #endif
 }
 
+bool exec_game(const std::string &folder) {
+#ifdef _WIN32
+    (void)folder;
+    return false;
+#else
+    std::string exe = game_exe(folder);
+    if (exe.empty())
+        return false;
+    std::string dir = exe.substr(0, exe.find_last_of('/'));
+    SDL_Log("play: %s in place of the launcher", exe.c_str());
+    single_instance_release();   // the lock is close-on-exec anyway
+    if (chdir(dir.c_str()) == 0)
+        execl(exe.c_str(), exe.c_str(), (char *)nullptr);
+    SDL_Log("play: exec failed (%s)", strerror(errno));
+    return false;
+#endif
+}
+
 bool start_game(const std::string &folder) {
     std::string exe = game_exe(folder);
     SDL_Log("play: %s", exe.empty() ? "no game in the folder" : exe.c_str());

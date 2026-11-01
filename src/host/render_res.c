@@ -16,7 +16,14 @@
  * shipped size runs out at the title screen. Both grow by the shipped size times the output's pixel ratio above 1920x1080
  * plus the scene's above 1600x900 (totk-pc-recomp's formula, from MacNativeGames' measurement); fs.c serves the rewritten
  * table (totk_heapdef_build) in place of the original and svc.c adds the amount to the application pool, so no other
- * heap shrinks. Without the rewritten table the game keeps its own sizes. */
+ * heap shrinks. Without the rewritten table the game keeps its own sizes.
+ *
+ * Sun shadow map (the shadow_size code patch; as totk-pc-recomp 1a07a8d, MIT): each frame the game sizes its shadow
+ * cascades (a D16 array of 4 layers, base 960) to the area they cover, down to ~400 near the ground, so foliage shadows
+ * turn blocky, and every change of size moves the shadow texels, so leaf shadows jump instead of sliding. The Switch
+ * does the same; the community mods fix the size. shadow_map= (TOTK_SHADOW_RES): "game" (default) or a fixed size
+ * 512..2048, a multiple of 8; above 960 the heap grows by the bigger maps (three in flight). [temporary] Off by
+ * default until its GPU cost is measured on the Steam Deck (dev-local/docs/plan.md). */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,12 +38,14 @@
 #define SCENE_H 900
 #define DTA_KIB 113664u   // DynamicTextureAllocatorMem, shipped
 #define SCENE_MAX 4096    // per side
+#define SHADOW_BASE 960   // the sun shadow map's base size
 
 static struct {
     int decided;
     unsigned ow, oh, sw, sh;
     int scene_set;    // the scene differs from the game's 5/6 of the output
     int heap_ok;      // fs.c serves the grown HeapDef (needed when anything is above the shipped sizes)
+    unsigned shadow;  // fixed sun shadow map size (TOTK_SHADOW_RES), 0: the game's own
 } R;
 
 static void decide(void) {
@@ -72,16 +81,39 @@ static void decide(void) {
     double sw = R.ow * k, sh = R.oh * k, fit = fmin(1.0, fmin(SCENE_MAX / sw, SCENE_MAX / sh));
     if (fit < 1.0) R.scene_set = 1;
     R.sw = (unsigned)(sw * fit + 0.5), R.sh = (unsigned)(sh * fit + 0.5);
+    const char *sm = getenv("TOTK_SHADOW_RES");
+    if (sm && *sm && strcmp(sm, "game")) {
+        char *end;
+        long n = strtol(sm, &end, 10);
+        if (!*end && n >= 512 && n <= 2048 && !(n & 7)) R.shadow = (unsigned)n;
+        else fprintf(stderr, "[totk] resolution: shadow map \"%s\" is not game or a size 512..2048 (a multiple of 8); game\n", sm);
+    }
 }
 
 static int changed(void) { decide(); return R.ow != BASE_W || R.oh != BASE_H || R.scene_set; }
 
+// Heap for a sun shadow map above the base size: four layers of 2 bytes, three maps in flight (made anew each frame).
+static uint64_t shadow_kib(void) {
+    decide();
+    return R.shadow > SHADOW_BASE ? ((uint64_t)R.shadow * R.shadow - SHADOW_BASE * SHADOW_BASE) * 8 * 3 / 1024 : 0;
+}
+
 uint64_t totk_heap_extra_kib(void) {
-    if (!changed()) return 0;
-    double grow = fmax(0.0, (double)R.ow * R.oh / (BASE_W * BASE_H) - 1.0) +
-                  fmax(0.0, (double)R.sw * R.sh / (SCENE_W * SCENE_H) - 1.0);
-    if (grow <= 0) return 0;
-    return (uint64_t)ceil(DTA_KIB * (1.0 + grow) / 1024.0) * 1024 - DTA_KIB;
+    uint64_t kib = 0;
+    if (changed()) {
+        double grow = fmax(0.0, (double)R.ow * R.oh / (BASE_W * BASE_H) - 1.0) +
+                      fmax(0.0, (double)R.sw * R.sh / (SCENE_W * SCENE_H) - 1.0);
+        if (grow > 0) kib = (uint64_t)ceil(DTA_KIB * (1.0 + grow) / 1024.0) * 1024 - DTA_KIB;
+    }
+    return kib + ((shadow_kib() + 1023) & ~1023ull);   // whole MiB
+}
+
+// The patched game code asks this (shadow_size, before the size is rounded up to 8); 0: the game's own size.
+int totk_shadow_size(uint32_t *n) {
+    decide();
+    if (!R.shadow || (shadow_kib() && !R.heap_ok)) return 0;
+    *n = R.shadow;
+    return 1;
 }
 
 uint64_t totk_heap_extra_bytes(void) { return ((totk_heap_extra_kib() << 10) + 0x1fffff) & ~0x1fffffull; }
@@ -126,6 +158,9 @@ int totk_aspect_output(unsigned *w, unsigned *h) {   // the output when it is no
 }
 
 void totk_resolution_log(void) {   // once, after the RomFS is up (fs.c)
+    uint32_t sm;
+    if (totk_shadow_size(&sm)) fprintf(stderr, "[totk] resolution: sun shadow map fixed at %ux%u (shadow_map)\n", sm, sm);
+    else if (R.shadow) fprintf(stderr, "[totk] resolution: shadow map %u asked, but the heap could not be grown; the game's own\n", R.shadow);
     if (!changed()) {
         fprintf(stderr, "[totk] resolution: the game's own (output 1920x1080, scene 1600x900)\n");
         return;
