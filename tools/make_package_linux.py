@@ -37,11 +37,11 @@ import version  # noqa: E402
 from make_package import NOT_IN_PACKAGE, LICENSE_COPIES, git  # noqa: E402
 
 GLIBC_FLOOR = (2, 34)
-APPIMAGETOOL = {   # published only under the moving "continuous" tag: pinned by hash (totk-pc-recomp's pins)
-    'tool': {'url': 'https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage',
-             'sha256': 'ac7fd56feade6002c2f57db39587113275d351fce911a5fbb29ea84cd0666cab'},
-    'runtime': {'url': 'https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64',
-                'sha256': '617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46'},
+APPIMAGETOOL = {   # from release tags, pinned by hash: "continuous" uploads change under the same name (totk-pc-recomp's pins)
+    'tool': {'url': 'https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage',
+             'sha256': 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'},
+    'runtime': {'url': 'https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64',
+                'sha256': '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d'},
 }
 NOTICES = '''# Third-party notices (Linux builder package)
 
