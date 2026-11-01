@@ -16,8 +16,6 @@ ahead of time, and its shaders and textures are prepared when the game is built,
 > UltraTears is not affiliated with or endorsed by Nintendo. *The Legend of Zelda* and *Tears of the Kingdom* are
 > trademarks of Nintendo.
 
-**Status:** early. On Windows the prologue, the Great Sky Island, Hyrule and the Depths play at 60 fps; the Steam Deck
-and Linux version is experimental.
 Report problems on [Issues](https://github.com/kuraeow/ultratears/issues) with `ultratears.log` from the game folder.
 
 ## Installing

@@ -16,9 +16,8 @@ Linux / Steam Deck из вашей собственной копии игры. �
 > UltraTears не связан с Nintendo и не одобрен ею. *The Legend of Zelda* и *Tears of the Kingdom* — товарные знаки
 > Nintendo.
 
-**Состояние:** ранняя версия. На Windows пролог, Небесный остров, Хайрул и Глубины играются при 60 к/с; версия для
-Steam Deck и Linux экспериментальная. О проблемах пишите в [Issues](https://github.com/kuraeow/ultratears/issues) и
-прикладывайте `ultratears.log` из папки игры.
+О проблемах пишите в [Issues](https://github.com/kuraeow/ultratears/issues) и прикладывайте `ultratears.log` из папки
+игры.
 
 ## Установка
 
