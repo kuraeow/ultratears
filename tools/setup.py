@@ -530,15 +530,31 @@ def step_textures(dump, state, cpus):
     return 'done'
 
 
+def cfg_lines():
+    """ultratears.cfg's own lines: where the game finds its data, relative to its folder. The same for every build (the
+    Steam Deck's tar, tools/make_deck_tar.py, has them as a build on the Deck writes them)."""
+    return ['# Written by tools/setup.py: where UltraTears finds its data (relative to this folder).',
+            'exefs=data/exefs', 'romfs=data/romfs', 'shaderpack=data/shaders/translated.pack', 'compiled=data/shaders/compiled.bin',
+            'textures=data/textures', 'saves=userdata', 'fonts=data/fonts']
+
+
+# A Linux build's start scripts: Steam's "Add a Non-Steam Game" lists only .sh and .AppImage files
+LINUX_SCRIPTS = {'UltraTears.sh': 'linux/ultratears', 'UltraTears-Launcher.sh': 'ultratears-launcher'}
+
+
+def linux_script(target):
+    return f'#!/bin/sh\ncd "$(dirname "$(readlink -f "$0")")" && exec ./{target} "$@"\n'
+
+
 def step_finish(dump, state, cpus):
     fonts = dump / 'sysdata/fonts'
-    lines = ['# Written by tools/setup.py: where UltraTears finds its data (relative to this folder).',
-             'exefs=data/exefs', 'romfs=data/romfs', 'shaderpack=data/shaders/translated.pack', 'compiled=data/shaders/compiled.bin',
-             'textures=data/textures',
-             'saves=userdata']
+    lines = cfg_lines()
     if fonts.is_dir() and list(fonts.glob('*.bfttf')):
         shutil.copytree(fonts, DATA / 'fonts', dirs_exist_ok=True)
-    lines.append('fonts=data/fonts')
+    if os.name != 'nt':   # built on Linux: the folder is the one played (the Steam Deck's tar has the same scripts)
+        for name, target in LINUX_SCRIPTS.items():
+            (ROOT / name).write_text(linux_script(target), encoding='utf-8', newline='\n')
+            (ROOT / name).chmod(0o755)
     # the player's settings (fps=, window=, vsync=, lang=: the launcher's Play screen, or written by hand) are kept:
     # an update must not reset them
     cfg = ROOT / 'ultratears.cfg'
@@ -568,18 +584,22 @@ DECK_TAR = 'UltraTears-SteamDeck.tar'
 
 
 def step_deck(dump, state, cpus):
-    """A build for Linux / Steam Deck: the game, its data and settings as UltraTears-SteamDeck.tar in this folder, which
-    the player carries to the Deck (tools/make_deck_tar.py). Made again when anything in it is newer."""
+    """A build for Linux / Steam Deck: UltraTears-SteamDeck.tar in this folder, which the player carries to the Deck
+    (tools/make_deck_tar.py): the folder a build on the Deck itself makes (the Linux builder of this release, the game
+    and its data), and the release's AppImage. Made again when anything in it is newer."""
     tar = ROOT / DECK_TAR
     if 'linux' not in state['platforms'] or os.name != 'nt':   # on Linux the game is built where it is played
         return 'not for the Steam Deck'
     pack = deck_pack(state)
-    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', ROOT / 'ultratears.cfg', pack,
+    builder, appimage = deps_install.linux_package(ROOT)
+    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, builder, appimage,
               DATA / 'romfs/romfs.bin', DATA / 'textures/bc7.idx']
-    if tar.is_file() and state.get('deck-tar') == str(pack) and all(p.stat().st_mtime <= tar.stat().st_mtime for p in inputs if p.exists()):
+    key = f'{pack}|{builder.name}'
+    if tar.is_file() and state.get('deck-tar') == key and all(p.stat().st_mtime <= tar.stat().st_mtime for p in inputs if p.exists()):
         return 'up to date'
-    run([sys.executable, 'tools/make_deck_tar.py', '--pack', pack.relative_to(ROOT)], 'packing the game for the Steam Deck')
-    state['deck-tar'] = str(pack)
+    run([sys.executable, 'tools/make_deck_tar.py', '--pack', pack.relative_to(ROOT), '--builder', builder,
+         '--appimage', appimage], 'packing the game for the Steam Deck')
+    state['deck-tar'] = key
     return f'{DECK_TAR}, {tar.stat().st_size / 2**30:.1f} GiB'
 
 

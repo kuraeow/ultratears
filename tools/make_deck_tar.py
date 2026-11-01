@@ -1,57 +1,45 @@
-"""The game for Linux / Steam Deck as one tar, made in the game folder on the PC (tools/build_game.py --platform linux
-built linux/ultratears; tools/setup.py --platform linux or both runs this as its step deck): UltraTears-SteamDeck.tar.
+"""The Steam Deck's tar, made in the game folder on the PC (tools/setup.py --platform linux or both runs this as its step
+deck): UltraTears-SteamDeck.tar, holding UltraTears/ - the folder a build on the Deck itself makes (the AppImage of the
+same release, tools/setup.py there) - and the release's AppImage in it:
 
-usage: python tools/make_deck_tar.py [--out UltraTears-SteamDeck.tar] [--pack data/shaders-deck/translated.pack]
-                                     [--keep-debug]
-Run in the game folder. A tar, not a zip: it keeps the executable bit, which a zip made on Windows loses. Inside, under
-UltraTears/: ultratears (debug information stripped unless --keep-debug; the full one stays in linux/ for reading crash
-addresses on the PC), libSDL3.so.0, ultratears.cfg for Linux, and data/ - the RomFS, ExeFS, the BC7 texture cache, the
-fonts and the shader pack for the Deck's AMD GPU (--pack; default data/shaders-deck, else data/shaders) as
-data/shaders/translated.pack, and data/generated - the game's C, so that the AppImage pointed at this folder on the Deck
-updates it without lifting the game again (it brings the builder; the tar has none). Not inside: the PC's objects (built
-by another compiler, the Deck's build compiles them anew), the PC's driver shader cache (the Deck builds its own at the
-first start), saves. Everything in it was made on this PC from the player's own copy of the game, for their own Deck:
-nothing of it is ever published.
+  - the Linux builder package of this release (--builder: UltraTears-builder-<v>-linux-x86_64.tar.gz,
+    tools/make_package_linux.py; deps_install.linux_package downloads it), its modes and links as they are: the
+    launcher, the tools, the source and deps/ (Python, LLVM, ninja, the translator, the Linux kit);
+  - what the build adds: linux/ultratears (with its debug information, as linked) and linux/libSDL3.so.0, data/ (the
+    ExeFS, the RomFS, the BC7 texture cache, the fonts, the game's C in data/generated, the shader pack for the Deck's
+    AMD GPU as data/shaders/translated.pack, data/setup.json as a build on the Deck records it), ultratears.cfg and the
+    start scripts (setup.py cfg_lines, LINUX_SCRIPTS: the same functions write them on the Deck);
+  - UltraTears.AppImage (--appimage): put into this folder and started, it updates it (src/launcher platform.cpp
+    default_install).
+
+Not inside, as on the Deck before its first update: build-linux/ (the objects; the Deck's own compiler makes them at
+its first update, the PC's are another compiler's), the driver's shader cache (made at the first start), saves. A tar,
+not a zip: it keeps the modes and the links, which a zip made on Windows loses. Everything made from the game here was
+made on this PC from the player's own copy of the game, for their own Deck: nothing of it is ever published.
+
+usage: python tools/make_deck_tar.py --builder <tar.gz> --appimage <AppImage> [--pack data/shaders-deck/translated.pack]
+                                     [--out UltraTears-SteamDeck.tar]
 """
 import argparse
 import io
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import progress  # noqa: E402
-from toolchain import CLANG64  # noqa: E402
+import setup  # noqa: E402
 
 TOP = 'UltraTears'
-# the player's settings that mean the same on the Deck; paths and the display settings are the Deck's own (its screen
-# 1280x800, 16:10, fullscreen, 40 fps: as the game's Deck defaults, src/host/boot.c deck_defaults), changed in the
-# launcher on the Deck
-KEEP = ('lang', 'debug', 'fps_overlay', 'snapshots', 'gpu_marks')
-DECK_CFG = ['# Written by tools/make_deck_tar.py: UltraTears for Linux / Steam Deck (paths relative to this folder).',
-            'exefs=data/exefs', 'romfs=data/romfs', 'shaderpack=data/shaders/translated.pack',
-            'compiled=data/shaders/compiled.bin', 'textures=data/textures', 'saves=userdata', 'fonts=data/fonts',
-            'window=fullscreen', 'resolution=1280x800', 'fps=40']
 
 
-def deck_cfg():
-    lines = list(DECK_CFG)
-    cfg = ROOT / 'ultratears.cfg'
-    if cfg.is_file():
-        for line in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
-            key = line.split('=', 1)[0]
-            if key in KEEP:
-                lines.append(line)
-    return ('\n'.join(lines) + '\n').encode()
-
-
-def deck_state():
-    """data/setup.json as the Deck's own build sees it (an AppImage pointed at the folder updates it, tools/setup.py):
-    built for Linux, its shader pack the Deck's (on an NVIDIA PC the one made with the AMD gather bias), no PC paths."""
+def deck_state(package):
+    """data/setup.json as a build on the Deck records it (an AppImage started in the folder takes it from there): built
+    for Linux by the Linux builder `package` (its VERSION.txt line), the shader pack the Deck's (on an NVIDIA PC the one
+    made with the AMD gather bias), no PC paths."""
     path = ROOT / 'data/setup.json'
     state = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
     if state.get('deck-shaders-pack'):
@@ -59,76 +47,71 @@ def deck_state():
     for k in ('deck-shaders-pack', 'deck-tar', 'dump', 'shaders-xlate', 'work-xlate'):
         state.pop(k, None)
     state['platforms'] = ['linux']
+    state['package'] = package
     return (json.dumps(state, indent=1) + '\n').encode()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--out', default='UltraTears-SteamDeck.tar')
+    ap.add_argument('--builder', type=pathlib.Path, required=True)
+    ap.add_argument('--appimage', type=pathlib.Path, required=True)
     ap.add_argument('--pack', help='the shader pack for the Deck (default: data/shaders-deck, else data/shaders)')
-    ap.add_argument('--keep-debug', action='store_true')
+    ap.add_argument('--out', default=setup.DECK_TAR)
     a = ap.parse_args()
-    game, sdl = ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0'
     deck = ROOT / 'data/shaders-deck/translated.pack'
     pack = ROOT / a.pack if a.pack else deck if deck.is_file() else ROOT / 'data/shaders/translated.pack'
-    for need in (game, sdl, pack, ROOT / 'data/romfs', ROOT / 'data/exefs'):
+    game, sdl = ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0'
+    for need in (game, sdl, pack, ROOT / 'data/romfs', ROOT / 'data/exefs', ROOT / 'data/generated', a.builder, a.appimage):
         if not need.exists():
-            sys.exit(f'missing {need.relative_to(ROOT)}: build the game for Linux and its shaders first')
-    exe = game
-    if not a.keep_debug:   # about a third of the size without the debug information
-        exe = ROOT / 'build-linux/ultratears.stripped'
-        if not exe.is_file() or exe.stat().st_mtime < game.stat().st_mtime:
-            # the builder package's trimmed CLANG64 has no objcopy; the Linux kit is a developer's, so MSYS2's will do
-            objcopy = next((p for p in (CLANG64 / 'llvm-objcopy.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-objcopy.exe'))
-                            if p.is_file()), None)
-            if objcopy is None:
-                sys.exit('no llvm-objcopy to strip the debug information: install MSYS2 CLANG64 or pass --keep-debug')
-            subprocess.run([str(objcopy), '--strip-debug', str(game), str(exe)], check=True)
+            sys.exit(f'missing {need}: build the game for Linux and its shaders first')
 
-    files = [(exe, 'ultratears', 0o755), (sdl, 'libSDL3.so.0', 0o755), (pack, 'data/shaders/translated.pack', 0o644)]
-    # the launcher for Linux (Play and the settings on the Deck; built by tools/build_launcher.py --platform linux, in a
-    # builder package as bin-linux/), the build's record and version (so it opens on Play), the licenses
-    launcher = next((p for p in (pathlib.Path(os.environ.get('ULTRS_LINUX_LAUNCHER', '')), ROOT / 'bin-linux/ultratears-launcher')
-                     if p.name and p.is_file()), None)
-    if launcher:
-        files.append((launcher, 'ultratears-launcher', 0o755))
-    else:
-        print('  no launcher for Linux (bin-linux/ultratears-launcher): the Deck starts the game directly', flush=True)
-    for name in ('VERSION.txt', 'LICENSE', 'THIRD-PARTY-NOTICES.md'):
-        if (ROOT / name).is_file():
-            files.append((ROOT / name, name, 0o644))
-    if (ROOT / 'licenses').is_dir():
-        files += [(p, p.relative_to(ROOT).as_posix(), 0o644) for p in sorted((ROOT / 'licenses').rglob('*')) if p.is_file()]
+    files = [(game, 'linux/ultratears', 0o755), (sdl, 'linux/libSDL3.so.0', 0o755),
+             (pack, 'data/shaders/translated.pack', 0o644), (a.appimage, 'UltraTears.AppImage', 0o755)]
+    if setup.SOURCE_DATES.is_file():
+        files.append((setup.SOURCE_DATES, 'data/source-dates.json', 0o644))
     for sub in ('exefs', 'romfs', 'textures', 'fonts', 'generated'):
-        base = ROOT / 'data' / sub
-        for dirpath, _, names in os.walk(base):
+        for dirpath, _, names in os.walk(ROOT / 'data' / sub):
             for n in sorted(names):
                 p = pathlib.Path(dirpath) / n
                 files.append((p, p.relative_to(ROOT).as_posix(), 0o644))
-    out = ROOT / a.out
-    tmp = out.with_suffix('.tar.part')
-    bar = progress.Bar('packing for the Steam Deck', sum(p.stat().st_size for p, _, _ in files), 'GiB', 2**30, rate=True)
-    with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
-        for name, data in (('ultratears.cfg', deck_cfg()), ('data/setup.json', deck_state())):
-            info = tarfile.TarInfo(f'{TOP}/{name}')
-            info.size, info.mode = len(data), 0o644
-            t.addfile(info, io.BytesIO(data))
-        # Steam's "Add a Non-Steam Game" lists only .sh / .AppImage files: a script for the game and one for the launcher
-        for name, exe_name in (('UltraTears.sh', 'ultratears'), ('UltraTears-Launcher.sh', 'ultratears-launcher')):
-            data = f'#!/bin/sh\ncd "$(dirname "$(readlink -f "$0")")" && exec ./{exe_name} "$@"\n'.encode()
-            info = tarfile.TarInfo(f'{TOP}/{name}')
-            info.size, info.mode = len(data), 0o755
-            t.addfile(info, io.BytesIO(data))
-        for path, name, mode in files:
-            info = tarfile.TarInfo(f'{TOP}/{name}')
-            st = path.stat()
-            info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), mode
-            with open(path, 'rb') as f:
-                t.addfile(info, f)
-            bar.add(st.st_size)
-    bar.finish()
+
+    with tarfile.open(a.builder) as pkg:
+        members = pkg.getmembers()
+        top = members[0].name.split('/', 1)[0]   # UltraTears-builder-<v>-linux-x86_64
+        version_line = pkg.extractfile(f'{top}/VERSION.txt').read().decode('utf-8').strip()
+        total = sum(p.stat().st_size for p, _, _ in files) + sum(m.size for m in members if m.isfile())
+        out = ROOT / a.out
+        tmp = out.with_suffix('.tar.part')
+        bar = progress.Bar('packing for the Steam Deck', total, 'GiB', 2**30, rate=True)
+        own = {name for _, name, _ in files} | {'ultratears.cfg', 'data/setup.json', *setup.LINUX_SCRIPTS}
+        with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
+            for m in members:   # the Linux builder: modes, links and times as tools/make_package_linux.py made them
+                rel = m.name.split('/', 1)[1] if '/' in m.name else ''
+                if not rel or rel in own or '..' in rel.split('/') or m.name.startswith('/'):
+                    continue
+                info = m.replace(name=f'{TOP}/{rel}', deep=False)
+                if m.islnk():   # a hard link names the member it links to by its path in the package
+                    info = info.replace(linkname=f'{TOP}/{m.linkname.split("/", 1)[1]}', deep=False)
+                t.addfile(info, pkg.extractfile(m) if m.isfile() else None)
+                bar.add(m.size if m.isfile() else 0)
+            texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines()) + '\n').encode(), 0o644),
+                     ('data/setup.json', deck_state(version_line), 0o644)]
+            texts += [(name, setup.linux_script(target).encode(), 0o755) for name, target in setup.LINUX_SCRIPTS.items()]
+            for name, data, mode in texts:
+                info = tarfile.TarInfo(f'{TOP}/{name}')
+                info.size, info.mode = len(data), mode
+                t.addfile(info, io.BytesIO(data))
+            for path, name, mode in files:
+                info = tarfile.TarInfo(f'{TOP}/{name}')
+                st = path.stat()
+                info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), mode
+                with open(path, 'rb') as f:
+                    t.addfile(info, f)
+                bar.add(st.st_size)
+        bar.finish()
     os.replace(tmp, out)
-    print(f'{out.name}: {len(files) + 4} files, {out.stat().st_size / 2**30:.1f} GiB', flush=True)
+    print(f'{out.name}: the Linux builder {version_line}, the game and its data; {out.stat().st_size / 2**30:.1f} GiB',
+          flush=True)
 
 
 if __name__ == '__main__':

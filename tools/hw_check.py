@@ -29,7 +29,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gpu_check  # noqa: E402
 
 INSTALL_GB = 36            # a build from nothing at its peak (data 27 GB, objects 2.7, tools 0.8, the shader export)
-LINUX_GB = 31              # a build for Linux / Steam Deck on top: the tar 25.4, its objects 2.7, the game 1.4, shaders 1.7
+LINUX_GB = 36              # a build for Linux / Steam Deck on top: the tar 28.7, its objects 2.7, the game 1.4, shaders 1.7, the Linux builder 0.6
 VRAM_GB, RAM_GB = 4, 16
 DECK_TAR = 'UltraTears-SteamDeck.tar'
 AMD = 0x1002

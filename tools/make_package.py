@@ -189,6 +189,9 @@ def main():
     ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'dist')   # tools/setup.py's default output
     ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip',
                     help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
+    ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'dev-local/dist',
+                    help="the folder with this release's Linux builder tar.gz and AppImage (tools/make_package_linux.py): "
+                         "named with their hashes in deps/linux-package.json, for the Steam Deck's tar")
     ap.add_argument('--test', action='store_true',
                     help='a package of an untagged commit, named after git describe: for testing, never for Releases')
     a = ap.parse_args()
@@ -198,7 +201,9 @@ def main():
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit):
+    linux_files = {'builder': a.linux_package / f'UltraTears-builder-{a.version}-linux-x86_64.tar.gz',
+                   'appimage': a.linux_package / f'UltraTears-{a.version}-x86_64.AppImage'}
+    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit, *linux_files.values()):
         if not need.is_file():
             sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
     name = f'UltraTears-builder-{a.version}-windows-x86_64'
@@ -256,6 +261,13 @@ def main():
     shutil.copy2(a.python / 'LICENSE.txt', lic / 'Python.txt')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
     (out / 'VERSION.txt').write_text(version.version_txt(a.version, commit))
+    # the Linux builder and the AppImage of this release, which the Steam Deck's tar carries (deps_install.linux_package):
+    # made first from the same commit (tools/make_package_linux.py), published beside this zip
+    pins = {}
+    for key, f in linux_files.items():
+        pins[key] = {'name': f.name, 'url': f'https://github.com/kuraeow/ultratears/releases/download/v{a.version}/{f.name}',
+                     'size': f.stat().st_size, 'sha256': deps_install.sha256_file(f)}
+    (out / deps_install.LINUX_PACKAGE).write_text(json.dumps(pins, indent=1), encoding='utf-8')
     # the launcher, built from this commit (it holds no code of the game: shipped built)
     launcher = ROOT / 'dev-local/build/launcher-release'
     subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--out', str(launcher)], check=True)

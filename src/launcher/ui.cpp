@@ -248,6 +248,22 @@ static int n_rows() { return for_deck() ? 7 : 6; }
 static bool linux_kit_gone() {
     return for_deck() && path_is_file(path_join(U.root, "package-files.txt")) && !path_is_dir(path_join(U.root, "deps/linux/sysroot"));
 }
+// The Steam Deck's tar carries the Linux builder and the AppImage of this release, downloaded once (tools/deps_install.py
+// linux_package, named in the package's deps/linux-package.json): not downloaded yet, the screen says so.
+static bool linux_package_missing() {
+    size_t n = 0;
+    char *s = (char *)SDL_LoadFile(path_join(U.root, "deps/linux-package.json").c_str(), &n);
+    if (!s)
+        return true;
+    Json pins;
+    json_parse(std::string(s, n), pins);
+    SDL_free(s);
+    for (const char *k : {"builder", "appimage"})
+        if (!path_is_file(path_join(path_join(U.root, "deps/downloads"), pins[k]["name"].str())))
+            return true;
+    return false;
+}
+
 static Json setup_state() {   // data/setup.json of the install folder: setup.py's record of the build
     Json st;
     size_t n = 0;
@@ -296,8 +312,8 @@ static bool needs_copy() {
 }
 
 // GB a build needs free: the game, the package copy when it goes elsewhere, and for the Steam Deck its game, objects,
-// shaders and the ~25 GB tar (tools/hw_check.py LINUX_GB)
-static double need_gb() { return (needs_copy() ? 41 : 40) + (for_deck() ? 31 : 0); }
+// shaders, the Linux builder and the ~29 GB tar (tools/hw_check.py LINUX_GB)
+static double need_gb() { return (needs_copy() ? 41 : 40) + (for_deck() ? 36 : 0); }
 
 static void check_dump(const std::string &path);
 
@@ -1331,9 +1347,9 @@ static float platform_choice(float x_right, bool note) {
         settings_save(U.set);
     }
     float left = x_right - w;
-    if (note && for_deck() && !path_is_dir(path_join(U.root, "deps/linux/sysroot"))) {
+    if (note && for_deck() && (!path_is_dir(path_join(U.root, "deps/linux/sysroot")) || linux_package_missing())) {
         // a builder package carries the kit (tools/make_package.py): gone from it, the package is damaged; a build from
-        // the source makes it from Valve's sysroot (tools/deps_install.py)
+        // the source makes it from Valve's sysroot (tools/deps_install.py). The Linux builder for the tar: downloaded.
         bool package = linux_kit_gone();
         std::string t = T(package ? "linux_kit_gone" : "linux_kit_note");
         ImU32 col = package ? C_ERR : C_SUB;

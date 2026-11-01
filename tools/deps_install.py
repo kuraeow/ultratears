@@ -180,6 +180,14 @@ def fetch(item, cache, label):
     return fetch_all([item], cache, label)[0]
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
 def good(path, item):
     if item.get('size') and path.stat().st_size != item['size']:
         return False
@@ -552,15 +560,51 @@ def install_linux_kit(home):
             f.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- the Linux builder (for the Steam Deck's tar)
+# The tar a Windows build makes for the Steam Deck holds the folder a build on the Deck makes: the Linux builder package
+# of the same release (UltraTears-builder-<v>-linux-x86_64.tar.gz, tools/make_package_linux.py) with the game and its
+# data, and the release's AppImage. The Windows builder package names both files with their hashes in
+# deps/linux-package.json (tools/make_package.py); they are downloaded once, when a build is for the Deck.
+# ULTRS_LINUX_PACKAGE=<folder>: the newest of both found there instead (development: dev-local/dist).
+LINUX_PACKAGE = 'deps/linux-package.json'
+
+
+def linux_package(home):
+    """(the Linux builder tar.gz, the AppImage), downloaded into deps/downloads when not there yet."""
+    local = os.environ.get('ULTRS_LINUX_PACKAGE')
+    if local:
+        d = pathlib.Path(local)
+        newest = lambda pat: max(d.glob(pat), key=lambda p: p.stat().st_mtime, default=None)   # noqa: E731
+        builder, image = newest('UltraTears-builder-*-linux-x86_64.tar.gz'), newest('UltraTears-*-x86_64.AppImage')
+        if not builder or not image:
+            raise DepsError(f'ULTRS_LINUX_PACKAGE={d}: no Linux builder tar.gz and AppImage there', 'linux_package_missing')
+        return builder, image
+    pins = home / LINUX_PACKAGE
+    if not pins.is_file():
+        raise DepsError('this builder has no Linux builder to put into the Steam Deck\'s tar (deps\\linux-package.json): '
+                        'a release package has it; for a build from the source set ULTRS_LINUX_PACKAGE to a folder with '
+                        'UltraTears-builder-*-linux-x86_64.tar.gz and the AppImage', 'linux_package_missing')
+    p = json.loads(pins.read_text(encoding='utf-8'))
+    items = [p['builder'], p['appimage']]
+    total = sum(i['size'] for i in items)
+    if not all((home / 'deps/downloads' / i['name']).is_file() for i in items):
+        say(f'  the Linux builder and the AppImage of this release ({total / 2**20:.0f} MiB, once) -> deps\\downloads')
+    builder, image = fetch_all(items, home / 'deps/downloads', 'the Linux builder')
+    return builder, image
+
+
 # ---------------------------------------------------------------- entry points
 def ensure_tools(home, linux=False):
-    """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing; linux: the Linux kit too."""
+    """Run on the build's Python (3.14+): CLANG64 and the translator, installed when missing; linux: the Linux kit too,
+    and on Windows the Linux builder for the Steam Deck's tar (before an hour of building, not after)."""
     if clang64_for(home) is None:
         install_clang64(home)
     if not xlate_ok(home):
         build_xlate(home)
     if (linux or LINUX) and linux_kit_for(home) is None:   # on Linux the kit is the sysroot of every build
         install_linux_kit(home)
+    if linux and not LINUX:
+        linux_package(home)
 
 
 def ready(home):
