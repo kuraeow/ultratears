@@ -749,14 +749,15 @@ def table_base(m, i, reg, window=40):
 
 
 def write_if_changed(path, text):
-    """Leaves unchanged chunks untouched so make only recompiles what a patch affected."""
+    """Leaves unchanged chunks untouched so make only recompiles what a patch affected. Lines end in LF on every system:
+    the C lifted on Windows for a Steam Deck is the same file a lift on the Deck writes."""
     try:
-        with open(path) as f:
+        with open(path, newline='') as f:
             if f.read() == text:
                 return
     except FileNotFoundError:
         pass
-    with open(path, 'w') as f:
+    with open(path, 'w', newline='\n') as f:
         f.write(text)
 
 

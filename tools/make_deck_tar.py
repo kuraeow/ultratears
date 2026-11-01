@@ -65,7 +65,7 @@ def main():
         if not need.exists():
             sys.exit(f'missing {need}: build the game for Linux and its shaders first')
 
-    files = [(game, 'linux/ultratears', 0o755), (sdl, 'linux/libSDL3.so.0', 0o755),
+    files = [(game, 'linux/ultratears', 0o755), (sdl, 'linux/libSDL3.so.0', 0o644),   # (as build_game.py copies it)
              (pack, 'data/shaders/translated.pack', 0o644), (a.appimage, 'UltraTears.AppImage', 0o755)]
     if setup.SOURCE_DATES.is_file():
         files.append((setup.SOURCE_DATES, 'data/source-dates.json', 0o644))

@@ -160,6 +160,9 @@ def main():
     shutil.copy2(out / 'deps/linux/sysroot/usr/lib/x86_64-linux-gnu/libSDL3.so.0', out / 'libSDL3.so.0')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
     (out / 'VERSION.txt').write_text(version.version_txt(ver, commit))
+    # no bytecode: it is Python's cache of where it ran (the paths in it differ), made again where the builder runs
+    for d in sorted(out.rglob('__pycache__'), reverse=True):
+        shutil.rmtree(d)
     # every program and library runs on glibc 2.34 (SteamOS 3, Ubuntu 22.04, Debian 12, Fedora 35)
     over = []
     for p in sorted(out.rglob('*')):
