@@ -118,7 +118,7 @@ ROMFS_FOLDERS = {
     'WorldMgr': (6, '7dade0ea2eeca301'),
 }
 ENCRYPTED = ('.nsp', '.nsz', '.xci', '.xcz', '.nca', '.ncz')
-KEEP = {'game', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 'dev-local'}
+KEEP = {'game', 'dump', 'data', 'build', 'userdata', 'diag', 'deps', 'dist', 'release', 'dev-local'}
 # Written by builds before the launcher (UltraTears.exe --debug); the launcher's Debug mode (debug=1 in ultratears.cfg)
 # replaces it: removed when found.
 DEBUG_BAT = 'UltraTears (debug).bat'
@@ -222,22 +222,24 @@ def own_python(home):
 
 
 def choose_dump(home, requested):
+    """--dump, else the one an earlier --dump gave for this output folder, else the checkout's dump/ (game/ where the
+    instructions before 0.2.0 had it)."""
     if requested:
         return requested.resolve()
-    for candidate in (home / 'game', ROOT / 'game'):
-        if (candidate / 'exefs').is_dir() or (candidate / 'romfs').is_dir():
-            return candidate.resolve()
-    try:   # the dump an earlier --dump gave for this output folder
+    try:
         remembered = json.loads((home / 'data/setup.json').read_text()).get('dump')
     except (OSError, ValueError):
         remembered = None
     if remembered and pathlib.Path(remembered).is_dir():
         return pathlib.Path(remembered)
-    return (home / 'game').resolve()
+    for candidate in (ROOT / 'dump', ROOT / 'game'):
+        if (candidate / 'exefs').is_dir() or (candidate / 'romfs').is_dir():
+            return candidate.resolve()
+    return (ROOT / 'dump').resolve()
 
 
 def build_from_checkout(a):
-    home = (a.output or ROOT / 'dist').resolve()
+    home = (a.output or ROOT / 'build').resolve()
     try:
         changed, removed = sync_source(home)
         say(f'UltraTears source -> {home}: {changed} files updated, {removed} removed')

@@ -1,6 +1,6 @@
-"""Make the builder package for a release: dist/UltraTears-builder-<version>-windows-x86_64.zip.
+"""Make the builder package for a release: release/UltraTears-builder-<version>-windows-x86_64.zip.
 
-usage: python tools/make_package.py [--home dist] [--python <Python 3.14>] [--no-zip]   (--no-zip: the folder, no zip)
+usage: python tools/make_package.py [--home build] [--python <Python 3.14>] [--no-zip]   (--no-zip: the folder, no zip)
 The version is the tag v<x.y.z> on HEAD (tools/version.py): tag the release commit first.
 Run on the developer's machine after a complete build in the game folder --home (tools/setup.py --output: its build/build.ninja
 and objects tell which parts of clang64 the build reads) and tools/build_xlate.py (dev-local/build/shaders):
@@ -188,12 +188,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--python', type=pathlib.Path, default=pathlib.Path(sys.base_prefix))
     ap.add_argument('--no-zip', action='store_true')
-    ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'dist')   # tools/setup.py's default output
-    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip',
+    ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'build')   # tools/setup.py's default output
+    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'release/ultrs-linux-kit.zip',
                     help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
-    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/dist/linux-used.txt',
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'release/linux-used.txt',
                     help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
-    ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'dev-local/dist',
+    ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'release',
                     help="the folder with this release's AppImage (tools/make_package_linux.py): named with its hash in "
                          "deps/linux-package.json, for the Steam Deck's tar")
     ap.add_argument('--test', action='store_true',
@@ -210,7 +210,7 @@ def main():
         if not need.is_file():
             sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
     name = f'UltraTears-builder-{a.version}-windows-x86_64'
-    out = ROOT / 'dev-local/dist' / name
+    out = ROOT / 'release' / name
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)

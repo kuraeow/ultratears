@@ -564,7 +564,7 @@ def install_linux_kit(home):
 # The tar a Windows build makes for the Steam Deck holds the game, its data and the release's AppImage (the builder on
 # the Deck). The Windows builder package names it with its hash in deps/linux-package.json (tools/make_package.py); it is
 # downloaded once, when a build is for the Deck. ULTRS_LINUX_PACKAGE=<folder>: the newest AppImage there instead
-# (development: dev-local/dist).
+# (development: release/).
 LINUX_PACKAGE = 'deps/linux-package.json'
 
 

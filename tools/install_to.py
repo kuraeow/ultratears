@@ -15,7 +15,7 @@ import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KEEP = {'data', 'build', 'build-linux', 'linux', 'userdata', 'diag', 'game', 'update', 'dist', 'dev-local'}   # the player's, never copied
+KEEP = {'data', 'build', 'build-linux', 'linux', 'userdata', 'diag', 'game', 'dump', 'update', 'dist', 'release', 'dev-local'}   # the player's, never copied
 SETTINGS = 'ultratears-launcher.ini'
 # From an AppImage: what stays in it (the tools; the launcher and its SDL3, which the AppImage starts itself)
 IN_APPIMAGE = ('deps/', 'ultratears-launcher', 'libSDL3.so.0')

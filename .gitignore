@@ -17,15 +17,17 @@ Firmware/
 *.bfttf
 
 # Development only, not in the repository or a release: local tools, reference checkouts, .NET caches, builds of
-# development tools, release packages (dev-local/dist)
+# development tools
 /dev-local/
+# Release packages (tools/make_package.py, make_package_linux.py) and what they are made from
+/release/
+# The player's dump when it is kept in the checkout (tools/setup.py's default; --dump names any other folder)
+/dump/
 
-# A game folder's own (tools/setup.py), should one ever be made inside the source folder; dist/ is where setup.py builds
+# A game folder's own (tools/setup.py), should one ever be made inside the source folder; build/ is where setup.py builds
 # the game when run from the source without --output
-/dist/
-/game/
-/data/
 /build/
+/data/
 /userdata/
 /diag/
 /deps/
@@ -33,7 +35,9 @@ Firmware/
 /UltraTears.exe
 /setup-files.txt
 
-# Former development layout (kept ignored until removed)
+# Former layouts (kept ignored until removed): the dump in game/, the game built in dist/
+/game/
+/dist/
 /work/
 /refs/
 /user-data/

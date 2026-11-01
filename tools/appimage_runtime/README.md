@@ -25,5 +25,5 @@ starts it, with `--play` as the only launch option.
 Its own build: `scripts/chroot/chroot_build.sh` of type2-runtime with `ALPINE_ARCH=x86_64` (an Alpine minirootfs chroot,
 verified with Alpine's key, builds static libfuse 3.15.0 and squashfuse 0.5.2 by their pinned hashes, then the runtime).
 It needs root (chroot, mounts) and gpg2. In this project's development setup: `dev-local/wsl/runtime.sh` in WSL, inside
-the ext4 image `dev-local/wsl/stage.img`, gives `dev-local/dist/runtime-x86_64`; `tools/make_package_linux.py --runtime`
+the ext4 image `dev-local/wsl/stage.img`, gives `release/runtime-x86_64`; `tools/make_package_linux.py --runtime`
 takes it (the default path).

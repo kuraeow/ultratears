@@ -143,7 +143,7 @@ git clone https://github.com/kuraeow/ultratears.git
 cd ultratears
 ```
 
-Put `exefs` and `romfs` in `ultratears\game` as shown above, then run:
+Put `exefs` and `romfs` in `ultratears\dump`, or anywhere and name that folder with `--dump D:\path\to\dump`, then run:
 
 ```powershell
 python tools/setup.py
@@ -151,21 +151,17 @@ python tools/setup.py
 
 This **one command performs the entire process**:
 
-1. Creates `dist` inside the repository.
+1. Creates `build` inside the repository.
 2. Copies the current tracked source files there.
-3. Installs the build tools this PC lacks into `dist\deps` (Python 3.14, Clang, and the shader translator built from
+3. Installs the build tools this PC lacks into `build\deps` (Python 3.14, Clang, and the shader translator built from
    this source); nothing comes from a release.
-4. Finds the dump: first in the output folder's `game`, then in the repository's `game`, then the folder given with
-   `--dump` last time for this output folder.
-5. Builds the complete game into `dist`.
-
-If the selected output folder already has its own populated `game`, that copy takes priority. `--dump` always selects
-the dump explicitly and removes any ambiguity.
+4. Finds the dump: the folder given with `--dump` (remembered for this output folder), else the repository's `dump`.
+5. Builds the complete game into `build`.
 
 The executable appears here:
 
 ```text
-ultratears\dist\UltraTears.exe
+ultratears\build\UltraTears.exe
 ```
 
 To build directly into another folder:

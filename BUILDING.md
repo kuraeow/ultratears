@@ -8,8 +8,9 @@ A source build has three locations:
 
 | Location | Example | Purpose |
 |---|---|---|
-| Source checkout | `D:\src\ultratears` | Git-tracked source code and, by default, the original `game\exefs` and `game\romfs` |
-| Output folder | `D:\src\ultratears\dist` | Build tools, intermediate files, converted game data and the final `UltraTears.exe` |
+| Source checkout | `D:\src\ultratears` | Git-tracked source code and, by default, the original `dump\exefs` and `dump\romfs` (or any folder, `--dump`) |
+| Output folder | `D:\src\ultratears\build` | Build tools, intermediate files, converted game data and the final `UltraTears.exe` |
+| Release packages | `D:\src\ultratears\release` | `tools/make_package.py` and `tools/make_package_linux.py` write the zip and the AppImage there |
 | Tool download cache | `D:\src\ultratears\dev-local\downloads` | The downloaded builder archive, reused when making another output folder |
 
 `python tools/setup.py` prepares the output folder **and immediately performs the complete game build**. It is not a
@@ -45,17 +46,17 @@ cd UltraTears
 python tools/setup.py
 ```
 
-The command copies tracked source files (including uncommitted edits) to `dist\`, installs missing tools and performs
-every game-build step. It reads the original dump from `game\` in the checkout without moving or modifying it. The
-result is `dist\UltraTears.exe`, supported by the converted files in `dist\data`.
+The command copies tracked source files (including uncommitted edits) to `build\`, installs missing tools and performs
+every game-build step. It reads the original dump from `dump\` in the checkout, or from the folder given with `--dump`,
+without moving or modifying it. The result is `build\UltraTears.exe`, supported by the converted files in `build\data`.
 
 Path selection is explicit and predictable:
 
 | Command | Output | Dump read from |
 |---|---|---|
-| `python tools/setup.py` | `<checkout>\dist` | `<output>\game` if populated, otherwise `<checkout>\game`, otherwise the last `--dump` |
-| `python tools/setup.py --output D:\Games\UltraTears` | `D:\Games\UltraTears` | `<output>\game` if populated, otherwise `<checkout>\game`, otherwise the last `--dump` |
-| `python tools/setup.py --dump D:\Dumps\TOTK` | `<checkout>\dist` | `D:\Dumps\TOTK` |
+| `python tools/setup.py` | `<checkout>\build` | the last `--dump` for this output folder, otherwise `<checkout>\dump` |
+| `python tools/setup.py --output D:\Games\UltraTears` | `D:\Games\UltraTears` | the last `--dump` for this output folder, otherwise `<checkout>\dump` |
+| `python tools/setup.py --dump D:\Dumps\TOTK` | `<checkout>\build` | `D:\Dumps\TOTK` |
 | `python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK` | `D:\Games\UltraTears` | `D:\Dumps\TOTK` |
 
 `--cpus N` limits the logical processors used (default: all, at low priority so the PC stays usable). `--only <step>`
@@ -151,9 +152,9 @@ has one source, the tag `v<x.y.z>` on the release commit (`tools/version.py`): t
 there. The exe writes it as the first line of its log and shows it in the file's
 properties; between releases it reads like `0.1.0-3-gabc1234` (`git describe`).
 
-It needs a complete build in the output folder (`dist\` by default; built elsewhere with `tools/setup.py --output
+It needs a complete build in the output folder (`build\` by default; built elsewhere with `tools/setup.py --output
 <folder>`, pass `--home <folder>`) and a clean working tree,
-and writes `dev-local\dist\UltraTears-builder-<version>-windows-x86_64.zip`: the public tree of HEAD, the part of MSYS2 CLANG64 the build
+and writes `release\UltraTears-builder-<version>-windows-x86_64.zip`: the public tree of HEAD, the part of MSYS2 CLANG64 the build
 reads (measured from ninja's dependency records and the linker's trace), Python 3.14 with the packages above,
 `ultrs-shaders.exe`, `UltraTears Launcher.exe` (built by `tools/build_launcher.py`), `package-files.txt` (what the
 launcher's updates replace, `tools/apply_update.py`), and the licenses of all of it.
