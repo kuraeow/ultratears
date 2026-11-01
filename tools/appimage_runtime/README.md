@@ -1,6 +1,6 @@
 # AppImage runtime with UltraTears' patch
 
-The AppImage's runtime (the program at the start of `UltraTears-<version>-x86_64.AppImage` that mounts the image and
+The AppImage's runtime (the program at the start of `UltraTears.AppImage` that mounts the image and
 starts `AppRun`) is [AppImage/type2-runtime](https://github.com/AppImage/type2-runtime) (MIT, `LICENSE` there) at tag
 `20251108` (`dd6cebe`), the release totk-pc-recomp pins, with one patch: `steam-sigchld.patch`.
 

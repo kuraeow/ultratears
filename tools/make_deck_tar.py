@@ -64,13 +64,17 @@ def main():
     for need in (game, sdl, pack, ROOT / 'data/romfs', ROOT / 'data/exefs', ROOT / 'data/generated', a.appimage):
         if not need.exists():
             sys.exit(f'missing {need}: build the game for Linux and its shaders first')
-    # the AppImage's own release, as its launcher reads it (UltraTears-<version>-x86_64.AppImage, this folder's commit)
-    ver = a.appimage.name[len('UltraTears-'):-len('-x86_64.AppImage')]
-    # its commit: in the name of a test build (0.2.0-37-geabddff-test), else this folder's (a release: the same commit)
-    m = re.search(r'-g([0-9a-f]{7,})', ver)
+    # the AppImage's own release, as its launcher reads it. A release's UltraTears.AppImage is made from the same tag as
+    # this folder's package: its VERSION.txt line. A test one carries its version in its name
+    # (UltraTears-0.2.0-37-geabddff-test-x86_64.AppImage), the commit in it.
     line = (ROOT / 'VERSION.txt').read_text(encoding='utf-8').strip() if (ROOT / 'VERSION.txt').is_file() else ''
-    commit = m.group(1) if m else line.rsplit('commit ', 1)[-1].rstrip(')') if 'commit ' in line else version.current()[1]
-    version_line = version.version_txt(ver, commit).strip()
+    if a.appimage.name == 'UltraTears.AppImage' and line:
+        version_line = line
+    else:
+        ver = a.appimage.name[len('UltraTears-'):-len('-x86_64.AppImage')]
+        m = re.search(r'-g([0-9a-f]{7,})', ver)
+        commit = m.group(1) if m else line.rsplit('commit ', 1)[-1].rstrip(')') if 'commit ' in line else version.current()[1]
+        version_line = version.version_txt(ver, commit).strip()
 
     files = [(game, 'linux/ultratears', 0o755), (sdl, 'linux/libSDL3.so.0', 0o644),   # (as build_game.py copies it)
              (pack, 'data/shaders/translated.pack', 0o644), (a.appimage, 'UltraTears.AppImage', 0o755)]

@@ -1,4 +1,4 @@
-"""Make the builder package for a release: release/UltraTears-builder-<version>-windows-x86_64.zip.
+"""Make the Windows builder package for a release: release/UltraTears-<version>-windows-x86_64.zip.
 
 usage: python tools/make_package.py [--home build] [--python <Python 3.14>] [--no-zip]   (--no-zip: the folder, no zip)
 The version is the tag v<x.y.z> on HEAD (tools/version.py): tag the release commit first.
@@ -223,11 +223,12 @@ def main():
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    linux_files = {'appimage': a.linux_package / f'UltraTears-{a.version}-x86_64.AppImage'}
+    # the release's AppImage is UltraTears.AppImage, the name it has in a game folder; a test one carries its version
+    linux_files = {'appimage': a.linux_package / (f'UltraTears-{a.version}-x86_64.AppImage' if a.test else 'UltraTears.AppImage')}
     for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit, a.used, *linux_files.values()):
         if not need.is_file():
             sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
-    name = f'UltraTears-builder-{a.version}-windows-x86_64'
+    name = f'UltraTears-{a.version}-windows-x86_64'
     out = ROOT / 'release' / name
     if out.exists():
         shutil.rmtree(out)

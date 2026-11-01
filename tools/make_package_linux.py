@@ -1,4 +1,5 @@
-"""Make the AppImage for a release (run on Linux: WSL or a Linux PC): release/UltraTears-<version>-x86_64.AppImage,
+"""Make the AppImage for a release (run on Linux: WSL or a Linux PC): release/UltraTears.AppImage, the name it has in a
+game folder, so a player puts it there as it is (a test one: UltraTears-<version>-x86_64.AppImage),
 from the Linux builder package folder release/UltraTears-builder-<version>-linux-x86_64 (kept for checks such as
 dev-local/wsl/build_test.sh; not published: the release is the Windows zip and this AppImage).
 
@@ -255,7 +256,7 @@ def main():
     items = [dict(url=v['url'], sha256=v['sha256']) for v in APPIMAGETOOL.values()]
     tool, = deps_install.fetch_all(items, cache, 'appimagetool')
     tool.chmod(0o755)
-    image = dist / f'UltraTears-{ver}-x86_64.AppImage'
+    image = dist / (f'UltraTears-{ver}-x86_64.AppImage' if a.test else 'UltraTears.AppImage')
     env = dict(os.environ, ARCH='x86_64', APPIMAGE_EXTRACT_AND_RUN='1')   # appimagetool is an AppImage: no FUSE needed
     subprocess.run([str(tool), '--no-appstream', '--runtime-file', str(runtime), str(out), str(image)], check=True, env=env)
     for f in ('AppRun', 'ultratears.desktop', 'ultratears.png'):

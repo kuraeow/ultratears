@@ -246,11 +246,15 @@ static int check_thread(void *) {
             for (size_t k = 0; k < assets.size(); k++) {
                 std::string name = assets[k]["name"].str(), digest = assets[k]["digest"].str();
 #ifdef _WIN32
-                bool mine = name.find("-builder-") != std::string::npos && name.find("windows-x86_64.zip") != std::string::npos;
+                // UltraTears-<v>-windows-x86_64.zip (from 0.2.0; before, UltraTears-builder-<v>-windows-x86_64.zip)
+                bool mine = name.rfind("UltraTears-", 0) == 0 && name.size() > 19 &&
+                            name.compare(name.size() - 19, 19, "-windows-x86_64.zip") == 0;
 #else
                 // the AppImage (decision 2026-11-01): put in the game folder in place of UltraTears.AppImage and
                 // started, it brings the folder up to date itself (appimage_update)
-                bool mine = name.rfind("UltraTears-", 0) == 0 && name.size() > 16 && name.compare(name.size() - 16, 16, "-x86_64.AppImage") == 0;
+                // named UltraTears.AppImage as the game folder has it (from 0.2.0), or UltraTears-<v>-x86_64.AppImage
+                bool mine = name == "UltraTears.AppImage" ||
+                            (name.rfind("UltraTears-", 0) == 0 && name.size() > 16 && name.compare(name.size() - 16, 16, "-x86_64.AppImage") == 0);
 #endif
                 if (!mine || digest.rfind("sha256:", 0) != 0)   // no hash, no update
                     continue;

@@ -31,7 +31,7 @@ dump\
 
 ### Windows
 
-1. Download `UltraTears-builder-<version>-windows-x86_64.zip` from [Releases](https://github.com/kuraeow/ultratears/releases)
+1. Download `UltraTears-<version>-windows-x86_64.zip` from [Releases](https://github.com/kuraeow/ultratears/releases)
    and extract it into its own folder.
 2. Start `UltraTears Launcher.exe`. If SmartScreen warns about it, choose **More info → Run anyway**.
 3. Choose the folder with `exefs` and `romfs` and click **Prepare the game**. It builds the game once, about 30 minutes.
@@ -42,14 +42,15 @@ To play on a Steam Deck, choose **For Linux (Steam Deck)** or **Both platforms**
 
 ### Linux and Steam Deck
 
-1. Download `UltraTears-<version>-x86_64.AppImage` from [Releases](https://github.com/kuraeow/ultratears/releases). On a
+1. Download `UltraTears.AppImage` from [Releases](https://github.com/kuraeow/ultratears/releases). On a
    Steam Deck, do this in Desktop Mode.
 2. In the file's Properties, on the **Permissions** tab, turn on **Allow executing file as program**, then start it.
 3. Choose the folder with `exefs` and `romfs` and click **Prepare the game**.
 4. When the game is prepared, add `UltraTears.AppImage` from the game folder to Steam as a non-Steam game. With `--play`
    in its launch options it starts the game directly, without the launcher. Start the game from Gaming Mode.
 
-The launcher finds new versions itself and rebuilds only what changed; saves in `userdata` are kept.
+The launcher finds new versions itself and rebuilds only what changed; saves in `userdata` are kept. On Linux you can
+also put a newer `UltraTears.AppImage` into the game folder in place of the old one: the launcher then offers the update.
 
 <details>
 <summary>Controls</summary>

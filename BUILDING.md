@@ -80,7 +80,7 @@ the dump can go once the build is done.
 files of Valve's Steam Runtime "sniper" sysroot; a source build makes it from the pinned sysroot, 1.2 GB once). The
 `deck` step packs the game, its data and the AppImage of the same release into `UltraTears-SteamDeck.tar`; on the
 Deck, that AppImage is the launcher and the builder. A package from Releases downloads the AppImage itself; from the
-source, set `ULTRS_LINUX_PACKAGE` to a folder with `UltraTears-*-x86_64.AppImage`.
+source, set `ULTRS_LINUX_PACKAGE` to a folder with `UltraTears.AppImage`.
 
 **On Linux.** `python3 tools/setup.py --dump <folder>` builds for that machine, the same way. The game needs kernel
 6.7+ (userfaultfd and `PAGEMAP_SCAN` for its write watch).
@@ -114,7 +114,7 @@ python tools/linux_used.py --home <game folder>      # what a Linux build reads 
 Then, on Linux (under WSL on an ext4 file system: `/mnt/c` and `/mnt/d` lose the modes and links of the tools):
 
 ```bash
-python3 tools/make_package_linux.py --xlate <ultrs-shaders> --launcher <ultratears-launcher>   # release/*.AppImage
+python3 tools/make_package_linux.py --xlate <ultrs-shaders> --launcher <ultratears-launcher>   # release/UltraTears.AppImage
 ```
 
 It takes from `dev-local\release-inputs\` the Linux kit (`ultrs-linux-kit.zip`, `tools/make_linux_kit.py`),
@@ -124,7 +124,7 @@ It takes from `dev-local\release-inputs\` the Linux kit (`ultrs-linux-kit.zip`, 
 And back on Windows:
 
 ```powershell
-python tools/make_package.py --home <game folder>    # release/UltraTears-builder-<x.y.z>-windows-x86_64.zip
+python tools/make_package.py --home <game folder>    # release/UltraTears-<x.y.z>-windows-x86_64.zip
 git push origin dev:main
 git push origin v<x.y.z>
 ```

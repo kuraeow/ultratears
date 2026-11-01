@@ -724,7 +724,7 @@ def step_deck(dump, state, cpus):
     pack = deck_pack(state)
     appimage = deps_install.linux_package(ROOT)
     if appimage is None:   # a build from the source without ULTRS_LINUX_PACKAGE (an AppImage): the game is built, no tar
-        say('  WARNING: no AppImage (ULTRS_LINUX_PACKAGE=<folder with UltraTears-*-x86_64.AppImage>): the Steam Deck\'s '
+        say('  WARNING: no AppImage (ULTRS_LINUX_PACKAGE=<folder with UltraTears.AppImage>): the Steam Deck\'s '
             'tar is not made; the game for Linux is built (linux/ultratears)')
         return 'no AppImage: no tar'
     inputs =[ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, appimage,

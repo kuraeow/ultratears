@@ -577,7 +577,8 @@ def linux_package(home):
     local = os.environ.get('ULTRS_LINUX_PACKAGE')
     if local:
         d = pathlib.Path(local)
-        return max(d.glob('UltraTears-*-x86_64.AppImage'), key=lambda p: p.stat().st_mtime, default=None)
+        images = list(d.glob('UltraTears.AppImage')) + list(d.glob('UltraTears-*-x86_64.AppImage'))
+        return max(images, key=lambda p: p.stat().st_mtime, default=None)
     pins = home / LINUX_PACKAGE
     if not pins.is_file():
         return None
