@@ -125,7 +125,7 @@ def trim_python(py, strip_tool):
 # LLVM's programs the player's build runs (clang, clang++, lld, ninja: tools/build_game.py, bc7_build.py); llvm-ar and
 # llvm-objcopy are for remaking the Linux kit and the Windows builder's tar, llvm-strip for this script. clang's own
 # headers of other processors' intrinsics go too (the game and its tools are built for x86-64 only).
-LLVM_KEEP = ('clang', 'clang++', 'clang-', 'lld', 'ld.lld', 'ninja', 'llvm-strip')   # llvm-strip: removed at the end
+LLVM_KEEP = ('clang', 'clang++', 'clang-', 'lld', 'ld.lld', 'ninja', 'llvm-strip', 'llvm-objcopy')   # the last two: removed at the end (llvm-strip is a link to llvm-objcopy)
 RESOURCE_DROP = ('arm', 'riscv', 'sifive', 'hexagon', 'hvx', 'velintrin', 'lasx', 'lsx', 'msa.h', 'altivec', 'htm',
                  's390', 'vecintrin', 'wasm', 'opencl', 'cuda', 'hip', 'openmp_wrappers', 'ppc_wrappers', 'llvm_libc_wrappers',
                  'nvptx', 'amdgpu', '__clang_cuda', '__clang_hip', 'larchintrin')
@@ -218,7 +218,8 @@ def main():
     # the launcher and the SDL3 it loads (rpath $ORIGIN)
     shutil.copy2(a.launcher, out / 'ultratears-launcher')
     subprocess.run([str(out / 'deps/llvm/bin/llvm-strip'), '--strip-debug', str(out / 'ultratears-launcher')], check=True)
-    (out / 'deps/llvm/bin/llvm-strip').unlink()   # this script's own: the player's build does not strip
+    for p in ('llvm-strip', 'llvm-objcopy'):   # this script's own: the player's build does not strip
+        (out / 'deps/llvm/bin' / p).unlink()
     (out / 'ultratears-launcher').chmod(0o755)
     shutil.copy2(out / 'deps/linux/sysroot/usr/lib/x86_64-linux-gnu/libSDL3.so.0', out / 'libSDL3.so.0')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
