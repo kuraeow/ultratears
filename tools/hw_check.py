@@ -13,6 +13,7 @@ goes on; 'info': a remark. The launcher has the texts for the codes in its langu
   vram_low          gpu, gb       warn   less than 4 GB of video memory
   ram_low           gb            warn   less than 16 GB of RAM
   cpu_no_avx2                     warn   the code is built for SSE4.2 (slower)
+  kernel_old        version       warn   Linux below 6.7: no write watch for the game's memory (very slow)
   disk_space        need_gb, free_gb, drive   block
   amd_untested      gpu           info   [temporary] AMD cards are not tested yet (dev-local/docs/issues.md, "#2, #16,
                                          #23"): remove once players with RDNA report that the game runs
@@ -137,7 +138,23 @@ def cases(folder, platforms=('windows',)):
             out.append({'code': 'ram_low', 'sev': 'warn', 'args': {'gb': round(ram / 2**30)}})
         if not avx2():
             out.append({'code': 'cpu_no_avx2', 'sev': 'warn', 'args': {}})
+    if os.name != 'nt' and kernel_version() < KERNEL_WRITE_WATCH:   # the game is built where it runs
+        out.append({'code': 'kernel_old', 'sev': 'warn', 'args': {'version': os.uname().release}})
     return out + disk_case(folder, 'linux' in platforms)
+
+
+KERNEL_WRITE_WATCH = (6, 7)   # userfaultfd write protection without faults (WP_ASYNC) and PAGEMAP_SCAN
+
+
+def kernel_version():
+    """Linux's version as numbers ((0, 0): unknown, as when not Linux). Below 6.7 the game has no write watch
+    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow (as
+    totk-pc-recomp warns, installer/steps.py). SteamOS 3.8 and later have 6.11+."""
+    try:
+        parts = os.uname().release.split('-')[0].split('.')
+        return tuple(int(p) for p in parts[:2])
+    except (AttributeError, ValueError):
+        return (0, 0)
 
 
 def text(case):
@@ -153,6 +170,7 @@ def text(case):
         'vram_low': f'{a.get("gpu")} has {a.get("gb")} GB of video memory; 4 GB or more is recommended',
         'ram_low': f'this PC has {a.get("gb")} GB of RAM; 16 GB or more is recommended',
         'cpu_no_avx2': 'the CPU lacks AVX2: the game is built for SSE4.2 and runs a little slower',
+        'kernel_old': f'Linux {a.get("version")}: 6.7 or newer is needed, else the game cannot track its memory writes and runs very slowly; update the system',
         'disk_space': f'the build needs {a.get("need_gb")} GB on {a.get("drive")}, {a.get("free_gb")} GB is free',
         'amd_untested': f'{a.get("gpu")}: AMD cards are not tested yet; please report how the game runs',
     }.get(case['code'], case['code'])

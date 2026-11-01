@@ -150,7 +150,7 @@ def main():
         game_cflags = game_cflags.replace(' -gcodeview', '') + ' ' + linux_flags()
     if arch != 'x86-64-v3':
         print(f'code for {arch}: this CPU has no AVX2 / FMA / BMI2 (slower than x86-64-v3)', flush=True)
-    a.j = a.j or a.cpus
+    a.j = a.j or min(a.cpus, jobs_for_ram())
     gen = ROOT / a.generated
     bd = 'build-linux' if linux else 'build'
     build = ROOT / bd
@@ -269,6 +269,14 @@ def main():
     if on_line:
         bar.finish()
     sys.exit(rc)
+
+
+def jobs_for_ram():
+    """As many clang processes as the memory holds: up to 768 MiB each, in 80 % of the RAM (as totk-pc-recomp's
+    build_game.py; the largest generated files take about that). 8 GB of RAM: 8, a Steam Deck's 16 GB: 16."""
+    import hw_check
+    ram = hw_check.ram_bytes()
+    return max(1, int(ram * 0.8) // (768 << 20)) if ram else 64
 
 
 def run_limited(cmd, env, mask, on_line=None):
