@@ -1,0 +1,69 @@
+diff --git a/src/runtime/runtime.c b/src/runtime/runtime.c
+index 2ebb3c8..d80bb3a 100644
+--- a/src/runtime/runtime.c
++++ b/src/runtime/runtime.c
+@@ -414,7 +414,35 @@ int appimage_print_binary(char* fname, unsigned long offset, unsigned long lengt
+ 	return 0;
+ }
+ 
++static char* find_fusermount_checked(bool verbose, char** fallback);
++
++/* UltraTears: Steam starts games with SIGCHLD ignored, and then the kernel reaps the "--version" child itself: waitpid
++ * fails with ECHILD, the status is never set, and every working fusermount was rejected ("No suitable fusermount
++ * binary found on the $PATH", from Steam only: the same AppImage started from a file manager worked). The check now
++ * runs with SIGCHLD at its default, and a setuid root fusermount3 (else fusermount) found on the way is used when no
++ * candidate passed it. */
+ char* find_fusermount(bool verbose) {
++    struct sigaction dfl, old;
++    memset(&dfl, 0, sizeof dfl);
++    dfl.sa_handler = SIG_DFL;
++    sigemptyset(&dfl.sa_mask);
++    int restore = sigaction(SIGCHLD, &dfl, &old) == 0;
++    char* fallback = NULL;
++    char* found = find_fusermount_checked(verbose, &fallback);
++    if (restore) {
++        sigaction(SIGCHLD, &old, NULL);
++    }
++    if (found != NULL) {
++        free(fallback);
++        return found;
++    }
++    if (fallback != NULL && verbose) {
++        printf("No fusermount passed --version: using %s\n", fallback);
++    }
++    return fallback;
++}
++
++static char* find_fusermount_checked(bool verbose, char** fallback) {
+     char* fusermount_base = "fusermount";
+ 
+     char* fusermount_path = getenv("PATH");
+@@ -468,6 +496,11 @@ char* find_fusermount(bool verbose) {
+                         printf("Found setuid root executable: %s\n", fusermount_full_path);
+                     }
+ 
++                    if (*fallback == NULL || (strcmp(entry->d_name, "fusermount3") == 0 && strstr(*fallback, "/fusermount3") == NULL)) {
++                        free(*fallback);
++                        *fallback = strdup(fusermount_full_path);
++                    }
++
+                     pid_t pid = fork();
+                     if (pid == -1) {
+                         perror("fork");
+@@ -490,10 +523,13 @@ char* find_fusermount(bool verbose) {
+                         exit(1);
+                     } else {
+                         // Parent process
+-                        int status;
+-                        waitpid(pid, &status, 0);
++                        int status = 0;
++                        pid_t w;
++                        do {
++                            w = waitpid(pid, &status, 0);
++                        } while (w == -1 && errno == EINTR);
+ 
+-                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
++                        if (w == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                             // The executable was found and executed successfully
+                             closedir(dir_ptr);
+                             free(path_copy);

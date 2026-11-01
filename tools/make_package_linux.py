@@ -12,9 +12,10 @@ linux-x64), ultratears-launcher with libSDL3.so.0 beside it. Every ELF file is c
 official LLVM binaries set (as totk-pc-recomp's make_release_linux.py check_glibc). The tar keeps the executable bits
 and the links; the Windows builder downloads it for a Steam Deck's tar, the Linux launcher for its updates.
 
-The AppImage: the same folder with AppRun (the launcher) and a desktop entry, packed by appimagetool with the static
-type-2 runtime (no libfuse2 on the host), both pinned by hash as totk-pc-recomp pins them. Started, the launcher copies
-the builder into the folder the player picks (tools/install_to.py) and builds the game there.
+The AppImage: the same folder with AppRun (the launcher) and a desktop entry, packed by appimagetool (pinned by hash as
+totk-pc-recomp pins it) with the static type-2 runtime (no libfuse2 on the host) built with this project's patch
+(tools/appimage_runtime: started from Steam, the released runtime finds no fusermount and the AppImage does not start).
+Started, the launcher copies the builder into the folder the player picks (tools/install_to.py) and builds the game there.
 """
 import argparse
 import hashlib
@@ -40,8 +41,6 @@ GLIBC_FLOOR = (2, 34)
 APPIMAGETOOL = {   # from release tags, pinned by hash: "continuous" uploads change under the same name (totk-pc-recomp's pins)
     'tool': {'url': 'https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage',
              'sha256': 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'},
-    'runtime': {'url': 'https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64',
-                'sha256': '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d'},
 }
 NOTICES = '''# Third-party notices (Linux builder package)
 
@@ -111,6 +110,8 @@ def main():
     ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip')
     ap.add_argument('--test', action='store_true', help='a package of an untagged commit (for testing, never released)')
     ap.add_argument('--no-appimage', action='store_true')
+    ap.add_argument('--runtime', type=pathlib.Path, default=ROOT / 'dev-local/dist/runtime-x86_64',
+                    help='the AppImage runtime built with tools/appimage_runtime (see its README.md)')
     a = ap.parse_args()
     if not sys.platform.startswith('linux'):
         sys.exit('make the Linux package on Linux (WSL): the links and modes of the tools must be made there')
@@ -197,9 +198,12 @@ def main():
     (out / 'AppRun').chmod(0o755)
     (out / 'ultratears.desktop').write_text(DESKTOP)
     shutil.copy2(ROOT / 'assets/launcher/l_emblem.png', out / 'ultratears.png')
+    runtime = a.runtime
+    if not runtime.is_file():
+        sys.exit(f'no AppImage runtime at {runtime}: build it with tools/appimage_runtime (README.md there)')
     cache = dist / 'appimage-tools'
     items = [dict(url=v['url'], sha256=v['sha256']) for v in APPIMAGETOOL.values()]
-    tool, runtime = deps_install.fetch_all(items, cache, 'appimagetool')
+    tool, = deps_install.fetch_all(items, cache, 'appimagetool')
     tool.chmod(0o755)
     image = dist / f'UltraTears-{ver}-x86_64.AppImage'
     env = dict(os.environ, ARCH='x86_64', APPIMAGE_EXTRACT_AND_RUN='1')   # appimagetool is an AppImage: no FUSE needed
