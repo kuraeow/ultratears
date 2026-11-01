@@ -862,14 +862,18 @@ def main():
                 r = getattr(m, '_refs', set())
                 m._refs = set()
             n = sum(len(l) + 1 for l in lines)
-            if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
+            # A big function gets a file of its own (they compile in parallel), and so does one with a dispatch over
+            # thousands of labels: build_game.py compiles such a file at -O0, and every function sharing it ran
+            # unoptimized too (in 1.4.3 about 640 functions, 459 of them the SDK's, in 2 files).
+            alone = n > args.big_fn or ('L_dispatch:' in lines[-4:] and sum(l.startswith('L_') for l in lines) > 2000)
+            if alone and fns:
                 pending = (a, lines, r)
                 break
             body += lines
             size += n
             fns.append(a)
             refs |= r
-            if n > args.big_fn:
+            if alone:
                 break
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
         text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]

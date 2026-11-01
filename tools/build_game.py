@@ -218,7 +218,9 @@ def main():
             # [temporary] a function with an unresolved computed branch is one switch over every
             # instruction; with thousands of labels clang -O1/-O2 takes from minutes to hours per file (main_376:
             # 20+ min at -O1), -O0 15 s. Such functions run unoptimized until their tables resolve.
-            if 'L_dispatch:' in text and text.count(chr(10) + 'L_') > 2000:
+            # Counted per function: a file's total once sent whole files of small dispatching functions to -O0
+            # (main_000 and sdk_130 of 1.4.3: ~630 functions unoptimized for dispatches of 133 and 385 labels).
+            if any('L_dispatch:' in f and f.count(chr(10) + 'L_') > 2000 for f in text.split(chr(10) + 'void f_')):
                 lines.append('  gameflags = ' + game_cflags.replace('-O2', '-O0'))
             game_objs.append(obj)
     if not game_objs:
