@@ -5,7 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
+#else
+#ifndef LOCALE_NAME_MAX_LENGTH
+#define LOCALE_NAME_MAX_LENGTH 85
+#endif
 #endif
 
 #include "host.h"
@@ -63,13 +69,17 @@ static uint64_t desired_language(void) {
             : !strcmp(language, "pt") ? portuguese : "en-US";
         memcpy(code, selected, strlen(selected));
     }
+    static int logged;
+    if (!logged++)
+        fprintf(stderr, "[totk] game language %s (%s)\n", code, explicit_code ? "lang= / TOTK_LANG" : "Windows or TOTK_LOCALE");
     uint64_t result;
     memcpy(&result, code, 8);
     return result;
 }
 
 static int focus_policy;
-static unsigned resume_notification, operation_notification, performance_notification;
+// What the game asked to be told; kept for when the port sends these (the mode never changes yet). Unused till then.
+__attribute__((unused)) static unsigned resume_notification, operation_notification, performance_notification;
 static uint32_t performance_configuration[2];
 
 HLE_FUNC("_ZN2nn2oe18GetDesiredLanguageEv", oe_desired_language) { c->x[0] = desired_language(); }

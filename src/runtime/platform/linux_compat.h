@@ -1,9 +1,28 @@
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
+#include <unistd.h>
+static inline int _chsize_s(int fd, int64_t size) {
+    return ftruncate(fd, (off_t)size);
+}
 // What glibc before 2.38 lacks (included via runtime/platform.h on Linux only): the AppImage is built against
 // Ubuntu 22.04's glibc 2.35 (no strlcpy / strlcat until 2.38, no arc4random until 2.36).
 #pragma once
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/random.h>
+
+static inline void *_aligned_malloc(size_t size, size_t alignment) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+}
+static inline void _aligned_free(void *ptr) {
+    free(ptr);
+}
 
 #if !__GLIBC_PREREQ(2, 38)
 static inline size_t strlcpy(char *d, const char *s, size_t n) {

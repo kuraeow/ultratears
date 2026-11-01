@@ -22,7 +22,15 @@
 
 // ---------------- upload memory and descriptor pools, per command slot ----------------
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *map; VkDeviceSize size, used; } chunk_t;
-typedef struct { chunk_t c[32]; int n, cur; VkDescriptorPool pool[64]; int npool, curpool; } slot_res;
+typedef struct { chunk_t c[32]; int n, cur, peak, resets, fpeak, fresets; VkDescriptorPool pool[64]; int npool, curpool; } slot_res;
+// Upload memory grows from a small chunk (doubling up to RING_MAX, or the size of one large upload) and gives back the
+// chunks a slot and thread did not touch over RING_TRIM of the slot's submissions. Before: chunks of at least 64 MiB
+// per slot and recording thread, kept for good - 1.9-2.6 GB of host memory after a load and a run (2026-10-28, L7).
+// Past the first RING_BASE bytes the chunks go back sooner, after RING_FAST untouched submissions of the slot (~4 s):
+// a load or teleport grew the rings to 0.7-0.9 GB, kept for ~30 s at the moment the new place's images arrive too
+// (the session's peak commit, 2026-10-28).
+enum { RING_MIN = 4u << 20, RING_MAX = 64u << 20, RING_TRIM = 120, RING_BASE = 12u << 20, RING_FAST = 16 };
+static _Atomic uint64_t g_ring_bytes, g_ring_peak, g_ring_made, g_ring_freed;   // memory log
 static slot_res g_res[VKB_SLOTS][VKB_MAXREC];   // per slot and recording thread (vkb_mt.c)
 static struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize used; } g_mpool[VKB_SLOTS];   // device memory for mirrors
 static uint32_t g_ring_type = UINT32_MAX;
@@ -48,12 +56,43 @@ static int chunk_new(chunk_t *c, VkDeviceSize size) {
     }
     VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};   // descriptor buffers
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, .allocationSize = req.size, .memoryTypeIndex = g_ring_type};
+    vkb_mtag = MT_RING;
     if (!vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &c->mem), "upload memory")) return 0;
     vk.vkBindBufferMemory(vkc.device, c->buf, c->mem, 0);
     void *m;
     if (!vk_check(vk.vkMapMemory(vkc.device, c->mem, 0, VK_WHOLE_SIZE, 0, &m), "map upload memory")) return 0;
     c->map = m; c->size = size; c->used = 0;
+    uint64_t now = atomic_fetch_add(&g_ring_bytes, size) + size, p = atomic_load(&g_ring_peak);
+    while (now > p && !atomic_compare_exchange_weak(&g_ring_peak, &p, now)) {}
+    atomic_fetch_add(&g_ring_made, 1);
     return 1;
+}
+static void chunk_free(chunk_t *c) {   // no submission uses it (its slot's last one is done)
+    vk.vkDestroyBuffer(vkc.device, c->buf, NULL);
+    vk.vkFreeMemory(vkc.device, c->mem, NULL);   // unmaps
+    atomic_fetch_sub(&g_ring_bytes, c->size);
+    atomic_fetch_add(&g_ring_freed, 1);
+    memset(c, 0, sizeof *c);
+}
+// The slot's previous submission is done: chunks this pair has not touched over RING_TRIM submissions go back, and
+// those past its first RING_BASE bytes over RING_FAST.
+static void ring_trim(slot_res *r) {
+    int touched = r->n;   // the chunks up to the last one written
+    while (touched > 0 && !r->c[touched - 1].used) touched--;
+    if (touched > r->peak) r->peak = touched;
+    if (touched > r->fpeak) r->fpeak = touched;
+    if (++r->fresets >= RING_FAST) {
+        int base = 0;   // the leading chunks within RING_BASE (at least the first)
+        for (VkDeviceSize sum = 0; base < r->n && (base == 0 || sum + r->c[base].size <= RING_BASE); base++) sum += r->c[base].size;
+        int keep = r->fpeak > base ? r->fpeak : base;
+        while (r->n > keep) chunk_free(&r->c[--r->n]);
+        r->fpeak = 0;
+        r->fresets = 0;
+    }
+    if (++r->resets < RING_TRIM) return;
+    while (r->n > r->peak) chunk_free(&r->c[--r->n]);
+    r->peak = 0;
+    r->resets = 0;
 }
 
 static __thread uint64_t g_rec;   // the command buffer this thread records (its caches below compare against it)
@@ -67,9 +106,15 @@ static int no_cache(void) {   // TOTK_VK_NO_RECORD_CACHE=1 (development): every 
     if (v < 0) { const char *e = getenv("TOTK_VK_NO_RECORD_CACHE"); v = e && *e && *e != '0'; }
     return v;
 }
+// Trims and vkb_ring_reclaim (any thread) change a slot's chunk list; recording into a slot (vkb_ring_alloc) does not
+// take it: reclaim leaves the recording slot alone.
+static pthread_mutex_t g_ring_mu = PTHREAD_MUTEX_INITIALIZER;
 void vkb_slot_reset(int slot) {   // the slot's previous submission has completed; a new one starts recording
     vkb_rec_begin();
     if (vkb_db_on()) vkb_db_slot_reset(slot);
+    pthread_mutex_lock(&g_ring_mu);
+    for (int w = 0; w < VKB_MAXREC; w++) ring_trim(&g_res[slot][w]);
+    pthread_mutex_unlock(&g_ring_mu);
     for (int w = 0; w < VKB_MAXREC; w++) {
         slot_res *r = &g_res[slot][w];
         for (int i = 0; i < r->n; i++) r->c[i].used = 0;
@@ -78,6 +123,37 @@ void vkb_slot_reset(int slot) {   // the slot's previous submission has complete
         r->curpool = 0;
     }
     g_mpool[slot].used = 0;
+}
+
+// Out of memory (count_alloc, backend_vk.c): the upload memory of the slots whose submission the GPU has finished and
+// that do not record now goes back, all of it - a slot grows it again from RING_MIN when it next records.
+uint64_t vkb_ring_reclaim(void) {
+    uint64_t freed = 0;
+    pthread_mutex_lock(&g_ring_mu);
+    for (int s = 0; s < VKB_SLOTS; s++) {
+        if (!vkb_slot_idle(s)) continue;
+        for (int w = 0; w < VKB_MAXREC; w++) {
+            slot_res *r = &g_res[s][w];
+            while (r->n) { freed += r->c[r->n - 1].size; chunk_free(&r->c[--r->n]); }
+            r->cur = r->peak = r->fpeak = r->resets = r->fresets = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_ring_mu);
+    return freed;
+}
+void vkb_ring_counts(uint64_t *peak, uint64_t *made, uint64_t *freed) {
+    *peak = atomic_load(&g_ring_peak);
+    *made = atomic_load(&g_ring_made);
+    *freed = atomic_load(&g_ring_freed);
+}
+void vkb_ring_stats(uint64_t *chunks, uint64_t *bytes, uint64_t *pairs) {   // memory log (racy reads: counts only)
+    *chunks = *bytes = *pairs = 0;
+    for (int s = 0; s < VKB_SLOTS; s++)
+        for (int w = 0; w < VKB_MAXREC; w++) {
+            const slot_res *r = &g_res[s][w];
+            if (r->n) (*pairs)++;
+            for (int i = 0; i < r->n; i++) { (*chunks)++; *bytes += r->c[i].size; }
+        }
 }
 
 void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
@@ -90,8 +166,10 @@ void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDevice
             r->cur++;
             continue;
         }
-        if (r->n == 32) die("upload memory: 32 chunks (2 GiB) in one submission");
-        if (!chunk_new(&r->c[r->n], n > (64u << 20) ? n : (64u << 20))) die("upload memory");
+        if (r->n == 32) die("upload memory: 32 chunks in one submission");
+        VkDeviceSize grow = r->n ? r->c[r->n - 1].size * 2 : RING_MIN;
+        if (grow > RING_MAX) grow = RING_MAX;
+        if (!chunk_new(&r->c[r->n], n > grow ? n : grow)) die("upload memory");
         r->n++;
     }
 }
@@ -130,7 +208,7 @@ static __thread struct {
     uint32_t vattr[16]; int nvattr; vs_st vstream[16]; int nvstream; NVNbufferRange vbuf[16];
     p_bind_buf ubo[6][18], ssbo[6][16];
     uint64_t tex[6][32], img[6][8];
-    int depth_clamp, raster_discard;
+    int depth_clamp, raster_discard, prim_restart;
     const char *bad_key;   // the unsupported shader of a program that cannot be drawn (audit)
     int64_t copy_stride;
 } S;   // this recording thread's (vkb_mt.c gives each chunk the state at its start)
@@ -213,6 +291,7 @@ void vkb_state(uint32_t op, const uint8_t *a) {
     }
     case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; break;
     case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value; break;
+    case OP_PRIM_RESTART: S.prim_restart = ((const p_flag *)a)->value; break;
     case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
     default: break;
     }
@@ -220,11 +299,12 @@ void vkb_state(uint32_t op, const uint8_t *a) {
 
 // ---------------- texture and sampler pools ----------------
 typedef struct { tex_t t; view_t v; uint8_t has_view, valid; } treg_t;
-typedef struct { samp_par p; VkSampler s; uint8_t valid; } sreg_t;
+typedef struct { samp_par p; VkSampler s; uint8_t valid, custom; } sreg_t;   // custom: s has its own border colour
 static treg_t *g_treg;
 static sreg_t *g_sreg;
 static int g_ntreg, g_nsreg;
 static vkb_rw g_reg_mu;   // game threads register while the recording threads read
+static _Atomic uint32_t g_custom_borders;   // live samplers with their own border colour (vkc.max_custom_border)
 
 static void *grow(void *a, int *n, int need, size_t elem) {
     if (need < *n) return a;
@@ -253,11 +333,16 @@ void mtl_reg_samp(int id, const samp_par *p) {
     g_sreg = grow(g_sreg, &g_nsreg, id, sizeof *g_sreg);
     sreg_t *r = &g_sreg[id];
     VkSampler old = VK_NULL_HANDLE;
-    if (r->s && (!p || memcmp(&r->p, p, sizeof *p))) { old = r->s; r->s = VK_NULL_HANDLE; }
+    int old_custom = 0;
+    if (r->s && (!p || memcmp(&r->p, p, sizeof *p))) { old = r->s; old_custom = r->custom; r->s = VK_NULL_HANDLE; r->custom = 0; }
     r->valid = p != NULL;
     if (p) r->p = *p;
     vkb_rw_write_end(&g_reg_mu);
-    if (old) { mtl_finish(); vk.vkDestroySampler(vkc.device, old, NULL); }   // [temporary] waits for the GPU
+    if (old) {
+        mtl_finish();   // [temporary] waits for the GPU
+        vk.vkDestroySampler(vkc.device, old, NULL);
+        if (old_custom) atomic_fetch_sub(&g_custom_borders, 1);
+    }
 }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
@@ -292,15 +377,29 @@ static VkSampler sampler(int id) {
     VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
         .reductionMode = p->reduction == 1 ? VK_SAMPLER_REDUCTION_MODE_MIN : p->reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
                                                                                                 : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE};
-    // [temporary] border colour: the nearest standard one (custom border colours: VK_EXT_custom_border_color later)
-    {
-        const float *b = p->border;
-        int standard = (b[0] == 0 && b[1] == 0 && b[2] == 0 && (b[3] == 0 || b[3] == 1)) || (b[0] == 1 && b[1] == 1 && b[2] == 1 && b[3] == 1);
-        if (!standard && (p->ws == 5 || p->wt == 5 || p->wr == 5 || p->ws == 4 || p->wt == 4 || p->wr == 4)) vkb_audit(A_BORDER_APPROX, NULL);
+    // Border colour. NVN takes any colour: TOTK clamps the grass interaction map to (0.5, 0.5, 0.5, 0.5), its "untouched"
+    // value; with transparent black the grass away from Link lay flat (MacNativeGames issue #49). A colour that is not
+    // one of Vulkan's three is the sampler's own (VK_EXT_custom_border_color, float, no format) while the driver's
+    // limit allows, else the nearest standard one.
+    const float *b = p->border;
+    int standard = (b[0] == 0 && b[1] == 0 && b[2] == 0 && (b[3] == 0 || b[3] == 1)) || (b[0] == 1 && b[1] == 1 && b[2] == 1 && b[3] == 1);
+    int uses_border = p->ws == 5 || p->wt == 5 || p->wr == 5 || p->ws == 4 || p->wt == 4 || p->wr == 4;
+    VkSamplerCustomBorderColorCreateInfoEXT own = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT, &red,
+        .customBorderColor.float32 = {b[0], b[1], b[2], b[3]}, .format = VK_FORMAT_UNDEFINED};
+    int custom = 0;
+    if (!standard && uses_border) {
+        if (vkc.has_custom_border && atomic_fetch_add(&g_custom_borders, 1) < vkc.max_custom_border) custom = 1;
+        else {
+            if (vkc.has_custom_border) atomic_fetch_sub(&g_custom_borders, 1);
+            vkb_audit(A_BORDER_APPROX, NULL);
+            static int said; if (!said++) VLOG("[sampler] border colour %g %g %g %g approximated by a standard one%s", b[0], b[1], b[2], b[3],
+                                              vkc.has_custom_border ? " (the driver's limit of custom border samplers reached)" : "");
+        }
     }
-    VkBorderColor border = p->border[3] < 0.5f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
-                         : p->border[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, &red,
+    VkBorderColor border = custom ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
+                         : b[3] < 0.5f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+                         : b[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, custom ? (void *)&own : (void *)&red,
         .magFilter = p->magf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .minFilter = p->minf == 1 || p->minf == 3 || p->minf == 5 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .mipmapMode = p->minf == 4 || p->minf == 5 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
@@ -311,14 +410,18 @@ static VkSampler sampler(int id) {
         .borderColor = border};
     if (ci.maxLod < ci.minLod) ci.maxLod = ci.minLod;
     VkSampler s;
-    if (!vk_check(vk.vkCreateSampler(vkc.device, &ci, NULL, &s), "sampler")) return sampler(-1);
+    if (!vk_check(vk.vkCreateSampler(vkc.device, &ci, NULL, &s), "sampler")) {
+        if (custom) atomic_fetch_sub(&g_custom_borders, 1);
+        return sampler(-1);
+    }
     vkb_rw_write(&g_reg_mu, LK_TEXREG);
     int kept = id < g_nsreg && g_sreg[id].valid && !memcmp(&g_sreg[id].p, &par, sizeof par) && !g_sreg[id].s;
-    if (kept) g_sreg[id].s = s;
+    if (kept) { g_sreg[id].s = s; g_sreg[id].custom = (uint8_t)custom; }
     else if (id < g_nsreg && g_sreg[id].valid && !memcmp(&g_sreg[id].p, &par, sizeof par) && g_sreg[id].s) {   // another thread made one meanwhile
         VkSampler other = g_sreg[id].s;
         vkb_rw_write_end(&g_reg_mu);
         vk.vkDestroySampler(vkc.device, s, NULL);
+        if (custom) atomic_fetch_sub(&g_custom_borders, 1);
         return other;
     }
     vkb_rw_write_end(&g_reg_mu);
@@ -396,8 +499,24 @@ static vkb_image *handle_image(uint64_t h, const view_t **view) {
     view_t *v = NULL;
     if (g_treg[id].has_view) { v = &views[next++ & 63]; *v = g_treg[id].v; }
     vkb_rw_read_end(&g_reg_mu);
+    vkb_image *im = vkb_image_of(&t);
+    if (vkb_depth_audit_on()) vkb_depth_audit_read(im, "sample");
+    // Texture objects over the same memory share one image whatever their swizzle (it does not change the memory): an
+    // object whose swizzle differs from the image's own gets it through its view. TOTK draws the minimap through one
+    // object and samples it through another with alpha ONE; as separate images the sampled one stayed empty.
+    const nvn_texdesc *a = im ? &im->d : NULL;
+    if (a && (!v || !v->set_swizzle) && (a->swizzle_r != t.d.swizzle_r || a->swizzle_g != t.d.swizzle_g ||
+                                         a->swizzle_b != t.d.swizzle_b || a->swizzle_a != t.d.swizzle_a)) {
+        if (!v) { v = &views[next++ & 63]; memset(v, 0, sizeof *v); }
+        int own = t.d.swizzle_r | t.d.swizzle_g | t.d.swizzle_b | t.d.swizzle_a;   // none set: identity
+        v->set_swizzle = 1;
+        v->swz[0] = own ? (uint8_t)t.d.swizzle_r : NVN_TEXTURE_SWIZZLE_R;
+        v->swz[1] = own ? (uint8_t)t.d.swizzle_g : NVN_TEXTURE_SWIZZLE_G;
+        v->swz[2] = own ? (uint8_t)t.d.swizzle_b : NVN_TEXTURE_SWIZZLE_B;
+        v->swz[3] = own ? (uint8_t)t.d.swizzle_a : NVN_TEXTURE_SWIZZLE_A;
+    }
     *view = v;
-    return vkb_image_of(&t);
+    return im;
 }
 
 // ---------------- sampled render targets ----------------
@@ -406,15 +525,37 @@ static vkb_image *handle_image(uint64_t h, const view_t **view) {
 // without it they would leave the pass, and the draw saw an empty texture instead (the audit's top substitution).
 static __thread vkb_image *g_fb_rt[9];   // this draw's targets: colour 0-7, depth 8
 static __thread uint32_t g_fb;           // the targets it samples (vkb.h VKB_FB_DEPTH)
+// AMD's Windows driver has the layout without its dynamic state: the layout alone (vk.c). Without barriers inside a pass
+// (no VK_KHR_dynamic_rendering_local_read) the pass ends before such a draw once anything was drawn in it, and the next
+// pass's barrier makes those writes visible. Without the layout extension at all a draw that samples its own target either
+//  - "general" (default): the target is attached in VK_IMAGE_LAYOUT_GENERAL and sampled in place, as before the
+//    extension existed. Undefined by the Vulkan spec, the way of layers and drivers before 2022. On the RTX 3060 as
+//    without the extension: the frame of the copies at the cost of the passes only;
+//  - "copy" (TOTK_VK_FB_FALLBACK=copy): reads a copy taken before the draw (vkb_tex_feedback_copy) - defined, but ~200
+//    copies a frame doubled the GPU time (12 -> 26 ms, p95 frame 35 -> 64 ms on the 3060);
+//  - "none" (=none): reads an empty texture, as before 2026-10-29 (the black screen of AMD).
+enum { FB_GENERAL, FB_COPY, FB_NONE };
+static int fb_fallback(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("TOTK_VK_FB_FALLBACK");
+        m = e && !strcmp(e, "copy") ? FB_COPY : e && !strcmp(e, "none") ? FB_NONE : FB_GENERAL;
+    }
+    return m;
+}
+int vkb_fb_general(void) { return !vkc.has_feedback_loop && fb_fallback() == FB_GENERAL; }
+static __thread uint32_t g_fbcopy;   // "copy": the sampled targets read from copies
+static __thread vkb_image *g_fbtwin[9];
+static __thread uint64_t g_drawn_pass;   // the pass in which this thread last recorded a draw
 
 static int fb_index(const vkb_image *im) {   // the target bit of a sampled image, -1: not a target of this draw
     for (int i = 0; im && i < 9; i++) if (g_fb_rt[i] == im) return i;
     return -1;
 }
 static void feedback_scan(const vkb_shader *vs, const vkb_shader *fs) {
-    g_fb = 0;
+    g_fb = g_fbcopy = 0;
     memset(g_fb_rt, 0, sizeof g_fb_rt);
-    if (!vkc.has_feedback_loop) return;
+    memset(g_fbtwin, 0, sizeof g_fbtwin);
     const p_set_rt *rt = vkb_rt();
     int n = rt->n < 0 ? 0 : rt->n > 8 ? 8 : rt->n, any = 0;
     for (int i = 0; i < n; i++) if (rt->color[i]) any |= (g_fb_rt[i] = vkb_image_of(rt->color[i])) != NULL;
@@ -428,8 +569,21 @@ static void feedback_scan(const vkb_shader *vs, const vkb_shader *fs) {
             if (b >= 0) g_fb |= 1u << b;
         }
     }
+    if (!vkc.has_feedback_loop && fb_fallback() != FB_GENERAL) {   // "general" keeps g_fb: attached in GENERAL
+        g_fbcopy = fb_fallback() == FB_COPY ? g_fb : 0;
+        g_fb = 0;
+    }
 }
 static int fb_sampled(const vkb_image *im) { int b = fb_index(im); return b >= 0 && ((g_fb >> b) & 1); }
+static vkb_image *fb_twin(vkb_image *im) {   // what the draw samples for im: its copy when it is a copied target
+    int b = g_fbcopy ? fb_index(im) : -1;
+    return b >= 0 && g_fbtwin[b] ? g_fbtwin[b] : im;
+}
+static void fb_copies(void) {   // outside a pass: the sampled targets copied (no feedback loops)
+    VkCommandBuffer cb = vkb_cmd();
+    for (int b = 0; b < 9; b++)
+        if ((g_fbcopy >> b & 1) && g_fb_rt[b]) g_fbtwin[b] = vkb_tex_feedback_copy(cb, g_fb_rt[b]);
+}
 
 // ---------------- buffers ----------------
 static VkBuffer g_zero;   // 64 KiB of zeros for unbound buffers
@@ -498,6 +652,7 @@ static int mirror_alloc(uint64_t addr, VkDeviceSize n, VkBuffer *buf, VkDeviceSi
         VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, .allocationSize = req.size,
                                    .memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        vkb_mtag = MT_MIRROR;
         if (ai.memoryTypeIndex == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_mpool[sl].mem), "mirror memory")) die("mirror memory");
         vk.vkBindBufferMemory(vkc.device, g_mpool[sl].buf, g_mpool[sl].mem, 0);
     }
@@ -562,6 +717,24 @@ void vkb_mirrors_submit(VkCommandBuffer cb) {
     g_nmir = 0;
 }
 
+// The first time this shader's buffer of this kind (0 uniform, 1 storage, 2 vertex) got a stand-in: 1 (log it).
+// Per shader, not the first 16 of the run: a startup shader used them all up before (Steam Deck, 2026-11-01), and what
+// the Depths terrain got was not in the log.
+static int stand_in_first(const char *key, int kind) {
+    enum { N = 2048 };
+    static uint64_t seen[N];
+    static int n;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)kind;
+    for (const char *p = key ? key : "?"; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    pthread_mutex_lock(&mu);
+    int first = n < N;
+    for (int i = 0; i < n && first; i++) first = seen[i] != h;
+    if (first) seen[n++] = h;
+    pthread_mutex_unlock(&mu);
+    return first;
+}
+
 // A buffer range for a guest address: the imported pool (offset aligned as the descriptor type needs) or a copy now.
 static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDeviceSize align, int copy_ok) {
     if (size > 65536 && align == vkc.props.limits.minUniformBufferOffsetAlignment) size = 65536;
@@ -579,6 +752,11 @@ static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDevice
             memcpy(p, (const void *)(uintptr_t)addr, size);
             return (VkDescriptorBufferInfo){rb, ro, size};
         }
+    }
+    // a storage range past the end of its pool (backend_vk.c vkb_span_addr): the whole of it, imported on its own
+    if (!copy_ok && addr && size && vkb_pool_room(addr) && vkb_span_addr(addr, size, &buf, &off) && !(off % align)) {
+        VkDeviceSize max = vkc.props.limits.maxStorageBufferRange;
+        return (VkDescriptorBufferInfo){buf, off, max && size > max ? max : size};
     }
     return (VkDescriptorBufferInfo){g_zero, 0, 65536};
 }
@@ -676,7 +854,7 @@ static void prepare_images(const vkb_shader *sh, int stage) {
     VkCommandBuffer cb = vkb_cmd();
     for (int i = 0; i < sh->ntex; i++) {
         const view_t *v = NULL;
-        vkb_image *im = sh->tex[i].separate ? NULL : handle_image(S.tex[stage][sh->tex[i].slot], &v);
+        vkb_image *im = sh->tex[i].separate ? NULL : fb_twin(handle_image(S.tex[stage][sh->tex[i].slot], &v));
         if (im && im->refresh_from) vkb_tex_refresh(cb, im);
         if (!im || fb_sampled(im)) continue;   // a sampled target: the pass sets its layout
         vkb_tex_upload(cb, im);
@@ -699,7 +877,7 @@ static int images_need_work(const vkb_shader *sh, int stage) {
     int mt = vkb_mt_recording();
     for (int i = 0; i < sh->ntex; i++) {
         const view_t *v = NULL;
-        vkb_image *im = sh->tex[i].separate ? NULL : handle_image(S.tex[stage][sh->tex[i].slot], &v);
+        vkb_image *im = sh->tex[i].separate ? NULL : fb_twin(handle_image(S.tex[stage][sh->tex[i].slot], &v));
         // render targets have no upload stamp: only their layout matters (this ended the pass at every draw before)
         if (!im || fb_sampled(im)) continue;
         if (mt) vkb_tex_upload(VK_NULL_HANDLE, im);
@@ -714,6 +892,7 @@ static int images_need_work(const vkb_shader *sh, int stage) {
     return 0;
 }
 
+uint64_t nvn_cpu2va(uint64_t cpu);   // hle_nvn.c: the address as the GPU sees it (the same with TOTK_GPU_VA off)
 // The guest range of a shader's storage buffer i (0 size: unknown / unbound).
 static void sbuf_range(const vkb_shader *sh, int stage, int i, uint64_t *addr, uint64_t *size) {
     *addr = 0; *size = 0;
@@ -726,9 +905,23 @@ static void sbuf_range(const vkb_shader *sh, int stage, int i, uint64_t *addr, u
         if (u->addr && sh->sbuf[i].off + 12 <= u->size) {
             uint32_t n;
             vkb_ucap_read(u->addr + sh->sbuf[i].off, addr, 8);
+            *addr = nvn_va2cpu(*addr);   // the game writes GPU addresses into its uniforms (hle_nvn.c)
             vkb_ucap_read(u->addr + sh->sbuf[i].off + 8, &n, 4);
             *size = n;
         }
+    }
+    // A range that runs on past the end of its pool is cut there (L20): TOTK's Depths terrain declares 258 MB from a
+    // pointer in c6 (one piece of the mesh, a .quad file of the game) and reads its patch tables and corner positions in
+    // the first MB. Whole, the range fitted no pool: an empty buffer was bound (every vertex of the terrain at one point:
+    // the ground not drawn, Link unlit near it) and the pool's device copy was not brought up to date for it. On the
+    // Switch the range reads on into the next pools of the GPU's address space; with TOTK_GPU_VA=1 the whole range is
+    // assembled (backend_vk.c vkb_span_addr).
+    // TOTK_VK_SBUF_CLIP=0: whole, as before.
+    static int clip = -1;
+    if (clip < 0) { const char *e = getenv("TOTK_VK_SBUF_CLIP"); clip = !e || *e != '0'; }
+    if (clip && *addr && *size > (1u << 20) && nvn_cpu2va(*addr) == *addr) {
+        uint64_t room = vkb_pool_room(*addr);
+        if (room && room < *size) *size = room;
     }
 }
 
@@ -815,6 +1008,139 @@ static void mirrors_prepare_fixed(int indexed, const p_draw_idx *di) {
     }
 }
 
+// ---- depth twins: colour images under a compare sampler in a compute shader
+// TOTK's compute passes sample an R32_SFLOAT texture through a shadow sampler (Ryujinx SamplerType Shadow, 0x400).
+// Maxwell compares any single-channel float or unorm texel; Vulkan only formats with SAMPLED_IMAGE_DEPTH_COMPARISON
+// (VUID-vkCmdDispatch-None-06479), which AMD's drivers (RADV on the Steam Deck too) do not give R32_SFLOAT, so the result
+// there is undefined; NVIDIA compares it. Such an image gets a depth twin of the same size and bits (R32_SFLOAT ->
+// D32_SFLOAT, R16_UNORM -> D16_UNORM), copied through upload memory right before the dispatch that samples it (outside
+// any pass: vkb_dispatch ended it), and the dispatch samples the twin. Draws keep the colour image (no copy inside their
+// pass). As totk-pc-recomp 3b5469a (MIT), after Savage Wind Recomp's depth twins (MIT); the code is ours.
+// [temporary] Suspected for the flickering fog on AMD (GitHub #38, #40; white fog in the open world on the Deck), not
+// confirmed. TOTK_DEPTH_TWIN=0: off; =2: also where the driver compares (to try the path on NVIDIA).
+enum { TWINS = 16 };
+typedef struct { VkImage src, img; VkDeviceMemory mem; VkImageView view[2]; uint32_t w, h, layers; VkFormat fmt; } twin_t;
+static twin_t g_twins[TWINS];
+static unsigned g_twin_next;
+static pthread_mutex_t g_twin_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static VkFormat twin_format(const vkb_image *im) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_DEPTH_TWIN"); on = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    if (!on || im->depth > 1 || im->compressed || !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return VK_FORMAT_UNDEFINED;
+    VkFormat df = im->format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : im->format == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM
+                : VK_FORMAT_UNDEFINED;
+    if (!df) return df;
+    static int compares[2] = {-1, -1};   // per source format: the driver compares it as it is
+    int i = df == VK_FORMAT_D16_UNORM;
+    if (compares[i] < 0) {
+        VkFormatProperties3 p3 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 p2 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &p3};
+        vk.vkGetPhysicalDeviceFormatProperties2(vkc.gpu, im->format, &p2);
+        compares[i] = (p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+        VLOG("%s under a compare sampler: %s", i ? "R16_UNORM" : "R32_SFLOAT",
+             compares[i] ? "compared by the driver" : "sampled through a depth twin in compute passes");
+    }
+    return compares[i] && on != 2 ? VK_FORMAT_UNDEFINED : df;
+}
+
+// The view of im's twin holding im's current texels (mip 0), the copies recorded into cb; NULL: none needed / possible.
+static VkImageView twin_view(VkCommandBuffer cb, vkb_image *im, VkImageViewType vt) {
+    VkFormat df = twin_format(im);
+    if (!df || (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY)) return VK_NULL_HANDLE;
+    uint32_t bpp = df == VK_FORMAT_D32_SFLOAT ? 4 : 2, layers = im->layers ? im->layers : 1;
+    VkDeviceSize bytes = (VkDeviceSize)im->width * im->height * layers * bpp;
+    if (bytes > (16u << 20)) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_twin_mu);
+    twin_t *t = NULL;
+    for (int i = 0; i < TWINS && !t; i++)
+        if (g_twins[i].img && g_twins[i].src == im->img && g_twins[i].w == im->width && g_twins[i].h == im->height &&
+            g_twins[i].layers == layers && g_twins[i].fmt == df)
+            t = &g_twins[i];
+    if (!t) {
+        t = &g_twins[g_twin_next++ % TWINS];
+        if (t->img) {   // the submissions being recorded may still sample the replaced twin
+            vkb_destroy_later(t->view[1], VK_NULL_HANDLE, VK_NULL_HANDLE);
+            vkb_destroy_later(t->view[0], t->img, t->mem);
+        }
+        *t = (twin_t){.src = im->img, .w = im->width, .h = im->height, .layers = layers, .fmt = df};
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = df,
+                                .extent = {im->width, im->height, 1}, .mipLevels = 1, .arrayLayers = layers,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VkMemoryRequirements req;
+        int ok = vk_check(vk.vkCreateImage(vkc.device, &ci, NULL, &t->img), "depth twin");
+        if (ok) {
+            vk.vkGetImageMemoryRequirements(vkc.device, t->img, &req);
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                       .memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            ok = ai.memoryTypeIndex != UINT32_MAX && vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &t->mem), "depth twin memory") &&
+                 vk_check(vk.vkBindImageMemory(vkc.device, t->img, t->mem, 0), "depth twin bind");
+        }
+        for (int k = 0; ok && k < 2; k++) {
+            VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
+                                        .viewType = k ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = df,
+                                        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, k ? layers : 1}};
+            ok = vk_check(vk.vkCreateImageView(vkc.device, &vi, NULL, &t->view[k]), "depth twin view");
+        }
+        if (!ok) {
+            for (int k = 0; k < 2; k++) if (t->view[k]) vk.vkDestroyImageView(vkc.device, t->view[k], NULL);
+            if (t->img) vk.vkDestroyImage(vkc.device, t->img, NULL);
+            if (t->mem) vk.vkFreeMemory(vkc.device, t->mem, NULL);
+            *t = (twin_t){0};
+            pthread_mutex_unlock(&g_twin_mu);
+            return VK_NULL_HANDLE;
+        }
+        static int said;
+        if (said++ < 8)
+            VLOG("depth twin %ux%ux%u %s for a compute pass's compare sampler", im->width, im->height, layers,
+                 df == VK_FORMAT_D32_SFLOAT ? "D32_SFLOAT" : "D16_UNORM");
+    }
+    VkImage timg = t->img;
+    VkImageView view = t->view[vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY];
+    pthread_mutex_unlock(&g_twin_mu);
+    VkBuffer rb;
+    VkDeviceSize ro;
+    if (!vkb_ring_alloc(bytes, 16, &rb, &ro)) return VK_NULL_HANDLE;
+    // the source's earlier writes and the twin's earlier readers before the copies; the twin's old texels are dropped
+    VkImageLayout L = vkb_layout(im);
+    VkImageMemoryBarrier2 ib[2] = {
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT, .oldLayout = L, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img,
+         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}},
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = timg,
+         .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers}}};
+    VkDependencyInfo d0 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = ib};
+    vk.vkCmdPipelineBarrier2(cb, &d0);
+    VkBufferImageCopy src = {ro, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers}, {0, 0, 0}, {im->width, im->height, 1}};
+    vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &src);
+    VkMemoryBarrier2 m1 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo d1 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m1};
+    vk.vkCmdPipelineBarrier2(cb, &d1);
+    VkBufferImageCopy dst = {ro, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, layers}, {0, 0, 0}, {im->width, im->height, 1}};
+    vk.vkCmdCopyBufferToImage(cb, rb, timg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &dst);
+    // the source back in its layout, the twin readable by the dispatch (vkb_dispatch's full barrier follows as well)
+    ib[0] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = 0, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = L, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = im->img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+    ib[1] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = timg, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers}};
+    vk.vkCmdPipelineBarrier2(cb, &d0);
+    return view;
+}
+
 static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, int stage) {
     uint32_t base = stage == 1 ? VKB_STAGE_BINDINGS : 0;
     VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment, sa = vkc.props.limits.minStorageBufferOffsetAlignment;
@@ -839,8 +1165,7 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
             info = guest_range(u->addr, u->size, ua, 1);
             if (info.buffer == g_zero && u->addr) {
                 vkb_audit(A_UBO_MISSING, sh->key);
-                static int said;
-                if (said++ < 16) VLOG("[temporary] shader %.12s: uniform buffer c%d %#llx+%llu not in an imported pool: zeros are bound",
+                if (stand_in_first(sh->key, 0)) VLOG("[temporary] shader %.12s: uniform buffer c%d %#llx+%llu not in an imported pool: zeros are bound",
                                       sh->key ? sh->key : "?", slot, (unsigned long long)u->addr, (unsigned long long)u->size);
             }
         }
@@ -853,18 +1178,20 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         if (sh->sbuf[i].slot == 0xFF) vkb_audit(A_SSBO_UNKNOWN_SOURCE, sh->key);
         else if (bi.buffer == g_zero) vkb_audit(A_SSBO_MISSING, sh->key);
         if (bi.buffer == g_zero && addr) {
-            static int said;
-            if (said++ < 16) VLOG("[temporary] shader %.12s: storage buffer %#llx+%llu not in an imported pool (or misaligned): an empty one is bound",
-                                  sh->key ? sh->key : "?", (unsigned long long)addr, (unsigned long long)size);
+            if (stand_in_first(sh->key, 1))
+                VLOG("[temporary] shader %.12s: storage buffer %d %#llx+%llu not in an imported pool (or misaligned for %llu): an empty one is bound "
+                     "(frame %llu; room in its pool %llu)", sh->key ? sh->key : "?", i, (unsigned long long)addr, (unsigned long long)size,
+                     (unsigned long long)sa, (unsigned long long)vkb_frame(), (unsigned long long)vkb_pool_room(addr));
         }
         put_buf(W, set, base + VKB_B_SBUF + (uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bi);
     }
     for (int i = 0; i < sh->ntex; i++) {
         uint64_t h = sh->tex[i].separate ? 0 : S.tex[stage][sh->tex[i].slot];
         const view_t *v = NULL;
-        vkb_image *im = h ? handle_image(h, &v) : NULL;
+        vkb_image *im = h ? fb_twin(handle_image(h, &v)) : NULL;
         VkImageViewType vt = view_type_of(sh->tex[i].type);
-        int readable = im && (fb_sampled(im) ? vkb_layout_is(im, VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT)
+        int readable = im && (fb_sampled(im) ? vkb_layout_is(im, vkc.has_feedback_loop ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                                                                        : VK_IMAGE_LAYOUT_GENERAL)
                                              : vkb_layout_is(im, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
         VkImageView view = readable ? vkb_view(im, v, 0, (int)vt) : VK_NULL_HANDLE;
         if (sh->tex[i].separate) vkb_audit(A_TEX_SEPARATE, sh->key);
@@ -874,6 +1201,10 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         else if (im->not_uploadable) vkb_audit(A_TEX_NOT_UPLOADED, sh->key);
         VkDescriptorImageInfo info = {sampler((int)(h >> 20) & 0xFFF), view ? view : dummy_view(vt),
                                       view ? vkb_layout(im) : VK_IMAGE_LAYOUT_GENERAL};
+        if (view && stage == 5 && (sh->tex[i].type & 0x400)) {   // a compare sampler in a dispatch: the depth twin
+            VkImageView tv = twin_view(vkb_cmd(), im, vt);
+            if (tv) info.imageView = tv, info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
         put_img(W, set, base + VKB_B_TEX + (uint32_t)i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, info);
     }
     for (int i = 0; i < sh->nimg; i++) {
@@ -1057,7 +1388,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
     if (dyn(D_SC, sc, sizeof sc[0] * (size_t)nvp)) vk.vkCmdSetScissorWithCount(cb, (uint32_t)nvp, sc);
     DYN(D_RDISC, VkBool32, S.raster_discard != 0, vk.vkCmdSetRasterizerDiscardEnable(cb, v_));
     DYN(D_TOPO, VkPrimitiveTopology, topo, vk.vkCmdSetPrimitiveTopology(cb, v_));
-    DYN(D_RESTART, VkBool32, VK_FALSE, vk.vkCmdSetPrimitiveRestartEnable(cb, v_));   // [temporary] NVN primitive restart state is not recorded yet
+    DYN(D_RESTART, VkBool32, S.prim_restart != 0, vk.vkCmdSetPrimitiveRestartEnable(cb, v_));
     // polygon state
     uint32_t cull = S.has_poly ? S.poly.cull : 0, front = S.has_poly ? S.poly.front : 1, mode = S.has_poly ? S.poly.mode : 2;
     DYN(D_CULL, VkCullModeFlags, (VkCullModeFlags)cull, vk.vkCmdSetCullMode(cb, v_));
@@ -1066,6 +1397,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
     int bias = S.has_poly && (S.poly.offset_en & 4);
     DYN(D_BIAS_EN, VkBool32, (VkBool32)bias, vk.vkCmdSetDepthBiasEnable(cb, v_));
     { float b[3] = {S.po.units, S.po.clamp, S.po.factor}; if (dyn(D_BIAS, b, sizeof b)) vk.vkCmdSetDepthBias(cb, b[0], b[1], b[2]); }
+    if (bias && vkb_depth_audit_on()) { const p_set_rt *rt = vkb_rt(); vkb_depth_audit_bias(rt->depth ? vkb_image_of(rt->depth) : NULL, S.po.units, S.po.factor); }
     DYN(D_LINEW, float, 1.0f, vk.vkCmdSetLineWidth(cb, v_));
     DYN(D_CLAMP, VkBool32, S.depth_clamp != 0, vk.vkCmdSetDepthClampEnableEXT(cb, v_));
     DYN(D_CLIP, VkBool32, !S.depth_clamp, vk.vkCmdSetDepthClipEnableEXT(cb, v_));
@@ -1206,6 +1538,21 @@ static VkFormat float_read(VkFormat f) {
     }
 }
 
+// The vertices an indexed draw with a base vertex reads: base + the largest index (restart indices left out). 0: not
+// known (the index buffer is not in game memory).
+static uint64_t draw_vertex_end(const p_draw_idx *di) {
+    uint32_t isz = di->itype == 0 ? 1u : di->itype == 1 ? 2u : 4u, restart = isz == 1 ? 0xFFu : isz == 2 ? 0xFFFFu : 0xFFFFFFFFu, top = 0;
+    void *hb;
+    uint64_t hoff;
+    if (!di->ibuf || di->count <= 0 || !mtl_addr(di->ibuf, (uint64_t)di->count * isz, &hb, &hoff)) return 0;
+    const uint8_t *ib = (const uint8_t *)(uintptr_t)di->ibuf;
+    for (int i = 0; i < di->count; i++) {
+        uint32_t v = isz == 1 ? ib[i] : isz == 2 ? ((const uint16_t *)ib)[i] : ((const uint32_t *)ib)[i];
+        if (v != restart && v > top) top = v;
+    }
+    return (uint64_t)di->base_vertex + top + 1;
+}
+static __thread uint64_t t_vertex_end;   // vkb_draw -> set_vertex_input: the vertices this draw reads (0: the game's ranges)
 static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
     VkVertexInputBindingDescription2EXT bind[16];
     VkVertexInputAttributeDescription2EXT attr[16];
@@ -1240,19 +1587,37 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
         VkBuffer buf;
         VkDeviceSize off;
         VkDeviceSize size = S.vbuf[s].size;
+        // The stride goes with the binding too, as well as in vkCmdSetVertexInputEXT below. Without
+        // VK_EXT_vertex_input_dynamic_state (AMD Polaris, Intel HD 600) the Khronos shader object layer turns the vertex
+        // input into pipelines with a dynamic stride, which only vkCmdBindVertexBuffers2 sets: bound without it, every
+        // stride read 0, each triangle collapsed to a point and nothing was drawn (black screen, RX 570, 2026-10-29).
+        VkDeviceSize stride = S.vstream[s].stride;
+        // A base vertex past the end of the game's range: the Switch's GPU reads on through game memory. TOTK's Depths
+        // terrain draws index ~75 MiB past a 2 MiB vertex buffer, into the next pool; the vertices read as zeros and the
+        // triangles shot out as shards (L20). The range the draw reads, imported across pools when it must be.
+        uint64_t need = t_vertex_end && !S.vstream[s].divisor ? t_vertex_end * S.vstream[s].stride : 0;
+        if (S.vbuf[s].address && need > size) {
+            if (vkb_gpu_addr(S.vbuf[s].address, need, &buf, &off)) size = need;
+            else if (vkb_pool_room(S.vbuf[s].address) && vkb_span_addr(S.vbuf[s].address, need, &buf, &off)) {
+                VkDeviceSize key[4] = {(VkDeviceSize)(uintptr_t)buf, off, need, stride};
+                if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &need, &stride);
+                continue;
+            }
+        }
         if (S.vbuf[s].address && size && vkb_gpu_addr(S.vbuf[s].address, size, &buf, &off)) {
-            VkDeviceSize key[3] = {(VkDeviceSize)(uintptr_t)buf, off, size};
-            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &size, NULL);
+            VkDeviceSize key[4] = {(VkDeviceSize)(uintptr_t)buf, off, size, stride};
+            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &size, &stride);
         }
         else {
             if (S.vbuf[s].address) {   // [temporary] not in an imported pool (a virtual pool: sparse binding later): zeros
                 vkb_audit(A_VBUF_MISSING, S.sh[0] ? S.sh[0]->key : NULL);
-                static int said;
-                if (said++ < 16) VLOG("[temporary] vertex buffer %#llx+%llu (stream %u) not in an imported pool: zeros are bound",
-                                      (unsigned long long)S.vbuf[s].address, (unsigned long long)S.vbuf[s].size, s);
+                if (stand_in_first(S.sh[0] ? S.sh[0]->key : NULL, 2))
+                    VLOG("[temporary] shader %.12s: vertex buffer %#llx+%llu (stream %u) not in an imported pool: zeros are bound (frame %llu)",
+                         S.sh[0] && S.sh[0]->key ? S.sh[0]->key : "?", (unsigned long long)S.vbuf[s].address,
+                         (unsigned long long)S.vbuf[s].size, s, (unsigned long long)vkb_frame());
             }
-            VkDeviceSize z = 0, zs = 65536, key[3] = {(VkDeviceSize)(uintptr_t)g_zero, 0, 65536};
-            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &g_zero, &z, &zs, NULL);
+            VkDeviceSize z = 0, zs = 65536, key[4] = {(VkDeviceSize)(uintptr_t)g_zero, 0, 65536, stride};
+            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &g_zero, &z, &zs, &stride);
         }
     }
     struct { uint32_t nb, na; VkVertexInputBindingDescription2EXT b[16]; VkVertexInputAttributeDescription2EXT a[16]; } vi;
@@ -1355,14 +1720,15 @@ void vkb_draw_stats(uint64_t *draws, uint64_t *skipped) {
 }
 
 // TOTK_VK_DRAWTRACE=<frame>:<n>: n draws from that present on (development): targets, shaders, counts, outcome.
+static long long g_trace_at = -1, g_trace_left;
+void vkb_draw_trace_arm(uint64_t frame, long long n) { g_trace_left = n; g_trace_at = (long long)frame; }   // F9 (vkb_dump_request)
 static int draw_trace(void) {
-    static long long at = -1, left;
-    if (at == -1) {
+    if (g_trace_at == -1) {
         const char *e = getenv("TOTK_VK_DRAWTRACE");
-        at = e ? atoll(e) : 0;
-        left = e && strchr(e, ':') ? atoll(strchr(e, ':') + 1) : 200;
+        g_trace_at = e ? atoll(e) : 0;
+        g_trace_left = e && strchr(e, ':') ? atoll(strchr(e, ':') + 1) : 200;
     }
-    return at > 0 && vkb_frame() >= (uint64_t)at && left-- > 0;
+    return g_trace_at > 0 && vkb_frame() >= (uint64_t)g_trace_at && g_trace_left-- > 0;
 }
 // ---------------- GPU profile (development) ----------------
 // TOTK_GPU_PROF=<present>: a timestamp before and after every draw and dispatch of that frame; the next present prints
@@ -1444,6 +1810,7 @@ static void trace_resources(const vkb_shader *sh, int stage) {
                            im->width, im->height, im->gpu_written ? "/gpu" : "", (const void *)im->storage,
                            (unsigned long long)((uintptr_t)im->img & 0xffff))
                 : snprintf(line + n, sizeof line - n, " t%d=-", sh->tex[i].slot);
+        if (im) vkb_tex_vcheck_add(im);
         int sid = (int)(S.tex[stage][sh->tex[i].slot] >> 20) & 0xFFF;
         vkb_rw_read(&g_reg_mu, LK_TEXREG);
         if (sid < g_nsreg && g_sreg[sid].valid) {
@@ -1575,6 +1942,64 @@ void vkb_draw(const uint8_t *a, int indexed) {
                  S.has_dr ? "set" : "-", S.dr[0], S.dr[1], S.nvp ? S.vp[0][4] : 0.0f, S.nvp ? S.vp[0][5] : 1.0f,
                  S.has_poly && (S.poly.offset_en & 4) ? "on" : "off", S.po.units, S.po.factor, S.po.clamp, S.depth_clamp,
                  r->depth ? "yes" : "no", r->depth ? r->depth->d.format : 0);
+            VLOG("[draw]   viewports %d: 0 at %g,%g size %gx%g | scissor %s %d,%d %dx%d", S.nvp, S.nvp ? S.vp[0][0] : 0.0f, S.nvp ? S.vp[0][1] : 0.0f,
+                 S.nvp ? S.vp[0][2] : 0.0f, S.nvp ? S.vp[0][3] : 0.0f, S.has_sc ? "set" : "-", S.sc.x, S.sc.y, S.sc.w, S.sc.h);
+        }
+        {   // vertex input: attributes (stream, offset, NVN format) and the streams' buffers; the index buffer
+            char vl[1024];
+            int vn = 0;
+            uint32_t used = 0;
+            for (int i = 0; i < S.nvattr && vn < (int)sizeof vl - 64; i++) {
+                va_st a;
+                memcpy(&a, &S.vattr[i], sizeof a);
+                if (!a.fmt) continue;
+                used |= 1u << a.stream;
+                vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " a%d=s%u+%u/%#x", i, (unsigned)a.stream, (unsigned)a.offset, (unsigned)a.fmt);
+            }
+            for (uint32_t s = 0; s < 16 && vn < (int)sizeof vl - 80; s++)
+                if (used >> s & 1)
+                    vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " | s%u=%#llx+%llu stride %u%s", s, (unsigned long long)S.vbuf[s].address,
+                                   (unsigned long long)S.vbuf[s].size, (unsigned)S.vstream[s].stride, S.vstream[s].divisor ? " instanced" : "");
+            if (indexed) snprintf(vl + vn, sizeof vl - (size_t)vn, " | index %#llx type %d base %d first inst %d", (unsigned long long)di->ibuf,
+                                  di->itype, di->base_vertex, di->base_instance);
+            static uint32_t traced;   // the number vkb_vcheck reports a draw by
+            uint32_t no = ++traced;
+            VLOG("[draw]   vertex #%u:%s", no, vl);
+            // the ranges the draw reads, for vkb_vcheck after the dump; indices past the end of a per-vertex stream in
+            // game memory itself are reported here (the vertices such a draw reads are garbage)
+            uint32_t isz = indexed ? (di->itype == 0 ? 1u : di->itype == 1 ? 2u : 4u) : 0;
+            if (indexed && di->ibuf) vkb_vcheck_add(di->ibuf, (uint64_t)di->count * isz, no, 0);
+            for (uint32_t s = 0; s < 16; s++)
+                if (used >> s & 1 && S.vbuf[s].address && S.vbuf[s].size) vkb_vcheck_add(S.vbuf[s].address, S.vbuf[s].size, no, 1);
+            for (int st = 0; st < 2; st++) {   // constants (object transforms) and storage buffers of both stages
+                const vkb_shader *sh = S.sh[st];
+                if (!sh) continue;
+                for (int slot = 3; slot < VKB_NCBUF; slot++) {
+                    const p_bind_buf *u = &S.ubo[st][slot - 3];
+                    if ((sh->cbuf_mask & (1u << slot)) && u->addr && u->size) vkb_vcheck_add(u->addr, u->size > 65536 ? 65536 : u->size, no, 2);
+                }
+                for (int i = 0; i < sh->nsbuf; i++) {
+                    uint64_t a, n;
+                    sbuf_range(sh, st, i, &a, &n);
+                    if (a && n) vkb_vcheck_add(a, n <= (16u << 20) ? n : (1u << 20), no, 3);   // a larger one: its first MB
+                }
+            }
+            void *ihb;
+            uint64_t ihoff;
+            if (indexed && di->ibuf && di->count > 0 && mtl_addr(di->ibuf, (uint64_t)di->count * isz, &ihb, &ihoff)) {   // in game memory
+                uint64_t top = 0;
+                const uint8_t *ib = (const uint8_t *)(uintptr_t)di->ibuf;
+                uint32_t restart = isz == 1 ? 0xFFu : isz == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+                for (int i = 0; i < di->count; i++) {
+                    uint32_t v = isz == 1 ? ib[i] : isz == 2 ? ((const uint16_t *)ib)[i] : ((const uint32_t *)ib)[i];
+                    if (v != restart && v > top) top = v;
+                }
+                top += (uint64_t)(int64_t)di->base_vertex;
+                for (uint32_t s = 0; s < 16; s++)
+                    if (used >> s & 1 && !S.vstream[s].divisor && S.vstream[s].stride && top >= S.vbuf[s].size / S.vstream[s].stride)
+                        VLOG("[vcheck] draw #%u: index up to %llu, stream %u holds %llu vertices (in game memory)", no, (unsigned long long)top, s,
+                             (unsigned long long)(S.vbuf[s].size / S.vstream[s].stride));
+            }
         }
         if (S.sh[0]) trace_resources(S.sh[0], 0);
         if (S.sh[1]) trace_resources(S.sh[1], 1);
@@ -1644,7 +2069,11 @@ void vkb_draw(const uint8_t *a, int indexed) {
         }
     }
     feedback_scan(vs, fs);
-    if (vkb_in_pass() && vkb_pass_fb() != g_fb) vkb_pass_end_r(PE_FEEDBACK);   // [temporary] a pass per change of sampled targets
+    // [temporary] a pass per change of sampled targets; without barriers inside a pass also once the pass has drawn (its
+    // writes become visible to this draw's reads only through the next pass's barrier)
+    if (vkb_in_pass() && (vkb_pass_fb() != g_fb || g_fbcopy || (g_fb && !vkc.has_local_read && g_drawn_pass == vkb_pass_serial())))
+        vkb_pass_end_r(PE_FEEDBACK);
+    if (g_fbcopy) fb_copies();
     if ((vkb_in_pass() && (images_need_work(vs, 0) || (fs && images_need_work(fs, 1))))) vkb_pass_end_r(PE_IMAGES);
     if (!vkb_in_pass()) {
         prepare_images(vs, 0);
@@ -1666,16 +2095,17 @@ void vkb_draw(const uint8_t *a, int indexed) {
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
     uint32_t sint, ints = int_attributes(&sint) & vs->in_mask;   // integer attributes: the vertex shader's variant for them
-    VkShaderEXT vobj = ints ? vkb_shader_variant(vs, ints, sint) : vs->obj;
+    int unwritten = fs && (fs->in_mask & ~vs->out_mask);   // fragment inputs the vertex shader does not write: added
+    VkShaderEXT vobj = ints || unwritten ? vkb_shader_variant(vs, ints, sint, fs) : vs->obj;
     uint32_t int_inputs = vobj != vs->obj ? ints : 0;
     if (ints && !int_inputs) vkb_audit(A_ATTR_INT_AS_FLOAT, vs->key);
-    if (fs && (fs->in_mask & ~vs->out_mask)) vkb_audit(A_FS_INPUT_UNWRITTEN, fs->key);
+    if (unwritten && vobj == vs->obj) vkb_audit(A_FS_INPUT_UNWRITTEN, fs->key);
     if (S.has_ms && S.ms.enable && S.ms.samples > 1) vkb_audit(A_MULTISAMPLE, fs ? fs->key : vs->key);
     if (vkb_render_suppressed()) vkb_audit(A_RENDER_DISABLED, fs ? fs->key : vs->key);
     VkShaderEXT objs[5] = {vobj, fs ? fs->obj : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     if (dyn(D_SHADERS, objs, sizeof objs)) vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
     set_dynamic_state(cb, vkb_rt_count(), vkb_rt_extent(), topo);
-    if (vkc.has_feedback_loop) {   // required state with shader objects once the feature is enabled
+    if (vkc.has_feedback_dynamic) {   // required state with shader objects once the feature is enabled
         VkImageAspectFlags loop = (g_fb & 0xFF ? VK_IMAGE_ASPECT_COLOR_BIT : 0) | (g_fb & VKB_FB_DEPTH ? g_fb_rt[8]->aspect : 0);
         DYN(D_FBLOOP, VkImageAspectFlags, loop, vk.vkCmdSetAttachmentFeedbackLoopEnableEXT(cb, v_));
     }
@@ -1697,6 +2127,12 @@ void vkb_draw(const uint8_t *a, int indexed) {
         vkb_cnt_add(g_local_barriers, 1);
     }
     wrote_pass = vkb_pass_serial();
+    g_drawn_pass = vkb_pass_serial();
+    t_vertex_end = 0;
+    if (indexed && di->base_vertex > 0)   // the indices are read only when the base vertex alone is past a stream's range
+        for (uint32_t s = 0; s < 16; s++)
+            if (S.vbuf[s].address && S.vstream[s].stride && !S.vstream[s].divisor &&
+                ((uint64_t)di->base_vertex + 1) * S.vstream[s].stride > S.vbuf[s].size) { t_vertex_end = draw_vertex_end(di); break; }
     set_vertex_input(cb, int_inputs);
     uint32_t inst = indexed ? (uint32_t)(di->instances ? di->instances : 1) : (uint32_t)(dr->instances ? dr->instances : 1);
     vkb_checkpoint(indexed ? "draw indexed" : "draw", vs->key, fs ? fs->key : NULL);

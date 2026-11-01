@@ -1,8 +1,8 @@
 """Development: lay out the development extraction as a player's dump (a folder with exefs/ and romfs/ of plain files),
 to test tools/setup.py and the RomFS folder mode as a player would meet them.
 
-usage: python tools/dev_player_dump.py --src <extraction: exefs/ and romfs/ with romfs.bin> [--out ../release-test/game]
-Game-derived data: written outside the source folder (the game folder's game/), never in git.
+usage: python tools/dev_player_dump.py --src <extraction: exefs/ and romfs/ with romfs.bin> [--out game]
+Game-derived data: written to game/ (ignored by git, where tools/setup.py looks for the dump) or --out, never in git.
 """
 import argparse
 import json
@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--src', required=True)
-    ap.add_argument('--out', default=str(ROOT.parent / 'release-test/game'))
+    ap.add_argument('--out', default=str(ROOT / 'game'))
     a = ap.parse_args()
     src, out = ROOT / a.src, ROOT / a.out
     (out / 'exefs').mkdir(parents=True, exist_ok=True)

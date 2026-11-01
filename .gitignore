@@ -1,5 +1,5 @@
-# The source folder holds no game data. Everything made from the game lives in the game folder (a builder package
-# unpacked elsewhere, tools/deploy.py); the patterns below are a safety net for what must never be committed.
+# The source folder holds no game data. Everything made from the game lives in a game folder (build/ by default, or the
+# folder given to tools/setup.py --output); the patterns below are a safety net for what must never be committed.
 
 # The user's own files from their console: never commit
 Game/
@@ -17,25 +17,41 @@ Firmware/
 *.bfttf
 
 # Development only, not in the repository or a release: local tools, reference checkouts, .NET caches, builds of
-# development tools, release packages
+# development tools
 /dev-local/
-/dist/
+# Release packages (tools/make_package.py, make_package_linux.py) and what they are made from
+/release/
+# The player's dump when it is kept in the checkout (tools/setup.py's default; --dump names any other folder)
+/dump/
 
-# A game folder's own (tools/setup.py), should one ever be made inside the source folder
-/game/
-/data/
+# A game folder (tools/setup.py): build/ when built from the source without --output; the rest, should one ever be
+# made right in the source folder
 /build/
+/build-linux/
+/data/
+/linux/
 /userdata/
 /diag/
 /deps/
+/temp/
+/mesa-cache/
+/update/
 /ultratears.cfg
-/UltraTears.exe
+/ultratears-launcher.ini
+/ultratears-launcher
+/libSDL3.so.0
 /setup-files.txt
+# Programs, libraries, debug files, logs and archives: none of them is source
+*.exe
+*.dll
+*.pdb
+*.AppImage
+*.tar
+*.log
 
-# Former development layout (kept ignored until removed)
-/work/
-/refs/
-/user-data/
+# Former layouts (kept ignored until removed): the dump in game/, the game built in dist/
+/game/
+/dist/
 .ninja_*
 
 # Local environments and build state
@@ -45,4 +61,3 @@ third_party/maxwell_shader/src/*/bin/
 third_party/maxwell_shader/src/*/obj/
 third_party/shader_translator/bin/
 third_party/shader_translator/obj/
-third_party/totk_xlate/

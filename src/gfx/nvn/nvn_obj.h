@@ -22,7 +22,7 @@ typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;   
 
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
 // game_mem/host/span: TOTK host-owned VM storage for physical/virtual pools (totk_vpool.c); host is NULL for game-backed pools.
-typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; } pool_t; FITS(pool_t, NVNmemoryPool);
+typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; uint64_t va; } pool_t;   // va: its GPU address (hle_nvn.c) FITS(pool_t, NVNmemoryPool);
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
@@ -53,7 +53,9 @@ typedef struct { NVNdevice *dev; samp_par p; } samp_builder_t;                  
 typedef struct { uint32_t magic; samp_par p; } samp_t;                                        FITS(samp_t, NVNsampler);
 _Static_assert(sizeof(samp_par) == 44, "TOTK sampler parameters");
 
-typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial：回放层解析结果的表键 | serial: table key for the replay layer's resolved result
+// frozen: an unchanging copy made by SetShaders, which recorded commands point to (the game may set other shaders on the
+// object or finalize and reuse it while commands that bound it are still queued for the translation thread)
+typedef struct prog_s { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; const struct prog_s *frozen; } prog_t;     FITS(prog_t, NVNprogram);   // serial：回放层解析结果的表键 | serial: table key for the replay layer's resolved result
 
 typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;                            FITS(sync_t, NVNsync);
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
@@ -114,7 +116,7 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_PRIM_RESTART, OP_COUNT_
 };
 // 载荷（紧跟 op_hdr）
 // Payload (immediately follows op_hdr)
@@ -152,6 +154,7 @@ void mtl_exec(const uint8_t *handle);
 void mtl_exec_rest(const uint64_t *handles, int n);   // 告知本次提交里当前句柄之后还有哪些句柄（通道前瞻跨句柄用） | Tells which handles in this submission still follow the current handle (used by the pass lookahead across handles)
 // 出图：把交换链贴图画到前端 CAMetalLayer（无窗口时只计数）
 // Present: draw the swapchain texture to the front-end CAMetalLayer (only counts when there is no window)
+void mtl_present_slot(uint64_t ns);   // UltraTears: the next mtl_present on this thread is shown no earlier than ns (0: at once)
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]);   // 出图入队、立即返回票号；period_s：该张至少显示的时长（= 出图周期，0 = 不限） | Enqueue a present and return the ticket immediately; period_s: minimum time this image is displayed (= present period, 0 = unlimited)
 void mtl_present_wait(uint64_t ticket);                    // 等该票号的出图处理完（blit 已提交到 GPU 队列） | Wait until the present with this ticket has been processed (blit committed to the GPU queue)
 void mtl_present_flush(void);                              // 等已入队的出图全部处理完 | Wait until all enqueued presents have been processed
@@ -193,6 +196,8 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso);   // 累计：提交线程�
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
 void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);   // TOTK: CPU texel write (WriteTexels)
+int mtl_write_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);     // its game memory part (1: written)
+void mtl_write_texels_image(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);  // its image part (translation thread)
 // 描述符池登记（贴图号 / 采样器号 → 对象快照）、程序释放
 // Descriptor pool registration (texture ID / sampler ID → object snapshot), program release
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);

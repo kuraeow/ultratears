@@ -1,0 +1,428 @@
+{
+ "comment": "Build tools of a source build, installed by tools/deps_install.py from where they are published. Change a version here together with its size and hash. Mirrors: the first base is the host the pinned URLs name; the others serve the same paths and are tried in turn when it is slow or unreachable (hashes are checked either way).",
+ "mirrors": {
+  "msys2": [
+   "https://repo.msys2.org",
+   "https://mirror.yandex.ru/mirrors/msys2",
+   "https://mirror.msys2.org",
+   "https://mirror.selfnet.de/msys2",
+   "https://mirror.clarkson.edu/msys2",
+   "https://mirror.umd.edu/msys2",
+   "https://mirrors.tuna.tsinghua.edu.cn/msys2",
+   "https://mirrors.ustc.edu.cn/msys2",
+   "https://mirrors.bfsu.edu.cn/msys2"
+  ],
+  "pypi": [
+   "https://files.pythonhosted.org",
+   "https://mirrors.aliyun.com/pypi",
+   "https://pypi.tuna.tsinghua.edu.cn",
+   "https://mirrors.ustc.edu.cn/pypi",
+   "https://mirrors.bfsu.edu.cn/pypi/web"
+  ]
+ },
+ "msys2": [
+  {
+   "name": "mingw-w64-clang-x86_64-clang",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-clang-23.1.3-1-any.pkg.tar.zst",
+   "size": 34232947,
+   "sha256": "1fee2841a761d739b96c7de1ebd08dec55c603b2c11ea47ce19b56161f2b031d"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-clang-libs",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-clang-libs-23.1.3-1-any.pkg.tar.zst",
+   "size": 25039872,
+   "sha256": "3de0accee7d5fc87dad60977f099948d1c59353ae9031365cdf39526bcf0f3d0"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-compiler-rt",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-compiler-rt-23.1.3-1-any.pkg.tar.zst",
+   "size": 814081,
+   "sha256": "3f0926a9b74eee208f0add40f05684ca1766bd44b64137de72c73eac165dc244"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-crt",
+   "version": "14.0.0.r495.g63ebe6cdb-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-crt-14.0.0.r495.g63ebe6cdb-1-any.pkg.tar.zst",
+   "size": 3029170,
+   "sha256": "85a5ad3e1414c1f737d39b04a95800f96380066fa69e0b046e99d10cd5e530e1"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-headers",
+   "version": "14.0.0.r495.g63ebe6cdb-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-headers-14.0.0.r495.g63ebe6cdb-1-any.pkg.tar.zst",
+   "size": 6889704,
+   "sha256": "a84695c0e29b0659506b519f3ba9ebfd35e91641819b2fe9b7f453393c9adc87"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libc++",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libc++-23.1.3-1-any.pkg.tar.zst",
+   "size": 1963078,
+   "sha256": "df3744b6bb6a39472d29424e0d45f573e750ee86058100b6d227e5294b98da39"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libunwind",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libunwind-23.1.3-1-any.pkg.tar.zst",
+   "size": 63334,
+   "sha256": "6dc583bd260a65e36ac7fe3bcf6669848032ed5edf4308591a338a3c02c88241"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libwinpthread",
+   "version": "14.0.0.r495.g63ebe6cdb-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libwinpthread-14.0.0.r495.g63ebe6cdb-1-any.pkg.tar.zst",
+   "size": 32422,
+   "sha256": "7c9e978aeb767af1555667d99e232d1149d60e42d1b6e890f73b2d87101fa483"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-winpthreads",
+   "version": "14.0.0.r495.g63ebe6cdb-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-winpthreads-14.0.0.r495.g63ebe6cdb-1-any.pkg.tar.zst",
+   "size": 44315,
+   "sha256": "3cbb449d4c13f2fc387976e6bc86756c31a3dd811ddd73b5d429d0b707d9dd03"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-lld",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-lld-23.1.3-1-any.pkg.tar.zst",
+   "size": 3628208,
+   "sha256": "dfbaf81be26c354348f5b372665077c75f3c0f54b9e9b8e5b8e769752507b23c"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-llvm-libs",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-llvm-libs-23.1.3-1-any.pkg.tar.zst",
+   "size": 34502244,
+   "sha256": "5711b4b57e69fb55afcc93c873d8dea72d997489fb273b1f88df800638eaa5f9"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-llvm-tools",
+   "version": "23.1.3-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-llvm-tools-23.1.3-1-any.pkg.tar.zst",
+   "size": 23348660,
+   "sha256": "be6386e7d28fdea73fdc03f5627183f06486052e1d51e01f2a411f6d0870233c"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-ninja",
+   "version": "1.13.2-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-ninja-1.13.2-1-any.pkg.tar.zst",
+   "size": 194994,
+   "sha256": "dbb68154241fc24df9c176f605712f6f2491226f8c495627e95201c149a49a65"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-sdl3",
+   "version": "3.4.18-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-sdl3-3.4.18-1-any.pkg.tar.zst",
+   "size": 2183553,
+   "sha256": "26847e18a9f413a1ebec5a2359881ceeef810558c63235ca0997a353c868035b"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-opus",
+   "version": "1.6.1-2",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-opus-1.6.1-2-any.pkg.tar.zst",
+   "size": 387943,
+   "sha256": "2f334ee8a4752842231fb1e42335bbb353192f03b41c8a78e5a37c59cded4867"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libvpx",
+   "version": "1.17.0-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libvpx-1.17.0-1-any.pkg.tar.zst",
+   "size": 1350051,
+   "sha256": "c03c249976710057699dd124fa27f4668df87029b06f73487555f47a4353486a"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-zstd",
+   "version": "1.5.7-2",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-zstd-1.5.7-2-any.pkg.tar.zst",
+   "size": 597342,
+   "sha256": "2d75c4ddf8f4f7b76fe33e3f1eea16450f9b3aede14285c886462d72f0ffd87d"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libiconv",
+   "version": "1.19-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libiconv-1.19-1-any.pkg.tar.zst",
+   "size": 736821,
+   "sha256": "26c4ac9f2023eecdfffb291cab40c60585a0cd0f72539ca03c5558f3ecd309ec"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-zlib",
+   "version": "1.3.2-2",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-zlib-1.3.2-2-any.pkg.tar.zst",
+   "size": 111651,
+   "sha256": "96d8db2f2bf24c0d4e82b899d50a3497d97536a8bd38ce275401d0f2b9580b5e"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-xz",
+   "version": "5.8.4-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-xz-5.8.4-1-any.pkg.tar.zst",
+   "size": 913351,
+   "sha256": "6fc8efc101a0a638f7d637731b24cc2989f479a0a41d76a6723fd82ae3bffac9"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libffi",
+   "version": "3.8.0-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libffi-3.8.0-1-any.pkg.tar.zst",
+   "size": 51575,
+   "sha256": "4d27339b52eabae86a1dff79cf432191ad8dd6acfa653b1179b12490234c66a6"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-libxml2",
+   "version": "2.15.4-2",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-libxml2-2.15.4-2-any.pkg.tar.zst",
+   "size": 1012502,
+   "sha256": "926f5cf56128d96580ea2e86759fa3ecaf76a8b852b91ef20878b516b81e3a0e"
+  },
+  {
+   "name": "mingw-w64-clang-x86_64-vulkan-headers",
+   "version": "1~1.4.363.0-1",
+   "url": "https://repo.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-vulkan-headers-1~1.4.363.0-1-any.pkg.tar.zst",
+   "size": 1799074,
+   "sha256": "7eabb1efd99c5bd80d2a2b3b5f9ef76afee32f096a175e0e4d0f86793fcb7247"
+  }
+ ],
+ "python": {
+  "version": "3.14.5",
+  "url": "https://api.nuget.org/v3-flatcontainer/python/3.14.5/python.3.14.5.nupkg",
+  "size": 15016460,
+  "sha256": "03ad5810986afd8273a34a28c15cb594300ba7f4749f24362d69206fa1b6ac15"
+ },
+ "wheels": [
+  {
+   "name": "lz4",
+   "version": "4.4.5",
+   "url": "https://files.pythonhosted.org/packages/18/2c/8332080fd293f8337779a440b3a143f85e374311705d243439a3349b81ad/lz4-4.4.5-cp314-cp314-win_amd64.whl",
+   "size": 101497,
+   "sha256": "92159782a4502858a21e0079d77cdcaade23e8a5d252ddf46b0652604300d7be"
+  },
+  {
+   "name": "capstone",
+   "version": "5.0.7",
+   "url": "https://files.pythonhosted.org/packages/70/39/2138d890a8e827636b9de9924fbc8527fe83e38b6d26605b30ac55e30ebe/capstone-5.0.7-py3-none-win_amd64.whl",
+   "size": 1272204,
+   "sha256": "4ab8bcb7da8f221ff45926ca168ca33e76f7237d06fbf3c10780002faa2670e1"
+  },
+  {
+   "name": "unicorn",
+   "version": "2.1.4",
+   "url": "https://files.pythonhosted.org/packages/70/3d/de7be9bd1addabe6d8a1369381f8a080400c349850e978689c5e18287957/unicorn-2.1.4-cp37-abi3-win_amd64.whl",
+   "size": 15943079,
+   "sha256": "d7107500c64ce5c168fbff6bef9485b5db1350050036f4cea568650cf8bdbdf5"
+  }
+ ],
+ "dotnet": {
+  "version": "10.0.402",
+  "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-win-x64.zip",
+  "sha512": "ae4fd528cb7e9f6af6aaf7de36715a69f761f183744f1bb3025d19f5a92447090ec561410e46266c1d10a63781ed6f3de771760bc76c876d87daabc367b898cd",
+  "size": 300755826
+ },
+ "linux_host": {
+  "comment": "The build's tools on Linux (tools/deps_install.py; a Linux builder package carries them, tools/make_package.py --linux): the same pins as totk-pc-recomp's tools/make_release_linux.py where it has them",
+  "python": {
+   "version": "3.14.10",
+   "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.14.10%2B20261026-x86_64-unknown-linux-gnu-install_only.tar.gz",
+   "size": 76564514,
+   "sha256": "1b38024924eb7f4cf0cab45d7b871d1f1991354190fccd2625ac7529a43786e2"
+  },
+  "wheels": [
+   {
+    "name": "lz4",
+    "version": "4.4.5",
+    "url": "https://files.pythonhosted.org/packages/f1/01/d52c7b11eaa286d49dae619c0eec4aabc0bf3cda7a7467eb77c62c4471f3/lz4-4.4.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "size": 1368661,
+    "sha256": "0bba042ec5a61fa77c7e380351a61cb768277801240249841defd2ff0a10742f"
+   },
+   {
+    "name": "capstone",
+    "version": "5.0.7",
+    "url": "https://files.pythonhosted.org/packages/15/3e/3a4f45dd4eda6fc8051f76bf3ed50ead6040d827000371211fbaaf057625/capstone-5.0.7-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "size": 1482184,
+    "sha256": "b809a9654844ce0d35099121a851ddd2ab2689df1ff6687037babcedcaae6391"
+   },
+   {
+    "name": "unicorn",
+    "version": "2.1.4",
+    "url": "https://files.pythonhosted.org/packages/e7/df/ded5e3684c2d7600b30cc8a7530277b8cb36644a1a9d34cade7ebb45604c/unicorn-2.1.4-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "size": 16436886,
+    "sha256": "9d6e6dea140560de4ebd8446661f7ef84a357d428c14a3ef09dacd306ec8c239"
+   }
+  ],
+  "llvm": {
+   "version": "23.1.3",
+   "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.xz",
+   "size": 2016524848,
+   "sha256": "ca9fe385a5d9e2d88132dc0e23a00e9f87f38fa75f67207b5e457d208e71d013",
+   "members": ["bin/clang-23", "bin/clang", "bin/clang++", "bin/lld", "bin/ld.lld", "bin/llvm-ar", "bin/llvm-ranlib",
+               "bin/llvm-objcopy", "bin/llvm-strip", "lib/clang/23/include"],
+   "license": {
+    "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.3/llvm/LICENSE.TXT",
+    "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+   }
+  },
+  "ninja": {
+   "version": "1.13.2",
+   "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip",
+   "size": 134040,
+   "sha256": "5749cbc4e668273514150a80e387a957f933c6ed3f5f11e03fb30955e2bbead6"
+  },
+  "dotnet": {
+   "version": "10.0.402",
+   "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.402/dotnet-sdk-10.0.402-linux-x64.tar.gz",
+   "sha512": "1904a98dda2db34ba78ba3c4fb1b224455329af91c341d83547843c1839e112b04ae699ee92fa2449a8f62249196a938723078c0c60b9f65c88539d5687729c2"
+  }
+ },
+ "linux_kit_sources": {
+  "comment": "What tools/make_linux_kit.py makes the Linux kit from, in a build from the source (a builder package carries the kit): Valve's Steam Runtime 3 sniper SDK sysroot and zstd's source",
+  "sniper": {
+   "version": "3.0.20261021.266025",
+   "url": "https://repo.steampowered.com/steamrt-images-sniper/snapshots/3.0.20261021.266025/com.valvesoftware.SteamRuntime.Sdk-amd64%2Ci386-sniper-sysroot.tar.gz",
+   "size": 1234880637,
+   "sha256": "8f71947035f97925a311b2ed753f22efcf2f13d6f1631945b8e537f8903ce2cf"
+  },
+  "zstd": {
+   "version": "1.5.7",
+   "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+   "size": 2434947,
+   "sha256": "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+  }
+ },
+ "launcher": {
+  "imgui": {
+   "version": "1.91.9b",
+   "files": [
+    {
+     "path": "LICENSE.txt",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/LICENSE.txt",
+     "size": 1083,
+     "sha256": "c80c5789748d955c4a650562baa0d750494e2c7128c2ca66aaebe2e3c4e198bf"
+    },
+    {
+     "path": "imconfig.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imconfig.h",
+     "size": 11579,
+     "sha256": "0884061cc43e27e1d346fe18dcd1425792eb2532d3d16610a82eb5ac751f7594"
+    },
+    {
+     "path": "imgui.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui.cpp",
+     "size": 882057,
+     "sha256": "af1cc31255fbf58d57ecc9d727cbd39a84e44fa8f11be7fd419fa0100c5255d8"
+    },
+    {
+     "path": "imgui.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui.h",
+     "size": 378236,
+     "sha256": "2d0180859ff85e7fe66ed9999b0f05f2fc45176773046a8f86b3b6bd190b0765"
+    },
+    {
+     "path": "imgui_draw.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui_draw.cpp",
+     "size": 258761,
+     "sha256": "9d2d9ee6745d9b98d7f39a16da8ffcf783f90bb8c9e931038fc8e9a15cbe3d84"
+    },
+    {
+     "path": "imgui_internal.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui_internal.h",
+     "size": 272833,
+     "sha256": "1363c617a743957f367afe1c6c88345870b7aa25ee339809fb915466e4fb9575"
+    },
+    {
+     "path": "imgui_tables.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui_tables.cpp",
+     "size": 247597,
+     "sha256": "4ea380fa9d49cac6cbfbc8b969969f9b0705518ec9ca340681d8c70e3eefbc28"
+    },
+    {
+     "path": "imgui_widgets.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imgui_widgets.cpp",
+     "size": 517769,
+     "sha256": "54ac29dbcbe70091f5e5fc2cb4099e6d0b9d1c939e5158f2be983cb508714414"
+    },
+    {
+     "path": "imstb_rectpack.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imstb_rectpack.h",
+     "size": 20344,
+     "sha256": "2efa3d5f7d003c19743b15155dad9f46d9f9fc783a18893d703b431d3c990972"
+    },
+    {
+     "path": "imstb_textedit.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imstb_textedit.h",
+     "size": 57128,
+     "sha256": "77010e494caf72c178b573569612aec409d24380409676325a31d02de0ec64b7"
+    },
+    {
+     "path": "imstb_truetype.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/imstb_truetype.h",
+     "size": 199485,
+     "sha256": "87f08919ae8e7223451d0e9d06b62829075d3e920c9e6ad436db9d7e7427ffce"
+    },
+    {
+     "path": "backends/imgui_impl_sdl3.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_sdl3.cpp",
+     "size": 40277,
+     "sha256": "f6973eebab67a6e2c6cad4a495c20d453c714b43ff90d8e444dd88a98c73c7e5"
+    },
+    {
+     "path": "backends/imgui_impl_sdl3.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_sdl3.h",
+     "size": 3040,
+     "sha256": "a6866cb9f9d9eb69ad64d49075fbcc247cadb9c872fcdfb0569f4b93ccb802a6"
+    },
+    {
+     "path": "backends/imgui_impl_sdlrenderer3.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_sdlrenderer3.cpp",
+     "size": 13575,
+     "sha256": "410b191de535723a81dde83212b1be88adc2b6d3c61f9a02691c6f4d07a6ec20"
+    },
+    {
+     "path": "backends/imgui_impl_sdlrenderer3.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_sdlrenderer3.h",
+     "size": 2781,
+     "sha256": "3e356dd91a17f4210e2aab5d4e28aa55adb0c95c26dc87c5dd5a806d46bad52f"
+    }
+   ]
+  },
+  "nanosvg": {
+   "version": "239e102",
+   "files": [
+    {
+     "path": "LICENSE.txt",
+     "url": "https://raw.githubusercontent.com/memononen/nanosvg/239e102ec2c691f2902e20ace2ed36ee4a35cfe6/LICENSE.txt",
+     "size": 880,
+     "sha256": "e82bc3dd03400aecabe12201219ba14750dbc4b36faab58663a7a6068548d372"
+    },
+    {
+     "path": "nanosvg.h",
+     "url": "https://raw.githubusercontent.com/memononen/nanosvg/239e102ec2c691f2902e20ace2ed36ee4a35cfe6/src/nanosvg.h",
+     "size": 88980,
+     "sha256": "e34fd5d084be106cea972d19ce5d27fd96d17ba89f8d06bdceee058420c8b2b0"
+    },
+    {
+     "path": "nanosvgrast.h",
+     "url": "https://raw.githubusercontent.com/memononen/nanosvg/239e102ec2c691f2902e20ace2ed36ee4a35cfe6/src/nanosvgrast.h",
+     "size": 39398,
+     "sha256": "79a9c5f4db19debf9f3a648a1589e96d92854f245a5cb4f3d823f263785234d8"
+    }
+   ]
+  },
+  "stb": {
+   "version": "stb_image 2.30",
+   "files": [
+    {
+     "path": "LICENSE",
+     "url": "https://raw.githubusercontent.com/nothings/stb/003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5/LICENSE",
+     "size": 2510,
+     "sha256": "bebfe904b14301657e4e5d655c811d51fd31b97c455b9cc2d8600d6bac6cff63"
+    },
+    {
+     "path": "stb_image.h",
+     "url": "https://raw.githubusercontent.com/nothings/stb/003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5/stb_image.h",
+     "size": 283010,
+     "sha256": "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
+    }
+   ]
+  }
+ }
+}

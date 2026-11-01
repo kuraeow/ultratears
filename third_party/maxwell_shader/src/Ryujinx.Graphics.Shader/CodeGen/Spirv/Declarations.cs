@@ -231,6 +231,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                 Dim dim = GetDim(image.Type);
 
+                // UltraTears: an image of unknown format may be written (imageStore), which needs this capability
+                // (VUID: "Capability StorageImageWriteWithoutFormat is required to write to storage image"; 22 of TOTK's
+                // compute shaders). The device feature shaderStorageImageWriteWithoutFormat is enabled where supported.
+                if (GetImageFormat(image.Format) == ImageFormat.Unknown)
+                {
+                    context.AddCapability(Capability.StorageImageWriteWithoutFormat);
+                }
+
                 SpvInstruction imageType = context.TypeImage(
                     context.GetType(image.Format.GetComponentType()),
                     dim,

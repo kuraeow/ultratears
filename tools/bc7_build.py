@@ -12,14 +12,16 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from toolchain import CLANG64, env as tool_env  # noqa: E402
-from build_game import run_limited  # noqa: E402
+from toolchain import CLANG64, exe as exe_name, env as tool_env  # noqa: E402
+from build_game import cpu_arch, run_limited  # noqa: E402
+import progress  # noqa: E402
 from romfs import RomFS  # noqa: E402
 
 SOURCES_C = ['tools/bc7build/bc7build.c', 'src/gfx/tex/astc.c', 'src/gfx/tex/bc7key.c']
@@ -27,21 +29,38 @@ SOURCES_CXX = ['src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/
 
 
 def build_tool(env):
-    exe = ROOT / 'build/bc7build.exe'
+    """build/bc7build(.exe) for this machine. Linux: against the Linux kit (its glibc headers, its static zstd and
+    libstdc++), as the game, so a builder package needs no system compiler or library."""
+    linux = os.name != 'nt'
+    exe = ROOT / ('build/bc7build' if linux else 'build/bc7build.exe')
     newest = max((ROOT / s).stat().st_mtime for s in SOURCES_C + SOURCES_CXX)
     if exe.exists() and exe.stat().st_mtime > newest:
         return exe
     objs = []
+    arch = cpu_arch()   # as the game: x86-64-v2 on CPUs without AVX2 (it was always v3: illegal instruction there)
+    kit = ''
+    if linux:
+        from build_game import LINUX_KIT, linux_flags
+        kit = linux_flags()
     (ROOT / 'build/obj').mkdir(parents=True, exist_ok=True)
     for s in SOURCES_C + SOURCES_CXX:
         cxx = s.endswith('.cpp')
         obj = ROOT / 'build/obj' / ('bc7build_' + s.replace('/', '_').rsplit('.', 1)[0] + '.o')
-        cmd = [str(CLANG64 / ('clang++.exe' if cxx else 'clang.exe')), '-O2', '-march=x86-64-v3', '-w', '-c', str(ROOT / s), '-o', str(obj)]
+        cmd = [str(CLANG64 / exe_name('clang++' if cxx else 'clang')), '-O2', f'-march={arch}', '-w', '-c', str(ROOT / s), '-o', str(obj)]
         if cxx:
             cmd += ['-std=c++17', '-fno-exceptions', '-fno-rtti']
+        if linux:   # bc7build.c seeks with the MSVCRT names (as PR #42)
+            cmd += kit.split() + ['-D_FILE_OFFSET_BITS=64', '-D_fseeki64=fseeko', '-D_ftelli64=ftello']
+            if cxx:
+                cmd += ['-stdlib=libstdc++']
         subprocess.run(cmd, check=True, env=env)
         objs.append(str(obj))
-    subprocess.run([str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-o', str(exe)] + objs + ['-static', '-pthread', '-lzstd', '-lc++'], check=True, env=env)
+    if linux:
+        link = [str(CLANG64 / 'clang++'), *kit.split(), '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
+                '-static-libstdc++', '-o', str(exe)] + objs + [f'-L{LINUX_KIT.as_posix()}/lib', '-l:libzstd.a', '-pthread', '-lm']
+    else:
+        link = [str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-o', str(exe)] + objs + ['-static', '-pthread', '-lzstd', '-lc++']
+    subprocess.run(link, check=True, env=env)
     return exe
 
 
@@ -70,9 +89,22 @@ def main():
     exe = build_tool(env)
     print(f'{len(files)} texture files -> {cache}', flush=True)
     t0 = time.time()
+    bar = progress.Bar(f're-encoding the textures ({len(files)} files)', sum(f['size'] for f in files), 'MiB', 2**20,
+                       rate=True, live=True)
+
+    def line(text):   # bc7build's "<done> / <n> files, <bytes> / <total> bytes, ..." once a second: the progress line
+        m = re.match(r'\d+ / \d+ files, (\d+) / (\d+) bytes', text)
+        if m:
+            bar.update(int(m.group(1)), int(m.group(2)))
+        elif text.startswith('done:'):
+            bar.update(bar.total, force=True)
+            bar.finish()
+            print(text, flush=True)
+        else:
+            bar.note(text.strip())   # a line of its own, the progress line below it ("0:00cache ..." ran together)
     rc = run_limited([str(exe), str(rom.image or rom.root), str(lst), str(cache), str(a.threads), str(a.quality),
                       str(a.max_block_area)], env,
-                     (1 << a.threads) - 1)
+                     (1 << a.threads) - 1, line)
     print(f'{time.time() - t0:.0f} s', flush=True)
     sys.exit(rc)
 

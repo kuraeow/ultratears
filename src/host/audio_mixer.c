@@ -697,7 +697,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k];m->level_sum+=x*x;if(fabs(x)>m->level_peak)m->level_peak=fabs(x); }
       m->level_count+=2*(uint64_t)frames;m->level_frames+=(uint64_t)frames;
       if (m->level_frames >= (uint64_t)r->param.sample_rate * 5) {
-          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, callback frames %llu / nonzero %llu\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
+          if (audio_stats()) fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, callback frames %llu / nonzero %llu\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
                   m->level_frames/(double)r->param.sample_rate,(unsigned long long)atomic_load(&m->underruns),(unsigned long long)atomic_load(&m->overruns),(unsigned long long)atomic_load(&m->missing_frames),(unsigned long long)atomic_load(&m->callback_frames),(unsigned long long)atomic_load(&m->callback_nonzero));
           m->level_sum=m->level_peak=0;m->level_count=m->level_frames=0;
       } }

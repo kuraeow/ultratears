@@ -4,6 +4,14 @@
 #include "audio_renderer.h"
 #include "ipc.h"
 #include <pthread.h>
+#include <stdlib.h>
+
+/* [port] TOTK_STATS=1: the periodic level / wave buffer lines (off for players; gfx/host/dm.h dm_stats). */
+static inline int audio_stats(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_STATS"); v = e && *e && *e != '0'; }
+    return v;
+}
 
 typedef struct {
     AudrenVoiceIn in;

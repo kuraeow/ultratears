@@ -17,8 +17,8 @@ enum {
 enum { VKB_SB_TABLE, VKB_SB_UBO, VKB_SB_UBO_PTR };
 typedef struct { uint8_t slot, separate; uint16_t type; } vkb_tex_ref;   // NVN binding slot; Ryujinx SamplerType
 
-enum { VKB_VARIANTS = 8 };
-typedef struct { uint32_t intmask, sintmask; VkShaderEXT obj; } vkb_variant;
+enum { VKB_VARIANTS = 16 };
+typedef struct { uint32_t intmask, sintmask, outmask, out_umask, out_imask; VkShaderEXT obj; } vkb_variant;
 
 typedef struct {
     VkShaderEXT obj;
@@ -40,13 +40,25 @@ typedef struct {
     int unsupported;                     // a resource outside the layout: draws with it are skipped
     const char *key;                     // SHA-256 key of the translation (traces)
     uint32_t *spv; size_t nspv_words;    // vertex shaders: the module as loaded (bindings rewritten), for variants
+    uint32_t stamp;                      // which translation (vkb_shbin_variant.stamp)
     uint32_t in_mask, out_mask;          // input / output locations
-    vkb_variant variants[VKB_VARIANTS]; int nvariants;   // integer-attribute variants made so far
+    uint32_t in_umask, in_imask;         // inputs of unsigned / signed integer type (fragment shaders)
+    vkb_variant variants[VKB_VARIANTS]; int nvariants;   // vertex variants (integer attributes, added outputs) made so far
 } vkb_shader;
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no translation (logged)
-// The vertex shader object for integer attributes at intmask (signed: sintmask): see vkb_spv.c.
-VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask);
+// The vertex shader object for integer attributes at intmask (signed: sintmask) and drawn with the fragment shader fs
+// (NULL: none): outputs added for the inputs of fs it does not write. See vkb_spv.c.
+VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask, const vkb_shader *fs);
 VkDescriptorSetLayout vkb_set_layout(int compute);
 VkPipelineLayout vkb_pipeline_layout(int compute);
 void vkb_shader_stats(uint64_t *loaded, uint64_t *missing);
+int vkb_prepare_shaders(void);   // UltraTears --prepare-shaders: every shader compiled by this driver; the exit code
+void vkb_shader_report(void);   // the memory log line: shader objects, programs, binaries on disk, compiled ahead
+// Shader objects follow the game's programs (vkb_shader.c): set holds the program's shaders and returns what it held
+// before; drop (ProgramFinalize) returns what it held; release, called from the translation queue after the commands
+// queued before it, lets go of them. NULL: nothing to release.
+typedef struct vkb_shader_rel vkb_shader_rel;
+vkb_shader_rel *vkb_shader_prog_set(const void *prog, int n, const NVNshaderData *sd);
+vkb_shader_rel *vkb_shader_prog_drop(const void *prog);
+void vkb_shader_release(vkb_shader_rel *rel);

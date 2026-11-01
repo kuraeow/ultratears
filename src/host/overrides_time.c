@@ -4,12 +4,17 @@
  * counts seconds of host monotonic time with one source id per process. ClockSnapshot uses the public 0xD0-byte
  * layout because game code may read its fields through inline accessors.
  * TODO(port): the snapshot's location name is "UTC"; map the Windows time zone to its IANA name. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #endif
 
 #include "host.h"
@@ -50,22 +55,28 @@ static int64_t posix_now(void) {
     return (int64_t)time(NULL) + off;
 }
 
-static int32_t local_utc_offset(int *dst) {
+static int32_t local_utc_offset(time_t t, int *dst) {
 #ifdef _WIN32
     TIME_ZONE_INFORMATION tz;
     DWORD r = GetTimeZoneInformation(&tz);
     *dst = r == TIME_ZONE_ID_DAYLIGHT;
     return -(int32_t)(tz.Bias + (r == TIME_ZONE_ID_DAYLIGHT ? tz.DaylightBias : r == TIME_ZONE_ID_STANDARD ? tz.StandardBias : 0)) * 60;
 #else
-    *dst = 0;
-    return 0;
+    struct tm local;
+    if (!localtime_r(&t, &local)) runtime_fail("local time zone conversion");
+    *dst = local.tm_isdst > 0;
+    return (int32_t)local.tm_gmtoff;
 #endif
 }
 
 static void fill_calendar(CalendarTime *c, CalendarAdditionalInfo *info, int64_t posix, int local) {
     time_t t = (time_t)posix;
     struct tm tm;
+#ifdef _WIN32
     if ((local ? localtime_s(&tm, &t) : gmtime_s(&tm, &t)) != 0) runtime_fail("calendar conversion");
+#else
+    if (!(local ? localtime_r(&t, &tm) : gmtime_r(&t, &tm))) runtime_fail("calendar conversion");
+#endif
     *c = (CalendarTime){(int16_t)(tm.tm_year + 1900), (int8_t)(tm.tm_mon + 1), (int8_t)tm.tm_mday, (int8_t)tm.tm_hour,
                         (int8_t)tm.tm_min, (int8_t)tm.tm_sec, 0};
     if (info) {
@@ -73,7 +84,7 @@ static void fill_calendar(CalendarTime *c, CalendarAdditionalInfo *info, int64_t
         info->day_of_week = tm.tm_wday;
         info->day_of_year = tm.tm_yday;
         int dst = 0;
-        int32_t offset = local ? local_utc_offset(&dst) : 0;
+        int32_t offset = local ? local_utc_offset(t, &dst) : 0;
         snprintf(info->name, sizeof info->name, "%s", local ? "LOCAL" : "UTC");
         info->dst = (uint8_t)(local && dst);
         info->utc_offset = offset;
@@ -116,7 +127,11 @@ HLE_FUNC("_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE", time_to_posix_
     struct tm tm = {0};
     tm.tm_year = cal->year - 1900; tm.tm_mon = cal->month - 1; tm.tm_mday = cal->day;
     tm.tm_hour = cal->hour; tm.tm_min = cal->minute; tm.tm_sec = cal->second;
+#ifdef _WIN32
     c->x[0] = (uint64_t)(int64_t)_mkgmtime(&tm);
+#else
+    c->x[0] = (uint64_t)(int64_t)timegm(&tm);
+#endif
 }
 HLE_FUNC("_ZN2nn4time13ClockSnapshotC1Ev", time_snapshot_init) { memset(snap(c->x[0]), 0, sizeof(ClockSnapshot)); }
 HLE_FUNC("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", time_snapshot_create) {

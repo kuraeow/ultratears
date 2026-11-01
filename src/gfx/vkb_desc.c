@@ -47,6 +47,12 @@ typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *map; VkDeviceSize si
 static dmem_t g_mem[VKB_SLOTS][VKB_MAXREC];
 static dmem_t g_old[VKB_SLOTS][VKB_MAXREC][8];   // replaced during a submission: freed when the slot comes round again
 static int g_nold[VKB_SLOTS][VKB_MAXREC];
+// The memory starts at DMEM_MIN and doubles when a submission needs more; when a slot and thread used under a quarter
+// of it over DMEM_TRIM of the slot's submissions, it is freed and made again at twice that use. Before: 16 MiB and up
+// per slot and recording thread, kept for good - 448 MiB after a load and a run (2026-10-28, L7).
+enum { DMEM_MIN = 2u << 20, DMEM_TRIM = 120 };
+typedef struct { VkDeviceSize peak, want; int resets; } dtrim_t;
+static dtrim_t g_trim[VKB_SLOTS][VKB_MAXREC];
 static __thread uint64_t g_gen = 1;   // changes whenever this thread's memory changes (offsets made before are void)
 static __thread uint64_t g_bound_rec, g_bound_gen;
 static uint32_t g_type = UINT32_MAX;   // the same answer whichever thread finds it
@@ -69,6 +75,7 @@ static int dmem_new(dmem_t *m, VkDeviceSize size) {
     }
     VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, .allocationSize = req.size, .memoryTypeIndex = g_type};
+    vkb_mtag = MT_DESC;
     if (g_type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &m->mem), "descriptor memory")) {
         vk.vkDestroyBuffer(vkc.device, m->buf, NULL);
         return 0;
@@ -88,17 +95,33 @@ static void dmem_free(dmem_t *m) {
 }
 void vkb_db_slot_reset(int slot) {   // the slot's previous submission is complete
     for (int w = 0; w < VKB_MAXREC; w++) {
-        for (int i = 0; i < g_nold[slot][w]; i++) dmem_free(&g_old[slot][w][i]);
+        dmem_t *m = &g_mem[slot][w];
+        dtrim_t *t = &g_trim[slot][w];
+        VkDeviceSize used = m->used;   // the submission's use, memories replaced during it included
+        for (int i = 0; i < g_nold[slot][w]; i++) { used += g_old[slot][w][i].used; dmem_free(&g_old[slot][w][i]); }
         g_nold[slot][w] = 0;
-        g_mem[slot][w].used = 0;
+        if (used > t->peak) t->peak = used;
+        m->used = 0;
+        if (++t->resets >= DMEM_TRIM) {
+            VkDeviceSize keep = t->peak * 2 > DMEM_MIN ? t->peak * 2 : DMEM_MIN;
+            if (m->buf && m->size > keep * 2) {   // no submission uses it (the slot's last one is done)
+                dmem_free(m);   // made again on the next draw of this slot and thread (vkb_db_set binds it anew)
+                t->want = keep;
+            }
+            t->peak = 0;
+            t->resets = 0;
+        }
     }
 }
 uint64_t vkb_db_gen(void) { return g_gen; }
 
 // ---- the bytes of one descriptor, per submission (tables per recording thread)
-enum { CACHE = 1 << 15 };
-typedef struct { uint64_t rec, k0, k1, k2, k3; uint8_t len, bytes[63]; } dcache_t;
-static __thread dcache_t *g_cache;
+// An entry holds the device's largest descriptor: 64 bytes a combined image sampler on NVIDIA, 96 on RADV (Steam Deck:
+// a fixed 63 stopped the game there at its first draw, 2026-10-29).
+enum { CACHE = 1 << 15, DESC_MAX = 256 };
+typedef struct { uint64_t rec, k0, k1, k2, k3; uint8_t len, bytes[]; } dcache_t;
+static __thread uint8_t *g_cache;
+static size_t g_stride;   // entry size: the header and the largest descriptor, 8-byte aligned
 static vkb_cnt g_get_calls, g_cache_hits;
 typedef struct { uint64_t rec; VkBuffer buf; VkDeviceAddress addr; } addr_t;
 static __thread addr_t *g_addr;   // 4096
@@ -128,19 +151,26 @@ static const uint8_t *descriptor(const VkWriteDescriptorSet *w, uint64_t rec, si
     uint64_t k0 = (uint64_t)w->descriptorType, k1, k2, k3;
     if (w->pBufferInfo) { k1 = (uint64_t)(uintptr_t)w->pBufferInfo->buffer; k2 = w->pBufferInfo->offset; k3 = w->pBufferInfo->range; }
     else { k1 = (uint64_t)(uintptr_t)w->pImageInfo->sampler; k2 = (uint64_t)(uintptr_t)w->pImageInfo->imageView; k3 = (uint64_t)w->pImageInfo->imageLayout; }
-    if (!g_cache && !(g_cache = calloc(CACHE, sizeof *g_cache))) die("descriptor cache");
+    if (!g_stride) {
+        size_t big = 0;
+        static const VkDescriptorType ty[] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        for (int i = 0; i < 4; i++) if (type_size(ty[i]) > big) big = type_size(ty[i]);
+        if (big > DESC_MAX) die("descriptor of %zu bytes", big);
+        g_stride = (sizeof(dcache_t) + big + 7) & ~(size_t)7;
+    }
+    if (!g_cache && !(g_cache = calloc(CACHE, g_stride))) die("descriptor cache");
     uint64_t h = (k0 * 0x9e3779b97f4a7c15ull) ^ (k1 * 0xc2b2ae3d27d4eb4full) ^ (k2 * 0x165667b19e3779f9ull) ^ (k3 * 0x27d4eb2f165667c5ull);
     uint32_t at = (uint32_t)(h >> 49) & (CACHE - 1);
     dcache_t *e = NULL;
     for (int probe = 0; probe < 16; probe++) {
-        dcache_t *c = &g_cache[(at + (uint32_t)probe) & (CACHE - 1)];
+        dcache_t *c = (dcache_t *)(g_cache + (size_t)((at + (uint32_t)probe) & (CACHE - 1)) * g_stride);
         if (c->rec == rec && c->k0 == k0 && c->k1 == k1 && c->k2 == k2 && c->k3 == k3) { vkb_cnt_add(g_cache_hits, 1); *len = c->len; return c->bytes; }
         if (c->rec != rec) { e = c; break; }
     }
-    static __thread uint8_t spill[64];   // the table region is full: no caching for this one
+    static __thread uint8_t spill[DESC_MAX];   // the table region is full: no caching for this one
     uint8_t *out = e ? e->bytes : spill;
     size_t n = type_size(w->descriptorType);
-    if (n > 63) die("descriptor of %zu bytes", n);
     VkDescriptorGetInfoEXT gi = {VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT, .type = w->descriptorType};
     VkDescriptorAddressInfoEXT ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
     if (w->pBufferInfo) {
@@ -173,7 +203,7 @@ VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWrit
     VkDeviceSize a = vkc.db.descriptorBufferOffsetAlignment ? vkc.db.descriptorBufferOffsetAlignment : 64;
     VkDeviceSize at = (m->used + a - 1) & ~(a - 1);
     if (!m->buf || at + g_size[compute] > m->size) {   // more memory: the old one stays until the slot's submission is done
-        VkDeviceSize size = m->size ? m->size * 2 : 16u << 20;
+        VkDeviceSize size = m->size ? m->size * 2 : g_trim[slot][wk].want ? g_trim[slot][wk].want : DMEM_MIN;
         VkDeviceSize cap = vkc.db.maxResourceDescriptorBufferRange < vkc.db.maxSamplerDescriptorBufferRange
                          ? vkc.db.maxResourceDescriptorBufferRange : vkc.db.maxSamplerDescriptorBufferRange;
         if (cap && size > cap) size = cap;
@@ -183,7 +213,7 @@ VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWrit
             memset(m, 0, sizeof *m);
         }
         if (!dmem_new(m, size)) die("descriptor memory");
-        VLOG("descriptor memory of slot %d, recording thread %d: %llu MiB", slot, wk, (unsigned long long)(size >> 20));
+        if (dm_stats()) VLOG("descriptor memory of slot %d, recording thread %d: %llu MiB", slot, wk, (unsigned long long)(size >> 20));
         g_gen++;
         at = 0;
     }

@@ -1,0 +1,17 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitShift.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitShift.cs
+@@ -159,6 +159,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
+                 }
+             }
+ 
++            // UltraTears: with a shift of 0 the formulas above shift the other word by 32, which SPIR-V leaves undefined
++            // (a shift amount not below the bit width); Maxwell gives the unshifted word: C for SHF.L, A for SHF.R.
++            // In TOTK 1.4.3 only the Depths terrain vertex shaders use SHF (32-bit, wrapping); an AMD driver masks the
++            // shift amount, so a shift of 0 gave A | C there.
++            Operand shiftIsZero = context.ICompareEqual(srcB, Const(0));
++
++            res = context.ConditionalSelect(shiftIsZero, left ? srcC : srcA, res);
++
+             if (!mask)
+             {
+                 // Clamped shift value.

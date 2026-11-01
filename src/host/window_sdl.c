@@ -5,15 +5,20 @@
 //  - game controllers: buttons by position as on a Switch controller (the right face button is A), sticks with Y up;
 //  - rumble: the game's vibration values (hid_feedback.c) drive the controller's low / high frequency motors.
 //  - motion: the controller's gyro and accelerometer feed motion_fusion.c (gyro aiming); F11 / Alt+Enter: fullscreen.
+//  - the mouse: kept in the window, the cursor hidden (mouse_capture); Ctrl lets it go.
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is boot.c's; SDL only gets SDL_SetMainReady
 #include <SDL3/SDL_main.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "host.h"
 #include "../vk/present.h"
+#ifndef _WIN32
+#include "icon_png.h"   // build-linux/: tools/build_game.py
+#endif
 
 static SDL_Window *window;
 static SDL_Gamepad *pad;
@@ -44,6 +49,24 @@ static int32_t stick(Sint16 v, int invert) {
     int32_t x = invert ? -(int32_t)v : v;
     return x > 32767 ? 32767 : x < -32767 ? -32767 : x;
 }
+/* The stick dead zone (GitHub #39: with an Xbox One pad Link walked right on his own): on the Switch the HID service
+   takes a resting stick's offset off before the game sees it, SDL gives the raw position. A radial dead zone of
+   TOTK_STICK_DEADZONE percent of the travel (default 10, 0..50) reads as centred, and the rest is scaled so the stick
+   still goes from 0 to full beyond it, without a jump at its edge. */
+static void dead_zone(int32_t *x, int32_t *y) {
+    static double dz = -1;
+    if (dz < 0) {
+        const char *e = getenv("TOTK_STICK_DEADZONE");
+        double v = e ? atof(e) : 10;
+        dz = (v >= 0 && v <= 50 ? v : 10) / 100 * 32767;
+        if (e) fprintf(stderr, "[totk] stick dead zone %.0f %% (TOTK_STICK_DEADZONE)\n", dz * 100 / 32767);
+    }
+    double r = sqrt((double)*x * *x + (double)*y * *y);
+    if (r <= dz) { *x = *y = 0; return; }
+    double k = r >= 32767 ? 32767 / r : (r - dz) / (32767 - dz) * 32767 / r;
+    *x = (int32_t)(*x * k);
+    *y = (int32_t)(*y * k);
+}
 static void pad_update(void) {
     RuntimeGamepadState s = {0};
     if (pad) {
@@ -62,6 +85,8 @@ static void pad_update(void) {
         s.ly = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), 1);
         s.rx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), 0);
         s.ry = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY), 1);
+        dead_zone(&s.lx, &s.ly);
+        dead_zone(&s.rx, &s.ry);
         s.connected = 1;
     }
     runtime_gamepad_set(&s);
@@ -94,6 +119,23 @@ int window_init(void) {
     pad_lock = SDL_CreateMutex();
     window = SDL_CreateWindow("UltraTears", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) { fprintf(stderr, "[totk] window: %s\n", SDL_GetError()); return 0; }
+#ifndef _WIN32
+    {   // the port's icon (assets/icon.ico's 256 px PNG, build/icon_png.h); on Windows the exe's resource gives it
+        SDL_Surface *icon = SDL_LoadPNG_IO(SDL_IOFromConstMem(ultrs_icon_png, sizeof ultrs_icon_png), true);
+        if (icon) SDL_SetWindowIcon(window, icon), SDL_DestroySurface(icon);
+    }
+#endif
+    // window= in ultratears.cfg (TOTK_WINDOW): window (default), borderless (the desktop's size, no mode change) or
+    // fullscreen (exclusive, at the desktop's resolution and refresh rate); F11 / Alt+Enter still switch
+    const char *mode = getenv("TOTK_WINDOW");
+    if (mode && (!SDL_strcmp(mode, "borderless") || !SDL_strcmp(mode, "fullscreen"))) {
+        const SDL_DisplayMode *desk = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window));
+        if (!SDL_strcmp(mode, "fullscreen") && desk)
+            SDL_SetWindowFullscreenMode(window, desk);
+        SDL_SetWindowFullscreen(window, true);
+        fprintf(stderr, "[totk] window: %s\n", mode);
+    }
+    SDL_SetWindowRelativeMouseMode(window, true);   // the mouse is the game window's from the start (mouse_capture)
     if (!vkp_init(window))
         runtime_fail("Vulkan initialization failed (Vulkan 1.3 with VK_EXT_shader_object is required)");
     return 1;
@@ -155,6 +197,22 @@ static void close_pad(SDL_JoystickID id) {
     pad_update();
 }
 
+// The refresh rate of the monitor the window is on (frame limit "display", frame_rate.c); 0 when not known.
+float window_refresh_hz(void) {
+    if (!window) return 0;
+    const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+    return m ? m->refresh_rate : 0;
+}
+
+// The mouse is the window's while the game has the focus, as in other PC games: the cursor hidden and kept in the
+// window (SDL's relative mode), taken at the start and by a click into the window, let go by Ctrl and whenever another
+// window gets the focus (Alt+Tab, the Windows key; SDL gives it back with the focus). The game gets no mouse input
+// yet (overrides_input.c: a mouse that does not move): this is only that the cursor stays out of the way.
+static void mouse_capture(bool on) {
+    if (SDL_GetWindowRelativeMouseMode(window) == on) return;
+    SDL_SetWindowRelativeMouseMode(window, on);
+}
+
 static void toggle_fullscreen(void) {
     bool on = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
     SDL_SetWindowFullscreen(window, !on);   // borderless desktop fullscreen (no display mode change)
@@ -189,10 +247,28 @@ _Noreturn void window_loop(void) {
                         toggle_fullscreen();
                         break;
                     }
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
+                        (e.key.scancode == SDL_SCANCODE_LCTRL || e.key.scancode == SDL_SCANCODE_RCTRL)) {
+                        mouse_capture(false);   // Ctrl lets the mouse go (no button of the game's layout)
+                        break;
+                    }
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) {
+                        void vk_overlay_toggle(void);   // vk/overlay.c: the frame counter
+                        vk_overlay_toggle();
+                        break;
+                    }
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F9) {
+                        void vkb_dump_request(void);   // gfx/vkb.h: TOTK_DUMP_KEY (development)
+                        vkb_dump_request();
+                        break;
+                    }
                     int k = mac_key(e.key.scancode);
                     if (k >= 0 && !e.key.repeat) runtime_input_key((unsigned)k, e.type == SDL_EVENT_KEY_DOWN);
                     break;
                 }
+                case SDL_EVENT_MOUSE_BUTTON_DOWN:   // a click into the window takes the mouse again
+                    if (!SDL_GetWindowRelativeMouseMode(window)) mouse_capture(true);
+                    break;
                 case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); break;
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
                 case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;

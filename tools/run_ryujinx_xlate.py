@@ -1,7 +1,7 @@
 """Translate the exported shaders with totk_xlate --serve (Ryujinx), in parallel on at most 8 logical CPUs.
 
 usage: python tools/run_ryujinx_xlate.py data/shaders [--workers 8]
-Writes <dir>/ryujinx/<key>.spv and <dir>/ryujinx-results.tsv (key, ok/fail, seconds, spv bytes, message).
+Writes <dir>/translated/<key>.spv (+ .res.json) and <dir>/translate-results.tsv (key, ok/fail, seconds, spv bytes, message).
 """
 import argparse
 import ctypes
@@ -16,9 +16,18 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import XLATE  # noqa: E402
+import progress  # noqa: E402
 
 
 def start_pinned(cmd, mask, env):
+    if os.name != 'nt':   # Linux: nice 10 and the CPUs set in the child before it starts (as PR #42)
+        def limit():
+            os.nice(10)
+            cpus = {i for i in range(64) if mask >> i & 1} & os.sched_getaffinity(0)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+        return subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, preexec_fn=limit)
     CREATE_SUSPENDED, BELOW_NORMAL = 0x4, 0x4000
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, creationflags=CREATE_SUSPENDED | BELOW_NORMAL)
@@ -36,16 +45,17 @@ def main():
     a = ap.parse_args()
     lines = (a.dir / 'jobs.jsonl').read_text().splitlines()
     if a.new_only:   # only shaders without a translation yet (the comparison's outputs stay)
-        lines = [l for l in lines if not (a.dir / 'ryujinx' / (json.loads(l)['job']['key'] + '.spv')).exists()]
-    (a.dir / 'ryujinx').mkdir(exist_ok=True)
+        lines = [l for l in lines if not (a.dir / 'translated' / (json.loads(l)['job']['key'] + '.spv')).exists()]
+    (a.dir / 'translated').mkdir(exist_ok=True)
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1',
                DOTNET_CLI_HOME=str(ROOT / 'third_party/dotnet-home'))
     if XLATE is None:
-        sys.exit('the shader translator ultrs-shaders.exe is missing: python tools/build_xlate.py')
+        sys.exit('the shader translator ultrs-shaders is missing: python tools/build_xlate.py')
     cmd = [str(XLATE)]   # tools/build_xlate.py, or the builder package's deps/shaders
     results, lock = [], threading.Lock()
     shards = [lines[i::a.workers] for i in range(a.workers)]
     t0 = time.time()
+    bar = progress.Bar('translating the shaders', len(lines), 'shaders') if a.quiet else None
 
     def worker(shard):
         p = start_pinned(cmd + ['--serve'], (1 << a.workers) - 1, env)
@@ -55,25 +65,29 @@ def main():
             p.stdin.write(line + '\n'); p.stdin.flush()
             reply = p.stdout.readline().strip()
             dt = time.perf_counter() - s
-            spv = a.dir / 'ryujinx' / f'{key}.spv'
+            spv = a.dir / 'translated' / f'{key}.spv'
             ok = reply.startswith('ok ')
             size = spv.stat().st_size if ok and spv.exists() else 0
             msg = '' if ok else (reply[len('fail ' + key) + 1:] if reply.startswith('fail') else reply or 'no reply')
             with lock:
                 results.append((key, 'ok' if ok else 'fail', dt, size, msg.replace('\t', ' ')[:300]))
-                if len(results) % 2000 == 0 and not a.quiet:
+                if bar:
+                    bar.update(len(results))
+                elif len(results) % 2000 == 0:
                     print(f'{len(results)}/{len(lines)} {time.time() - t0:.0f}s', flush=True)
         p.stdin.close(); p.wait()
 
     threads = [threading.Thread(target=worker, args=(s,)) for s in shards]
     for t in threads: t.start()
     for t in threads: t.join()
-    with (a.dir / ('ryujinx-results-new.tsv' if a.new_only else 'ryujinx-results.tsv')).open('w') as f:   # --new-only keeps the full table
+    if bar:
+        bar.finish()
+    with (a.dir / ('translate-results-new.tsv' if a.new_only else 'translate-results.tsv')).open('w') as f:   # --new-only keeps the full table
         f.write('key\tresult\tseconds\tspv_bytes\tmessage\n')
         for r in sorted(results):
             f.write(f'{r[0]}\t{r[1]}\t{r[2]:.4f}\t{r[3]}\t{r[4]}\n')
     ok = sum(r[1] == 'ok' for r in results)
-    print(f'ryujinx: {ok}/{len(results)} ok, {time.time() - t0:.0f}s wall, {sum(r[2] for r in results):.0f}s busy')
+    print(f'shaders translated: {ok}/{len(results)} ok, {time.time() - t0:.0f}s wall, {sum(r[2] for r in results):.0f}s busy')
 
 
 if __name__ == '__main__':

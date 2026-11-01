@@ -25,16 +25,21 @@ BATCH = 2000
 ALIGN = 16
 
 
-def pack(folder, out, threads=16, progress=print):
-    """-> (file count, bytes, content hash). Writes <out>/romfs.bin, index.json, runtime-index.bin."""
-    rom = RomFS(folder)
+def pack(folder, out, threads=16, progress=print, folders=None):
+    """-> (file count, bytes, content hash). Writes <out>/romfs.bin, index.json, runtime-index.bin. folders (a dict):
+    filled with each top-level folder's (file count, the first 16 hex digits of the SHA-256 over its files' SHA-256), so
+    a RomFS that differs from the expected one can say where (tools/setup.py ROMFS_FOLDERS).
+    The console shows a progress line (tools/progress.py); progress is kept for callers and no longer used."""
+    import progress as bars
+    with bars.Ticker('listing the RomFS files'):
+        rom = RomFS(folder)
     if rom.image is not None:
         raise ValueError(f'{folder} is already an image')
     names = sorted(rom.files)   # byte order of the paths, as the runtime's index wants
     out.mkdir(parents=True, exist_ok=True)
     rows, total, offset = [], sum(rom.files.values()), 0
     content = hashlib.sha256()
-    t0 = last = time.time()
+    bar = bars.Bar(f'packing the RomFS ({len(names)} files)', total, 'GiB', 2**30, rate=True)
 
     def read(p):
         data = rom.read(p)
@@ -55,17 +60,22 @@ def pack(folder, out, threads=16, progress=print):
                 img.write(data)
                 offset += len(data)
                 content.update(digest)
-            if time.time() - last > 10:
-                last = time.time()
-                done = sum(r['size'] for r in rows)
-                progress(f'  RomFS: {len(rows)} / {len(names)} files, {done / 2**30:.1f} / {total / 2**30:.1f} GiB, '
-                         f'{time.time() - t0:.0f} s')
+                if folders is not None:
+                    top = p.split('/', 1)[0]
+                    n, h = folders.get(top) or (0, hashlib.sha256())
+                    h.update(digest)
+                    folders[top] = (n + 1, h)
+                bar.add(len(data))
+    bar.finish()
     (out / 'romfs.bin').unlink(missing_ok=True)
     part.rename(out / 'romfs.bin')
     (out / 'index.json').write_text(json.dumps(dict(status='pass', source='folder', content_sha256=content.hexdigest(),
                                                     files=rows)))
     subprocess.run([sys.executable, str(ROOT / 'tools/make_romfs_index.py'), str(out)], check=True,
                    stdout=subprocess.DEVNULL)
+    if folders is not None:
+        for top, (n, h) in folders.items():
+            folders[top] = (n, h.hexdigest()[:16])
     return len(rows), offset, content.hexdigest()
 
 

@@ -10,12 +10,13 @@
 
 #define VK_FN_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceLayerProperties) X(vkEnumerateInstanceExtensionProperties)
 #define VK_FN_INSTANCE(X) X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
-    X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceMemoryProperties) \
-    X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) \
+    X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceMemoryProperties2)\
+    X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFormatProperties2) \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkDestroySurfaceKHR)
 #define VK_FN_DEVICE(X) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkQueueWaitIdle) \
+    X(vkGetDeviceFaultInfoEXT) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
     X(vkCreateCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) \
@@ -28,8 +29,8 @@
     X(vkDestroyImageView) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdClearAttachments) X(vkCmdCopyImage) \
     X(vkCmdClearDepthStencilImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
     X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateDescriptorPool) X(vkResetDescriptorPool) \
-    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCreateSampler) X(vkDestroySampler) \
-    X(vkCreateShadersEXT) X(vkDestroyShaderEXT) X(vkCmdBindShadersEXT) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDispatch) \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCreateSampler) X(vkDestroySampler) \
+    X(vkCreateShadersEXT) X(vkDestroyShaderEXT) X(vkGetShaderBinaryDataEXT) X(vkCmdBindShadersEXT) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDispatch) \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetVertexInputEXT) X(vkCmdSetViewportWithCount) \
     X(vkCmdSetScissorWithCount) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetRasterizerDiscardEnable) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPolygonModeEXT) X(vkCmdSetDepthBiasEnable) X(vkCmdSetDepthBias) \
@@ -41,7 +42,7 @@
     X(vkCmdSetLineWidth) X(vkCmdSetDepthClipNegativeOneToOneEXT) X(vkCmdSetViewport) X(vkCmdSetScissor) \
     X(vkCmdSetProvokingVertexModeEXT) X(vkCmdSetDepthClipEnableEXT) X(vkCmdSetDepthBounds) \
     X(vkCreateQueryPool) X(vkResetQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp2) X(vkGetQueryPoolResults) \
-    X(vkCmdSetAttachmentFeedbackLoopEnableEXT) X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) \
+    X(vkCmdSetAttachmentFeedbackLoopEnableEXT) X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkCmdWriteBufferMarkerAMD) X(vkInvalidateMappedMemoryRanges) \
     X(vkGetDescriptorSetLayoutSizeEXT) X(vkGetDescriptorSetLayoutBindingOffsetEXT) X(vkGetDescriptorEXT) \
     X(vkCmdBindDescriptorBuffersEXT) X(vkCmdSetDescriptorBufferOffsetsEXT)
 #define VK_FN_DECLARE(f) PFN_##f f;
@@ -60,10 +61,19 @@ typedef struct {
     VkPhysicalDeviceMemoryProperties memory;
     uint64_t host_pointer_alignment;   // VK_EXT_external_memory_host
     int has_descriptor_buffer, has_gpl, has_eds3, has_vertex_input_ds, has_depth_clip_control, has_shader_object, has_interlock;
-    int has_feedback_loop;   // VK_EXT_attachment_feedback_loop_layout + _dynamic_state: sampling a bound attachment
+    int has_feedback_loop;   // VK_EXT_attachment_feedback_loop_layout: sampling a bound attachment in its feedback loop layout
+    int has_feedback_dynamic;   // ...+ _dynamic_state: the loop declared per draw (AMD's Windows driver has the layout only)
     int has_local_read;      // VK_KHR_dynamic_rendering_local_read: barriers inside a pass (draws reading what earlier draws wrote)
     VkPhysicalDeviceDescriptorBufferPropertiesEXT db;   // VK_EXT_descriptor_buffer: descriptor sizes, alignment, ranges
+    VkPhysicalDeviceShaderObjectPropertiesEXT so;      // VK_EXT_shader_object: the driver's shader binary format (UUID, version)
     int has_checkpoints;     // TOTK_VK_CHECKPOINTS=1: VK_NV_device_diagnostic_checkpoints (where a lost device stopped)
+    int has_memory_budget;   // VK_EXT_memory_budget: the memory this process uses per heap (the memory log line)
+    int has_buffer_marker;   // TOTK_VK_CHECKPOINTS=1: VK_AMD_buffer_marker (the same, written by the GPU to host memory)
+    int has_device_fault;    // VK_EXT_device_fault: the driver's report of a lost device (vk_device_fault_report)
+    int has_custom_border;   // VK_EXT_custom_border_color without a format: any sampler border colour, as on NVN
+    uint32_t max_custom_border;   // ...at most this many such samplers at once (maxCustomBorderColorSamplers)
+    uint32_t subgroup_pin;   // 32 where the driver may run shaders in other subgroup sizes (AMD: 32 or 64), else 0
+    VkShaderStageFlags subgroup_pin_stages;   // ...the stages it can pin (requiredSubgroupSizeStages)
 } VkContext;
 extern VkContext vkc;
 
@@ -74,3 +84,4 @@ int vk_init(SDL_Window *window);
 void vk_queue_lock(void);       // the queue is used by the replayer's submit thread and the present thread
 void vk_queue_unlock(void);
 int vk_check(VkResult r, const char *what);   // 1 on success, logs the failure otherwise
+void vk_device_fault_report(void);             // after a lost device: the driver's report (VK_EXT_device_fault)

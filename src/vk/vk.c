@@ -1,10 +1,16 @@
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 // The shared Vulkan instance and device (see vk.h).
 #include "vk.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <pthread.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,9 +23,12 @@ static pthread_mutex_t queue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_queue_lock(void) { pthread_mutex_lock(&queue_mu); }
 void vk_queue_unlock(void) { pthread_mutex_unlock(&queue_mu); }
 
+void vk_device_fault_report(void);
 int vk_check(VkResult r, const char *what) {
     if (r == VK_SUCCESS) return 1;
     LOG("%s failed (%d)", what, (int)r);
+    static int reported;
+    if (r == VK_ERROR_DEVICE_LOST && !reported++) vk_device_fault_report();   // once, whichever call saw it first
     return 0;
 }
 
@@ -34,14 +43,51 @@ static int has_layer(const char *name) {
     return found;
 }
 
+// TOTK_VK_VALIDATION: the layer's errors and warnings into the game's log ("[validation] ..."). Without a messenger the
+// layer prints to the process's own output, which a player's log (ultratears.log) does not get (2026-10-29: a tester's
+// validation run with the output redirected came back empty).
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                         VkDebugUtilsMessageTypeFlagsEXT types,
+                                                         const VkDebugUtilsMessengerCallbackDataEXT *data, void *user) {
+    (void)types; (void)user;
+    static int said;
+    if (said++ < 5000)
+        LOG("[validation] %s %s", severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning",
+            data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
+
+// Mesa's drivers (RADV on the Steam Deck) keep a shader cache of their own beside ours, by default in ~/.cache and up to
+// 1 GB. A Deck's /home is small and the game usually sits on the SD card: unless MESA_SHADER_CACHE_DIR names a folder,
+// it goes to mesa-cache in the game folder. Read by the driver when the device is made, so set before the instance.
+// (As totk-pc-recomp's vk_device.c mesa_cache_beside_exe, MIT.)
+static void mesa_cache_beside_game(void) {
+#ifndef _WIN32
+    if (getenv("MESA_SHADER_CACHE_DIR")) return;
+    char dir[4096];
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 16);
+    char *cut = n > 0 ? (dir[n] = 0, strrchr(dir, '/')) : NULL;
+    if (!cut) return;
+    strcpy(cut + 1, "mesa-cache");
+    setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+#endif
+}
+
 static int create_instance(SDL_Window *window) {
+    mesa_cache_beside_game();
     PFN_vkGetInstanceProcAddr gipa = NULL;
     if (window) gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     else {   // no window (TOTK_HEADLESS): SDL's video subsystem is not up, so the loader is loaded here
+#ifdef _WIN32
         HMODULE m = LoadLibraryA("vulkan-1.dll");
         if (m) gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(m, "vkGetInstanceProcAddr");
+#else
+        void *m = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!m) m = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (m) gipa = (PFN_vkGetInstanceProcAddr)dlsym(m, "vkGetInstanceProcAddr");
+#endif
     }
-    if (!gipa) { LOG("no Vulkan loader (vulkan-1.dll)"); return 0; }
+    if (!gipa) { LOG("no Vulkan loader"); return 0; }
 #define LOAD(f) vk.f = (PFN_##f)gipa(NULL, #f);
     VK_FN_GLOBAL(LOAD)
 #undef LOAD
@@ -54,6 +100,12 @@ static int create_instance(SDL_Window *window) {
     if (v && strcmp(v, "0") && !validate) LOG("TOTK_VK_VALIDATION: %s not installed", layer);
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "UltraTears",
                              .apiVersion = VK_API_VERSION_1_3};
+    const char *with_debug[64];   // with validation: the window's extensions and VK_EXT_debug_utils (its messenger)
+    if (validate && next < 63) {
+        for (Uint32 i = 0; i < next; i++) with_debug[i] = exts[i];
+        with_debug[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        exts = with_debug;
+    }
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = next, .ppEnabledExtensionNames = exts,
                                .enabledLayerCount = validate ? 1u : 0u, .ppEnabledLayerNames = &layer};
@@ -61,7 +113,17 @@ static int create_instance(SDL_Window *window) {
 #define LOAD(f) vk.f = (PFN_##f)gipa(vkc.instance, #f);
     VK_FN_INSTANCE(LOAD)
 #undef LOAD
-    if (validate) LOG("validation layer on");
+    if (validate) {
+        PFN_vkCreateDebugUtilsMessengerEXT create =
+            (PFN_vkCreateDebugUtilsMessengerEXT)gipa(vkc.instance, "vkCreateDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT mi = {VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT,
+            .pfnUserCallback = validation_message};
+        VkDebugUtilsMessengerEXT messenger;
+        int ok = create && create(vkc.instance, &mi, NULL, &messenger) == VK_SUCCESS;
+        LOG("validation layer on%s", ok ? ": its messages go to this log ([validation])" : " (no messenger: messages to the console)");
+    }
     if (window && !SDL_Vulkan_CreateSurface(window, vkc.instance, NULL, &vkc.surface)) {
         LOG("window surface: %s", SDL_GetError());
         vkc.surface = VK_NULL_HANDLE;
@@ -117,11 +179,27 @@ static int pick_device(void) {
     if (best < 0) { LOG("no Vulkan 1.3 GPU with VK_EXT_external_memory_host%s", vkc.surface ? " that presents to the window" : ""); return 0; }
     vk.vkGetPhysicalDeviceProperties(vkc.gpu, &vkc.props);
     vk.vkGetPhysicalDeviceMemoryProperties(vkc.gpu, &vkc.memory);
-    vkc.db = (VkPhysicalDeviceDescriptorBufferPropertiesEXT){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT};
+    vkc.so = (VkPhysicalDeviceShaderObjectPropertiesEXT){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT};
+    vkc.db = (VkPhysicalDeviceDescriptorBufferPropertiesEXT){VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT, &vkc.so};
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT host = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT, &vkc.db};
-    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host};
+    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, &host};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p13};
     vk.vkGetPhysicalDeviceProperties2(vkc.gpu, &p2);
     vkc.host_pointer_alignment = host.minImportedHostPointerAlignment;
+    // The shader translator (Ryujinx) assumes Maxwell's 32-lane warps for SHFL, VOTE and the lane id; a driver that
+    // picks the subgroup size per shader (AMD RDNA: 32 or 64) is told 32 per shader object (vkb_shader.c make_object).
+    // Where the size is fixed (NVIDIA: 32) nothing is pinned. TOTK_VK_SUBGROUP_PIN=0 turns it off (A/B).
+    const char *pin = getenv("TOTK_VK_SUBGROUP_PIN");
+    if (p13.minSubgroupSize <= 32 && p13.maxSubgroupSize >= 32 && p13.minSubgroupSize != p13.maxSubgroupSize && !(pin && *pin == '0')) {
+        vkc.subgroup_pin = 32;
+        vkc.subgroup_pin_stages = p13.requiredSubgroupSizeStages;
+        // a compute workgroup must fit in maxComputeWorkgroupSubgroups subgroups of 32: where the largest would not,
+        // compute shaders keep the driver's size
+        if ((uint64_t)p13.maxComputeWorkgroupSubgroups * 32 < vkc.props.limits.maxComputeWorkGroupInvocations)
+            vkc.subgroup_pin_stages &= ~(VkShaderStageFlags)VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    LOG("subgroup size %u..%u; pinned to %u for stages %#x", p13.minSubgroupSize, p13.maxSubgroupSize, vkc.subgroup_pin,
+        (unsigned)vkc.subgroup_pin_stages);
     LOG("GPU: %s (Vulkan %u.%u.%u, driver %#x)", vkc.props.deviceName, VK_API_VERSION_MAJOR(vkc.props.apiVersion),
         VK_API_VERSION_MINOR(vkc.props.apiVersion), VK_API_VERSION_PATCH(vkc.props.apiVersion), vkc.props.driverVersion);
     return 1;
@@ -138,6 +216,7 @@ static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_T
 static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
 static VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
 static VkPhysicalDeviceCustomBorderColorFeaturesEXT fcbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+static VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
 static VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
 static VkPhysicalDeviceConditionalRenderingFeaturesEXT fcr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
 static VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
@@ -148,7 +227,7 @@ static VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT ffl = {VK_STRUCTU
 static VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT ffld = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
 static int has_fl, has_fld;
 static VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
-static int has_lr;
+static int has_lr, has_cbc;
 
 static int create_device(void) {
     ExtList ex = device_extensions(vkc.gpu);
@@ -170,7 +249,7 @@ static int create_device(void) {
         {VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, &fvids, &vkc.has_vertex_input_ds},
         {VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, &fdcc, &vkc.has_depth_clip_control},
         {VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, &fdce, NULL},
-        {VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, &fcbc, NULL},
+        {VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, &fcbc, &has_cbc},
         {VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, &fpv, NULL},
         {VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, &fcr, NULL},
         {VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, &fu8, NULL},
@@ -182,12 +261,17 @@ static int create_device(void) {
         {VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME, &ffld, &has_fld},
         // ...and a draw that samples a target earlier draws of the pass wrote waits for them inside the pass
         {VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, &flr, &has_lr},
+        {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, NULL, &vkc.has_memory_budget},   // the memory log line
         // development (TOTK_VK_CHECKPOINTS=1): the markers a lost device reached
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
+        // ...and written by the GPU to host memory, which outlives the device (the NVIDIA driver gave 0 checkpoints, 2026-10-27)
+        {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
+        // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
+        {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
     };
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
-        if (want[i].flag == &vkc.has_checkpoints && !getenv("TOTK_VK_CHECKPOINTS")) continue;
+        if ((want[i].flag == &vkc.has_checkpoints || want[i].flag == &vkc.has_buffer_marker) && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
         if (want[i].flag) *want[i].flag = 1;
@@ -200,10 +284,45 @@ static int create_device(void) {
         LOG("VK_EXT_shader_object is required but is not supported by this GPU or driver");
         return 0;
     }
-    vkc.has_feedback_loop = has_fl && has_fld && ffl.attachmentFeedbackLoopLayout && ffld.attachmentFeedbackLoopDynamicState;
-    if (!vkc.has_feedback_loop) LOG("no attachment feedback loops: textures that are attachments of their pass read empty");
+    // the shaders' interlock is the pixel one (vkb_spv_drop_interlock removes it where this is missing)
+    vkc.has_interlock = vkc.has_interlock && ffsi.fragmentShaderPixelInterlock;
+    if (!vkc.has_interlock) LOG("no fragment shader pixel interlock: shaders that use it run without it");
+    // Without the dynamic state (AMD's Windows driver) the shader objects cannot declare the loop: the layout alone is
+    // used, which the Vulkan spec leaves undefined there but AMD's driver samples right (PR #36 by Moran45, Radeon 780M).
+    vkc.has_feedback_loop = has_fl && ffl.attachmentFeedbackLoopLayout;
+    vkc.has_feedback_dynamic = vkc.has_feedback_loop && has_fld && ffld.attachmentFeedbackLoopDynamicState;
     vkc.has_local_read = has_lr && flr.dynamicRenderingLocalRead;
-    if (vkc.has_feedback_loop && !vkc.has_local_read) LOG("no barriers inside a pass: a draw sampling its own target may miss earlier draws' writes");
+    // TOTK_VK_NO_FEEDBACK (development): =1 as AMD's Windows driver (the layout without the dynamic state, no barriers
+    // inside a pass); =2 without feedback loops at all (what is done then: TOTK_VK_FB_FALLBACK, vkb_draw.c)
+    const char *nf = getenv("TOTK_VK_NO_FEEDBACK");
+    if (nf && *nf && *nf != '0') {
+        vkc.has_feedback_dynamic = vkc.has_local_read = 0;
+        if (*nf == '2') vkc.has_feedback_loop = 0;
+    }
+    ffl.attachmentFeedbackLoopLayout = (VkBool32)vkc.has_feedback_loop;   // the features enabled are the ones used
+    ffld.attachmentFeedbackLoopDynamicState = (VkBool32)vkc.has_feedback_dynamic;
+    flr.dynamicRenderingLocalRead = (VkBool32)vkc.has_local_read;
+    if (!vkc.has_feedback_loop) LOG("no attachment feedback loops: a target sampled by its own draw is attached in GENERAL (TOTK_VK_FB_FALLBACK)");
+    else if (!vkc.has_feedback_dynamic) LOG("attachment feedback loops without the dynamic state: the layout alone");
+    if (!vkc.has_local_read) LOG("no barriers inside a pass: a pass that drew ends before a draw sampling its target");
+    if (!f13.subgroupSizeControl && vkc.subgroup_pin) {
+        LOG("no subgroup size control: shaders run in the driver's subgroup size");
+        vkc.subgroup_pin = 0;
+    }
+    // NVN samplers take any border colour (TOTK clamps the grass interaction map to 0.5 grey); the samplers are made
+    // before the texture is known, so the colour must work without a format
+    vkc.has_custom_border = has_cbc && fcbc.customBorderColors && fcbc.customBorderColorWithoutFormat;
+    vkc.has_device_fault = vkc.has_device_fault && ffault.deviceFault;
+    ffault.deviceFaultVendorBinary = VK_FALSE;   // the counts and addresses are enough for the log
+    if (vkc.has_custom_border) {
+        VkPhysicalDeviceCustomBorderColorPropertiesEXT cbp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cbp};
+        vk.vkGetPhysicalDeviceProperties2(vkc.gpu, &p2);
+        vkc.max_custom_border = cbp.maxCustomBorderColorSamplers;
+        LOG("custom sampler border colours: up to %u samplers", vkc.max_custom_border);
+    } else LOG("no custom sampler border colours: the nearest standard colour is used");
+    fcbc.customBorderColors = (VkBool32)vkc.has_custom_border;   // the features enabled are the ones used
+    fcbc.customBorderColorWithoutFormat = (VkBool32)vkc.has_custom_border;
     // TOTK_VK_ROBUST=1 (development): bounds-checked buffer access, to tell a shader's out-of-range access from other
     // causes of a lost device
     if (!getenv("TOTK_VK_ROBUST")) f2.features.robustBufferAccess = VK_FALSE;
@@ -240,4 +359,29 @@ int vk_init(SDL_Window *window) {
     if (!state) state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
     pthread_mutex_unlock(&mu);
     return state == 1;
+}
+
+/* After VK_ERROR_DEVICE_LOST (VK_EXT_device_fault): the driver's description of the fault, the GPU addresses it involved
+   and the vendor's codes, into the log. Nothing when the driver has no report. */
+void vk_device_fault_report(void) {
+    if (!vkc.has_device_fault || !vk.vkGetDeviceFaultInfoEXT) return;
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, NULL) != VK_SUCCESS) { LOG("device fault: no report from the driver"); return; }
+    VkDeviceFaultAddressInfoEXT addr[16];
+    VkDeviceFaultVendorInfoEXT ven[16];
+    if (n.addressInfoCount > 16) n.addressInfoCount = 16;
+    if (n.vendorInfoCount > 16) n.vendorInfoCount = 16;
+    n.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = addr, .pVendorInfos = ven};
+    VkResult r = vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { LOG("device fault: no report from the driver (%d)", (int)r); return; }
+    LOG("device fault: %s", info.description[0] ? info.description : "(no description)");
+    static const char *const kind[] = {"none", "invalid read", "invalid write", "invalid execute", "instruction pointer unknown",
+                                       "instruction pointer invalid", "instruction pointer fault"};
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        LOG("  address %#llx (+-%#llx): %s", (unsigned long long)addr[i].reportedAddress,
+            (unsigned long long)addr[i].addressPrecision, addr[i].addressType < 7 ? kind[addr[i].addressType] : "?");
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        LOG("  vendor: %s (code %#llx, data %#llx)", ven[i].description, (unsigned long long)ven[i].vendorFaultCode,
+            (unsigned long long)ven[i].vendorFaultData);
 }

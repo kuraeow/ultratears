@@ -72,7 +72,8 @@ static void scan_pages(range_t *r, uintptr_t a, size_t len, int count) {
             if (count) atomic_store(&r->gen[p], g);
         }
         atomic_fetch_add(&g_scan_pages, (uint64_t)n);
-        if (n < 512) break;   // all of the range reported; with 512 there may be more: scan again (bits were reset)
+        if (n < 512) break;   // all of the range reported; with 512 there may be more: from after the last one
+        lo = (uintptr_t)pages[n - 1] + (uintptr_t)pg;
     }
 }
 

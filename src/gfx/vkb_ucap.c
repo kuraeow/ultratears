@@ -24,7 +24,9 @@
 #include "vkb_lock.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
-enum { UBO_MAX = 65536, OTHER_MAX = 1 << 20, MERGE_MAX = 4 << 20 };
+// SSBO_MAX: TOTK binds one 1.4 MB storage buffer (per-object transforms / skinning) to most draws of a frame; read live,
+// animated meshes and props tore into wedges (2026-10-28, F9 geom8/f6333).
+enum { UBO_MAX = 65536, OTHER_MAX = 1 << 20, SSBO_MAX = 4 << 20, MERGE_MAX = 4 << 20 };
 
 typedef struct { uint64_t lo, hi; } rng;
 typedef struct { int n; rng *r; size_t *off; uint8_t *bytes; uint64_t done; } ucap;   // ranges sorted, disjoint; off: into bytes; done: the GPU had completed this submission at the capture
@@ -53,7 +55,7 @@ static void collect(rng **v, int *n, int *cap, const uint8_t *p, int depth) {
                 const p_bind_buf *b = (const p_bind_buf *)(p + 8);
                 addr = b->addr; sz = b->size;
                 if (h.op == OP_BIND_UBO && sz > UBO_MAX) sz = UBO_MAX;
-                if (h.op == OP_BIND_SSBO && sz > OTHER_MAX) sz = 0;
+                if (h.op == OP_BIND_SSBO && sz > SSBO_MAX) sz = 0;
             }
             if (addr && sz) {
                 if (*n == *cap) { *cap = *cap ? *cap * 2 : 4096; if (!(*v = realloc(*v, sizeof **v * (size_t)*cap))) die("uniform capture ranges"); }
@@ -140,6 +142,7 @@ static int arena_get(int slot, VkDeviceSize need) {
         if ((req.memoryTypeBits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
     VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, .allocationSize = req.size, .memoryTypeIndex = type};
+    vkb_mtag = MT_UCAP;
     if (type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &a->mem), "uniform copy memory")) {
         vk.vkDestroyBuffer(vkc.device, a->buf, NULL); *a = (arena_t){0}; return 0;
     }
@@ -148,10 +151,12 @@ static int arena_get(int slot, VkDeviceSize need) {
     return 1;
 }
 
+static _Atomic int g_ninl;   // inline updates logged (below)
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // replay thread, the submission just begun
     ucap *c = capv ? capv : mtl_sub_capture_ubos(h, n);   // without the translation thread: the replay is in the submit call
     if (g_cur) { free(g_cur->r); free(g_cur->off); free(g_cur->bytes); free(g_cur); g_cur = NULL; }
     g_nu = 0; g_uslot = -1; g_ubytes = NULL; g_uoff = NULL;
+    atomic_store_explicit(&g_ninl, 0, memory_order_release);   // a new submission: its own inline updates
     if (!c) return;
     g_cur = c;
     if (!c->n || vkb_slot() < 0) return;
@@ -184,6 +189,40 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // repl
     g_nu = c->n; g_uslot = slot; g_ubytes = c->bytes; g_uoff = c->off;
 }
 
+// Inline uniform updates of the submission being replayed, in command order (L20): the CPU reads of uniform memory
+// (pointers to storage buffers) see the ones before their own position. TOTK rewrites c6 of its Depths terrain between
+// draws with the pointer to each piece of the mesh; the CPU read memory (the newest pointer) and every terrain draw took
+// one piece's corners: the far terrain in shards. Appended by the walk of the submission (or by the replay on one
+// thread) before any reader at a later position runs; a fixed array, so readers on other threads never see it move.
+enum { INLINE_MAX = 1 << 16 };
+typedef struct { uint64_t seq, addr, n; const uint8_t *data; } inl_t;
+static inl_t *g_inl;
+static _Atomic int g_ninl;
+void vkb_ucap_inline(uint64_t addr, uint64_t n, const uint8_t *data) {
+    if (vkb_mt_recording()) return;   // the walk of the submission logged it already (as vkb_ucap_drop)
+    if (!g_inl && !(g_inl = malloc(sizeof *g_inl * INLINE_MAX))) die("inline uniform updates");
+    int k = atomic_load_explicit(&g_ninl, memory_order_relaxed);
+    if (k == INLINE_MAX) { static int said; if (!said++) VLOG("[temporary] more than %d inline uniform updates in a submission: later ones not seen by CPU reads", INLINE_MAX); return; }
+    g_inl[k] = (inl_t){vkb_seq(), addr, n, data};
+    atomic_store_explicit(&g_ninl, k + 1, memory_order_release);
+}
+static void inline_overlay(uint64_t addr, uint8_t *out, size_t n) {   // the updates before this position, newest last
+    int cnt = atomic_load_explicit(&g_ninl, memory_order_acquire);
+    uint64_t at = vkb_seq();
+    int lo = 0, hi = cnt;   // the first update at or after this position
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_inl[m].seq < at) lo = m + 1; else hi = m; }
+    uint64_t need = n;   // bytes not yet decided, newest update first
+    uint8_t got[4096];
+    if (!cnt || n > sizeof got) return;
+    memset(got, 0, n);
+    for (int i = lo - 1; i >= 0 && need; i--) {
+        const inl_t *u = &g_inl[i];
+        if (u->addr >= addr + n || addr >= u->addr + u->n) continue;
+        for (uint64_t b = 0; b < n; b++)
+            if (!got[b] && addr + b >= u->addr && addr + b < u->addr + u->n) { out[b] = u->data[addr + b - u->addr]; got[b] = 1; need--; }
+    }
+}
+
 static int dropped(const urng *u) { return atomic_load_explicit(&u->drop_at, memory_order_acquire) <= vkb_seq(); }
 static int find(uint64_t a) {   // the first range ending above a
     int lo = 0, hi = g_nu;
@@ -212,6 +251,7 @@ void vkb_ucap_read(uint64_t addr, void *out, size_t n) {   // CPU reads of unifo
         if (i < g_nu && addr >= g_u[i].lo && addr + n <= g_u[i].hi && !dropped(&g_u[i])) { memcpy(out, g_ubytes + g_uoff[i] + (addr - g_u[i].lo), n); return; }
     }
     memcpy(out, (const void *)(uintptr_t)addr, n);
+    inline_overlay(addr, out, n);
 }
 void vkb_ucap_drop(uint64_t addr, uint64_t len) {   // a GPU write to [addr, addr+len): copies it overlaps are dropped
     if (vkb_mt_recording()) return;   // the walk of the submission dropped it already (vkb_mt.c)

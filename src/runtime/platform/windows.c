@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <timeapi.h>
 #include <io.h>
+#include <malloc.h>
 
 #include "../platform.h"
 
@@ -61,7 +62,9 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
     DWORD gran = 4096;
     if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran) != 0) return -1;
     *page = gran;
-    if (n >= (ULONG_PTR)max) ResetWriteWatch((void *)(uintptr_t)addr, (SIZE_T)size);  // (more than fit: caller takes all)
+    // Only the pages returned are reset. With max of them there may be more: the caller asks again from after the last
+    // one. (Resetting the whole range here lost every written page past the first max: a mesh streamed in several MB at
+    // once kept its old contents in the GPU's copy - the "giant planes", L13 in dev-local/docs/issues.md.)
     return (int)n;
 }
 
@@ -76,6 +79,88 @@ void plat_commit(uint64_t addr, uint64_t size) {
     if (!VirtualAlloc((void *)(uintptr_t)a, e - a, MEM_COMMIT, PAGE_READWRITE))
         fprintf(stderr, "[plat] commit %llx+%llx failed (%lu)\n", (unsigned long long)addr,
                 (unsigned long long)size, GetLastError());
+}
+
+// PROCESS_MEMORY_COUNTERS_EX and its kernel32 entry (psapi.h is not in the trimmed toolchain)
+typedef struct {
+    DWORD cb, PageFaultCount;
+    SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage,
+           QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage;
+} mem_counters;
+__declspec(dllimport) BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, mem_counters *counters, DWORD cb);
+
+void plat_memory_map(void) {
+    mem_counters pc = {.cb = sizeof pc};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc);
+    // the heaps' committed regions (HeapWalk region entries), to tell them apart from other private memory
+    enum { MAXR = 4096, TOP = 12 };
+    static struct { uint64_t lo, hi; } hr[MAXR];
+    int nhr = 0;
+    uint64_t heap_commit = 0, heap_used = 0;
+    // The process heap and the C runtime's (malloc): they live as long as the process. Other heaps (the driver's) may be
+    // destroyed between GetProcessHeaps and HeapLock - walking them crashed (2026-10-28); their memory counts as other.
+    HANDLE heaps[2] = {GetProcessHeap(), (HANDLE)_get_heap_handle()};
+    DWORD nh = heaps[1] && heaps[1] != heaps[0] ? 2 : 1;
+    for (DWORD h = 0; h < nh; h++) {
+        if (!HeapLock(heaps[h])) continue;
+        PROCESS_HEAP_ENTRY e = {0};
+        while (HeapWalk(heaps[h], &e)) {
+            if (e.wFlags & PROCESS_HEAP_REGION) {
+                heap_commit += e.Region.dwCommittedSize;
+                if (nhr < MAXR) { hr[nhr].lo = (uint64_t)(uintptr_t)e.lpData; hr[nhr].hi = (uint64_t)(uintptr_t)e.Region.lpLastBlock; nhr++; }
+            } else if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY) heap_used += e.cbData;
+        }
+        HeapUnlock(heaps[h]);
+    }
+    uint64_t guest = 0, priv = 0, mapped = 0, image = 0, in_heap = 0;
+    struct { uint64_t base, size; } top[TOP] = {{0}};
+    static const uint64_t edge[] = {64 << 10, 1 << 20, 4 << 20, 16 << 20, 63 << 20, 65 << 20, UINT64_MAX};   // size classes
+    enum { NB = sizeof edge / sizeof edge[0] };
+    uint64_t bn[NB] = {0}, bb[NB] = {0};
+    for (uint64_t a = 0x10000; a < 0x7FFFFFFF0000ull;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) break;
+        uint64_t base = (uint64_t)(uintptr_t)mi.BaseAddress, size = mi.RegionSize;
+        if (mi.State == MEM_COMMIT) {
+            if (base >= g_lo && base < g_hi) guest += size;
+            else if (mi.Type == MEM_IMAGE) image += size;
+            else if (mi.Type == MEM_MAPPED) mapped += size;
+            else {
+                int heap = 0;
+                for (int i = 0; i < nhr && !heap; i++) heap = base >= hr[i].lo && base < hr[i].hi + 1;
+                if (heap) in_heap += size;
+                else {
+                    priv += size;
+                    int c = 0;
+                    while (size >= edge[c]) c++;
+                    bn[c]++; bb[c] += size;
+                    int k = TOP - 1;
+                    if (size > top[k].size) {
+                        while (k > 0 && size > top[k - 1].size) { top[k] = top[k - 1]; k--; }
+                        top[k].base = base; top[k].size = size;
+                    }
+                }
+            }
+        }
+        a = base + size;
+    }
+    const double M = 1048576.0;
+    static DWORD faults_before;   // page faults since the last map (with a simulated small PC: pages trimmed and back)
+    fprintf(stderr, "[mem] commit charge %.0f MiB (peak %.0f), in RAM %.0f MiB (peak %.0f), page faults %lu since the last; "
+            "committed: guest window %.0f, heaps %.0f (in use %.0f, %d regions; %.0f found by the walk), other private %.0f, "
+            "mapped %.0f, images %.0f MiB\n",
+            pc.PrivateUsage / M, pc.PeakPagefileUsage / M, pc.WorkingSetSize / M, pc.PeakWorkingSetSize / M,
+            pc.PageFaultCount - faults_before, guest / M, heap_commit / M, heap_used / M, nhr, in_heap / M, priv / M,
+            mapped / M, image / M);
+    faults_before = pc.PageFaultCount;
+    static const char *const cls[NB] = {"<64K", "64K-1M", "1-4M", "4-16M", "16-63M", "~64M", ">65M"};
+    char line[512];
+    int at = 0;
+    for (int c = 0; c < NB; c++)
+        if (bn[c]) at += snprintf(line + at, sizeof line - (size_t)at, " %s: %llu = %.0f MiB;", cls[c], (unsigned long long)bn[c], bb[c] / M);
+    fprintf(stderr, "[mem]   other private by region size:%s\n", at ? line : " -");
+    for (int k = 0; k < TOP && top[k].size; k++)
+        fprintf(stderr, "[mem]   private %016llx +%.1f MiB\n", (unsigned long long)top[k].base, top[k].size / M);
 }
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
@@ -121,44 +206,133 @@ void plat_sleep_until_ns(uint64_t t) {
 // game's audio threads stay above it.
 void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 
+void plat_thread_start(void) {}   // the vectored exception handler needs no stack of its own
+
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 }
 
 // ---- process
-// Release builds are GUI-subsystem executables (no console window): stdout / stderr go to lasrecomp.log next to the
-// exe, and a fatal error shows a message box (plat_fatal_notice) instead of vanishing. Processes started by this one
-// (the start screen re-executing itself for the game) append to the same log.
+// stdout / stderr go to ultratears.log next to the exe unless they are already captured (a file or a pipe: "> x.log
+// 2>&1"), and a fatal error shows a message box (plat_fatal_notice) instead of vanishing. UltraTears.exe is a console
+// program: started from a .bat or a double click its log went to the console window, which closes with the game - a
+// player whose game crashed had no log to send (2026-10-29). Processes started by this one (the start screen
+// re-executing itself for the game) append to the same log.
 static char g_log_path[MAX_PATH];
 
-static void log_to_file_without_console(void) {
-    if (GetStdHandle(STD_ERROR_HANDLE) && GetStdHandle(STD_ERROR_HANDLE) != INVALID_HANDLE_VALUE) return;  // console / pipe
+// TOTK_LOG_FILE=0: the log stays on the console (development); =1 or a path: always to that file. Under Wine (Proton)
+// always to the file: its console closes with the game, and PROTON_LOG has only Wine's own lines.
+// A constructor before all others: the first lines (the version, written first by main; the NVN registry's, from a
+// constructor) went to the console while the file got the rest.
+__attribute__((constructor(102))) static void log_to_file_without_console(void) {   // (101: boot.c reserves the guest window first)
+    static bool done;
+    if (done) return;
+    done = true;
+    const char *force = getenv("TOTK_LOG_FILE");
+    if (force && !*force) force = NULL;
+    if (force && !strcmp(force, "0")) return;
+    if (!force && GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) force = "1";
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD type = err && err != INVALID_HANDLE_VALUE ? GetFileType(err) : FILE_TYPE_UNKNOWN;
+    if (!force && (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE)) return;   // captured by whoever started the game
+    bool console = type == FILE_TYPE_CHAR;
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
     if (!n || n >= sizeof exe) return;
     char *slash = strrchr(exe, '\\');
     if (slash) slash[1] = 0;
-    snprintf(g_log_path, sizeof g_log_path, "%slasrecomp.log", exe);
-    bool append = getenv("LASRECOMP_LOG_APPEND") != NULL;
+    if (force && strcmp(force, "1") != 0) snprintf(g_log_path, sizeof g_log_path, "%s", force);
+    else snprintf(g_log_path, sizeof g_log_path, "%sultratears.log", exe);
+    bool append = getenv("TOTK_LOG_APPEND") != NULL;
+    if (!append && (!force || !strcmp(force, "1"))) {   // the last run's log stays as ultratears-previous.log: a player restarting after a crash keeps it
+        char prev[MAX_PATH];
+        snprintf(prev, sizeof prev, "%sultratears-previous.log", exe);
+        MoveFileExA(g_log_path, prev, MOVEFILE_REPLACE_EXISTING);
+    }
+    if (console) fprintf(stderr, "UltraTears: the log is written to %s\n", g_log_path);
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
-    _putenv("LASRECOMP_LOG_APPEND=1");
+    _putenv("TOTK_LOG_APPEND=1");
+    { void runtime_env_changed(void); runtime_env_changed(); }
 }
 
-// The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
-// with an illegal instruction on an older CPU.
+// The console window only in Debug mode (the launcher's, debug=1 / --debug: TOTK_STATS; the user's choice 2026-10-31).
+// Without it a console the game was given (a double click: UltraTears.exe is a console program) is let go; with it one
+// is opened if there is none, and the log file is followed onto it a few times a second. The file stays the log: a
+// crash loses nothing that the console had not shown yet.
+static DWORD WINAPI follow_log(void *arg) {
+    (void)arg;
+    HANDLE con = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE log = CreateFileA(g_log_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                             OPEN_EXISTING, 0, NULL);
+    if (con == INVALID_HANDLE_VALUE || log == INVALID_HANDLE_VALUE) return 0;
+    char buf[16384];
+    for (;;) {
+        DWORD n = 0, w;
+        if (ReadFile(log, buf, sizeof buf, &n, NULL) && n) {
+            WriteFile(con, buf, n, &w, NULL);
+            continue;
+        }
+        Sleep(200);
+    }
+}
+
+void plat_debug_console(int debug) {
+    DWORD pids[2];
+    bool own = GetConsoleWindow() && GetConsoleProcessList(pids, 2) == 1;   // ours alone (a double click), not a terminal's
+    if (!debug) {
+        if (own) FreeConsole();
+        return;
+    }
+    if (!g_log_path[0]) return;   // the log is not in our file (captured, or kept on the console by TOTK_LOG_FILE=0)
+    if (!GetConsoleWindow()) {
+        if (!AllocConsole()) return;
+        SetConsoleTitleA("UltraTears - log (Debug mode)");
+        SetConsoleOutputCP(CP_UTF8);
+    }
+    CloseHandle(CreateThread(NULL, 0, follow_log, NULL, 0, NULL));
+}
+
+// The code is built for the CPU of the PC that built it (tools/build_game.py --arch: x86-64-v3 with AVX2, FMA and BMI2,
+// or x86-64-v2 with SSE4.2 where those are missing, issue #19): say so instead of crashing with an illegal instruction
+// when the folder moved to an older CPU.
 static void require_cpu(void) {
     __builtin_cpu_init();
+#ifdef __AVX2__
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    MessageBoxA(NULL, "LAS Recomp needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer).",
+    MessageBoxA(NULL, "This copy of UltraTears was built for a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / "
+                "Zen or newer). Prepare the game again on this PC (UltraTears Launcher): it builds the game for this CPU.", "UltraTears", MB_ICONERROR | MB_OK);
+#else
+    if (__builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("ssse3")) return;
+    MessageBoxA(NULL, "UltraTears needs a CPU with SSE4.2 (Intel Nehalem / 2008 or newer, AMD Bulldozer or newer).",
                 "UltraTears", MB_ICONERROR | MB_OK);
+#endif
     ExitProcess(1);
 }
 
 // Fatal error (rt_fatal_trace): the last FATAL / exception line of the log in a message box, when there is no console.
+// Most fatal errors after a failed allocation name only what was being allocated: say why when memory ran out (the
+// system's commit limit nearly reached, or this process's own limit with TOTK_SIM_*).
+static bool out_of_memory(void) {
+    MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+    mem_counters pc = {.cb = sizeof pc};
+    K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc);
+    bool low = GlobalMemoryStatusEx(&ms) && ms.ullAvailPageFile < (512ull << 20);
+    if (!low && QueryInformationJobObject(NULL, JobObjectExtendedLimitInformation, &li, sizeof li, NULL) &&
+        (li.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY))
+        low = li.PeakProcessMemoryUsed + (256ull << 20) > li.ProcessMemoryLimit;
+    if (low)
+        fprintf(stderr, "[plat] out of memory: %llu MiB of commit left in the system; process %llu MiB (its limit %llu, used at most %llu)\n",
+                (unsigned long long)(ms.ullAvailPageFile >> 20), (unsigned long long)(pc.PrivateUsage >> 20),
+                (unsigned long long)(li.ProcessMemoryLimit >> 20), (unsigned long long)(li.PeakProcessMemoryUsed >> 20));
+    return low;
+}
+
 void plat_fatal_notice(void) {
+    bool low = out_of_memory();
     if (!g_log_path[0]) return;
     fflush(stderr);
     char text[1024] = "UltraTears stopped because of an error.";
@@ -186,13 +360,46 @@ void plat_fatal_notice(void) {
         }
     }
     size_t l = strlen(text);
+    if (low)
+        l += (size_t)snprintf(text + l, sizeof text - l, "\n\nThe PC ran out of memory (RAM and page file). Close other programs, "
+                              "or let Windows manage the page file size (System > About > Advanced system settings > "
+                              "Performance > Advanced > Virtual memory).");
     snprintf(text + l, sizeof text - l, "\n\nDetails: %s", g_log_path);
     MessageBoxA(NULL, text, "UltraTears", MB_ICONERROR | MB_OK);
 }
 
+// Development: run as on a PC with less memory (L7, #31). TOTK_SIM_RAM_GB=8 or 16: the RAM a game gets there next to
+// Windows and the usual programs (the total less 3 GB) as a hard working-set limit (pages over it are trimmed and
+// fault back: from RAM here, so this shows the trimming, not a slow disk), and a commit limit of 1.5 times that
+// (allocations over it fail as on a PC whose page file is full). TOTK_SIM_RAM_MB / TOTK_SIM_COMMIT_MB set them
+// exactly. Video memory the driver keeps on the GPU is in the commit but not in the working set.
+static void simulate_small_pc(void) {
+    const char *gb = getenv("TOTK_SIM_RAM_GB"), *ram = getenv("TOTK_SIM_RAM_MB"), *com = getenv("TOTK_SIM_COMMIT_MB");
+    uint64_t ws = 0, commit = 0;
+    if (gb && atoi(gb) > 3) ws = (uint64_t)(atoi(gb) - 3) << 30, commit = ws * 3 / 2;
+    if (ram && atoi(ram) > 0) ws = (uint64_t)atoi(ram) << 20;
+    if (com && atoi(com) > 0) commit = (uint64_t)atoi(com) << 20;
+    if (ws) {
+        BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), 64 << 20, (SIZE_T)ws,
+                                             QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE);
+        fprintf(stderr, "[plat] simulated PC: working set at most %llu MiB%s (%lu)\n", (unsigned long long)(ws >> 20),
+                ok ? "" : " - not set", ok ? 0ul : GetLastError());
+    }
+    if (commit) {
+        HANDLE job = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        li.ProcessMemoryLimit = (SIZE_T)commit;
+        BOOL ok = job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) &&
+                  AssignProcessToJobObject(job, GetCurrentProcess());
+        fprintf(stderr, "[plat] simulated PC: commit at most %llu MiB%s (%lu)\n", (unsigned long long)(commit >> 20),
+                ok ? "" : " - not set", ok ? 0ul : GetLastError());
+    }
+}
+
 void plat_init(void) {
-    log_to_file_without_console();
     require_cpu();
+    simulate_small_pc();
     _fmode = _O_BINARY;  // fopen/open default to binary (the runtime's "r"/"w" files are binary or LF text)
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
@@ -282,7 +489,7 @@ void plat_print_backtrace(void) {
         const char *s = plat_symbol(pc, &off);
         if (!s) s = rt_host_fn_name(pc, &off);
         if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
-        else fprintf(stderr, "  #%-2d %016llx lasrecomp+%llx\n", i, (unsigned long long)pc,
+        else fprintf(stderr, "  #%-2d %016llx UltraTears+%llx\n", i, (unsigned long long)pc,
                      (unsigned long long)(pc - exe));
     }
 }

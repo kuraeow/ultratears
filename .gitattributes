@@ -1,0 +1,2 @@
+# GitHub's Download ZIP (git archive) fills in the commit: tools/version.py reads it where there is no .git
+tools/archive-version.txt export-subst

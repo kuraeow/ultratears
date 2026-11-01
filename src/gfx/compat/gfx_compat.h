@@ -1,4 +1,5 @@
-// Windows stand-ins for the macOS APIs MacNativeGames' graphics front end (d2r_gfx/gfx/nvn) uses.
+// Windows (and, where Linux lacks them, Linux) stand-ins for the macOS APIs MacNativeGames' graphics front end
+// (d2r_gfx/gfx/nvn) uses. The POSIX ones (mmap, sigsetjmp, getrusage) are stand-ins on Windows only.
 // - Mach time: mach_absolute_time() is the runtime's monotonic nanoseconds (timebase 1/1), mach_wait_until() sleeps
 //   precisely until such a time.
 // - Mach thread/task statistics and real-time thread policies: unavailable (KERN_FAILURE); MacNativeGames only logs
@@ -7,6 +8,9 @@
 // - sigsetjmp guards: plain setjmp (guest pages are committed on first touch, so guarded guest reads do not fault).
 // - malloc_size: _msize.
 #pragma once
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -14,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef __linux__
+int pthread_setname_np(pthread_t thread, const char *name);
+#endif
 #include <sched.h>
 #include <time.h>
 #include <malloc.h>
@@ -61,7 +68,18 @@ static inline mach_port_t pthread_mach_thread_np(pthread_t t) { (void)t; return 
 static inline kern_return_t mach_port_deallocate(mach_port_t t, mach_port_t p) { (void)t; (void)p; return KERN_SUCCESS; }
 static inline kern_return_t thread_info(mach_port_t t, int f, thread_info_t i, mach_msg_type_number_t *n) { (void)t; (void)f; (void)i; (void)n; return KERN_FAILURE; }
 static inline kern_return_t task_info(mach_port_t t, int f, task_info_t i, mach_msg_type_number_t *n) { (void)t; (void)f; (void)i; (void)n; return KERN_FAILURE; }
-static inline kern_return_t thread_policy_set(mach_port_t t, int f, thread_policy_t p, mach_msg_type_number_t n) { (void)t; (void)f; (void)p; (void)n; return KERN_FAILURE; }
+extern void plat_thread_realtime(uint64_t period_ns);
+static inline kern_return_t thread_policy_set(mach_port_t t, int f, thread_policy_t p, mach_msg_type_number_t n) {
+    (void)t; (void)f; (void)n;
+    if (p) {
+        const thread_time_constraint_policy_data_t *tcp = (const thread_time_constraint_policy_data_t *)p;
+        uint64_t period_ns = tcp->period ? (uint64_t)tcp->period : 16666666ULL;
+        plat_thread_realtime(period_ns);
+    } else {
+        plat_thread_realtime(16666666ULL);
+    }
+    return KERN_SUCCESS;
+}
 static inline kern_return_t thread_policy_get(mach_port_t t, int f, thread_policy_t p, mach_msg_type_number_t *n, boolean_t *d) { (void)t; (void)f; (void)p; (void)n; (void)d; return KERN_FAILURE; }
 static inline kern_return_t vm_read_overwrite(mach_port_t t, vm_address_t a, vm_size_t n, vm_address_t d, vm_size_t *got) { (void)t; (void)a; (void)n; (void)d; *got = 0; return KERN_FAILURE; }
 
@@ -74,6 +92,14 @@ static inline int pthread_attr_set_qos_class_np(pthread_attr_t *a, qos_class_t q
 static inline int pthread_set_qos_class_self_np(qos_class_t q, int r) { (void)q; (void)r; return 0; }
 static inline int pthread_get_qos_class_np(pthread_t t, qos_class_t *q, int *r) { (void)t; *q = QOS_CLASS_UNSPECIFIED; *r = 0; return 0; }
 
+#ifdef __linux__
+// Linux has the POSIX calls themselves: the stand-ins below are Windows'. (They were applied on Linux too: every mmap
+// of the graphics code failed there, a physical pool's storage among them, and siglongjmp out of a fault handler left
+// SIGSEGV blocked, so the next fault would end the game; found on the first Linux run, 2026-11-01.)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#define malloc_size(p) malloc_usable_size(p)
+#else
 // ---- signals and guarded reads
 #ifndef SIGBUS
 #define SIGBUS 10
@@ -99,14 +125,20 @@ static inline void *mmap(void *a, size_t n, int p, int f, int fd, long o) { (voi
 static inline int munmap(void *a, size_t n) { (void)a; (void)n; return -1; }
 static inline int mprotect(void *a, size_t n, int p) { (void)a; (void)n; (void)p; return -1; }
 static inline int getpagesize(void) { return 4096; }
+#endif
 
 // ---- threads: macOS names only the calling thread
 static inline int gfx_setname(const char *n) { return pthread_setname_np(pthread_self(), n); }
 #define pthread_setname_np(n) gfx_setname(n)
 
 // ---- more Darwin calls: the thread id and per-clock nanoseconds
+#ifdef __linux__
+#include <sys/syscall.h>
+static inline int pthread_threadid_np(void *t, uint64_t *id) { (void)t; *id = (uint64_t)syscall(SYS_gettid); return 0; }
+#elif defined(_WIN32)
 unsigned long __stdcall GetCurrentThreadId(void);
 static inline int pthread_threadid_np(void *t, uint64_t *id) { (void)t; *id = GetCurrentThreadId(); return 0; }
+#endif
 static inline uint64_t clock_gettime_nsec_np(clockid_t clk) {
     struct timespec ts;
     if (clock_gettime(clk, &ts)) return 0;

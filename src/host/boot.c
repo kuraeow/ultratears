@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unistd.h>
 #include "host.h"
 #include "version.h"   // build/version.h (tools/build_game.py, tools/version.py)
 #ifdef _WIN32
@@ -42,23 +43,75 @@ static void *game_main(void *unused);
 // shaders, texture cache, saves and fonts, each as the TOTK_* variable it stands for unless that is already set (a
 // TOTK_* line sets one directly).
 static char g_exefs[4096];
+// The game executable's folder (Windows: GetModuleFileName; Linux: /proc/self/exe), with its separator.
+#ifdef _WIN32
+#define SEP '\\'
+static int exe_dir(char *path, size_t n) {
+    DWORD k = GetModuleFileNameA(NULL, path, (DWORD)n);
+    char *slash = k && k < n ? strrchr(path, SEP) : NULL;
+    if (!slash) return 0;
+    *slash = 0;
+    return 1;
+}
+static int enter_dir(const char *path) { return SetCurrentDirectoryA(path) != 0; }
+#define name_eq _stricmp
+#else
+#define SEP '/'
+static int exe_dir(char *path, size_t n) {
+    ssize_t k = readlink("/proc/self/exe", path, n - 1);
+    if (k <= 0) return 0;
+    path[k] = 0;
+    char *slash = strrchr(path, SEP);
+    if (!slash) return 0;
+    *slash = 0;
+    return 1;
+}
+static int enter_dir(const char *path) { return chdir(path) == 0; }
+#define name_eq strcmp
+#endif
+
+/* The Steam Deck's defaults, for what ultratears.cfg leaves unset (as totk-pc-recomp's device profile, runtime/cfg.c): its
+   screen's 1280x800 (16:10: the camera and the UI follow, host/render_res.c), fullscreen, 40 fps (a divisor of the LCD's
+   and OLED's 40 Hz modes, and of 120 Hz). The Deck: SteamDeck=1 (Steam sets it there) or Valve's board, product Jupiter
+   (LCD) or Galileo (OLED). Any key the player set wins. */
+static void deck_defaults(void) {
+#ifndef _WIN32
+    const char *env = getenv("SteamDeck");
+    int deck = env && !strcmp(env, "1");
+    if (!deck) {
+        char vendor[64] = "", product[64] = "";
+        FILE *v = fopen("/sys/class/dmi/id/board_vendor", "r"), *p = fopen("/sys/class/dmi/id/product_name", "r");
+        if (v && fgets(vendor, sizeof vendor, v) && p && fgets(product, sizeof product, p)) {
+            vendor[strcspn(vendor, "\r\n")] = 0, product[strcspn(product, "\r\n")] = 0;
+            deck = !strcmp(vendor, "Valve") && (!strcmp(product, "Jupiter") || !strcmp(product, "Galileo"));
+        }
+        if (v) fclose(v);
+        if (p) fclose(p);
+    }
+    if (!deck) return;
+    setenv("TOTK_OUTPUT_RES", "1280x800", 0);
+    setenv("TOTK_WINDOW", "fullscreen", 0);
+    setenv("TOTK_FPS_LIMIT", "40", 0);
+    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps (the Deck's defaults where ultratears.cfg sets none)\n",
+            getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"));
+#endif
+}
+
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
-#ifdef _WIN32
-    char path[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
-    char *slash = n && n < sizeof path ? strrchr(path, '\\') : NULL;
-    if (!slash) return exefs;
-    *slash = 0;
-    char cfg[MAX_PATH + 32];
-    snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
+    char path[4096];
+    if (!exe_dir(path, sizeof path)) return exefs;
+    char cfg[4096 + 32];
+    snprintf(cfg, sizeof cfg, "%s%cultratears.cfg", path, SEP);
     FILE *f = fopen(cfg, "r");
-    if (!f && (slash = strrchr(path, '\\')) && !_stricmp(slash, "\\build")) {   // build\\UltraTears.exe: the folder above
+    char *slash;
+    // build\UltraTears.exe (an old layout) or linux/ultratears (the Linux game beside the data on the PC): the folder above
+    if (!f && (slash = strrchr(path, SEP)) && (!name_eq(slash + 1, "build") || !name_eq(slash + 1, "linux"))) {
         *slash = 0;
-        snprintf(cfg, sizeof cfg, "%s\\ultratears.cfg", path);
+        snprintf(cfg, sizeof cfg, "%s%cultratears.cfg", path, SEP);
         f = fopen(cfg, "r");
     }
-    if (!SetCurrentDirectoryA(path)) fprintf(stderr, "[totk] cannot enter %s\n", path);
+    if (!enter_dir(path)) fprintf(stderr, "[totk] cannot enter %s\n", path);
     if (f) {
         char line[4600];
         while (fgets(line, sizeof line, f)) {
@@ -67,9 +120,18 @@ static const char *default_exefs(void) {
             if (!eq || line[0] == '#') continue;
             *eq = 0;
             static const char *const keys[][2] = {   // the file's names -> the runtime's variables
-                {"romfs", "TOTK_ROMFS"}, {"shaders", "TOTK_SHADER_DIR"}, {"textures", "TOTK_BC7_DIR"},
-                {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}};
+                {"romfs", "TOTK_ROMFS"}, {"shaders", "TOTK_SHADER_DIR"}, {"compiled", "TOTK_SHADER_BIN"}, {"shaderpack", "TOTK_SHADER_PACK"}, {"textures", "TOTK_BC7_DIR"},
+                {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
+                // the player's settings (the launcher's Play screen writes them)
+                {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
+                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
+                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"},
+                {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
+                {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
+            else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
+                if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
+            }
             else if (!strncmp(line, "TOTK_", 5)) setenv(line, eq + 1, 0);
             else
                 for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++)
@@ -79,15 +141,62 @@ static const char *default_exefs(void) {
         fprintf(stderr, "[totk] game folder %s (%s)\n", path, cfg);
     } else
         fprintf(stderr, "[totk] game folder %s (no ultratears.cfg: setup.py's layout)\n", path);
-#endif
+    deck_defaults();
     return exefs;
+}
+
+/* A setting the player changes in the game (F10, the frame counter) kept in ultratears.cfg of the game folder (the
+   working directory), so the next start and the launcher's Play screen show it: the key's line goes, and with a value
+   "key=value" is added at the end. The other lines stay as they are. */
+void totk_cfg_set(const char *key, const char *value) {
+    FILE *f = fopen("ultratears.cfg", "rb");
+    if (!f) return;
+    char *in = NULL;
+    size_t n = 0, cap = 0, klen = strlen(key);
+    for (int c; (c = fgetc(f)) != EOF;) {
+        if (n + 2 > cap) { cap = cap ? cap * 2 : 4096; char *t = realloc(in, cap); if (!t) { free(in); fclose(f); return; } in = t; }
+        in[n++] = (char)c;
+    }
+    fclose(f);
+    FILE *w = fopen("ultratears.cfg.new", "wb");
+    if (!w) { free(in); return; }
+    int ok = 1;
+    for (size_t i = 0; i < n;) {
+        size_t e = i;
+        while (e < n && in[e] != '\n') e++;
+        int mine = e - i > klen && !strncmp(in + i, key, klen) && in[i + klen] == '=';
+        if (!mine) {
+            ok &= fwrite(in + i, 1, e - i, w) == e - i;
+            ok &= fputc('\n', w) != EOF;
+        }
+        i = e + 1;
+    }
+    if (*value) ok &= fprintf(w, "%s=%s\n", key, value) > 0;
+    ok &= fclose(w) == 0;
+    free(in);
+#ifdef _WIN32
+    if (ok && MoveFileExA("ultratears.cfg.new", "ultratears.cfg", MOVEFILE_REPLACE_EXISTING)) return;
+#else
+    if (ok && rename("ultratears.cfg.new", "ultratears.cfg") == 0) return;
+#endif
+    remove("ultratears.cfg.new");
 }
 
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
-    if (argc > 2) { fprintf(stderr, "usage: UltraTears [exefs dir]\n"); return 2; }
-    const char *exefs = argc == 2 ? argv[1] : default_exefs();
+    // --debug: the statistics lines in the log (TOTK_STATS=1; the launcher's Debug mode writes debug=1 instead)
+    // --prepare-shaders: every shader compiled by this GPU's driver ahead of play, then exit (gfx/vkb_shader.c)
+    const char *arg = NULL;
+    int prepare = 0;
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--debug")) setenv("TOTK_STATS", "1", 1);
+        else if (!strcmp(argv[i], "--prepare-shaders")) prepare = 1;
+        else if (!arg) arg = argv[i];
+        else { fprintf(stderr, "usage: UltraTears [--debug] [--prepare-shaders] [exefs dir]\n"); return 2; }
+    const char *exefs = arg ? arg : default_exefs();
+    if (prepare) { int vkb_prepare_shaders(void); return vkb_prepare_shaders(); }
+    plat_debug_console(getenv("TOTK_STATS") != NULL);   // after ultratears.cfg (debug=1)
     plat_init();
     plat_crash_handler_install();
     if (!g_window) {

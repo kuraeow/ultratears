@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <zstd.h>
 
 #include "../../src/gfx/tex/astc.h"
@@ -40,7 +41,10 @@ enum { BC1_AREA = 100, BC1_LEVEL = 10 };   // larger ASTC blocks: BC1 when opaqu
 static _Atomic uint64_t g_bc1;
 static const char *g_romfs;
 static int g_folder;   // g_romfs is a folder of plain files, not romfs.bin
-static _Atomic int g_next;
+static _Atomic int g_next, g_done;
+static _Atomic unsigned long long g_done_bytes;
+static _Atomic long long g_said_at;   // the second of the last progress line
+static unsigned long long g_total_bytes;
 static _Atomic uint64_t g_surfaces, g_astc_files, g_encoded, g_had, g_bad, g_texels;
 
 // ---- the cache files (the same records as vkb_bc7.c)
@@ -280,11 +284,14 @@ static void *worker(void *unused) {
     size_t cap = 0;
     for (int i; (i = atomic_fetch_add(&g_next, 1)) < g_nfiles;) {
         do_file(rf, &g_files[i], &buf, &cap);
-        if (i % 500 == 0) {
-            printf("%d / %d files, %llu ASTC surfaces, %llu encoded, %.0f Mtexels\n", i, g_nfiles, (unsigned long long)g_surfaces,
-                   (unsigned long long)g_encoded, g_texels / 1e6);
-            fflush(stdout);
-        }
+        // progress once a second, counted in finished files and their bytes (tools/bc7_build.py draws it): the
+        // largest files go first, so "every 500 files" said nothing for minutes at the start
+        int done = atomic_fetch_add(&g_done, 1) + 1;
+        unsigned long long bytes = atomic_fetch_add(&g_done_bytes, g_files[i].size) + g_files[i].size;
+        long long now = (long long)time(NULL), last = atomic_load(&g_said_at);
+        if ((now != last && atomic_compare_exchange_strong(&g_said_at, &last, now)) || done == g_nfiles)
+            printf("%d / %d files, %llu / %llu bytes, %llu surfaces encoded\n", done, g_nfiles, bytes, g_total_bytes,
+                   (unsigned long long)g_encoded);
     }
     free(buf);
     if (rf) fclose(rf);
@@ -294,6 +301,7 @@ static void *worker(void *unused) {
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: bc7build <romfs.bin> <list> <cache dir> [threads] [quality]\n"); return 2; }
     g_romfs = argv[1];
+    setvbuf(stdout, NULL, _IONBF, 0);   // read through a pipe (tools/bc7_build.py): every line as it is printed
     int threads = argc > 4 ? atoi(argv[4]) : 8;
     if (argc > 5) g_quality = atoi(argv[5]);
     if (argc > 6) g_max_area = atoi(argv[6]);
@@ -306,6 +314,7 @@ int main(int argc, char **argv) {
     while (fscanf(lf, "%llu %llu %191[^\n]", (unsigned long long *)&f.off, (unsigned long long *)&f.size, f.path) == 3) {
         if (g_nfiles == cap) { cap = cap ? cap * 2 : 4096; g_files = realloc(g_files, sizeof *g_files * (size_t)cap); }
         g_files[g_nfiles++] = f;
+        g_total_bytes += f.size;
     }
     fclose(lf);
     open_cache(argv[3]);

@@ -1,3 +1,4 @@
+#ifdef _WIN32
 // Sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>]). A host thread wakes about
 // 1000 times a second, suspends every other thread of the process in turn, reads its instruction pointer and resumes
 // it. At the end the samples are mapped to functions through the PDB (dbghelp) and a report is written:
@@ -312,3 +313,8 @@ void runtime_profiler_start(void) {
     if (h) SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
     fprintf(stderr, "[prof] armed: %.0f s from now, for %.0f s, report %s\n", start_s, duration_s, out_path);
 }
+#else
+#include "host.h"
+
+void runtime_profiler_start(void) {}
+#endif

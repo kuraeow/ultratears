@@ -237,6 +237,7 @@ uint32_t (*dm_thread_tick_fn)(void);   // the current game tick, when diagnostic
 static void *thread_main(void *p) {
     thr_t *t = p;
     t_self = t;
+    plat_thread_start();
     Cpu *c = guest_cpu_new(t->stack_top, guest_tls_alloc());
     guest_cpu_set(c);
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);

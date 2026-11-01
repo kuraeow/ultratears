@@ -68,6 +68,10 @@ void vkb_copy_buf_tex(const p_copy_b2t *c, int to_tex) {
     int bw, bh, bpb;
     uint64_t len;
     vkb_image *im = copy_range(c, what, &len, &bw, &bh, &bpb, 0);
+    if (c->tex && vkb_rt_log_match(c->tex))
+        VLOG("[rtlog] %s texture %llu (%s) buffer %#llx+%llu region %dx%d at %d,%d, present %llu", what, (unsigned long long)c->tex->serial,
+             im ? "copied" : "not copied", (unsigned long long)c->src, (unsigned long long)(im ? len : 0), c->r.width, c->r.height, c->r.xoffset,
+             c->r.yoffset, (unsigned long long)vkb_frame());
     if (!im) return;
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     int is3d = im->depth > 1, nz = c->r.depth > 0 ? c->r.depth : 1;
@@ -115,6 +119,11 @@ static VkFormatFeatureFlags features(VkFormat f) {
 // Switch); scaling, mirroring or a different texel size as a blit (filtered with LINEAR_FILTER).
 void vkb_copy_tex_tex(const p_copy_t2t *c) {
     vkb_image *s = c->src ? vkb_image_of(c->src) : NULL, *d = c->dst ? vkb_image_of(c->dst) : NULL;
+    if ((c->src && vkb_rt_log_match(c->src)) || (c->dst && vkb_rt_log_match(c->dst)))
+        VLOG("[rtlog] texture -> texture copy %llu (format %#x %ux%u) -> %llu (format %#x %ux%u), present %llu",
+             c->src ? (unsigned long long)c->src->serial : 0ull, c->src ? c->src->d.format : 0, c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0,
+             c->dst ? (unsigned long long)c->dst->serial : 0ull, c->dst ? c->dst->d.format : 0, c->dst ? c->dst->d.width : 0, c->dst ? c->dst->d.height : 0,
+             (unsigned long long)vkb_frame());
     if (!s || !d) { unsupported("texture -> texture copy", s ? s : d); return; }
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;

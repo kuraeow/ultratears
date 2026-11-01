@@ -26,7 +26,7 @@ def main():
     romfs, out, exefs = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
     modules = {name: bytes(Nso(exefs / name).image) for name in ('main', 'subsdk0', 'sdk')}
     raw = out / 'raw'
-    code_dir = out / 'ryujinx-code'
+    code_dir = out / 'code'
     raw.mkdir(parents=True, exist_ok=True)
     code_dir.mkdir(parents=True, exist_ok=True)
     shaders, startup = inventory(RomFS(romfs), modules)
@@ -40,7 +40,7 @@ def main():
             path.write_bytes(code[0 if stage == 'cs' else 0x30:length])
             job = dict(key=key, stage=stage, code=str(path.resolve()), c1=code[c1:length].hex(), depth_minus_w=True,
                        tex={}, img={}, attr={}, fout={})
-            jobs.write(json.dumps(dict(job=job, out=str((out / 'ryujinx').resolve()))) + '\n')
+            jobs.write(json.dumps(dict(job=job, out=str((out / 'translated').resolve()))) + '\n')
             table.write(f'{key}\t{stage}\t{int(key in startup)}\t{length}\t{source}\n')
     print(f'{len(shaders)} shaders exported to {out}')
 

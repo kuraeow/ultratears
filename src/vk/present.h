@@ -20,4 +20,5 @@ int vkp_active(void);               // a window with a swapchain is there (else 
 // copy of the game's frame into it (layout UNDEFINED -> TRANSFER_DST -> TRANSFER_SRC), then hand it over with the
 // timeline value after which the copy is done. -1 = none free (the frame is dropped).
 int vkp_out_acquire(uint32_t width, uint32_t height, VkImage *image);
-void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4]);
+// not_before: the time (runtime_now_ns) the frame is shown at the earliest, 0 at once (the steady rate's slot)
+void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int crop[4], uint64_t not_before);

@@ -2,9 +2,9 @@
 and the few the game modules embed, as (stage, control, code, source) by the runtime's key (SHA-256 of control + code).
 
 From MacNativeGames games/totk/scripts/prepare_shader_seed.py @b75be8c (MIT, (c) 2026 MacNativeGames contributors;
-license: third_party/licenses/MacNativeGames.txt): digest, checked, sarc, bnsh_shaders, sharcb_shaders and
-startup_package unchanged; inventory() reads the RomFS through tools/romfs.py (a folder of plain files or the
-development romfs.bin) and takes the modules as images (bytes), not as files.
+license: third_party/licenses/MacNativeGames.txt): digest, checked, sarc, bnsh_shaders and startup_package unchanged,
+sharcb_shaders also skips records that point at themselves; inventory() reads the RomFS through tools/romfs.py (a folder
+of plain files or the development romfs.bin) and takes the modules as images (bytes), not as files.
 """
 import hashlib
 import struct
@@ -96,7 +96,10 @@ def sharcb_shaders(data):
                 continue
             code_off = struct.unpack_from('<Q', data, record)[0]
             control_at = record + struct.unpack_from('<i', data, record+12)[0]
-            if not start <= control_at <= pool - 0x880 or code_off >= pool_size:
+            # A control's own bytes hold the size words too; read as a record, its control offset is 0 (the "control" would
+            # start with the record itself). In 1.4.3 they gave 102 "shaders" that no draw uses: 82 cut short (the
+            # translator failed on them, issue #37), 20 with a control made of other bytes.
+            if control_at == record or not start <= control_at <= pool - 0x880 or code_off >= pool_size:
                 continue
             control = data[control_at:control_at+0x880]
             c1, length = struct.unpack_from('<II', control, 0x700)

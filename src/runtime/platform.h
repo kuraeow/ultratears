@@ -27,6 +27,9 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // MEM_WRITE_WATCH), their addresses into pages[] (at most max), and the tracking reset for the range. Returns the
 // count (max: maybe more), or -1 where there is no tracking (macOS, Linux). Page size: *page.
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page);
+// Development (TOTK_MEMMAP=1): the process's committed memory by kind (guest window, heaps, other private, mapped,
+// images) and its largest private regions, to stderr. Slow (walks the address space and the heaps).
+void plat_memory_map(void);
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)
@@ -35,10 +38,12 @@ int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 uint64_t plat_now_ns(void);                // monotonic
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);
+void plat_thread_start(void);   // first thing on a new thread (Linux: its own signal stack for the fault handler)
 void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers  // periodic timing thread (vsync): don't coalesce its timers
 
 // ---- process
 void plat_init(void);                                // first thing in main()
+void plat_debug_console(int debug);   // a console window with the log in Debug mode, none otherwise
 bool plat_exe_path(char *buf, size_t size);
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
 #if defined(_WIN32) || defined(__linux__)

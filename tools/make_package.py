@@ -1,11 +1,13 @@
-"""Make the builder package for a release: dist/UltraTears-builder-<version>-windows-x86_64.zip.
+"""Make the Windows builder package for a release: release/UltraTears-<version>-windows-x86_64.zip.
 
-usage: python tools/make_package.py [--home ../release-test] [--python <Python 3.14>] [--no-zip]
+usage: python tools/make_package.py [--home build] [--python <Python 3.14>] [--no-zip]   (--no-zip: the folder, no zip)
 The version is the tag v<x.y.z> on HEAD (tools/version.py): tag the release commit first.
 Run on the developer's machine after a complete build in the game folder --home (tools/setup.py --output: its build/build.ninja
 and objects tell which parts of clang64 the build reads) and tools/build_xlate.py (dev-local/build/shaders):
   - the source: the public tree of HEAD (tools/public_tree.py: what git tracks, without the internal notes), so nothing
-    made from the game can slip in;
+    made from the game can slip in; without what the player's build does not use (NOT_IN_PACKAGE: the sources of the
+    launcher and the translator, which come built, with their licenses in licenses/ and a link to the source in
+    THIRD-PARTY-NOTICES.md; developer tools; GitHub's files);
   - deps/clang64: the part of MSYS2 CLANG64 the build uses, found by measuring, not guessing: the headers ninja
     recorded for every compiled file (and those of tools/bc7build), the libraries and objects lld reads when it links
     UltraTears.exe and bc7build.exe (its --verbose "Reading" lines), the programs (clang, clang++, lld, llvm-windres, ninja) and every DLL
@@ -13,11 +15,18 @@ and objects tell which parts of clang64 the build reads) and tools/build_xlate.p
   - deps/python: Python 3.14 (the given install, default the one running this) without its tests, docs and Tk, with
     the packages the build imports (lz4, capstone, unicorn) from this project's .venv;
   - deps/shaders/ultrs-shaders.exe, the shader translator (tools/build_xlate.py);
-  - setup.bat, VERSION.txt and THIRD-PARTY-NOTICES.md.
+  - deps/linux: the Linux kit for builds for the Steam Deck (tools/make_linux_kit.py, --linux-kit), only the files such
+    a build reads (tools/linux_used.py, --used);
+  - deps/linux-package.json: the AppImage of the same release, which the Steam Deck's tar carries (downloaded when a
+    build for the Deck needs it): the release is this zip and that AppImage;
+  - UltraTears Launcher.exe (tools/build_launcher.py), the window that builds and starts the game; no .bat;
+  - VERSION.txt, THIRD-PARTY-NOTICES.md and package-files.txt (every file of the package: what
+    tools/apply_update.py replaces and removes when the launcher updates it).
 Refuses a dirty working tree: the package must be the commit it names.
 """
 import argparse
 import io
+import json
 import os
 import pathlib
 import re
@@ -30,46 +39,22 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import CLANG64, env as tool_env  # noqa: E402
+import deps_install  # noqa: E402
+import linux_used  # noqa: E402
 import public_tree  # noqa: E402
 import version  # noqa: E402
 
 PREFIX = CLANG64.parent if CLANG64 else None   # .../clang64
-PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.exe', 'llvm-rc.exe', 'ninja.exe']
+# llvm-objcopy: the game for the Steam Deck without its debug information (tools/make_deck_tar.py); llvm-ar: the Linux
+# kit made again from Valve's sysroot when deps/linux was deleted (tools/make_linux_kit.py)
+PROGRAMS = ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'lld.exe', 'llvm-windres.exe', 'llvm-rc.exe', 'llvm-objcopy.exe',
+            'llvm-ar.exe', 'ninja.exe']
 # MSYS2 package (share/licenses/<name>) of each part of clang64 the package carries
 LICENSES = ['clang', 'clang-libs', 'compiler-rt', 'crt', 'headers', 'libc++', 'libunwind', 'libwinpthread', 'winpthreads',
             'lld', 'llvm', 'llvm-libs', 'llvm-tools', 'ninja', 'SDL3', 'opus', 'libvpx', 'zstd', 'libiconv', 'zlib', 'xz',
             'libffi', 'libxml2', 'vulkan-headers']
 PY_PACKAGES = ['lz4', 'capstone', 'unicorn']
 PY_SKIP = {'test', 'idlelib', 'tkinter', 'turtledemo', 'ensurepip', 'lib2to3', '__pycache__'}
-
-SETUP_BAT = r'''@echo off
-rem UltraTears: build the game from your own dump. Put your extracted exefs and romfs folders into game\ here and
-rem run this file (or drag a dump folder kept elsewhere onto it). Run it again to resume, or after an update.
-cd /d "%~dp0"
-if "%~1"=="" (
-  "deps\python\python.exe" tools\setup.py
-) else (
-  "deps\python\python.exe" tools\setup.py --dump "%~1"
-)
-echo.
-pause
-'''
-
-
-GAME_TXT = '''Put your own extracted copy of The Legend of Zelda: Tears of the Kingdom, update 1.4.3 applied, here:
-
-  game\\exefs\\   main, subsdk0, sdk, main.npdm, ...
-  game\\romfs\\   Actor\\, Pack\\, Shader\\, ... (about 304,000 files, 16 GB)
-
-then run setup.bat. After the build the game reads data\\romfs, so game\\romfs may be deleted. README.md has the details.
-
-Положите сюда свою извлечённую копию The Legend of Zelda: Tears of the Kingdom с обновлением 1.4.3:
-
-  game\\exefs\\   main, subsdk0, sdk, main.npdm, ...
-  game\\romfs\\   Actor\\, Pack\\, Shader\\, ... (около 304 000 файлов, 16 ГБ)
-
-и запустите setup.bat. После сборки игра читает data\\romfs, папку game\\romfs можно удалить. Подробнее — README.ru.md.
-'''
 
 
 NOTICES = '''# Third-party notices (builder package)
@@ -81,11 +66,32 @@ This package also carries tools to build it; each keeps its license, copied into
 |---|---|---|---|
 | deps/clang64 | Parts of MSYS2 CLANG64: LLVM clang, lld, libc++, libunwind, compiler-rt (Apache-2.0 WITH LLVM-exception); mingw-w64 headers, CRT and winpthreads (ZPL / MIT / public domain); ninja (Apache-2.0); SDL3 (zlib); opus, libvpx, zstd (BSD); libiconv (LGPL-2.1+, linked statically: the objects to relink are made on your PC by the build itself); zlib, xz, libffi, libxml2 (their DLLs, loaded by clang); Vulkan headers (Apache-2.0 / MIT) | as listed | licenses/msys2/<package>/ |
 | deps/python | Python 3.14 (PSF License) with lz4 (BSD), capstone (BSD), unicorn (GPL-2.0) | as listed | licenses/Python.txt; each package's *.dist-info in deps/python/Lib/site-packages |
-| deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT), published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, third_party/shader_translator/LICENSE |
+| UltraTears Launcher.exe | The launcher (GPL-3.0-or-later) with SDL3 (zlib), Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libc++ (Apache-2.0 WITH LLVM-exception) | as listed | licenses/msys2/SDL3, licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-Inter.txt, licenses/OFL-MontserratAlternates.txt |
+| bin-linux/ultratears-launcher | The launcher for Linux / Steam Deck, put into the Deck's tar (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) beside it in the tar | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
+| deps/linux | The Linux kit for builds for the Steam Deck (tools/make_linux_kit.py): files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
+| deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
 
-Sources: MSYS2 packages https://packages.msys2.org (CLANG64), Python https://www.python.org, Ryujinx
-https://github.com/Ryubing, MacNativeGames (third_party/README.md).
+Source code. The launcher and the shader translator come built; their source, like all of this project's, is at
+https://github.com/kuraeow/ultratears/tree/{commit} (src/launcher, third_party/shader_translator,
+third_party/maxwell_shader; tools/build_launcher.py and tools/build_xlate.py build them). Others: MSYS2 packages
+https://packages.msys2.org (CLANG64), Python https://www.python.org, unicorn https://github.com/unicorn-engine/unicorn,
+capstone https://github.com/capstone-engine/capstone, Ryujinx https://github.com/Ryubing, MacNativeGames
+(third_party/README.md).
 '''
+
+# The source tree in the package is what the build on the player's PC uses: what only builds the parts that come built
+# (the launcher, the shader translator), the developers' tools and GitHub's files stay in the repository.
+NOT_IN_PACKAGE = ['src/launcher', 'assets/launcher',
+                  'assets/cover.png', 'third_party/maxwell_shader', 'third_party/shader_translator', 'tools/build_xlate.py',
+                  'tools/build_launcher.py', 'tools/make_package.py', 'tools/eden_xlate', 'tools/run_eden_xlate.py',
+                  'tools/compare_spirv_opt.py', 'tools/validate_spirv.py', 'tools/gen_nvn_thunks.py', 'tools/recon_code.py',
+                  'tools/recon_romfs.py', 'tools/dev_glsl_tree.py', 'tools/dev_lum.py', 'tools/dev_player_dump.py',
+                  'tools/dev_timeline.py', '.github', '.gitignore', '.gitattributes', 'CONTRIBUTING.md', 'BUILDING.md']
+# licenses of what is compiled into the launcher and the translator, kept when their sources are left out
+LICENSE_COPIES = {'deps/launcher/imgui/LICENSE.txt': 'imgui.txt', 'deps/launcher/nanosvg/LICENSE.txt': 'nanosvg.txt',
+                  'deps/launcher/stb/LICENSE': 'stb.txt', 'assets/launcher/fonts/OFL-Inter.txt': 'OFL-Inter.txt',
+                  'assets/launcher/fonts/OFL-MontserratAlternates.txt': 'OFL-MontserratAlternates.txt',
+                  'third_party/shader_translator/LICENSE': 'totk_xlate.txt'}
 
 
 def git(*args):
@@ -116,12 +122,30 @@ def clang64_files_used(home):
             p = p.replace('\\', '/')
             if p.lower().startswith(str(PREFIX).replace('\\', '/').lower()):
                 used.add(pathlib.Path(p))
-    # libraries: what lld reads in the two links (--verbose)
+    # the launcher's headers: tools/setup.py builds it in a game folder made from the source (build_launcher_into), and
+    # such a folder may be one unpacked from this package, with only these tools
+    import build_launcher
+    deps_install.launcher_libs(ROOT)
+    build_launcher.resources(tmp)   # its version.h
+    inc = [f'-I{ROOT / d}' for d in ('deps/launcher/imgui', 'deps/launcher/imgui/backends', 'deps/launcher/nanosvg',
+                                      'deps/launcher/stb')] + [f'-I{tmp}', '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS', '-DUNICODE',
+                                                               '-D_UNICODE', '-march=x86-64-v2']
+    for src in build_launcher.SOURCES:
+        cxx = src.endswith('.cpp')
+        cmd = [str(CLANG64 / ('clang++.exe' if cxx else 'clang.exe')), '-M', *inc, str(ROOT / src)] + (['-std=c++17'] if cxx else [])
+        r = subprocess.run(cmd, capture_output=True, text=True, env=tool_env())
+        if r.returncode:
+            sys.exit(f'the launcher header probe of {src} failed:\n{r.stderr[-2000:]}')
+        for p in re.split(r'\s+', r.stdout.replace('\\\n', ' ')):
+            p = p.replace('\\', '/')
+            if p.lower().startswith(str(PREFIX).replace('\\', '/').lower()):
+                used.add(pathlib.Path(p))
+    # libraries: what lld reads in the links of the game, the texture encoder and the launcher (--verbose)
     ninja = (home / 'build/build.ninja').read_text()
     rsp = re.search(r'^build UltraTears\.exe: link (.*)$', ninja, re.M).group(1).split()   # ninja deletes the .rsp
     link = re.search(r'command = clang (.*) -o \$out @\$out.rsp (.*)', ninja)
     flags = link.group(1).split() + link.group(2).split()
-    for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++'])):
+    for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++']), ([], build_launcher.LIBS.split())):
         probe = tmp / 'probe.c'
         probe.write_text('int main(void) { return 0; }\n')
         cmd = [str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-Wl,--verbose', '-o', str(tmp / 'probe.exe')]
@@ -173,7 +197,8 @@ def copy_python(src, dst):
         if base.lower() in {p.lower() for p in PY_PACKAGES} or (name.endswith('.dist-info') and
                                                                name.split('-')[0].lower() in ('lz4', 'capstone', 'unicorn')):
             s = venv_site / name
-            (shutil.copytree(s, site / name, ignore=shutil.ignore_patterns('__pycache__')) if s.is_dir()
+            # without the import libraries and C headers (unicorn.lib alone is 50 MB): Python loads the DLLs
+            (shutil.copytree(s, site / name, ignore=shutil.ignore_patterns('__pycache__', '*.lib', 'include')) if s.is_dir()
              else shutil.copy2(s, site / name))
 
 
@@ -181,19 +206,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--python', type=pathlib.Path, default=pathlib.Path(sys.base_prefix))
     ap.add_argument('--no-zip', action='store_true')
-    ap.add_argument('--home', type=pathlib.Path, default=ROOT.parent / 'release-test')
+    ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'build')   # tools/setup.py's default output
+    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/ultrs-linux-kit.zip',
+                    help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/linux-used.txt',
+                    help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
+    ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'release',
+                    help="the folder with this release's AppImage (tools/make_package_linux.py): named with its hash in "
+                         "deps/linux-package.json, for the Steam Deck's tar")
+    ap.add_argument('--test', action='store_true',
+                    help='a package of an untagged commit, named after git describe: for testing, never for Releases')
     a = ap.parse_args()
     if git('status', '--porcelain', '--untracked-files=no').strip():
         sys.exit('the working tree has uncommitted changes: commit first, the package must be the commit it names')
-    a.version = version.release()
+    a.version = version.current()[0] + '-test' if a.test else version.release()
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate):
+    # the release's AppImage is UltraTears.AppImage, the name it has in a game folder; a test one carries its version
+    linux_files = {'appimage': a.linux_package / (f'UltraTears-{a.version}-x86_64.AppImage' if a.test else 'UltraTears.AppImage')}
+    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit, a.used, *linux_files.values()):
         if not need.is_file():
-            sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py)')
-    name = f'UltraTears-builder-{a.version}-windows-x86_64'
-    out = ROOT / 'dev-local/dist' / name
+            sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
+    name = f'UltraTears-{a.version}-windows-x86_64'
+    out = ROOT / 'release' / name
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -203,6 +239,17 @@ def main():
     with tarfile.open(fileobj=io.BytesIO(tar)) as t:
         t.extractall(out, filter='data')
     commit = git('rev-parse', '--short', 'HEAD').strip()
+    lic = out / 'licenses'
+    lic.mkdir()
+    deps_install.launcher_libs(ROOT)   # their licenses come from deps/launcher
+    for src, dst in LICENSE_COPIES.items():
+        shutil.copy2(ROOT / src, lic / dst)
+    for p in NOT_IN_PACKAGE:
+        p = out / p
+        if p.is_dir():
+            shutil.rmtree(p)
+        elif p.is_file():
+            p.unlink()
     # deps/clang64
     used = clang64_files_used(home) | dll_closure(PROGRAMS)
     for f in sorted(used):
@@ -210,7 +257,6 @@ def main():
         dst = out / 'deps/clang64' / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, dst)
-    lic = out / 'licenses'
     for pkg in LICENSES:
         d = PREFIX / 'share/licenses' / pkg
         if d.is_dir():
@@ -221,13 +267,36 @@ def main():
     copy_python(a.python, py)
     (out / 'deps/shaders').mkdir(parents=True)
     shutil.copy2(xlate, out / 'deps/shaders/ultrs-shaders.exe')
+    stamp = xlate.parent / 'source.txt'   # the translator must be made from this commit's sources
+    if not stamp.is_file() or stamp.read_text().strip() != deps_install.xlate_stamp(ROOT):
+        sys.exit(f'{xlate} was not built from this source: run tools/build_xlate.py again')
+    shutil.copy2(stamp, out / 'deps/shaders/source.txt')
+    # deps/linux: the Linux kit, for a build for the Steam Deck (setup.py --platform linux / both), only the files such
+    # a build reads (tools/linux_used.py), so no download of its own
+    with zipfile.ZipFile(a.linux_kit) as z:
+        z.extractall(out / 'deps/linux')
+    shutil.copytree(out / 'deps/linux/licenses', lic / 'linux-kit')
+    linux_used.trim(out / 'deps/linux', 'linux/', linux_used.load(a.used))
+    # the package's own tools: a build from it installs nothing (tools/deps_install.py)
+    (out / 'deps/installed.json').write_text(json.dumps({'python': 'package', 'clang64': 'package', 'shaders': 'package',
+                                                         'linux_kit': 'package'}, indent=1))
     shutil.copy2(ROOT / 'third_party/maxwell_shader/LICENSE.txt', lic / 'Ryujinx.txt')
     shutil.copy2(a.python / 'LICENSE.txt', lic / 'Python.txt')
-    (out / 'setup.bat').write_text(SETUP_BAT.replace('\n', '\r\n'))
-    (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES)
-    (out / 'game').mkdir()
-    (out / 'game/PUT-YOUR-GAME-HERE.txt').write_text(GAME_TXT.replace('\n', '\r\n'), encoding='utf-8')
+    (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
     (out / 'VERSION.txt').write_text(version.version_txt(a.version, commit))
+    # the AppImage of this release, which the Steam Deck's tar carries (deps_install.linux_package): made first from the
+    # same commit (tools/make_package_linux.py), published beside this zip; the release has these two files only
+    pins = {}
+    for key, f in linux_files.items():
+        pins[key] = {'name': f.name, 'url': f'https://github.com/kuraeow/ultratears/releases/download/v{a.version}/{f.name}',
+                     'size': f.stat().st_size, 'sha256': deps_install.sha256_file(f)}
+    (out / deps_install.LINUX_PACKAGE).write_text(json.dumps(pins, indent=1), encoding='utf-8')
+    # the launcher, built from this commit (it holds no code of the game: shipped built)
+    launcher = ROOT / 'dev-local/build/launcher-release'
+    subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--out', str(launcher)], check=True)
+    shutil.copy2(launcher / 'UltraTears Launcher.exe', out / 'UltraTears Launcher.exe')
+    files = sorted(f.relative_to(out).as_posix() for f in out.rglob('*') if f.is_file()) + ['package-files.txt']
+    (out / 'package-files.txt').write_text('\n'.join(sorted(files)) + '\n', encoding='utf-8')
     size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())
     print(f'{out}: {size / 2**20:.0f} MiB, {len(used)} files of clang64')
     if not a.no_zip:
@@ -237,6 +306,7 @@ def main():
                 if f.is_file():
                     zf.write(f, pathlib.Path(name) / f.relative_to(out))
         print(f'{z}: {z.stat().st_size / 2**20:.0f} MiB')
+        shutil.rmtree(out)   # the zip is the package; --no-zip keeps the folder instead (checks without unpacking)
 
 
 if __name__ == '__main__':

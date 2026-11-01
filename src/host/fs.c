@@ -141,6 +141,7 @@ static void index_folder(const char *dir) {
             (runtime_now_ns() - t0) / 1e6);
 }
 
+static void heapdef_overlay(void);
 void runtime_fs_init(void) {
     if (image_fd >= 0 || rom_folder) return;
     const char *dir = getenv("TOTK_ROMFS");
@@ -152,6 +153,7 @@ void runtime_fs_init(void) {
         need(snprintf(rom_dir, sizeof rom_dir, "%s", dir) < (int)sizeof rom_dir, "RomFS folder path");
         rom_folder = 1;
         index_folder(rom_dir);
+        heapdef_overlay();
         return;
     }
     snprintf(path, sizeof path, "%s/runtime-index.bin", dir);
@@ -172,6 +174,7 @@ void runtime_fs_init(void) {
     image_fd = open(path, O_RDONLY | O_BINARY);
     need(image_fd >= 0, "RomFS image missing");
     fprintf(stderr, "[totk] RomFS: %llu files from %s\n", (unsigned long long)file_count, dir);
+    heapdef_overlay();
 }
 /* First entry whose path is >= p */
 static uint64_t lower(const char *p) {
@@ -182,6 +185,73 @@ static uint64_t lower(const char *p) {
 static uint64_t file_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
+}
+/* RomFS files served from memory in place of the game's (as totk-pc-recomp's romfs.c overlay, MIT): the HeapDef table
+   a bigger game resolution needs (render_res.c: its render-target heap and that heap's parent grown) and, above 30 fps,
+   the layout archive whose quick menus capture their background at once (ui_capture.c). */
+#define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
+#define UI_COMMON "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"
+#define ZS_DICTS "Pack/ZsDic.pack.zs"
+enum { NOVR = 4 };
+static struct { uint64_t index; uint8_t *data; uint64_t size; } ovr[NOVR];
+static int novr;
+static int ovr_find(uint64_t i) { for (int k = 0; k < novr; k++) if (ovr[k].index == i) return k; return -1; }
+// A whole RomFS file (malloc), NULL if absent or over max bytes.
+static void *rom_file(const char *path, size_t max, size_t *n) {
+    uint64_t i = file_index(path);
+    if (i == UINT64_MAX) return NULL;
+    Entry e = entry(i);
+    void *in = e.size && e.size < max ? malloc((size_t)e.size) : NULL;
+    int ok = in != NULL;
+    if (ok && rom_folder) {
+        char full[8192];
+        snprintf(full, sizeof full, "%s/%s", rom_dir, path);
+        int fd = open(full, O_RDONLY | O_BINARY);
+        ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok)
+        ok = pread(image_fd, in, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
+    if (!ok) { free(in); return NULL; }
+    *n = (size_t)e.size;
+    return in;
+}
+static void ovr_add(const char *path, void *data, size_t n) {
+    need(novr < NOVR, "RomFS overlay table");
+    ovr[novr].index = file_index(path), ovr[novr].data = data, ovr[novr].size = n;
+    novr++;
+}
+static void heapdef_overlay(void) {
+    uint64_t totk_heap_extra_kib(void);
+    int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
+    void totk_resolution_log(void);
+    int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
+                      void **out, size_t *out_n);
+    int totk_aspect_output(unsigned *w, unsigned *h);
+    int totk_fr_fps60(void);
+    size_t n = 0, dn = 0, out_n = 0;
+    void *in = totk_heap_extra_kib() ? rom_file(HEAPDEF, 16u << 20, &n) : NULL, *out = NULL;
+    if (in && totk_heapdef_build(in, n, &out, &out_n)) {
+        ovr_add(HEAPDEF, out, out_n);
+        fprintf(stderr, "[totk] RomFS: %s served grown (%zu bytes)\n", HEAPDEF, out_n);
+    }
+    free(in);
+    totk_resolution_log();
+    // the layout archive: above 30 fps the quick menus capture their background at once (host/ui_capture.c); on an
+    // output of another shape than 16:9 the layouts are laid out for it (host/ui_aspect.c)
+    unsigned aw = 0, ah = 0;
+    int capture = totk_fr_fps60(), aspect = totk_aspect_output(&aw, &ah);
+    if (!capture && !aspect) return;
+    in = rom_file(UI_COMMON, 64u << 20, &n);
+    void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
+    uint64_t t0 = runtime_now_ns();
+    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, &out, &out_n)) {
+        ovr_add(UI_COMMON, out, out_n);
+        fprintf(stderr, "[totk] RomFS: %s served%s%s (%.0f ms)\n", UI_COMMON,
+                capture ? ", the quick menus' background captured at once" : "",
+                aspect ? ", the layouts for the output's shape" : "", (runtime_now_ns() - t0) / 1e6);
+    } else if (!in || !dicts)
+        fprintf(stderr, "[totk] RomFS: %s or %s missing: the game's own layouts\n", UI_COMMON, ZS_DICTS);
+    free(in); free(dicts);
 }
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
@@ -239,6 +309,15 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
     Entry e = entry(i - 1);
+    int k = ovr_find(i - 1);
+    if (k >= 0) {   /* a file served from memory (heapdef_overlay) */
+        if ((uint64_t)offset > ovr[k].size) return R_ROM_INVALID;
+        uint64_t n = size < ovr[k].size - (uint64_t)offset ? size : ovr[k].size - (uint64_t)offset;
+        guest_prepare_write(buffer, n);
+        memcpy(buffer, ovr[k].data + offset, (size_t)n);
+        *out = n;
+        return 0;
+    }
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
@@ -253,7 +332,8 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    *out = (int64_t)entry(i - 1).size;
+    int k = ovr_find(i - 1);
+    *out = k >= 0 ? (int64_t)ovr[k].size : (int64_t)entry(i - 1).size;
     return 0;
 }
 static void romfs_close(uint64_t h) {

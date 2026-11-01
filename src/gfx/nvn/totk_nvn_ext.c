@@ -265,10 +265,6 @@ NVN(nvnCommandBufferSetSampleMask, void, NVNcommandBuffer *c, int m) {
     (void)c; if ((m & 0xffff) != 0xffff) { static int once; if (!once++) LOG("[warning] SetSampleMask %#x: fixed-function sample mask not applied", m); }
 }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; (void)r; }   /* only used with the alpha test, reported in the replay */
-/* Metal always restarts strips at the all-ones index; other restart indices are reported. */
-NVN(nvnCommandBufferSetPrimitiveRestart, void, NVNcommandBuffer *c, uint32_t e, int index) {
-    (void)c; if ((e & 0xff) && index != -1 && index != 0xffff) { static int once; if (!once++) LOG("[warning] SetPrimitiveRestart index %#x: Metal restarts only at the all-ones index", index); }
-}
 /* Metal has no depth-bounds test. Disabling is exact; an enabled range is drawn without the test and reported. */
 NVN(nvnCommandBufferSetDepthBounds, void, NVNcommandBuffer *c, uint32_t e, float lo, float hi) {
     (void)c; if ((e & 0xff) && (lo > 0.0f || hi < 1.0f)) { static int once; if (!once++) LOG("[warning] SetDepthBounds [%g, %g]: depth-bounds test not available on Metal (fragments outside the range are kept)", lo, hi); }

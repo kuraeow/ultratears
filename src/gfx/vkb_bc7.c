@@ -11,12 +11,20 @@
 // BC1: the interface's 12x12 ASTC maps when opaque (tools/bc7build: a texture is BC1 only if none of its texels is
 // transparent; half the bytes of BC7, and 12x12 ASTC holds less detail than BC1 keeps). Nothing from the game is
 // in the repository or a build: the cache is made on the player's machine from the player's copy (README.md, Legal).
-#include <direct.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define _mkdir(path) mkdir(path, 0777)
+#define _fseeki64(file, offset, origin) fseeko(file, offset, origin)
+#define _ftelli64(file) ftello(file)
+#endif
 
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
@@ -44,6 +52,12 @@ typedef struct { uint64_t a, b, off; uint32_t len, fmt; } rec_t;   // also the r
 static rec_t *g_tab;
 static size_t g_cap, g_n;
 static FILE *g_pack, *g_idx;
+// bc7.pack as it was when opened, mapped read-only: a read is a copy, no file call and no lock (a texture has hundreds
+// of surfaces; fseek + fread each, under g_mu, was much of an upload). The pages are the system's file cache, as the
+// reads were: no memory of the game's, dropped by the system when it needs the RAM. Blocks appended later (encoded in
+// the background) are read from the file.
+static const uint8_t *g_map;
+static uint64_t g_map_size;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_open;   // 1 open, -1 cannot be used
 static uint64_t g_hits, g_misses, g_encoded, g_dropped, g_encode_ns;
@@ -91,7 +105,20 @@ static int open_files(void) {   // g_mu held
         good += sizeof r;
     }
     _fseeki64(g_idx, good, SEEK_SET);
-    VLOG("BC7 cache %s: %zu surfaces, %.1f MiB", d, g_n, pack_size / 1048576.0);
+    snprintf(path, sizeof path, "%s/bc7.pack", d);
+#ifdef _WIN32
+    HANDLE f = pack_size > 0 ? CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    HANDLE m = f != INVALID_HANDLE_VALUE ? CreateFileMappingA(f, NULL, PAGE_READONLY, (DWORD)((uint64_t)pack_size >> 32), (DWORD)pack_size, NULL) : NULL;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (m) { g_map = MapViewOfFile(m, FILE_MAP_READ, 0, 0, (SIZE_T)pack_size); CloseHandle(m); }
+#else
+    const void *plat_map_file(const char *path, uint64_t len, uint64_t *size);   // platform/linux.c (mmap: not reachable here)
+    uint64_t mapped_size;
+    if (pack_size > 0) g_map = plat_map_file(path, (uint64_t)pack_size, &mapped_size);
+#endif
+    if (g_map) g_map_size = (uint64_t)pack_size;
+    VLOG("BC7 cache %s: %zu surfaces, %.1f MiB%s", d, g_n, pack_size / 1048576.0, g_map ? " (mapped)" : "");
     g_open = 1;
     return 1;
 }
@@ -112,9 +139,11 @@ int vkb_bc7_read(vkb_bc7_key k, uint8_t *out, size_t n) {
     int ok = open_files() && g_cap;
     rec_t r = {0};
     if (ok) { r = *slot(k.a, k.b); ok = (r.a || r.b) && r.len == n; }
-    if (ok) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
+    int mapped = ok && r.off + n <= g_map_size;
+    if (ok && !mapped) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
     if (ok) g_hits++; else g_misses++;
     pthread_mutex_unlock(&g_mu);
+    if (mapped) memcpy(out, g_map + r.off, n);   // (the mapped part is never written again)
     return ok;
 }
 void vkb_bc7_store(vkb_bc7_key k, const uint8_t *data, size_t n) { vkb_bc_store(k, data, n, VKB_BC_7); }
@@ -147,7 +176,9 @@ static int quality(void) {   // TOTK_BC7_QUALITY=0..4 (bc7enc's uber level; back
 static void *encoder(void *unused) {
     (void)unused;
     pthread_setname_np("totk-bc7");
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);   // the game's and the recording threads come first
+#endif
     for (;;) {
         pthread_mutex_lock(&g_jmu);
         while (!g_jobs) pthread_cond_wait(&g_jcv, &g_jmu);

@@ -1,0 +1,46 @@
+// AMD FidelityFX Super Resolution 1 edge-adaptive upscale (EASU) of the game's output to the swapchain size
+// (runtime/vk_fsr.c). ffx/ffx_a.h and ffx/ffx_fsr1.h are AMD's headers, unmodified (MIT, ffx/LICENSE.txt). Each
+// invocation writes four pixels of a 16x16 tile, as AMD's sample does; the constants come from FsrEasuConOffset, so the
+// game's crop rectangle can start anywhere in its image.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Params {
+    vec4 view;   // crop width, crop height, source image width, source image height
+    vec4 out_;   // output width, output height, crop x, crop y
+} pc;
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx/ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(src, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(src, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(src, p, 2); }
+#include "ffx/ffx_fsr1.h"
+
+void put(AU2 p, AU4 c0, AU4 c1, AU4 c2, AU4 c3) {
+    if (p.x >= uint(pc.out_.x) || p.y >= uint(pc.out_.y)) return;
+    AF3 c;
+    FsrEasuF(c, p, c0, c1, c2, c3);
+    imageStore(dst, ivec2(p), vec4(c, 1.0));
+}
+
+void main() {
+    AU4 c0, c1, c2, c3;
+    FsrEasuConOffset(c0, c1, c2, c3, pc.view.x, pc.view.y, pc.view.z, pc.view.w, pc.out_.x, pc.out_.y, pc.out_.z,
+                     pc.out_.w);
+    AU2 p = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    put(p, c0, c1, c2, c3);
+    p.x += 8u;
+    put(p, c0, c1, c2, c3);
+    p.y += 8u;
+    put(p, c0, c1, c2, c3);
+    p.x -= 8u;
+    put(p, c0, c1, c2, c3);
+}
