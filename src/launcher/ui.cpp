@@ -289,12 +289,18 @@ static Json setup_state() {   // data/setup.json of the install folder: setup.py
 // no builder, the AppImage is it, so a newer AppImage put in the folder makes the build stale. A folder of an older
 // layout (a builder copied in) is stale too once the AppImage that runs is a newer release than that copy.
 static bool has_package(const std::string &folder);
+// the package in `from` replaces the one in `to`: another build (the whole VERSION.txt line, so a rebuild with the same
+// number, 0.2.0-41-g... then 0.2.0, counts too), only never an older release over a newer one
+static bool package_replaces(const std::string &from, const std::string &to) {
+    std::string a = package_version_line(from), b = package_version_line(to);
+    return !a.empty() && a != b && !version_newer(package_version(to), package_version(from));
+}
 static bool stale() {
     std::string line = package_version_line(U.root);
 #ifdef _WIN32
     bool newer = false;   // the PC's launcher is in its package: an update replaces it with the package (apply_update.py)
 #else
-    bool newer = has_package(U.home) && has_package(U.install) && version_newer(package_version(U.home), package_version(U.install));
+    bool newer = has_package(U.home) && has_package(U.install) && package_replaces(U.home, U.install);
 #endif
     return installed() && ((!line.empty() && setup_state()["package"].str() != "UltraTears " + line) || newer);
 }
@@ -324,7 +330,7 @@ static bool has_package(const std::string &folder) { return path_is_file(path_jo
 static bool needs_copy() {
     if (same_path(U.install, U.home))
         return false;
-    return !has_package(U.install) || version_newer(package_version(U.home), package_version(U.install));
+    return !has_package(U.install) || package_replaces(U.home, U.install);
 }
 
 // GB a build needs free: the game, the package copy when it goes elsewhere, and for the Steam Deck its game, objects,
