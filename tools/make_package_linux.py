@@ -3,7 +3,7 @@ from the Linux builder package folder release/UltraTears-builder-<version>-linux
 dev-local/wsl/build_test.sh; not published: the release is the Windows zip and this AppImage).
 
 usage: python3 tools/make_package_linux.py --xlate <linux ultrs-shaders> --launcher <linux ultratears-launcher>
-                                           [--linux-kit release/ultrs-linux-kit.zip] [--test] [--no-appimage]
+                                           [--linux-kit dev-local/release-inputs/ultrs-linux-kit.zip] [--test] [--no-appimage]
 The same as the Windows builder package (tools/make_package.py) with the Linux tools: the source (the public tree of
 HEAD, without NOT_IN_PACKAGE), deps/python (python-build-standalone with the build's wheels) and deps/llvm (clang, lld,
 the clang resource headers for x86, ninja) from the pins of tools/deps.json "linux_host"
@@ -152,12 +152,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--xlate', type=pathlib.Path, required=True)
     ap.add_argument('--launcher', type=pathlib.Path, required=True)
-    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'release/ultrs-linux-kit.zip')
+    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/ultrs-linux-kit.zip')
     ap.add_argument('--test', action='store_true', help='a package of an untagged commit (for testing, never released)')
     ap.add_argument('--no-appimage', action='store_true')
-    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'release/linux-used.txt',
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/linux-used.txt',
                     help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
-    ap.add_argument('--runtime', type=pathlib.Path, default=ROOT / 'release/runtime-x86_64',
+    ap.add_argument('--runtime', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/runtime-x86_64',
                     help='the AppImage runtime built with tools/appimage_runtime (see its README.md)')
     a = ap.parse_args()
     if not sys.platform.startswith('linux'):

@@ -207,9 +207,9 @@ def main():
     ap.add_argument('--python', type=pathlib.Path, default=pathlib.Path(sys.base_prefix))
     ap.add_argument('--no-zip', action='store_true')
     ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'build')   # tools/setup.py's default output
-    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'release/ultrs-linux-kit.zip',
+    ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/ultrs-linux-kit.zip',
                     help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
-    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'release/linux-used.txt',
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/linux-used.txt',
                     help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
     ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'release',
                     help="the folder with this release's AppImage (tools/make_package_linux.py): named with its hash in "

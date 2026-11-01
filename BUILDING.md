@@ -117,8 +117,9 @@ Then, on Linux (under WSL on an ext4 file system: `/mnt/c` and `/mnt/d` lose the
 python3 tools/make_package_linux.py --xlate <ultrs-shaders> --launcher <ultratears-launcher>   # release/*.AppImage
 ```
 
-It takes from `release\` the Linux kit (`ultrs-linux-kit.zip`, `tools/make_linux_kit.py`), `linux-used.txt` and the
-AppImage runtime with this project's patch (`runtime-x86_64`, [tools/appimage_runtime](tools/appimage_runtime/README.md)).
+It takes from `dev-local\release-inputs\` the Linux kit (`ultrs-linux-kit.zip`, `tools/make_linux_kit.py`),
+`linux-used.txt` and the AppImage runtime with this project's patch (`runtime-x86_64`,
+[tools/appimage_runtime](tools/appimage_runtime/README.md)), so `release\` holds only the two files of the release.
 
 And back on Windows:
 

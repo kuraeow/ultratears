@@ -8,7 +8,7 @@ encoder's sources (tools/bc7_build.py builds it on Linux too; clang -M with the 
 links the game and the encoder (--verbose). The result is a list of paths: linux/<path in deps/linux> and
 clang/include/<header> (clang's resource headers, whatever its version).
 
-usage: python tools/linux_used.py --home ../release-test [--out release/linux-used.txt]
+usage: python tools/linux_used.py --home ../release-test [--out dev-local/release-inputs/linux-used.txt]
 """
 import argparse
 import pathlib
@@ -148,7 +148,7 @@ def trim(top, prefix, used):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--home', type=pathlib.Path, required=True, help='a game folder that built the game for Linux')
-    ap.add_argument('--out', type=pathlib.Path, default=ROOT / 'release/linux-used.txt')
+    ap.add_argument('--out', type=pathlib.Path, default=ROOT / 'dev-local/release-inputs/linux-used.txt')
     a = ap.parse_args()
     used = measure(a.home.resolve())
     a.out.parent.mkdir(parents=True, exist_ok=True)
