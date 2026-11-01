@@ -87,6 +87,22 @@ To build directly into a separate game folder:
 python tools/setup.py --output D:\Games\UltraTears
 ```
 
+## Linux and the Steam Deck
+
+On Windows, `python tools/setup.py --platform linux` (or `both`; remembered for later runs) cross-compiles the game for
+Linux into `linux/ultratears` against the Linux kit in `deps\linux` (files of Valve's Steam Runtime 3 "sniper" SDK
+sysroot and a static zstd, `tools/make_linux_kit.py`; a source build makes it from the pinned sysroot, 1.2 GB once).
+Its last step packs `UltraTears-SteamDeck.tar`: the folder a build on the Deck makes (`tools/make_deck_tar.py`), which
+holds the Linux builder package and the AppImage of the same release. A Releases package downloads both by the hashes
+in `deps\linux-package.json`; a source build needs `ULTRS_LINUX_PACKAGE=<folder>` with
+`UltraTears-builder-*-linux-x86_64.tar.gz` and `UltraTears-*-x86_64.AppImage` (made as below).
+
+On Linux (glibc 2.34+), `python3 tools/setup.py` builds for that machine: it installs python-build-standalone 3.14,
+LLVM 23.1.3 (the version of the Windows builder's clang), ninja and the Linux kit into `deps/`, and builds the shader
+translator with the .NET SDK. The game needs kernel 6.7+ for its write watch (userfaultfd + PAGEMAP_SCAN); on Linux the
+memory pools are copies of game memory in Vulkan memory (`src/gfx/backend_vk.c`, "pool copies"), `TOTK_POOL_IMPORT=1`
+imports them instead (development). The game's log goes beside it (`ultratears.log`) also when Steam starts it.
+
 ## Where the game looks for its data
 
 `UltraTears.exe` reads `ultratears.cfg` next to it: the ExeFS (`exefs=`) and the `TOTK_*` variables for the RomFS,
@@ -114,12 +130,21 @@ starts, but loading reads many small files, which is slower; the packed image is
 
 ```
 python tools/build_xlate.py
+python tools/build_xlate.py --rid linux-x64
+python tools/build_launcher.py --platform linux
 git tag v<version>
+(on Linux) python3 tools/make_package_linux.py --xlate <ultrs-shaders> --launcher <ultratears-launcher>
 python tools/setup.py
-python tools/make_package.py
+python tools/make_package.py --linux-package <folder with the Linux files>
 git push origin dev:main
 git push origin v<version>
 ```
+
+The Linux files come first: `tools/make_package_linux.py` (on Linux; under WSL on an ext4 file system, since `/mnt/c`
+and `/mnt/d` lose the modes and links of the Linux tools) writes `UltraTears-builder-<version>-linux-x86_64.tar.gz`
+and `UltraTears-<version>-x86_64.AppImage` (appimagetool and the static type-2 runtime, pinned by hash), and
+`tools/make_package.py` records both with their hashes in the Windows package's `deps\linux-package.json`. All three
+files go into the same release.
 
 Releases are made from `dev`: `main` is moved to the release commit, so its README matches the package. The version
 has one source, the tag `v<x.y.z>` on the release commit (`tools/version.py`): the package and the exe take it from

@@ -3,8 +3,8 @@
 # UltraTears
 
 **UltraTears** is an unofficial builder: on your PC it turns your own copy of a Nintendo Switch game into a native
-Windows program. It works with one game, *Tears of the Kingdom* version 1.4.3. Steam Deck and Linux support is planned
-and is a high priority. It is not an emulator: the program code of your copy is translated ahead of time (static
+Windows program, and from 0.2.0 into a native Linux / Steam Deck program as well (experimental). It works with one game,
+*Tears of the Kingdom* version 1.4.3. It is not an emulator: the program code of your copy is translated ahead of time (static
 recompilation, ARM64 → C → x86-64), and the Switch system and its NVN graphics API are replaced by the port's own
 implementations on Windows and Vulkan. Shaders and textures are converted for PC graphics cards when the game is built,
 not while you play.
@@ -26,14 +26,14 @@ Early. Measured on the developer's PC (Windows 10, Ryzen, 16 threads, GeForce RT
 | What | Result |
 |---|---|
 | Title screen, prologue, Great Sky Island, Hyrule, the Depths | plays |
-| Frame rate | the game's own 30 fps; all shaders are compiled ahead (in the background on the first start, ~3 min), so they cause no hitches |
-| Steam Deck / Linux | not supported yet; a native version is planned and is a high priority |
+| Frame rate | 60 fps by default (30, 40 and 45 too; above 60 in beta); all shaders are compiled ahead (in the background on the first start, ~3 min), so they cause no hitches |
+| Steam Deck / Linux | experimental native version (see [Steam Deck and Linux](#steam-deck-and-linux-experimental)): it plays; frame drops and the Depths' ground on the Deck are being worked on |
 | AMD graphics cards | a likely fix for the black screen on Windows is in 0.2.0, not yet confirmed on real AMD hardware |
 | Other PCs and graphics cards | a few player reports so far |
 
-Known issues: in the Depths the ground is broken or black in places; some cloth and banners tear (for example at a
-tower); the controller layout follows the Switch (A is the right face button); no settings menu yet (window size,
-resolution, upscaling and 60 fps come later).
+Known issues: some cloth and banners tear (for example at a tower); green mist in caves flickers on AMD cards; the
+controller layout follows the Switch (A is the right face button). The frame rate, resolution, aspect ratio (16:9,
+16:10, 21:9, 32:9) and the frame counter are set in the launcher's Play screen.
 
 ## Choose how to build first
 
@@ -184,6 +184,36 @@ python tools/setup.py --output D:\Games\UltraTears --dump D:\Dumps\TOTK-1.4.3
 Run the same command again after changing the source: unchanged data and object files are reused. More options and
 implementation details are in [BUILDING.md](BUILDING.md).
 
+## Steam Deck and Linux (experimental)
+
+The game also builds as a native Linux program (Vulkan through Mesa / RADV on the Deck; not Proton). Two ways give the
+same game folder:
+
+**A. Build on your Windows PC, carry it to the Deck.** In the launcher, next to **Prepare the game**, choose **For Linux
+(Steam Deck)** or **Both platforms**. The first time, the launcher also downloads the Linux builder and the AppImage of
+the same release (about 600 MB). The result is `UltraTears-SteamDeck.tar` (about 29 GB) in the game folder; the
+finish screen shows it. Copy it to the Deck (an SD card or a network share), switch to Desktop Mode and extract it there
+(Dolphin: right click → Extract here). The folder `UltraTears` appears. The Deck builds nothing.
+
+**B. Build on the Deck itself.** Download `UltraTears-<version>-x86_64.AppImage` from Releases in Desktop Mode, make it
+executable (right click → Properties → Permissions → Is executable), start it, choose the folder with `exefs` and
+`romfs` and click **Prepare the game**. The AppImage copies the builder and itself into the game folder (by default
+`UltraTears` beside the AppImage) and builds there; this takes considerably longer than on a desktop PC.
+
+**Playing.** Everything starts through `UltraTears/UltraTears.AppImage`: without arguments it opens the launcher (Play,
+settings, updates); with `--play` it starts the game directly. To play in Gaming Mode, add it in Desktop Mode via
+Steam → **Add a Non-Steam Game** → Browse → `UltraTears.AppImage`, then in the game's Properties type `--play` into
+**Launch Options**. On the Deck the game runs fullscreen at 1280×800 (16:10) with a 40 fps limit by default; the
+launcher's Play screen changes it.
+
+**Updating.** Put the AppImage of a newer release into the `UltraTears` folder and start it: it rebuilds only what
+changed. A folder from the PC's tar is updated the same way (the first update compiles the game code once on the Deck).
+
+Requirements: SteamOS 3.7 or another Linux with kernel 6.7+ and glibc 2.34+, a Vulkan 1.3 driver with
+`VK_EXT_shader_object` (RADV on the Deck has it), 16 GB of RAM; about 30 GB free for the folder, about 70 GB for way B
+(the dump and the build's intermediate files). The log is `UltraTears/ultratears.log`; for a performance report turn
+on Debug mode in the launcher's Debug tab.
+
 ## What the builder does with the dump
 
 The original `exefs` and `romfs` are never run directly or moved. The builder reads them and creates a PC-ready copy
@@ -225,10 +255,6 @@ A Releases build updates itself: once a day the launcher asks GitHub Releases fo
 and `userdata` stay) and rebuilds only what changed. `updates=off` in `ultratears-launcher.ini` turns the check off.
 From 0.2.0 or older (no launcher yet), extract the new package over the old folder and start the launcher. For a Git build, run `git pull`, then repeat the same `python tools/setup.py` command and
 options.
-
-> **Steam Deck and Linux are not supported yet.** Through Proton the Windows build starts, but runs at a few frames
-> per second and closes in Gaming Mode. A native Linux and Steam Deck version is planned and is one of the project's
-> high-priority tasks.
 
 ## If the build stops with an error
 
