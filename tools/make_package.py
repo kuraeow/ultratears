@@ -15,10 +15,11 @@ and objects tell which parts of clang64 the build reads) and tools/build_xlate.p
   - deps/python: Python 3.14 (the given install, default the one running this) without its tests, docs and Tk, with
     the packages the build imports (lz4, capstone, unicorn) from this project's .venv;
   - deps/shaders/ultrs-shaders.exe, the shader translator (tools/build_xlate.py);
-  - deps/linux: the Linux kit for builds for the Steam Deck (tools/make_linux_kit.py, --linux-kit);
+  - deps/linux: the Linux kit for builds for the Steam Deck (tools/make_linux_kit.py, --linux-kit), only the files such
+    a build reads (tools/linux_used.py, --used);
+  - deps/linux-package.json: the AppImage of the same release, which the Steam Deck's tar carries (downloaded when a
+    build for the Deck needs it): the release is this zip and that AppImage;
   - UltraTears Launcher.exe (tools/build_launcher.py), the window that builds and starts the game; no .bat;
-  - bin-linux/ultratears-launcher: the launcher for Linux the Steam Deck's tar carries (build_launcher.py --platform
-    linux, with the Linux kit: deps/linux or dev-local/linux-cross);
   - VERSION.txt, THIRD-PARTY-NOTICES.md and package-files.txt (every file of the package: what
     tools/apply_update.py replaces and removes when the launcher updates it).
 Refuses a dirty working tree: the package must be the commit it names.
@@ -39,6 +40,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 from toolchain import CLANG64, env as tool_env  # noqa: E402
 import deps_install  # noqa: E402
+import linux_used  # noqa: E402
 import public_tree  # noqa: E402
 import version  # noqa: E402
 
@@ -189,9 +191,11 @@ def main():
     ap.add_argument('--home', type=pathlib.Path, default=ROOT / 'dist')   # tools/setup.py's default output
     ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip',
                     help='the Linux kit (tools/make_linux_kit.py) the package carries in deps/linux')
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/dist/linux-used.txt',
+                    help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
     ap.add_argument('--linux-package', type=pathlib.Path, default=ROOT / 'dev-local/dist',
-                    help="the folder with this release's Linux builder tar.gz and AppImage (tools/make_package_linux.py): "
-                         "named with their hashes in deps/linux-package.json, for the Steam Deck's tar")
+                    help="the folder with this release's AppImage (tools/make_package_linux.py): named with its hash in "
+                         "deps/linux-package.json, for the Steam Deck's tar")
     ap.add_argument('--test', action='store_true',
                     help='a package of an untagged commit, named after git describe: for testing, never for Releases')
     a = ap.parse_args()
@@ -201,9 +205,8 @@ def main():
     if not a.version:
         sys.exit('HEAD has no release tag: git tag v<x.y.z> (the package is named after it)')
     home, xlate = a.home.resolve(), ROOT / 'dev-local/build/shaders/ultrs-shaders.exe'
-    linux_files = {'builder': a.linux_package / f'UltraTears-builder-{a.version}-linux-x86_64.tar.gz',
-                   'appimage': a.linux_package / f'UltraTears-{a.version}-x86_64.AppImage'}
-    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit, *linux_files.values()):
+    linux_files = {'appimage': a.linux_package / f'UltraTears-{a.version}-x86_64.AppImage'}
+    for need in (home / 'UltraTears.exe', home / 'build/build.ninja', xlate, a.linux_kit, a.used, *linux_files.values()):
         if not need.is_file():
             sys.exit(f'{need} is missing: build first (tools/setup.py --output, tools/build_xlate.py, tools/make_linux_kit.py)')
     name = f'UltraTears-builder-{a.version}-windows-x86_64'
@@ -249,11 +252,12 @@ def main():
     if not stamp.is_file() or stamp.read_text().strip() != deps_install.xlate_stamp(ROOT):
         sys.exit(f'{xlate} was not built from this source: run tools/build_xlate.py again')
     shutil.copy2(stamp, out / 'deps/shaders/source.txt')
-    # deps/linux: the Linux kit, for a build for the Steam Deck (setup.py --platform linux / both); ~18 MB in the zip,
-    # so no download of its own
+    # deps/linux: the Linux kit, for a build for the Steam Deck (setup.py --platform linux / both), only the files such
+    # a build reads (tools/linux_used.py), so no download of its own
     with zipfile.ZipFile(a.linux_kit) as z:
         z.extractall(out / 'deps/linux')
     shutil.copytree(out / 'deps/linux/licenses', lic / 'linux-kit')
+    linux_used.trim(out / 'deps/linux', 'linux/', linux_used.load(a.used))
     # the package's own tools: a build from it installs nothing (tools/deps_install.py)
     (out / 'deps/installed.json').write_text(json.dumps({'python': 'package', 'clang64': 'package', 'shaders': 'package',
                                                          'linux_kit': 'package'}, indent=1))
@@ -261,8 +265,8 @@ def main():
     shutil.copy2(a.python / 'LICENSE.txt', lic / 'Python.txt')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
     (out / 'VERSION.txt').write_text(version.version_txt(a.version, commit))
-    # the Linux builder and the AppImage of this release, which the Steam Deck's tar carries (deps_install.linux_package):
-    # made first from the same commit (tools/make_package_linux.py), published beside this zip
+    # the AppImage of this release, which the Steam Deck's tar carries (deps_install.linux_package): made first from the
+    # same commit (tools/make_package_linux.py), published beside this zip; the release has these two files only
     pins = {}
     for key, f in linux_files.items():
         pins[key] = {'name': f.name, 'url': f'https://github.com/kuraeow/ultratears/releases/download/v{a.version}/{f.name}',
@@ -272,15 +276,6 @@ def main():
     launcher = ROOT / 'dev-local/build/launcher-release'
     subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--out', str(launcher)], check=True)
     shutil.copy2(launcher / 'UltraTears Launcher.exe', out / 'UltraTears Launcher.exe')
-    # the launcher for Linux, which the Steam Deck's tar carries (tools/make_deck_tar.py), built with the Linux kit and
-    # without its debug information
-    launcher = ROOT / 'dev-local/build/launcher-linux-release'
-    subprocess.run([sys.executable, str(ROOT / 'tools/build_launcher.py'), '--platform', 'linux', '--out', str(launcher)],
-                   check=True)
-    (out / 'bin-linux').mkdir()
-    objcopy = next(p for p in (CLANG64 / 'llvm-objcopy.exe', pathlib.Path('C:/msys64/clang64/bin/llvm-objcopy.exe')) if p.is_file())
-    subprocess.run([str(objcopy), '--strip-debug', str(launcher / 'ultratears-launcher'),
-                    str(out / 'bin-linux/ultratears-launcher')], check=True)
     files = sorted(f.relative_to(out).as_posix() for f in out.rglob('*') if f.is_file()) + ['package-files.txt']
     (out / 'package-files.txt').write_text('\n'.join(sorted(files)) + '\n', encoding='utf-8')
     size = sum(f.stat().st_size for f in out.rglob('*') if f.is_file())

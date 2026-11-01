@@ -33,6 +33,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import progress  # noqa: E402
 import setup  # noqa: E402
+import version  # noqa: E402
 
 TOP = 'UltraTears'
 
@@ -54,7 +55,6 @@ def deck_state(package):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--builder', type=pathlib.Path, required=True)
     ap.add_argument('--appimage', type=pathlib.Path, required=True)
     ap.add_argument('--pack', help='the shader pack for the Deck (default: data/shaders-deck, else data/shaders)')
     ap.add_argument('--out', default=setup.DECK_TAR)
@@ -62,9 +62,14 @@ def main():
     deck = ROOT / 'data/shaders-deck/translated.pack'
     pack = ROOT / a.pack if a.pack else deck if deck.is_file() else ROOT / 'data/shaders/translated.pack'
     game, sdl = ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0'
-    for need in (game, sdl, pack, ROOT / 'data/romfs', ROOT / 'data/exefs', ROOT / 'data/generated', a.builder, a.appimage):
+    for need in (game, sdl, pack, ROOT / 'data/romfs', ROOT / 'data/exefs', ROOT / 'data/generated', a.appimage):
         if not need.exists():
             sys.exit(f'missing {need}: build the game for Linux and its shaders first')
+    # the AppImage's own release, as its launcher reads it (UltraTears-<version>-x86_64.AppImage, this folder's commit)
+    ver = a.appimage.name[len('UltraTears-'):-len('-x86_64.AppImage')]
+    line = (ROOT / 'VERSION.txt').read_text(encoding='utf-8').strip() if (ROOT / 'VERSION.txt').is_file() else ''
+    commit = line.rsplit('commit ', 1)[-1].rstrip(')') if 'commit ' in line else version.current()[1]
+    version_line = version.version_txt(ver, commit).strip()
 
     files = [(game, 'linux/ultratears', 0o755), (sdl, 'linux/libSDL3.so.0', 0o644),   # (as build_game.py copies it)
              (pack, 'data/shaders/translated.pack', 0o644), (a.appimage, 'UltraTears.AppImage', 0o755)]
@@ -76,42 +81,27 @@ def main():
                 p = pathlib.Path(dirpath) / n
                 files.append((p, p.relative_to(ROOT).as_posix(), 0o644))
 
-    with tarfile.open(a.builder) as pkg:
-        members = pkg.getmembers()
-        top = members[0].name.split('/', 1)[0]   # UltraTears-builder-<v>-linux-x86_64
-        version_line = pkg.extractfile(f'{top}/VERSION.txt').read().decode('utf-8').strip()
-        total = sum(p.stat().st_size for p, _, _ in files) + sum(m.size for m in members if m.isfile())
-        out = ROOT / a.out
-        tmp = out.with_suffix('.tar.part')
-        bar = progress.Bar('packing for the Steam Deck', total, 'GiB', 2**30, rate=True)
-        own = {name for _, name, _ in files} | {'ultratears.cfg', 'data/setup.json'}
-        with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
-            for m in members:   # the Linux builder: modes, links and times as tools/make_package_linux.py made them
-                rel = m.name.split('/', 1)[1] if '/' in m.name else ''
-                if not rel or rel in own or '..' in rel.split('/') or m.name.startswith('/'):
-                    continue
-                info = m.replace(name=f'{TOP}/{rel}', deep=False)
-                if m.islnk():   # a hard link names the member it links to by its path in the package
-                    info = info.replace(linkname=f'{TOP}/{m.linkname.split("/", 1)[1]}', deep=False)
-                t.addfile(info, pkg.extractfile(m) if m.isfile() else None)
-                bar.add(m.size if m.isfile() else 0)
-            texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines()) + '\n').encode(), 0o644),
-                     ('data/setup.json', deck_state(version_line), 0o644)]
-            for name, data, mode in texts:
-                info = tarfile.TarInfo(f'{TOP}/{name}')
-                info.size, info.mode = len(data), mode
-                t.addfile(info, io.BytesIO(data))
-            for path, name, mode in files:
-                info = tarfile.TarInfo(f'{TOP}/{name}')
-                st = path.stat()
-                info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), mode
-                with open(path, 'rb') as f:
-                    t.addfile(info, f)
-                bar.add(st.st_size)
-        bar.finish()
+    total = sum(p.stat().st_size for p, _, _ in files)
+    out = ROOT / a.out
+    tmp = out.with_suffix('.tar.part')
+    bar = progress.Bar('packing for the Steam Deck', total, 'GiB', 2**30, rate=True)
+    with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
+        texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines()) + '\n').encode(), 0o644),
+                 ('data/setup.json', deck_state(version_line), 0o644)]
+        for name, data, mode in texts:
+            info = tarfile.TarInfo(f'{TOP}/{name}')
+            info.size, info.mode = len(data), mode
+            t.addfile(info, io.BytesIO(data))
+        for path, name, mode in files:
+            info = tarfile.TarInfo(f'{TOP}/{name}')
+            st = path.stat()
+            info.size, info.mtime, info.mode = st.st_size, int(st.st_mtime), mode
+            with open(path, 'rb') as f:
+                t.addfile(info, f)
+            bar.add(st.st_size)
+    bar.finish()
     os.replace(tmp, out)
-    print(f'{out.name}: the Linux builder {version_line}, the game and its data; {out.stat().st_size / 2**30:.1f} GiB',
-          flush=True)
+    print(f'{out.name}: {version_line}, the game and its data; {out.stat().st_size / 2**30:.1f} GiB', flush=True)
 
 
 if __name__ == '__main__':

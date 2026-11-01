@@ -2,6 +2,9 @@
 folder): the game is then built there, by the copy. Only the package's own files (package-files.txt, which
 make_package.py writes; without it every file outside the player's folders) and the launcher's settings; an unchanged
 file is left as it is, so a copy that stopped midway continues.
+From an AppImage (Linux) the package's tools stay in it: the folder gets the source and the scripts, and deps/ there
+is a link to the AppImage's deps/ (the launcher makes it again at every start: the mount point changes), so a game
+folder holds no second copy of Python, LLVM and the Linux kit (~1 GB), and a newer AppImage is the newer builder.
 usage: deps\\python\\python.exe tools/install_to.py <folder>   (events as setup.py --json: progress, done, error)
 """
 import filecmp
@@ -14,6 +17,13 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KEEP = {'data', 'build', 'build-linux', 'linux', 'userdata', 'diag', 'game', 'update', 'dist', 'dev-local'}   # the player's, never copied
 SETTINGS = 'ultratears-launcher.ini'
+# From an AppImage: what stays in it (the tools; the launcher and its SDL3, which the AppImage starts itself)
+IN_APPIMAGE = ('deps/', 'ultratears-launcher', 'libSDL3.so.0')
+
+
+def from_appimage():
+    appdir = os.environ.get('APPDIR')
+    return bool(appdir) and pathlib.Path(appdir).resolve() == ROOT
 
 
 def emit(ev, **fields):
@@ -35,6 +45,9 @@ def main():
         if dest == ROOT or ROOT in dest.parents:
             raise ValueError(f'{dest} is inside the package itself')
         files = package_files()
+        appimage = from_appimage()
+        if appimage:
+            files = [f for f in files if not (f.startswith(IN_APPIMAGE[0]) or f in IN_APPIMAGE[1:])]
         total, done = sum((ROOT / f).stat().st_size for f in files if not (ROOT / f).is_symlink()), 0
         for f in files:
             src, dst = ROOT / f, dest / f
@@ -62,6 +75,17 @@ def main():
                 os.replace(tmp, dst)
             done += st.st_size
             emit('progress', label='copy', done=done, total=total, eta=None)
+        if appimage:   # deps/ -> the AppImage's (a folder of the older layout had its own copy: replaced)
+            link = dest / 'deps'
+            if link.is_dir() and not link.is_symlink():
+                shutil.rmtree(link)
+            for old in IN_APPIMAGE[1:]:
+                (dest / old).unlink(missing_ok=True)
+            tmp = dest / 'deps.new'
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
+            os.symlink(ROOT / 'deps', tmp)
+            os.replace(tmp, link)
         # From an AppImage ($APPIMAGE, set by its runtime): the AppImage itself into the folder as UltraTears.AppImage, the
         # one program the player starts there (--play: the game), as the Steam Deck's tar has it (tools/make_deck_tar.py)
         image = pathlib.Path(os.environ.get('APPIMAGE', ''))

@@ -570,27 +570,25 @@ LINUX_PACKAGE = 'deps/linux-package.json'
 
 
 def linux_package(home):
-    """(the Linux builder tar.gz, the AppImage), downloaded into deps/downloads when not there yet."""
+    """The AppImage of this release, which the Steam Deck's tar carries (the builder on the Deck: its launcher builds and
+    updates there with the tools inside it), downloaded into deps/downloads when not there yet."""
     local = os.environ.get('ULTRS_LINUX_PACKAGE')
     if local:
         d = pathlib.Path(local)
-        newest = lambda pat: max(d.glob(pat), key=lambda p: p.stat().st_mtime, default=None)   # noqa: E731
-        builder, image = newest('UltraTears-builder-*-linux-x86_64.tar.gz'), newest('UltraTears-*-x86_64.AppImage')
-        if not builder or not image:
-            raise DepsError(f'ULTRS_LINUX_PACKAGE={d}: no Linux builder tar.gz and AppImage there', 'linux_package_missing')
-        return builder, image
+        image = max(d.glob('UltraTears-*-x86_64.AppImage'), key=lambda p: p.stat().st_mtime, default=None)
+        if not image:
+            raise DepsError(f'ULTRS_LINUX_PACKAGE={d}: no AppImage there', 'linux_package_missing')
+        return image
     pins = home / LINUX_PACKAGE
     if not pins.is_file():
-        raise DepsError('this builder has no Linux builder to put into the Steam Deck\'s tar (deps\\linux-package.json): '
-                        'a release package has it; for a build from the source set ULTRS_LINUX_PACKAGE to a folder with '
-                        'UltraTears-builder-*-linux-x86_64.tar.gz and the AppImage', 'linux_package_missing')
-    p = json.loads(pins.read_text(encoding='utf-8'))
-    items = [p['builder'], p['appimage']]
-    total = sum(i['size'] for i in items)
-    if not all((home / 'deps/downloads' / i['name']).is_file() for i in items):
-        say(f'  the Linux builder and the AppImage of this release ({total / 2**20:.0f} MiB, once) -> deps\\downloads')
-    builder, image = fetch_all(items, home / 'deps/downloads', 'the Linux builder')
-    return builder, image
+        raise DepsError('this builder has no AppImage to put into the Steam Deck\'s tar (deps\\linux-package.json): a '
+                        'release package has it; for a build from the source set ULTRS_LINUX_PACKAGE to a folder with '
+                        'UltraTears-*-x86_64.AppImage', 'linux_package_missing')
+    item = json.loads(pins.read_text(encoding='utf-8'))['appimage']
+    if not (home / 'deps/downloads' / item['name']).is_file():
+        say(f'  the AppImage of this release ({item["size"] / 2**20:.0f} MiB, once) -> deps\\downloads')
+    image, = fetch_all([item], home / 'deps/downloads', 'the AppImage')
+    return image
 
 
 # ---------------------------------------------------------------- entry points

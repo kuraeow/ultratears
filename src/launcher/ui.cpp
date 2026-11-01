@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------- look
 static const ImU32 C_BG = IM_COL32(12, 12, 12, 255);
@@ -281,9 +285,18 @@ static Json setup_state() {   // data/setup.json of the install folder: setup.py
 // built by another package than the one in the install folder (an update came since): the next build redoes only what
 // changed. setup.py records the package with the build (data/setup.json "package"), so any launcher, the one the
 // player extracted or the copy in the install folder, sees the same.
+// The builder is the install folder's package, else the launcher's own (U.root): on Linux the Steam Deck's tar carries
+// no builder, the AppImage is it, so a newer AppImage put in the folder makes the build stale. A folder of an older
+// layout (a builder copied in) is stale too once the AppImage that runs is a newer release than that copy.
+static bool has_package(const std::string &folder);
 static bool stale() {
-    std::string line = package_version_line(U.install);
-    return installed() && !line.empty() && setup_state()["package"].str() != "UltraTears " + line;
+    std::string line = package_version_line(U.root);
+#ifdef _WIN32
+    bool newer = false;   // the PC's launcher is in its package: an update replaces it with the package (apply_update.py)
+#else
+    bool newer = has_package(U.home) && has_package(U.install) && version_newer(package_version(U.home), package_version(U.install));
+#endif
+    return installed() && ((!line.empty() && setup_state()["package"].str() != "UltraTears " + line) || newer);
 }
 
 // The game's files are already in data\ of the install folder (setup.py packed the RomFS and took the ExeFS): the
@@ -319,6 +332,30 @@ static bool needs_copy() {
 static double need_gb() { return (needs_copy() ? 41 : 40) + (for_deck() ? 36 : 0); }
 
 static void check_dump(const std::string &path);
+
+// Linux: a game folder the AppImage builds in carries no tools of its own: its deps/ is a link to the running AppImage's
+// (tools/install_to.py makes it), whose mount point changes at every start, so the link is made again before anything
+// looks at it. A deps/ folder of its own (a folder of the older layout) stays until install_to.py replaces it.
+static void link_deps() {
+#ifndef _WIN32
+    const char *appdir = SDL_getenv("APPDIR");
+    if (!appdir || !*appdir || U.home == U.install || !path_is_file(path_join(U.install, "tools/setup.py")))
+        return;
+    std::string link = path_join(U.install, "deps"), target = path_join(U.home, "deps"), tmp = link + ".new";
+    struct stat st;
+    if (lstat(link.c_str(), &st) == 0 && !S_ISLNK(st.st_mode))
+        return;
+    char now[4096];
+    ssize_t n = readlink(link.c_str(), now, sizeof now - 1);
+    if (n > 0 && std::string(now, (size_t)n) == target)
+        return;
+    unlink(tmp.c_str());
+    if (symlink(target.c_str(), tmp.c_str()) == 0 && rename(tmp.c_str(), link.c_str()) == 0)
+        SDL_Log("deps: %s -> %s", link.c_str(), target.c_str());
+    else
+        SDL_Log("deps: cannot link %s to %s", link.c_str(), target.c_str());
+#endif
+}
 
 static void use_install(const std::string &folder) {
     U.install = folder;
@@ -1777,7 +1814,7 @@ static void gfx_poll() {
 void ui_play_mode() {   // main.cpp: --play
     std::string here = default_install();   // the game the AppImage lies in (as AppRun took it before), whatever the settings say
     if (path_is_file(path_join(here, "ultratears.cfg")))
-        use_install(here);
+        use_install(here), link_deps();
     if (!installed() || stale())
         return;   // nothing to play yet, or an update to finish: the launcher as usual
     G.play_mode = true;
@@ -1857,6 +1894,7 @@ void ui_init(SDL_Window *w) {
 #endif
     std::string inst = U.set.get("install");
     use_install(inst.empty() ? (root && *root ? U.home : default_install()) : inst);
+    link_deps();
     // the platform chosen last; else what the folder was built for (data/setup.json "platforms"), else this PC
     U.platform = U.set.get("platform");
 #ifndef _WIN32

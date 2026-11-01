@@ -33,6 +33,7 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import deps_install  # noqa: E402
+import linux_used  # noqa: E402
 import public_tree  # noqa: E402
 import version  # noqa: E402
 from make_package import NOT_IN_PACKAGE, LICENSE_COPIES, git  # noqa: E402
@@ -97,6 +98,55 @@ def strip_elves(where, tool):
             subprocess.run([str(tool), '--strip-unneeded', str(p)], check=True)
 
 
+# Python parts the builder never imports (Tk, the tests, the IDE), static libraries nothing links (the unicorn wheel's
+# libunicorn.a, 31 MB); what is left is stripped as LLVM is (python-build-standalone ships symbols: libpython 130 MB).
+PY_DROP = ('test', 'idlelib', 'turtledemo', 'tkinter', 'ensurepip', '__pycache__')
+
+
+def trim_python(py, strip_tool):
+    lib = next(py.glob('lib/python3.*'))
+    for name in PY_DROP:
+        for p in list(lib.rglob(name)):
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+    for p in list(py.rglob('*')):
+        if (p.is_file() or p.is_symlink()) and (p.suffix == '.a' or p.name.startswith(('libtcl', 'libtk', '_tkinter'))):
+            p.unlink()
+    for p in list((py / 'lib').glob('t*')):   # Tcl and Tk's own folders (tcl9.0, tk9.0, thread*, itcl*)
+        if p.is_dir() and p.name.startswith(('tcl', 'tk', 'thread', 'itcl', 'sqlite3.')):
+            shutil.rmtree(p)
+    strip_elves(py, strip_tool)
+    r = subprocess.run([str(py / 'bin/python3'), '-c', 'import lz4.block, capstone, unicorn, zipfile, json, tarfile, ssl'],
+                       capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f'the trimmed Python cannot import what the build needs:\n{r.stderr}')
+
+
+# LLVM's programs the player's build runs (clang, clang++, lld, ninja: tools/build_game.py, bc7_build.py); llvm-ar and
+# llvm-objcopy are for remaking the Linux kit and the Windows builder's tar, llvm-strip for this script. clang's own
+# headers of other processors' intrinsics go too (the game and its tools are built for x86-64 only).
+LLVM_KEEP = ('clang', 'clang++', 'clang-', 'lld', 'ld.lld', 'ninja', 'llvm-strip')   # llvm-strip: removed at the end
+RESOURCE_DROP = ('arm', 'riscv', 'sifive', 'hexagon', 'hvx', 'velintrin', 'lasx', 'lsx', 'msa.h', 'altivec', 'htm',
+                 's390', 'vecintrin', 'wasm', 'opencl', 'cuda', 'hip', 'openmp_wrappers', 'ppc_wrappers', 'llvm_libc_wrappers',
+                 'nvptx', 'amdgpu', '__clang_cuda', '__clang_hip', 'larchintrin')
+
+
+def trim_llvm(llvm):
+    for p in list((llvm / 'bin').iterdir()):
+        if not p.name.startswith(LLVM_KEEP):
+            p.unlink()
+    for inc in llvm.glob('lib/clang/*/include'):
+        for p in sorted(inc.rglob('*'), reverse=True):
+            if p.relative_to(inc).parts[0].startswith(RESOURCE_DROP) or p.name.startswith(RESOURCE_DROP):
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                elif p.exists() or p.is_symlink():
+                    p.unlink()
+    for d in llvm.glob('lib/clang/*/*'):   # the runtime libraries and sanitizer lists: --rtlib=libgcc, no sanitizers
+        if d.name != 'include':
+            shutil.rmtree(d) if d.is_dir() else d.unlink()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--xlate', type=pathlib.Path, required=True)
@@ -104,6 +154,8 @@ def main():
     ap.add_argument('--linux-kit', type=pathlib.Path, default=ROOT / 'dev-local/dist/ultrs-linux-kit.zip')
     ap.add_argument('--test', action='store_true', help='a package of an untagged commit (for testing, never released)')
     ap.add_argument('--no-appimage', action='store_true')
+    ap.add_argument('--used', type=pathlib.Path, default=ROOT / 'dev-local/dist/linux-used.txt',
+                    help='what a build for Linux reads of the Linux kit (tools/linux_used.py)')
     ap.add_argument('--runtime', type=pathlib.Path, default=ROOT / 'dev-local/dist/runtime-x86_64',
                     help='the AppImage runtime built with tools/appimage_runtime (see its README.md)')
     a = ap.parse_args()
@@ -141,13 +193,18 @@ def main():
             shutil.rmtree(p)
         elif p.is_file():
             p.unlink()
-    # the tools, from the same pins a source build installs
+    # the tools, from the same pins a source build installs, without what a player's build does not use
     deps_install.install_python_linux(out)
     deps_install.install_llvm(out)
     strip_elves(out / 'deps/llvm/bin', out / 'deps/llvm/bin/llvm-strip')
+    trim_python(out / 'deps/python', out / 'deps/llvm/bin/llvm-strip')
+    trim_llvm(out / 'deps/llvm')
     with zipfile.ZipFile(a.linux_kit) as z:
         z.extractall(out / 'deps/linux')
     shutil.copytree(out / 'deps/linux/licenses', lic / 'linux-kit')
+    used = linux_used.load(a.used)
+    print(f'the Linux kit: {linux_used.trim(out / "deps/linux", "linux/", used) / 2**20:.0f} MiB the build does not read '
+          f'left out ({a.used.name})', flush=True)
     (out / 'deps/shaders').mkdir(parents=True)
     shutil.copy2(a.xlate, out / 'deps/shaders/ultrs-shaders')
     (out / 'deps/shaders/ultrs-shaders').chmod(0o755)
@@ -161,6 +218,7 @@ def main():
     # the launcher and the SDL3 it loads (rpath $ORIGIN)
     shutil.copy2(a.launcher, out / 'ultratears-launcher')
     subprocess.run([str(out / 'deps/llvm/bin/llvm-strip'), '--strip-debug', str(out / 'ultratears-launcher')], check=True)
+    (out / 'deps/llvm/bin/llvm-strip').unlink()   # this script's own: the player's build does not strip
     (out / 'ultratears-launcher').chmod(0o755)
     shutil.copy2(out / 'deps/linux/sysroot/usr/lib/x86_64-linux-gnu/libSDL3.so.0', out / 'libSDL3.so.0')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))

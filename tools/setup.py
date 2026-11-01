@@ -625,20 +625,21 @@ DECK_TAR = 'UltraTears-SteamDeck.tar'
 
 def step_deck(dump, state, cpus):
     """A build for Linux / Steam Deck: UltraTears-SteamDeck.tar in this folder, which the player carries to the Deck
-    (tools/make_deck_tar.py): the folder a build on the Deck itself makes (the Linux builder of this release, the game
-    and its data), and the release's AppImage. Made again when anything in it is newer."""
+    (tools/make_deck_tar.py): the game and its data, and the release's AppImage, which is the builder there (its
+    launcher builds and updates the game in that folder with the tools inside it). Made again when anything in it is
+    newer."""
     tar = ROOT / DECK_TAR
     if 'linux' not in state['platforms'] or os.name != 'nt':   # on Linux the game is built where it is played
         return 'not for the Steam Deck'
     pack = deck_pack(state)
-    builder, appimage = deps_install.linux_package(ROOT)
-    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, builder, appimage,
+    appimage = deps_install.linux_package(ROOT)
+    inputs = [ROOT / 'linux/ultratears', ROOT / 'linux/libSDL3.so.0', pack, appimage,
               DATA / 'romfs/romfs.bin', DATA / 'textures/bc7.idx']
-    key = f'{pack}|{builder.name}'
+    key = f'{pack}|{appimage.name}'
     if tar.is_file() and state.get('deck-tar') == key and all(p.stat().st_mtime <= tar.stat().st_mtime for p in inputs if p.exists()):
         return 'up to date'
-    run([sys.executable, 'tools/make_deck_tar.py', '--pack', pack.relative_to(ROOT), '--builder', builder,
-         '--appimage', appimage], 'packing the game for the Steam Deck')
+    run([sys.executable, 'tools/make_deck_tar.py', '--pack', pack.relative_to(ROOT), '--appimage', appimage],
+        'packing the game for the Steam Deck')
     state['deck-tar'] = key
     return f'{DECK_TAR}, {tar.stat().st_size / 2**30:.1f} GiB'
 
