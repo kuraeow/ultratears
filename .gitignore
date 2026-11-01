@@ -17,11 +17,12 @@ Firmware/
 *.bfttf
 
 # Development only, not in the repository or a release: local tools, reference checkouts, .NET caches, builds of
-# development tools, release packages
+# development tools, release packages (dev-local/dist)
 /dev-local/
-/dist/
 
-# A game folder's own (tools/setup.py), should one ever be made inside the source folder
+# A game folder's own (tools/setup.py), should one ever be made inside the source folder; dist/ is where setup.py builds
+# the game when run from the source without --output
+/dist/
 /game/
 /data/
 /build/
