@@ -10,6 +10,7 @@ usage: python tools/build_launcher.py [--out <folder>] [--debug] [--platform lin
 libstdc++ static, libcurl of the system loaded when an update is looked for.
 """
 import argparse
+import os
 import pathlib
 import subprocess
 import sys
@@ -30,7 +31,8 @@ SOURCES = ['src/launcher/main.cpp', 'src/launcher/ui.cpp', 'src/launcher/setup_p
 ASSETS = ['fonts/Inter_18pt-Regular.ttf', 'fonts/Inter_18pt-Medium.ttf', 'fonts/MontserratAlternates-Bold.ttf',
           'fonts/MontserratAlternates-SemiBold.ttf', 'l_emblem.png', 'l_pattern.png', 'l_ic_check.svg', 'l_ic_error.svg',
           'l_ic_folder.svg', 'l_ic_warn.svg', 'l_ic_chevron.svg']
-LINUX_LIBS = '-stdlib=libstdc++ -static-libstdc++ -Wl,-rpath,$$ORIGIN -lSDL3 -lm -lpthread -ldl'
+RPATH = '$$ORIGIN' if os.name == 'nt' else "'$$ORIGIN'"   # as tools/build_game.py RPATH: sh on Linux, no shell on Windows
+LINUX_LIBS = f'-stdlib=libstdc++ -static-libstdc++ -Wl,-rpath,{RPATH} -lSDL3 -lm -lpthread -ldl'
 LIBS = ('-static -mwindows -lSDL3 -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi '
         '-lshell32 -lwinmm -ldwmapi -lwinhttp -lbcrypt -liconv -lc++')
 

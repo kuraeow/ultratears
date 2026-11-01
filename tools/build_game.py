@@ -52,6 +52,12 @@ LINUX_KIT = pathlib.Path(os.environ.get('ULTRS_LINUX_KIT') or next(
 LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c']
 
 
+# The rpath of the Linux programs, as ninja writes it into a command: on Linux ninja runs commands through sh, which
+# would put an empty $ORIGIN there and "-rpath" would take the next input as its value (the first object went
+# missing from the link); on Windows there is no shell, and quotes would stay in the path.
+RPATH = '$$ORIGIN' if os.name == 'nt' else "'$$ORIGIN'"
+
+
 def linux_flags():
     kit = LINUX_KIT.as_posix()
     return f'--target=x86_64-linux-gnu --sysroot={kit}/sysroot -I{kit}/include'
@@ -150,7 +156,7 @@ def main():
     build = ROOT / bd
     build.mkdir(exist_ok=True)
     link = (f'  command = clang {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
-            f'-Wl,-rpath,$$ORIGIN -o $out @$out.rsp {linux_libs()}' if linux else
+            f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
             f'  command = clang -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
     lines = [
         f'builddir = {bd}',   # ninja's own state (.ninja_log, .ninja_deps) beside the objects, not beside the sources
