@@ -99,6 +99,12 @@ def main():
         info = tarfile.TarInfo(f'{TOP}/ultratears.cfg')
         info.size, info.mode = len(data), 0o644
         t.addfile(info, io.BytesIO(data))
+        # Steam's "Add a Non-Steam Game" lists only .sh / .AppImage files: a script for the game and one for the launcher
+        for name, exe_name in (('UltraTears.sh', 'ultratears'), ('UltraTears-Launcher.sh', 'ultratears-launcher')):
+            data = f'#!/bin/sh\ncd "$(dirname "$(readlink -f "$0")")" && exec ./{exe_name} "$@"\n'.encode()
+            info = tarfile.TarInfo(f'{TOP}/{name}')
+            info.size, info.mode = len(data), 0o755
+            t.addfile(info, io.BytesIO(data))
         for path, name, mode in files:
             info = tarfile.TarInfo(f'{TOP}/{name}')
             st = path.stat()
