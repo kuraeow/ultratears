@@ -55,7 +55,7 @@ dump\
 <details>
 <summary>Управление</summary>
 
-Работают геймпады Xbox, DualSense, Switch Pro и другие; кнопки расположены как на Switch (A — правая кнопка).
+Кнопки геймпада расположены как на Switch (A — правая кнопка).
 
 Клавиатура: WASD — движение, стрелки — камера, J = A, K / пробел = B, I = X, U = Y, Q / E = L / R, Alt / Shift =
 ZL / ZR, Enter = +, Tab / Esc = − (карта), T F G H = крестовина, Z / C = нажатие стиков, F11 или Alt+Enter — полный

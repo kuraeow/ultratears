@@ -54,7 +54,7 @@ The launcher finds new versions itself and rebuilds only what changed; saves in 
 <details>
 <summary>Controls</summary>
 
-Xbox, DualSense, Switch Pro and other controllers work; the button layout follows the Switch (A is the right button).
+The controller's button layout follows the Switch (A is the right button).
 
 Keyboard: WASD move, arrow keys camera, J = A, K / Space = B, I = X, U = Y, Q / E = L / R, Alt / Shift = ZL / ZR,
 Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, F11 or Alt+Enter full screen.
