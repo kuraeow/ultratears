@@ -717,6 +717,24 @@ void vkb_mirrors_submit(VkCommandBuffer cb) {
     g_nmir = 0;
 }
 
+// The first time this shader's buffer of this kind (0 uniform, 1 storage, 2 vertex) got a stand-in: 1 (log it).
+// Per shader, not the first 16 of the run: a startup shader used them all up before (Steam Deck, 2026-11-01), and what
+// the Depths terrain got was not in the log.
+static int stand_in_first(const char *key, int kind) {
+    enum { N = 2048 };
+    static uint64_t seen[N];
+    static int n;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)kind;
+    for (const char *p = key ? key : "?"; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    pthread_mutex_lock(&mu);
+    int first = n < N;
+    for (int i = 0; i < n && first; i++) first = seen[i] != h;
+    if (first) seen[n++] = h;
+    pthread_mutex_unlock(&mu);
+    return first;
+}
+
 // A buffer range for a guest address: the imported pool (offset aligned as the descriptor type needs) or a copy now.
 static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDeviceSize align, int copy_ok) {
     if (size > 65536 && align == vkc.props.limits.minUniformBufferOffsetAlignment) size = 65536;
@@ -1014,8 +1032,7 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
             info = guest_range(u->addr, u->size, ua, 1);
             if (info.buffer == g_zero && u->addr) {
                 vkb_audit(A_UBO_MISSING, sh->key);
-                static int said;
-                if (said++ < 16) VLOG("[temporary] shader %.12s: uniform buffer c%d %#llx+%llu not in an imported pool: zeros are bound",
+                if (stand_in_first(sh->key, 0)) VLOG("[temporary] shader %.12s: uniform buffer c%d %#llx+%llu not in an imported pool: zeros are bound",
                                       sh->key ? sh->key : "?", slot, (unsigned long long)u->addr, (unsigned long long)u->size);
             }
         }
@@ -1028,9 +1045,10 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         if (sh->sbuf[i].slot == 0xFF) vkb_audit(A_SSBO_UNKNOWN_SOURCE, sh->key);
         else if (bi.buffer == g_zero) vkb_audit(A_SSBO_MISSING, sh->key);
         if (bi.buffer == g_zero && addr) {
-            static int said;
-            if (said++ < 16) VLOG("[temporary] shader %.12s: storage buffer %#llx+%llu not in an imported pool (or misaligned): an empty one is bound",
-                                  sh->key ? sh->key : "?", (unsigned long long)addr, (unsigned long long)size);
+            if (stand_in_first(sh->key, 1))
+                VLOG("[temporary] shader %.12s: storage buffer %d %#llx+%llu not in an imported pool (or misaligned for %llu): an empty one is bound "
+                     "(frame %llu; room in its pool %llu)", sh->key ? sh->key : "?", i, (unsigned long long)addr, (unsigned long long)size,
+                     (unsigned long long)sa, (unsigned long long)vkb_frame(), (unsigned long long)vkb_pool_room(addr));
         }
         put_buf(W, set, base + VKB_B_SBUF + (uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bi);
     }
@@ -1456,9 +1474,10 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
         else {
             if (S.vbuf[s].address) {   // [temporary] not in an imported pool (a virtual pool: sparse binding later): zeros
                 vkb_audit(A_VBUF_MISSING, S.sh[0] ? S.sh[0]->key : NULL);
-                static int said;
-                if (said++ < 16) VLOG("[temporary] vertex buffer %#llx+%llu (stream %u) not in an imported pool: zeros are bound",
-                                      (unsigned long long)S.vbuf[s].address, (unsigned long long)S.vbuf[s].size, s);
+                if (stand_in_first(S.sh[0] ? S.sh[0]->key : NULL, 2))
+                    VLOG("[temporary] shader %.12s: vertex buffer %#llx+%llu (stream %u) not in an imported pool: zeros are bound (frame %llu)",
+                         S.sh[0] && S.sh[0]->key ? S.sh[0]->key : "?", (unsigned long long)S.vbuf[s].address,
+                         (unsigned long long)S.vbuf[s].size, s, (unsigned long long)vkb_frame());
             }
             VkDeviceSize z = 0, zs = 65536, key[4] = {(VkDeviceSize)(uintptr_t)g_zero, 0, 65536, stride};
             if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &g_zero, &z, &zs, &stride);
