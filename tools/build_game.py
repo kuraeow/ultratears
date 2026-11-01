@@ -239,6 +239,16 @@ def main():
             sys.exit(f'libSDL3.so.0 is missing from the Linux kit ({lib}): the game for Linux needs it beside itself')
         shutil.copy2(sdl, ROOT / 'linux/libSDL3.so.0')
     env = tool_env()
+    # Another compiler (an update brought another LLVM): ninja sees the same command lines and would keep the objects
+    # the old one made, so they go and everything is compiled by the new one.
+    cc = subprocess.run([str(CLANG64 / exe('clang')), '--version'], capture_output=True, text=True, env=env).stdout.split('\n')[0]
+    stamp = build / 'compiler.txt'
+    if stamp.is_file() and stamp.read_text(encoding='utf-8').strip() != cc.strip():
+        import shutil
+        print(f'another compiler ({cc.strip()}): compiling everything again', flush=True)
+        for sub in ('obj', 'game'):
+            shutil.rmtree(build / sub, ignore_errors=True)
+    stamp.write_text(cc.strip() + '\n', encoding='utf-8')
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
     # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free.
