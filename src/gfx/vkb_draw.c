@@ -1008,6 +1008,139 @@ static void mirrors_prepare_fixed(int indexed, const p_draw_idx *di) {
     }
 }
 
+// ---- depth twins: colour images under a compare sampler in a compute shader
+// TOTK's compute passes sample an R32_SFLOAT texture through a shadow sampler (Ryujinx SamplerType Shadow, 0x400).
+// Maxwell compares any single-channel float or unorm texel; Vulkan only formats with SAMPLED_IMAGE_DEPTH_COMPARISON
+// (VUID-vkCmdDispatch-None-06479), which AMD's drivers (RADV on the Steam Deck too) do not give R32_SFLOAT, so the result
+// there is undefined; NVIDIA compares it. Such an image gets a depth twin of the same size and bits (R32_SFLOAT ->
+// D32_SFLOAT, R16_UNORM -> D16_UNORM), copied through upload memory right before the dispatch that samples it (outside
+// any pass: vkb_dispatch ended it), and the dispatch samples the twin. Draws keep the colour image (no copy inside their
+// pass). As totk-pc-recomp 3b5469a (MIT), after Savage Wind Recomp's depth twins (MIT); the code is ours.
+// [temporary] Suspected for the flickering fog on AMD (GitHub #38, #40; white fog in the open world on the Deck), not
+// confirmed. TOTK_DEPTH_TWIN=0: off; =2: also where the driver compares (to try the path on NVIDIA).
+enum { TWINS = 16 };
+typedef struct { VkImage src, img; VkDeviceMemory mem; VkImageView view[2]; uint32_t w, h, layers; VkFormat fmt; } twin_t;
+static twin_t g_twins[TWINS];
+static unsigned g_twin_next;
+static pthread_mutex_t g_twin_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static VkFormat twin_format(const vkb_image *im) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_DEPTH_TWIN"); on = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    if (!on || im->depth > 1 || im->compressed || !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return VK_FORMAT_UNDEFINED;
+    VkFormat df = im->format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : im->format == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM
+                : VK_FORMAT_UNDEFINED;
+    if (!df) return df;
+    static int compares[2] = {-1, -1};   // per source format: the driver compares it as it is
+    int i = df == VK_FORMAT_D16_UNORM;
+    if (compares[i] < 0) {
+        VkFormatProperties3 p3 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 p2 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &p3};
+        vk.vkGetPhysicalDeviceFormatProperties2(vkc.gpu, im->format, &p2);
+        compares[i] = (p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+        VLOG("%s under a compare sampler: %s", i ? "R16_UNORM" : "R32_SFLOAT",
+             compares[i] ? "compared by the driver" : "sampled through a depth twin in compute passes");
+    }
+    return compares[i] && on != 2 ? VK_FORMAT_UNDEFINED : df;
+}
+
+// The view of im's twin holding im's current texels (mip 0), the copies recorded into cb; NULL: none needed / possible.
+static VkImageView twin_view(VkCommandBuffer cb, vkb_image *im, VkImageViewType vt) {
+    VkFormat df = twin_format(im);
+    if (!df || (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY)) return VK_NULL_HANDLE;
+    uint32_t bpp = df == VK_FORMAT_D32_SFLOAT ? 4 : 2, layers = im->layers ? im->layers : 1;
+    VkDeviceSize bytes = (VkDeviceSize)im->width * im->height * layers * bpp;
+    if (bytes > (16u << 20)) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_twin_mu);
+    twin_t *t = NULL;
+    for (int i = 0; i < TWINS && !t; i++)
+        if (g_twins[i].img && g_twins[i].src == im->img && g_twins[i].w == im->width && g_twins[i].h == im->height &&
+            g_twins[i].layers == layers && g_twins[i].fmt == df)
+            t = &g_twins[i];
+    if (!t) {
+        t = &g_twins[g_twin_next++ % TWINS];
+        if (t->img) {   // the submissions being recorded may still sample the replaced twin
+            vkb_destroy_later(t->view[1], VK_NULL_HANDLE, VK_NULL_HANDLE);
+            vkb_destroy_later(t->view[0], t->img, t->mem);
+        }
+        *t = (twin_t){.src = im->img, .w = im->width, .h = im->height, .layers = layers, .fmt = df};
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = df,
+                                .extent = {im->width, im->height, 1}, .mipLevels = 1, .arrayLayers = layers,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        VkMemoryRequirements req;
+        int ok = vk_check(vk.vkCreateImage(vkc.device, &ci, NULL, &t->img), "depth twin");
+        if (ok) {
+            vk.vkGetImageMemoryRequirements(vkc.device, t->img, &req);
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                       .memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+            ok = ai.memoryTypeIndex != UINT32_MAX && vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &t->mem), "depth twin memory") &&
+                 vk_check(vk.vkBindImageMemory(vkc.device, t->img, t->mem, 0), "depth twin bind");
+        }
+        for (int k = 0; ok && k < 2; k++) {
+            VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
+                                        .viewType = k ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, .format = df,
+                                        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, k ? layers : 1}};
+            ok = vk_check(vk.vkCreateImageView(vkc.device, &vi, NULL, &t->view[k]), "depth twin view");
+        }
+        if (!ok) {
+            for (int k = 0; k < 2; k++) if (t->view[k]) vk.vkDestroyImageView(vkc.device, t->view[k], NULL);
+            if (t->img) vk.vkDestroyImage(vkc.device, t->img, NULL);
+            if (t->mem) vk.vkFreeMemory(vkc.device, t->mem, NULL);
+            *t = (twin_t){0};
+            pthread_mutex_unlock(&g_twin_mu);
+            return VK_NULL_HANDLE;
+        }
+        static int said;
+        if (said++ < 8)
+            VLOG("depth twin %ux%ux%u %s for a compute pass's compare sampler", im->width, im->height, layers,
+                 df == VK_FORMAT_D32_SFLOAT ? "D32_SFLOAT" : "D16_UNORM");
+    }
+    VkImage timg = t->img;
+    VkImageView view = t->view[vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY];
+    pthread_mutex_unlock(&g_twin_mu);
+    VkBuffer rb;
+    VkDeviceSize ro;
+    if (!vkb_ring_alloc(bytes, 16, &rb, &ro)) return VK_NULL_HANDLE;
+    // the source's earlier writes and the twin's earlier readers before the copies; the twin's old texels are dropped
+    VkImageLayout L = vkb_layout(im);
+    VkImageMemoryBarrier2 ib[2] = {
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+         .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT, .oldLayout = L, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img,
+         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}},
+        {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = timg,
+         .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers}}};
+    VkDependencyInfo d0 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = ib};
+    vk.vkCmdPipelineBarrier2(cb, &d0);
+    VkBufferImageCopy src = {ro, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers}, {0, 0, 0}, {im->width, im->height, 1}};
+    vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &src);
+    VkMemoryBarrier2 m1 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+                           .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
+    VkDependencyInfo d1 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &m1};
+    vk.vkCmdPipelineBarrier2(cb, &d1);
+    VkBufferImageCopy dst = {ro, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, layers}, {0, 0, 0}, {im->width, im->height, 1}};
+    vk.vkCmdCopyBufferToImage(cb, rb, timg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &dst);
+    // the source back in its layout, the twin readable by the dispatch (vkb_dispatch's full barrier follows as well)
+    ib[0] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = 0, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = L, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = im->img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+    ib[1] = (VkImageMemoryBarrier2){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = timg, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, layers}};
+    vk.vkCmdPipelineBarrier2(cb, &d0);
+    return view;
+}
+
 static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, int stage) {
     uint32_t base = stage == 1 ? VKB_STAGE_BINDINGS : 0;
     VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment, sa = vkc.props.limits.minStorageBufferOffsetAlignment;
@@ -1068,6 +1201,10 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         else if (im->not_uploadable) vkb_audit(A_TEX_NOT_UPLOADED, sh->key);
         VkDescriptorImageInfo info = {sampler((int)(h >> 20) & 0xFFF), view ? view : dummy_view(vt),
                                       view ? vkb_layout(im) : VK_IMAGE_LAYOUT_GENERAL};
+        if (view && stage == 5 && (sh->tex[i].type & 0x400)) {   // a compare sampler in a dispatch: the depth twin
+            VkImageView tv = twin_view(vkb_cmd(), im, vt);
+            if (tv) info.imageView = tv, info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
         put_img(W, set, base + VKB_B_TEX + (uint32_t)i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, info);
     }
     for (int i = 0; i < sh->nimg; i++) {
