@@ -1,7 +1,8 @@
-# Reviewing pull requests
+# Contributing
 
-The maintainer's checklist for every pull request. Contributors are welcome to read it: a PR that already answers
-these points is merged sooner.
+Pull requests and issues are welcome. Below is the checklist every pull request is reviewed against: a PR that already
+answers these points is merged sooner. In short: open it against `dev`, one topic per PR, nothing from the game (code,
+assets, keys, firmware) and no code from the NintendoSDK, and say how it affects speed and image quality.
 
 UltraTears runs code on players' machines and builds from their own copy of the game, so a review looks for three
 things at once: harm (malware, leaked game material), bugs, and regressions in speed or image quality.
