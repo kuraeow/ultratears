@@ -7,10 +7,11 @@ same release, tools/setup.py there) - and the release's AppImage in it:
     launcher, the tools, the source and deps/ (Python, LLVM, ninja, the translator, the Linux kit);
   - what the build adds: linux/ultratears (with its debug information, as linked) and linux/libSDL3.so.0, data/ (the
     ExeFS, the RomFS, the BC7 texture cache, the fonts, the game's C in data/generated, the shader pack for the Deck's
-    AMD GPU as data/shaders/translated.pack, data/setup.json as a build on the Deck records it), ultratears.cfg and the
-    start scripts (setup.py cfg_lines, LINUX_SCRIPTS: the same functions write them on the Deck);
-  - UltraTears.AppImage (--appimage): put into this folder and started, it updates it (src/launcher platform.cpp
-    default_install).
+    AMD GPU as data/shaders/translated.pack, data/setup.json as a build on the Deck records it) and ultratears.cfg
+    (setup.py cfg_lines, which writes it on the Deck too);
+  - UltraTears.AppImage (--appimage), the one program the player starts, as on the Deck (tools/install_to.py copies the
+    AppImage into the folder it builds in): the launcher, or with --play the game (Steam's launch option); started
+    from a newer release, it updates the folder (src/launcher platform.cpp default_install).
 
 Not inside, as on the Deck before its first update: build-linux/ (the objects; the Deck's own compiler makes them at
 its first update, the PC's are another compiler's), the driver's shader cache (made at the first start), saves. A tar,
@@ -83,7 +84,7 @@ def main():
         out = ROOT / a.out
         tmp = out.with_suffix('.tar.part')
         bar = progress.Bar('packing for the Steam Deck', total, 'GiB', 2**30, rate=True)
-        own = {name for _, name, _ in files} | {'ultratears.cfg', 'data/setup.json', *setup.LINUX_SCRIPTS}
+        own = {name for _, name, _ in files} | {'ultratears.cfg', 'data/setup.json'}
         with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
             for m in members:   # the Linux builder: modes, links and times as tools/make_package_linux.py made them
                 rel = m.name.split('/', 1)[1] if '/' in m.name else ''
@@ -96,7 +97,6 @@ def main():
                 bar.add(m.size if m.isfile() else 0)
             texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines()) + '\n').encode(), 0o644),
                      ('data/setup.json', deck_state(version_line), 0o644)]
-            texts += [(name, setup.linux_script(target).encode(), 0o755) for name, target in setup.LINUX_SCRIPTS.items()]
             for name, data, mode in texts:
                 info = tarfile.TarInfo(f'{TOP}/{name}')
                 info.size, info.mode = len(data), mode

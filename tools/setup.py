@@ -538,23 +538,14 @@ def cfg_lines():
             'textures=data/textures', 'saves=userdata', 'fonts=data/fonts']
 
 
-# A Linux build's start scripts: Steam's "Add a Non-Steam Game" lists only .sh and .AppImage files
-LINUX_SCRIPTS = {'UltraTears.sh': 'linux/ultratears', 'UltraTears-Launcher.sh': 'ultratears-launcher'}
-
-
-def linux_script(target):
-    return f'#!/bin/sh\ncd "$(dirname "$(readlink -f "$0")")" && exec ./{target} "$@"\n'
-
-
 def step_finish(dump, state, cpus):
     fonts = dump / 'sysdata/fonts'
     lines = cfg_lines()
     if fonts.is_dir() and list(fonts.glob('*.bfttf')):
         shutil.copytree(fonts, DATA / 'fonts', dirs_exist_ok=True)
-    if os.name != 'nt':   # built on Linux: the folder is the one played (the Steam Deck's tar has the same scripts)
-        for name, target in LINUX_SCRIPTS.items():
-            (ROOT / name).write_text(linux_script(target), encoding='utf-8', newline='\n')
-            (ROOT / name).chmod(0o755)
+    # Linux: UltraTears.AppImage is what the player starts (--play: the game); the start scripts of 2026-11-01 go
+    for old in ('UltraTears.sh', 'UltraTears-Launcher.sh'):
+        (ROOT / old).unlink(missing_ok=True)
     # the player's settings (fps=, window=, vsync=, lang=: the launcher's Play screen, or written by hand) are kept:
     # an update must not reset them
     cfg = ROOT / 'ultratears.cfg'

@@ -62,6 +62,16 @@ def main():
                 os.replace(tmp, dst)
             done += st.st_size
             emit('progress', label='copy', done=done, total=total, eta=None)
+        # From an AppImage ($APPIMAGE, set by its runtime): the AppImage itself into the folder as UltraTears.AppImage, the
+        # one program the player starts there (--play: the game), as the Steam Deck's tar has it (tools/make_deck_tar.py)
+        image = pathlib.Path(os.environ.get('APPIMAGE', ''))
+        if image.name and image.is_file():
+            dst = dest / 'UltraTears.AppImage'
+            if image.resolve() != dst.resolve() and not (dst.is_file() and filecmp.cmp(image, dst, shallow=False)):
+                tmp = dst.with_name(dst.name + '.copying')
+                shutil.copy2(image, tmp)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, dst)
         if (ROOT / SETTINGS).is_file():   # the language and the dump, without the install folder (it is that folder now)
             lines = [l for l in (ROOT / SETTINGS).read_text(encoding='utf-8').splitlines() if not l.startswith('install=')]
             (dest / SETTINGS).write_text('\n'.join(lines) + '\n', encoding='utf-8')

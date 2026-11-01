@@ -63,8 +63,18 @@ unicorn https://github.com/unicorn-engine/unicorn, capstone https://github.com/c
 https://github.com/Ryubing, MacNativeGames (third_party/README.md), the Steam Runtime (licenses/linux-kit/README.txt).
 '''
 APPRUN = '''#!/bin/sh
-# UltraTears: the launcher of this AppImage (it copies the builder into the folder the player picks and builds there)
+# UltraTears: the one program a player starts on Linux / the Steam Deck. Without arguments: the launcher (Play, the
+# settings, updates; it copies the builder and this AppImage into the folder the player picks and builds there).
+# --play: the game of the folder this AppImage lies in, past the launcher (Steam's launch option); no game there yet:
+# the launcher.
 HERE="$(dirname "$(readlink -f "$0")")"
+if [ "$1" = "--play" ]; then
+    shift
+    GAME="$(dirname "${APPIMAGE:-$HERE}")"
+    if [ -x "$GAME/linux/ultratears" ]; then
+        exec "$GAME/linux/ultratears" "$@"
+    fi
+fi
 exec "$HERE/ultratears-launcher" "$@"
 '''
 DESKTOP = '''[Desktop Entry]
