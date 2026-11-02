@@ -188,7 +188,17 @@ def shadow_size(gen, addr):
     return '{ extern int totk_shadow_size(uint32_t *n); uint32_t n_; if (totk_shadow_size(&n_)) c->x[11] = n_; }'
 
 
+# Equipment-switch cooldown (from totk-pc-recomp recomp/patches-v143.txt, MIT; their issue #18, found by JieML1100):
+# the player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is above FLT_EPSILON, but
+# the equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0. Whole 30 Hz steps reach
+# exactly 0; a measured step leaves a rounding remainder, and one in (0, FLT_EPSILON] is never stepped again and keeps
+# equipment locked until a load. With realtime the threshold is 0: the remainder goes below 0 like any last step.
+def cooldown(gen, addr):   # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON) -> movi v1.2s, #0
+    return word_or(gen, addr, 0x0f016681, 0x0f000401, fr('totk_fr_realtime'), 'equipment cooldown')
+
+
 PATCHES = {
+    MAIN + 0x2b036c: cooldown,
     0x8005843e0: drs_off,
     MAIN + 0x585e50: scene_size(0),
     MAIN + 0x585e60: scene_size(1),
