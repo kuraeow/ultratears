@@ -65,6 +65,7 @@ void rt_udf(Cpu *c, uint64_t pc) { (void)c; g_status = 2; g_fault_at = pc; longj
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; g_status = 2; g_fault_at = pc; longjmp(*g_jb, 1); }
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; g_status = 2; g_fault_at = pc; longjmp(*g_jb, 1); }
 uint64_t rt_ticks(void) { return 0; }
+void rt_spin_gate(Cpu *c, uint64_t head) { (void)c; (void)head; }
 
 static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
     if (!g_in_run) return EXCEPTION_CONTINUE_SEARCH;

@@ -235,6 +235,34 @@ static void preempt_point_set(thr_t *t) {
     rt_preempt_fn = runtime_core_checkpoint;
     rt_preempt_flag = t && cores_enabled() && !getenv("TOTK_NO_PREEMPT") ? &t->preempt : NULL;   // TOTK_NO_PREEMPT=1: as before
 }
+// A pass through a spin wait: a guest loop that only another thread can end (tools/lifter/spin_waits_v143.txt; the
+// lifter calls this on its back-edge). The loop holds a virtual core while it spins, and the thread that would end it
+// may be waiting for that core: once one wait has lasted 50 us (TOTK_SPIN_HANDOFF_US) and any thread waits for a core,
+// the core goes over for a yield and comes back. Passes of one loop at most 20 us apart are one wait. As totk-pc-recomp
+// runtime/kernel.c rt_spin_gate (MIT). TOTK_SPIN=0: the loop keeps its core, as before.
+static __thread uint64_t sw_head, sw_t0, sw_last;
+void rt_spin_gate(Cpu *c, uint64_t head) {
+    (void)c;
+    __builtin_ia32_pause();
+    thr_t *t = t_self;
+    if (!t) return;
+    static int on = -1;
+    static uint64_t handoff_ns;
+    if (on < 0) {
+        const char *e = getenv("TOTK_SPIN_HANDOFF_US");
+        handoff_ns = (uint64_t)(e && *e ? atoll(e) : 50) * 1000;
+        e = getenv("TOTK_SPIN");
+        on = !(e && *e == '0');
+    }
+    uint64_t now = now_ns();
+    if (head != sw_head || now - sw_last > 20000) { sw_head = head; sw_t0 = now; }   // a new wait
+    sw_last = now;
+    if (!on || t->cur_core < 0 || now - sw_t0 < handoff_ns || !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) return;
+    int away = runtime_core_away();
+    sched_yield();
+    runtime_core_back(&away);
+    sw_last = now_ns();
+}
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {

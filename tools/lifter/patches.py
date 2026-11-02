@@ -210,6 +210,22 @@ def zstd_call(word, target, host):
     return f
 
 
+# Spin waits (tools/lifter/spin_waits_v143.txt): {back-edge: loop head}, absolute. gen.py puts rt_spin_gate on the
+# back-edge; the bases are tools/gen_game.py MODULES.
+def _spins():
+    import os
+    bases = {'main': 0x800000000, 'subsdk0': 0x804000000, 'sdk': 0x805000000}
+    out = {}
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'spin_waits_v143.txt')) as f:
+        for line in f:
+            w = line.split('#')[0].split()
+            if len(w) == 4 and w[0] == 'spin':
+                b = bases[w[1]]
+                out[b + int(w[3], 16)] = b + int(w[2], 16)
+    return out
+
+
+SPINS = _spins()
 ZSTD_MULTI, ZSTD_DDICT = MAIN + 0x3a1f0, MAIN + 0x3a1e0
 ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MULTI), 0xbdc8e8: (0x97d17642, ZSTD_MULTI),
               0x27ce4dc: (0x9761af45, ZSTD_MULTI), 0x5f574c: (0x97e912a5, ZSTD_DDICT), 0xbdc910: (0x97d17634, ZSTD_DDICT),

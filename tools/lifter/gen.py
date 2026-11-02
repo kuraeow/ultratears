@@ -712,9 +712,9 @@ class Module:
                 elif k == 'trap':
                     body.append((i, f'    {spill}{fx(i, ins.code)}'))
                 elif k == 'b':
-                    body.append((i, '    ' + jump(ins.target, i)))
+                    body.append((i, '    ' + spin_gate(a, ins.target) + jump(ins.target, i)))
                 elif k == 'bcond':
-                    body.append((i, f'    if ({fx(i, ins.cond)}) {{ {jump(ins.target, i)} }}'))
+                    body.append((i, f'    if ({fx(i, ins.cond)}) {{ {spin_gate(a, ins.target)}{jump(ins.target, i)} }}'))
                 elif k == 'bl':
                     t = ins.target
                     if self.in_text(t):
@@ -825,9 +825,9 @@ class Module:
             if k == 'op' or k == 'trap':
                 out.append('    ' + ins.code)
             elif k == 'b':
-                out.append('    ' + jump(ins.target))
+                out.append('    ' + spin_gate(a, ins.target) + jump(ins.target))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({ins.cond}) {{ {spin_gate(a, ins.target)}{jump(ins.target)} }}')
             elif k == 'bl':
                 t = ins.target
                 if self.in_text(t):
@@ -867,7 +867,7 @@ class Module:
         return out
 
 
-from patches import PATCHES, PRE_PATCHES
+from patches import PATCHES, PRE_PATCHES, SPINS
 
 
 def table_base(m, i, reg, window=40):
@@ -886,6 +886,11 @@ def table_base(m, i, reg, window=40):
             regs.add(w & 31)  # ADD (shifted/extended register) of the base
             added = True
     return False
+
+
+def spin_gate(a, target):
+    """rt_spin_gate before the back-edge of a spin wait (tools/lifter/spin_waits_v143.txt), else nothing."""
+    return f'rt_spin_gate(c, {hx(target)}); ' if SPINS.get(a) == target else ''
 
 
 def write_if_changed(path, text):
