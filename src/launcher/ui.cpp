@@ -1915,7 +1915,8 @@ void ui_init(SDL_Window *w) {
         U.platform = win && lin ? "both" : lin ? "linux" : "windows";
     }
     update_cleanup(U.root);
-    // updates: one question to GitHub a day at most; a release found stays offered until it is installed
+    // updates: one question to GitHub at every start, in the background (no answer: nothing shown); a release found
+    // stays offered until it is installed
     U.upd.version = U.set.get("update_version");
     if (!U.upd.version.empty() && U.upd.version != U.version && !U.version.empty()) {
         U.upd.name = U.set.get("update_name"), U.upd.url = U.set.get("update_url");
@@ -1923,16 +1924,8 @@ void ui_init(SDL_Window *w) {
         U.upd.size = SDL_strtoull(U.set.get("update_size").c_str(), nullptr, 10);
         U.has_upd = !U.upd.url.empty() && !U.upd.sha256.empty();
     }
-    long long checked = SDL_strtoll(U.set.get("update_checked").c_str(), nullptr, 10);
-    SDL_Time now = 0;
-    SDL_GetCurrentTime(&now);
-    long long secs = (long long)(now / SDL_NS_PER_SECOND);
-    if (U.set.get("updates") != "off" && !U.version.empty() && !python_path(U.root).empty() &&
-        (secs - checked > 24 * 3600 || secs < checked)) {
-        U.set.set("update_checked", std::to_string(secs));
-        settings_save(U.set);
+    if (U.set.get("updates") != "off" && !U.version.empty() && !python_path(U.root).empty())
         update_check_start(U.version);
-    }
     ImGuiStyle &st = ImGui::GetStyle();
     st.WindowPadding = ImVec2(0, 0);
     st.WindowBorderSize = 0;

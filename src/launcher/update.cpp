@@ -1,5 +1,5 @@
-// Updates of the builder package from GitHub Releases: at most one question a day (ultratears-launcher.ini, updates=off
-// turns it off), the newest release's builder zip (Windows) or AppImage (Linux) downloaded into update\ of the package,
+// Updates of the builder package from GitHub Releases: one question at every start (ultratears-launcher.ini, updates=off
+// turns it off; no answer, no network: nothing is shown), the newest release's builder zip (Windows) or AppImage (Linux) downloaded into update\ of the package,
 // its size and SHA-256 (the digest GitHub keeps for every release file) checked before tools/apply_update.py puts the
 // zip in place, or the AppImage takes UltraTears.AppImage's place (platform.cpp appimage_update).
 // HTTP: WinHTTP on Windows, the system's libcurl on Linux; SHA-256: BCrypt on Windows, its own on Linux.
@@ -235,9 +235,9 @@ static int check_thread(void *) {
     Json list;
     UpdateInfo best;
     if (ok && json_parse(body, list)) {
-        for (size_t i = 0; i < list.size(); i++) {   // newest first; pre-releases count (the port is in beta)
+        for (size_t i = 0; i < list.size(); i++) {   // newest first; drafts and pre-releases are not offered
             const Json &r = list[i];
-            if (r["draft"].truth())
+            if (r["draft"].truth() || r["prerelease"].truth())
                 continue;
             std::string tag = r["tag_name"].str();
             if (!newer(tag, G.current) || (best.version.size() && !newer(tag, best.version)))
