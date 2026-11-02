@@ -2607,6 +2607,12 @@ uint64_t mtl_sub_commit(void) {
 // chunk waits for all earlier work and moves its images there. The submission is then one vkQueueSubmit2 of: the slot's
 // command buffer (GPU start time, captured uniforms, the move into the prologue's layouts), the prologue, and for each
 // chunk its move and itself, then the end (copies back).
+// Between chunks (2026-11-02): no wait for all earlier work. The game's own barriers are replayed inside the chunks
+// (OP_BARRIER), so a chunk boundary needs only what the cut itself adds: after the prologue everything (its uploads and
+// pool copies), into a pass cut inside its targets' writes (it begins again with LOAD), and after a chunk whose shaders
+// stored the storage writes (that flag is its recording thread's: the next chunk may be recorded on another). Before,
+// a full ALL_COMMANDS barrier drained the GPU before each of the 16-32 chunks of a frame (totk-pc-recomp splits with none,
+// vk_exec.c). TOTK_VK_CHUNK_BARRIER=1: the full barrier between all chunks, as before.
 // [temporary] Mirrors of written storage buffers are not made (one thread only); TOTK_VK_RECORD_THREADS=1 records as before.
 // A pass longer than 5/4 of the chunk size (the Great Sky Island's G-buffer pass: ~2100 draws, one chunk of 12 of the
 // submission's 14 ms while the other threads waited) is cut inside: the chunk ends its pass and the next one begins it
@@ -2626,6 +2632,7 @@ struct mt_chunk {
     VkCommandBuffer cb;
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
+    int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
 };
 static mt_chunk g_ch[MT_MAXCH];
 static int g_nch;
@@ -2748,6 +2755,7 @@ static void mt_record(mt_chunk *c) {
         if (chunk_end_at(c, i, p) || exec_ops(p, 0, EX_CHUNK, i, c)) break;
     }
     pass_end_why(PE_SUBMIT);
+    c->stores = vkb_stores_take();
     vk.vkEndCommandBuffer(c->cb);
     vkb_trk_set(NULL);
     t_recording = 0;
@@ -2793,6 +2801,7 @@ static void chunk_open(int hidx, const uint8_t *p) {   // a chunk starts at p, i
     c->rt = g_rt;
     c->render_off = g_render_off;
     c->stride = vkb_copy_stride_get();
+    c->split = 0;
     g_mt_draws = 0;
 }
 static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends before p: recording threads may take it
@@ -2811,6 +2820,7 @@ static int walk_op(const uint8_t *p, int hidx) {   // before a command at depth 
     if (((h.op == OP_SET_RT && g_mt_draws >= (uint64_t)g_chunk_draws) || split) && g_nch < MT_MAXCH - 1) {
         chunk_close(hidx, p);
         chunk_open(hidx, p);
+        g_ch[g_nch].split = split && h.op != OP_SET_RT;
     }
     return 0;
 }
@@ -2848,13 +2858,35 @@ static void walk_command(uint32_t op, const uint8_t *a) {
     }
 }
 
-// Before a chunk: everything earlier is done, and its images move into the layouts it needs first.
-static void glue(VkCommandBuffer cb, vkb_trk *t) {
+// Before a chunk: its images move into the layouts it needs first, with what the cut needs (see above). full: everything
+// earlier is done (after the prologue); attach: the targets' writes before a pass cut inside; stores: storage writes.
+enum { GLUE_FULL = 1, GLUE_ATTACH = 2, GLUE_STORES = 4 };
+static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
+    static int all = -1;
+    if (all < 0) { const char *e = getenv("TOTK_VK_CHUNK_BARRIER"); all = e && *e == '1'; }
+    if (all) need = GLUE_FULL;
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    if (!(need & GLUE_FULL)) {
+        mb.srcStageMask = mb.dstStageMask = 0; mb.srcAccessMask = mb.dstAccessMask = 0;
+        if (need & GLUE_ATTACH) {
+            const VkPipelineStageFlags2 att = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            mb.srcStageMask |= att; mb.dstStageMask |= att;
+            mb.srcAccessMask |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            mb.dstAccessMask |= VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+        if (need & GLUE_STORES) {   // as pass_begin's after storage writes
+            mb.srcStageMask |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            mb.dstAccessMask |= VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        }
+    }
     VkImageMemoryBarrier2 ib[64];
-    int ni = 0, first = 1;
+    int ni = 0, first = mb.srcStageMask != 0;
     for (int k = 0; k <= t->n; k++) {
         if (k < t->n) {
             vkb_trk_e *e = &t->e[k];
@@ -2866,7 +2898,7 @@ static void glue(VkCommandBuffer cb, vkb_trk *t) {
                 .subresourceRange = {e->im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
             if (ni < 64) continue;
         }
-        if (ni || first) {
+        if (ni || first) {   // first: the memory barrier, with the first batch of moves or alone
             VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = first ? 1u : 0u, .pMemoryBarriers = &mb,
                                     .imageMemoryBarrierCount = (uint32_t)ni, .pImageMemoryBarriers = ib};
             vk.vkCmdPipelineBarrier2(cb, &dep);
@@ -2930,13 +2962,13 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     rec_ns += tt - tr;
     // in order: the slot's command buffer moves images into the prologue's layouts, then each chunk's move and the chunk
     vk.vkEndCommandBuffer(g_pro_cb);
-    glue(g_slots[g_cur].cb, &g_pro_trk);
+    glue(g_slots[g_cur].cb, &g_pro_trk, GLUE_FULL);
     g_mt_nlist = 0;
     g_mt_list[g_mt_nlist++] = g_pro_cb;
     for (int k = 0; k < g_nch; k++) {
         VkCommandBuffer m = wp_get(g_cur, VKB_MAXREC);
         glue_images += (uint64_t)g_ch[k].trk.n;
-        glue(m, &g_ch[k].trk);
+        glue(m, &g_ch[k].trk, k == 0 ? GLUE_FULL : (g_ch[k].split ? GLUE_ATTACH : 0) | (g_ch[k - 1].stores ? GLUE_STORES : 0));
         vk.vkEndCommandBuffer(m);
         g_mt_list[g_mt_nlist++] = m;
         g_mt_list[g_mt_nlist++] = g_ch[k].cb;
