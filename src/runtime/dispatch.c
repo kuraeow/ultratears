@@ -260,4 +260,6 @@ volatile int g_fnprof;
 void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr; (void)lr; (void)x0; }
 
 // ---- CNTPCT_EL0: the Switch's 19.2 MHz system counter
-uint64_t rt_ticks(void) { return (uint64_t)((unsigned __int128)plat_now_ns() * 12 / 625); }
+// The Switch's 19.2 MHz counter: ns * 12 / 625, as a multiply by that ratio in 16.48 fixed point (a 128-bit division
+// per call before; the game reads the counter often).
+uint64_t rt_ticks(void) { return (uint64_t)(((unsigned __int128)plat_now_ns() * (((12ull << 48) + 312) / 625)) >> 48); }

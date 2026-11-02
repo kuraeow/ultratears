@@ -386,7 +386,16 @@ int svc_thread(int num, uint64_t *regs) {
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-        } else if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0); }
+        } else if (ns > 0) {
+#ifdef _WIN32   // winpthreads' nanosleep counts whole ms: the SDK's 20 us sleeps did not sleep at all (two takes of G
+                // each), and 1 ms or more came up to 1 ms late. A high-resolution timer, spinning the last 0.2 ms,
+                // with the core already given up (as totk-pc-recomp's sleep_ns).
+            uint64_t plat_now_ns(void); void plat_sleep_until_ns(uint64_t t);
+            plat_sleep_until_ns(plat_now_ns() + (uint64_t)ns);
+#else            // exact on Linux (timer slack 1 us, platform/linux.c)
+            struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0);
+#endif
+        }
         else {   // 让出（0 / -1 / -2）。主线程的让出次数与耗时记账：游戏渲染任务图「等全部做完」是纯轮询 + 让出（main+0x15ee898），量它占一帧多少 | Yield (0 / -1 / -2). Count and time of the main thread's yields are recorded: the game's render task graph "wait for everything to finish" is pure polling + yield (main+0x15ee898); measure how much of a frame it takes
             thr_t *me = t_self;
             uint64_t y0 = now_ns();

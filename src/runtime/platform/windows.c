@@ -171,12 +171,16 @@ int plat_protect(uint64_t addr, uint64_t size, int prot) {
 
 // ---- time
 static LARGE_INTEGER qpf;
+static uint64_t g_ns_mul;   // ns per counter tick in 32.32 fixed point: a multiply, not a 128-bit division per call
 
 uint64_t plat_now_ns(void) {
-    if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
+    if (!g_ns_mul) {
+        QueryPerformanceFrequency(&qpf);
+        g_ns_mul = (uint64_t)(((unsigned __int128)1000000000u << 32) / (uint64_t)qpf.QuadPart);
+    }
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (uint64_t)((unsigned __int128)t.QuadPart * 1000000000u / (uint64_t)qpf.QuadPart);
+    return (uint64_t)(((unsigned __int128)(uint64_t)t.QuadPart * g_ns_mul) >> 32);
 }
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
