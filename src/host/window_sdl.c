@@ -145,6 +145,13 @@ int window_init(void) {
 static void pad_attached(void) {   // pad_lock held; pad may be NULL
     if (!pad) { runtime_motion_live(0); return; }
     fprintf(stderr, "[totk] game controller: %s\n", SDL_GetGamepadName(pad));
+    {   // which device it is: a Steam Input virtual gamepad (Steam handle) gives no motion; the Deck's own controller,
+        // opened by SDL's HIDAPI driver (Steam Input off for the game), has a gyro
+        const char *path = SDL_GetGamepadPath(pad);
+        fprintf(stderr, "[totk]   type %d, vendor %04x product %04x, %s, path %s\n", (int)SDL_GetGamepadType(pad),
+                SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+                SDL_GetGamepadSteamHandle(pad) ? "a Steam Input virtual gamepad" : "not through Steam Input", path ? path : "-");
+    }
     if (SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) &&
         SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
         const char *axes = getenv("TOTK_GYRO_AXES");
