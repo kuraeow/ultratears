@@ -17,6 +17,7 @@
 #include "vkb_shader.h"
 #include "vkb_audit.h"
 #include "vkb_lock.h"
+#include "nvn/nvn_dirty.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -212,17 +213,26 @@ static __thread struct {
     const char *bad_key;   // the unsupported shader of a program that cannot be drawn (audit)
     int64_t copy_stride;
 } S;   // this recording thread's (vkb_mt.c gives each chunk the state at its start)
+// Bumped by every change of S that the dynamic state reads (set_dynamic_state: unchanged since its last call in this
+// command buffer, nothing to compare).
+static __thread uint32_t t_sgen;
 
 void vkb_state_reset(void) {
+    t_sgen++;
     memset(&S, 0, sizeof S);
     for (int f = 0; f < 2; f++) { S.stencil[f].value_mask = 0xFF; S.stencil[f].write_mask = 0xFF; }
     S.chmask.mask = 0xFFFFFFFF;
 }
 size_t vkb_state_size(void) { return sizeof S; }
 void vkb_state_save(void *dst) { memcpy(dst, &S, sizeof S); }
-void vkb_state_load(const void *src) { memcpy(&S, src, sizeof S); }
+void vkb_state_load(const void *src) { memcpy(&S, src, sizeof S); t_sgen++; }
 
 void vkb_state(uint32_t op, const uint8_t *a) {
+    switch (op) {   // bindings, programs and vertex input leave the dynamic state as it is
+    case OP_BIND_PROGRAM: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
+    case OP_BIND_TEX: case OP_BIND_IMG: case OP_COPY_STRIDE: break;
+    default: t_sgen++; break;
+    }
     switch (op) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = (const p_bind_program *)a;
@@ -1376,7 +1386,7 @@ static VkStencilOp stencil_op(uint32_t o) { return o >= 1 && o <= 8 ? (VkStencil
 // passes do not reset them): a value equal to the one recorded last in this submission is not recorded again. Every draw
 // used to record ~45 state commands, the shaders and the vertex input; on the Great Sky Island (~6000 draws a frame) the
 // driver's share of recording was ~60 % of the replay thread (2026-10-24).
-static vkb_cnt g_dc_hits, g_dc_calls, g_local_barriers;
+static vkb_cnt g_dc_hits, g_dc_calls, g_local_barriers, g_dyn_skips;
 static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed since the last time in this command buffer)
     if (B->dc.rec != g_rec) { memset(B->dc.valid, 0, sizeof B->dc.valid); B->dc.rec = g_rec; }
     vkb_cnt_add(g_dc_calls, 1);
@@ -1390,6 +1400,17 @@ static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed sinc
 #define DYN(k, T, val, call) do { T v_ = (val); if (dyn(k, &v_, sizeof v_)) call; } while (0)
 
 static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, VkPrimitiveTopology topo) {
+    // Nothing changed since the last draw of this command buffer: its ~45 values are recorded already. Not while the
+    // depth audit or TOTK_VK_DEPTH_ALWAYS look at each draw.
+    static __thread struct { uint64_t rec; uint32_t gen; int ncolor; VkExtent2D ext; VkPrimitiveTopology topo; } last;
+    static int per_draw = -1;
+    if (per_draw < 0) per_draw = getenv("TOTK_VK_DEPTH_ALWAYS") != NULL || getenv("TOTK_VK_DYN_EVERY") != NULL;
+    if (!per_draw && !no_cache() && !vkb_depth_audit_on() && last.rec == g_rec && B->dc.rec == g_rec && last.gen == t_sgen &&
+        last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo) {
+        vkb_cnt_add(g_dyn_skips, 1);
+        return;
+    }
+    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo;
     // viewports (TOTK uses the upper-left window origin, as Vulkan) and the depth range
     VkViewport vps[16];
     int nvp = S.nvp ? S.nvp : 1;
@@ -1565,17 +1586,28 @@ static VkFormat float_read(VkFormat f) {
 }
 
 // The vertices an indexed draw with a base vertex reads: base + the largest index (restart indices left out). 0: not
-// known (the index buffer is not in game memory).
+// known (the index buffer is not in game memory). The largest index of an index range is kept per recording thread
+// while the game has not written its pages (nvn_dirty): scanning every index of every such draw was ~5 % of recording.
+typedef struct { uint64_t ibuf, stamp; int32_t count; uint32_t itype, top; } itop_t;
+static __thread itop_t *t_itop;
 static uint64_t draw_vertex_end(const p_draw_idx *di) {
     uint32_t isz = di->itype == 0 ? 1u : di->itype == 1 ? 2u : 4u, restart = isz == 1 ? 0xFFu : isz == 2 ? 0xFFFFu : 0xFFFFFFFFu, top = 0;
     void *hb;
-    uint64_t hoff;
-    if (!di->ibuf || di->count <= 0 || !mtl_addr(di->ibuf, (uint64_t)di->count * isz, &hb, &hoff)) return 0;
+    uint64_t hoff, len = (uint64_t)di->count * isz;
+    if (!di->ibuf || di->count <= 0 || !mtl_addr(di->ibuf, len, &hb, &hoff)) return 0;
+    enum { NT = 1024 };
+    if (!t_itop && !(t_itop = calloc(NT, sizeof *t_itop))) die("index ranges");
+    itop_t *c = &t_itop[((di->ibuf >> 4) ^ ((uint64_t)di->count * 0x9E3779B1u)) & (NT - 1)];
+    if (c->ibuf == di->ibuf && c->count == di->count && c->itype == (uint32_t)di->itype &&
+        !nvn_dirty_since((const void *)(uintptr_t)di->ibuf, (size_t)len, c->stamp))
+        return (uint64_t)di->base_vertex + c->top + 1;
+    uint64_t stamp = nvn_dirty_now();   // before reading: a write meanwhile is after the stamp
     const uint8_t *ib = (const uint8_t *)(uintptr_t)di->ibuf;
     for (int i = 0; i < di->count; i++) {
         uint32_t v = isz == 1 ? ib[i] : isz == 2 ? ((const uint16_t *)ib)[i] : ((const uint32_t *)ib)[i];
         if (v != restart && v > top) top = v;
     }
+    *c = (itop_t){di->ibuf, stamp, di->count, (uint32_t)di->itype, top};
     return (uint64_t)di->base_vertex + top + 1;
 }
 static __thread uint64_t t_vertex_end;   // vkb_draw -> set_vertex_input: the vertices this draw reads (0: the game's ranges)
@@ -1732,8 +1764,8 @@ void vkb_draw_stats(uint64_t *draws, uint64_t *skipped) {
     uint64_t dc_calls = vkb_cnt_sum(g_dc_calls), dc_hits = vkb_cnt_sum(g_dc_hits);
     uint64_t gets = 0, hits = 0;
     if (vkb_db_on()) vkb_db_stats(&gets, &hits);
-    if (dc_calls) VLOG("recording caches: state %.0f %% not recorded again, descriptor sets %llu made / %llu reused (descriptor bytes: %llu from the driver, %llu cached), mirrors %llu made / %llu sent back early, barriers inside passes %llu",
-                       100.0 * (double)dc_hits / (double)dc_calls, (unsigned long long)vkb_cnt_sum(g_sets_new), (unsigned long long)vkb_cnt_sum(g_sets_reused),
+    if (dc_calls) VLOG("recording caches: state %.0f %% not recorded again (%llu draws without a change), descriptor sets %llu made / %llu reused (descriptor bytes: %llu from the driver, %llu cached), mirrors %llu made / %llu sent back early, barriers inside passes %llu",
+                       100.0 * (double)dc_hits / (double)dc_calls, (unsigned long long)vkb_cnt_sum(g_dyn_skips), (unsigned long long)vkb_cnt_sum(g_sets_new), (unsigned long long)vkb_cnt_sum(g_sets_reused),
                        (unsigned long long)gets, (unsigned long long)hits, (unsigned long long)g_mirrors_made, (unsigned long long)g_mirrors_evicted,
                        (unsigned long long)vkb_cnt_sum(g_local_barriers));
     *skipped = sk[0] + sk[1] + sk[2] + sk[3];
