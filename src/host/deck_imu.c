@@ -7,7 +7,11 @@
 // Report layout and scales as SDL's Steam Deck driver reads them (SDL3 src/joystick/hidapi/SDL_hidapi_steamdeck.c,
 // zlib; no code taken): a 64-byte report, bytes 0-1 the version 0x0001, byte 2 the type (0x09: the controller's state),
 // the state from byte 4: packet number (4), buttons (8), the two pads (8), then accelerometer x, y, z and gyro x, y, z
-// as int16, little-endian; 32768 = 2 G and 2000 deg/s. TOTK_DECK_GYRO=0: off.
+// as int16, little-endian; 32768 = 2 G and 2000 deg/s. Steam keeps the controller's motion off unless the player's
+// Steam Input layout uses it (the reports carried zeros, 2026-11-02): as SDL's driver does, the controller is told to
+// send raw gyro and accelerometer data (feature report 0x87 "set settings", register SETTING_IMU_MODE), and told again
+// every few seconds in case Steam sets it back. Only that register is written; Steam's layout stays as it is.
+// TOTK_DECK_GYRO=0: off.
 #include <stdint.h>
 
 int deck_imu_start(void);
@@ -17,6 +21,8 @@ int deck_imu_start(void) { return 0; }
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/hidraw.h>
+#include <sys/ioctl.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -27,7 +33,17 @@ int deck_imu_start(void) { return 0; }
 
 #include "host.h"
 
-enum { REPORT = 64, STATE = 0x09 };
+enum { REPORT = 64, STATE = 0x09, SET_SETTINGS = 0x87, SETTING_IMU_MODE = 48, IMU_RAW_ACCEL = 0x08, IMU_RAW_GYRO = 0x10 };
+static int g_writable;
+
+static int imu_on(int fd) {   // 1: the controller took the setting
+    unsigned char f[REPORT + 1] = {0};   // f[0]: the report number, 0 (the Deck's reports are not numbered)
+    f[1] = SET_SETTINGS;
+    f[2] = 3;   // one setting: register, value low, value high
+    f[3] = SETTING_IMU_MODE;
+    f[4] = IMU_RAW_ACCEL | IMU_RAW_GYRO;
+    return ioctl(fd, HIDIOCSFEATURE(sizeof f), f) >= 0;
+}
 static int g_fd = -1, g_started;
 
 static int le16(const unsigned char *p) { return (int16_t)(p[0] | p[1] << 8); }
@@ -46,7 +62,9 @@ static int open_deck(void) {
         fclose(f);
         if (!match) continue;
         snprintf(path, sizeof path, "/dev/hidraw%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        g_writable = fd >= 0;
+        if (fd < 0) fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) { if (errno == EACCES) denied = 1; continue; }
         unsigned char b[REPORT];
         for (int tries = 0; tries < 10; tries++) {   // up to ~0.2 s for a report
@@ -55,7 +73,9 @@ static int open_deck(void) {
             ssize_t n = read(fd, b, sizeof b);
             if (is_state(b, n)) {
                 fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-                fprintf(stderr, "[totk] Steam Deck controller motion read from %s (beside Steam Input)\n", path);
+                int on = g_writable && imu_on(fd);
+                fprintf(stderr, "[totk] Steam Deck controller motion read from %s (beside Steam Input); raw motion %s\n", path,
+                        on ? "turned on" : g_writable ? "could not be turned on" : "not writable: as Steam has it");
                 return fd;
             }
         }
@@ -68,8 +88,10 @@ static int open_deck(void) {
 static void *deck_main(void *arg) {
     (void)arg;
     unsigned char b[REPORT];
-    uint64_t quiet = 0, said_quiet = 0;
+    uint64_t quiet = 0, said_quiet = 0, last_on = runtime_now_ns(), said_live = 0;
     for (;;) {
+        uint64_t now = runtime_now_ns();
+        if (g_writable && now - last_on > 3000000000ull) { imu_on(g_fd); last_on = now; }   // Steam may set it back
         ssize_t n = read(g_fd, b, sizeof b);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -84,6 +106,7 @@ static void *deck_main(void *arg) {
             continue;
         }
         quiet = 0;
+        if (!said_live++) fprintf(stderr, "[totk] Steam Deck controller: motion data arriving\n");
         // SDL's gamepad frame from the report (as its Steam Deck driver), then the Switch frame (as window_sdl.c's
         // pad_sensor): the gyro reads in the report's own axes, the acceleration negated (gravity, not the push).
         const double k = 2000.0 * M_PI / 180.0 / 32768.0, a = 2.0 / 32768.0;
