@@ -62,6 +62,7 @@ static __thread uint64_t g_bound_rec, g_bound_gen;
 static uint32_t g_type = UINT32_MAX;   // the same answer whichever thread finds it
 
 static int dmem_new(dmem_t *m, VkDeviceSize size) {
+    uint64_t t0 = runtime_now_ns();
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
@@ -89,6 +90,7 @@ static int dmem_new(dmem_t *m, VkDeviceSize size) {
     if (!vk_check(vk.vkMapMemory(vkc.device, m->mem, 0, VK_WHOLE_SIZE, 0, &p), "map descriptor memory")) return 0;
     VkBufferDeviceAddressInfo ad = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = m->buf};
     m->map = p; m->size = size; m->used = 0; m->addr = vk.vkGetBufferDeviceAddress(vkc.device, &ad);
+    vkb_step_add(PK_ALLOC, t0);
     return 1;
 }
 static void dmem_free(dmem_t *m) {

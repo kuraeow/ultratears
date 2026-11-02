@@ -138,6 +138,7 @@ static int keep_on(void);
 static int arena_get(int slot, VkDeviceSize need) {
     arena_t *a = &g_arena[slot];
     if (a->cap >= need) return 1;
+    uint64_t t0 = runtime_now_ns();
     if (a->buf) { vk.vkDestroyBuffer(vkc.device, a->buf, NULL); vk.vkFreeMemory(vkc.device, a->mem, NULL); }   // the slot's last submission is done
     *a = (arena_t){0};
     VkDeviceSize cap = 1u << 20;
@@ -159,11 +160,18 @@ static int arena_get(int slot, VkDeviceSize need) {
     }
     vk.vkBindBufferMemory(vkc.device, a->buf, a->mem, 0);
     a->cap = cap;
+    vkb_step_add(PK_ALLOC, t0);
     return 1;
 }
 
 static _Atomic int g_ninl;   // inline updates logged (below)
+static void snapshot(const uint64_t *h, int n, void *capv);
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // replay thread, the submission just begun
+    uint64_t t0 = runtime_now_ns();
+    snapshot(h, n, capv);
+    vkb_step_add(PK_UCAP, t0);
+}
+static void snapshot(const uint64_t *h, int n, void *capv) {
     ucap *c = capv ? capv : mtl_sub_capture_ubos(h, n);   // without the translation thread: the replay is in the submit call
     if (g_cur) { free(g_cur->r); free(g_cur->off); free(g_cur->bytes); free(g_cur); g_cur = NULL; }
     g_nu = 0; g_uslot = -1; g_ubytes = NULL; g_uoff = NULL;

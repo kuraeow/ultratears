@@ -1458,21 +1458,25 @@ static void gpu_time_end(int slot, VkCommandBuffer cb) {   // into the submissio
 // A submission whose recording took over 100 ms: where the time went (log line "long submission"). The game waits for
 // its recording at the present: these are the hitches when new parts of the world arrive.
 extern uint64_t vkb_astc_ns, vkb_shader_load_ns;
-static uint64_t g_sub_t0, g_sub_snap[6];
-static void sub_snap(uint64_t v[6]) {
+static uint64_t g_sub_t0, g_sub_snap[11];
+static void sub_snap(uint64_t v[11]) {
     v[0] = vkb_step_ns[PK_CREATE]; v[1] = vkb_step_ns[PK_UPLOAD]; v[2] = vkb_astc_ns; v[3] = vkb_shader_load_ns;
     v[4] = g_sh_scan_ns; v[5] = g_sh_in_bytes;
+    v[6] = vkb_step_ns[PK_ALLOC]; v[7] = vkb_step_ns[PK_UCAP]; v[8] = vkb_step_ns[PK_SYNC]; v[9] = vkb_step_ns[PK_SUBMIT]; v[10] = g_slot_wait_ns;
 }
 static void sub_long_check(uint64_t fence) {
-    uint64_t now = runtime_now_ns(), v[6];
+    uint64_t now = runtime_now_ns(), v[11];
     if (!g_sub_t0 || now - g_sub_t0 < 100000000ull) return;
     sub_snap(v);
     static int said;
     if (said++ < 64)
-        VLOG("long submission %llu: recorded in %.0f ms: new images %.0f ms, uploads %.0f ms (ASTC %.0f ms), shaders made %.0f ms, "
-             "pool copy checks %.0f ms, pool copies in %.1f MiB; draws %llu", (unsigned long long)fence, (now - g_sub_t0) / 1e6,
-             (v[0] - g_sub_snap[0]) / 1e6, (v[1] - g_sub_snap[1]) / 1e6, (v[2] - g_sub_snap[2]) / 1e6, (v[3] - g_sub_snap[3]) / 1e6,
-             (v[4] - g_sub_snap[4]) / 1e6, (v[5] - g_sub_snap[5]) / 1048576.0, (unsigned long long)vkb_draw_count());
+        VLOG("long submission %llu: recorded in %.0f ms: waited for a free slot %.0f ms, new images %.0f ms, uploads %.0f ms (ASTC %.0f ms), "
+             "shaders made %.0f ms, memory made %.0f ms, uniform snapshot %.0f ms, pool copy checks %.0f ms, pool copies in %.1f MiB; "
+             "draws %llu (submit and pool sync after it: of the submission before %.0f / %.0f ms)", (unsigned long long)fence,
+             (now - g_sub_t0) / 1e6, (v[10] - g_sub_snap[10]) / 1e6, (v[0] - g_sub_snap[0]) / 1e6, (v[1] - g_sub_snap[1]) / 1e6,
+             (v[2] - g_sub_snap[2]) / 1e6, (v[3] - g_sub_snap[3]) / 1e6, (v[6] - g_sub_snap[6]) / 1e6, (v[7] - g_sub_snap[7]) / 1e6,
+             (v[4] - g_sub_snap[4]) / 1e6, (v[5] - g_sub_snap[5]) / 1048576.0, (unsigned long long)vkb_draw_count(),
+             (v[9] - g_sub_snap[9]) / 1e6, (v[8] - g_sub_snap[8]) / 1e6);
 }
 
 int mtl_slot_free(void) {   // a submission can begin without waiting for the GPU (work that can wait checks first)
@@ -2645,7 +2649,9 @@ uint64_t mtl_sub_commit(void) {
                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)ncbi, .pCommandBufferInfos = cbi,
                         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig};
+    uint64_t tps = runtime_now_ns();
     pc_sync(fence);   // pool copies: the CPU's writes into the pools this submission uses
+    vkb_step_add(PK_SYNC, tps);
     uint64_t ts0 = runtime_now_ns();
     vk_queue_lock();
     VkResult r = vk.vkQueueSubmit2(vkc.queue, 1, &si, VK_NULL_HANDLE);

@@ -42,7 +42,35 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return UINT32_MAX;
 }
 
+// Chunks given back wait here for the next growth, up to SPARE_MAX bytes, instead of going back to the driver: during
+// play the rings grow at every burst of texture uploads and gave the memory back seconds later, so each burst made
+// chunks again - vkAllocateMemory of tens of MiB of mapped device memory, up to ~100 ms in one submission (2026-11-03,
+// the user's play log: hitches of 60-370 ms while moving). Out of memory (vkb_ring_reclaim) frees them too.
+enum { SPARE_MAX = 256u << 20, NSPARE = 64 };
+static chunk_t g_spare[NSPARE];
+static int g_nspare;
+static VkDeviceSize g_spare_bytes;
+static pthread_mutex_t g_spare_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_ring_reused;
+static void chunk_destroy(chunk_t *c);
+static int spare_take(chunk_t *c, VkDeviceSize size) {   // the smallest spare chunk of at least size
+    pthread_mutex_lock(&g_spare_mu);
+    int best = -1;
+    for (int i = 0; i < g_nspare; i++)
+        if (g_spare[i].size >= size && (best < 0 || g_spare[i].size < g_spare[best].size)) best = i;
+    if (best >= 0) {
+        *c = g_spare[best];
+        g_spare[best] = g_spare[--g_nspare];
+        g_spare_bytes -= c->size;
+        c->used = 0;
+    }
+    pthread_mutex_unlock(&g_spare_mu);
+    if (best >= 0) atomic_fetch_add(&g_ring_reused, 1);
+    return best >= 0;
+}
 static int chunk_new(chunk_t *c, VkDeviceSize size) {
+    if (spare_take(c, size)) return 1;
+    uint64_t t0 = runtime_now_ns();
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
@@ -66,9 +94,18 @@ static int chunk_new(chunk_t *c, VkDeviceSize size) {
     uint64_t now = atomic_fetch_add(&g_ring_bytes, size) + size, p = atomic_load(&g_ring_peak);
     while (now > p && !atomic_compare_exchange_weak(&g_ring_peak, &p, now)) {}
     atomic_fetch_add(&g_ring_made, 1);
+    vkb_step_add(PK_ALLOC, t0);
     return 1;
 }
-static void chunk_free(chunk_t *c) {   // no submission uses it (its slot's last one is done)
+static void chunk_free(chunk_t *c) {   // no submission uses it (its slot's last one is done): to the spares if they have room
+    pthread_mutex_lock(&g_spare_mu);
+    int kept = g_nspare < NSPARE && g_spare_bytes + c->size <= SPARE_MAX;
+    if (kept) { g_spare[g_nspare++] = *c; g_spare_bytes += c->size; }
+    pthread_mutex_unlock(&g_spare_mu);
+    if (kept) memset(c, 0, sizeof *c);
+    else chunk_destroy(c);
+}
+static void chunk_destroy(chunk_t *c) {
     vk.vkDestroyBuffer(vkc.device, c->buf, NULL);
     vk.vkFreeMemory(vkc.device, c->mem, NULL);   // unmaps
     atomic_fetch_sub(&g_ring_bytes, c->size);
@@ -135,11 +172,15 @@ uint64_t vkb_ring_reclaim(void) {
         if (!vkb_slot_idle(s)) continue;
         for (int w = 0; w < VKB_MAXREC; w++) {
             slot_res *r = &g_res[s][w];
-            while (r->n) { freed += r->c[r->n - 1].size; chunk_free(&r->c[--r->n]); }
+            while (r->n) { freed += r->c[r->n - 1].size; chunk_destroy(&r->c[--r->n]); }
             r->cur = r->peak = r->fpeak = r->resets = r->fresets = 0;
         }
     }
     pthread_mutex_unlock(&g_ring_mu);
+    pthread_mutex_lock(&g_spare_mu);
+    while (g_nspare) { freed += g_spare[g_nspare - 1].size; chunk_destroy(&g_spare[--g_nspare]); }
+    g_spare_bytes = 0;
+    pthread_mutex_unlock(&g_spare_mu);
     return freed;
 }
 void vkb_ring_counts(uint64_t *peak, uint64_t *made, uint64_t *freed) {
