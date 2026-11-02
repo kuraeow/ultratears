@@ -161,6 +161,10 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
 }
 static thr_t *me_or_null(void) { return t_self; }
+static int core_better_waiter(const thr_t *t, int c) {   // holding G: a waiter for core c better than t
+    for (const thr_t *w = g_core_wait; w; w = w->cnext) if (core_allowed(w, c) && w->prio < t->prio) return 1;
+    return 0;
+}
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
@@ -173,9 +177,20 @@ void runtime_core_back(int *away) {
     pthread_mutex_lock(&G); core_take(t); pthread_mutex_unlock(&G);
 }
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
+// Called at every SVC (guest.c rt_svc) and indirect call (runtime/dispatch.c rt_dispatch). The request may be stale:
+// the waiter got another core meanwhile, and giving this one up would hand it to a worse thread.
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
-    pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G);
+    if (t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) { core_put(t); core_take(t); }   // core_put clears the request
+    else t->preempt = 0;
+    pthread_mutex_unlock(&G);
+}
+extern __thread volatile int *rt_preempt_flag;   // runtime/dispatch.c
+extern void (*rt_preempt_fn)(void);
+static void preempt_point_set(thr_t *t) {
+    rt_preempt_fn = runtime_core_checkpoint;
+    rt_preempt_flag = t && cores_enabled() && !getenv("TOTK_NO_PREEMPT") ? &t->preempt : NULL;   // TOTK_NO_PREEMPT=1: as before
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
@@ -237,6 +252,7 @@ uint32_t (*dm_thread_tick_fn)(void);   // the current game tick, when diagnostic
 static void *thread_main(void *p) {
     thr_t *t = p;
     t_self = t;
+    preempt_point_set(t);
     plat_thread_start();
     Cpu *c = guest_cpu_new(t->stack_top, guest_tls_alloc());
     guest_cpu_set(c);
@@ -260,6 +276,7 @@ static _Noreturn void thread_exit_on_host(void *argument) {
     t->exited = 1;
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
     t_self = NULL;
+    rt_preempt_flag = NULL;
     if (t->closed) thr_free(t);
     pthread_mutex_unlock(&G);
     pthread_exit(NULL);
@@ -276,6 +293,7 @@ uint32_t svc_thread_main_init(void) {
     t->cur_core = -1;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
     t_self = t;
+    preempt_point_set(t);
     return t->handle;
 }
 

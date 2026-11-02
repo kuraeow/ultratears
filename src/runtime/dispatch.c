@@ -163,8 +163,16 @@ static GuestFn dispatch_slow(Cpu *c) {
     return f;
 }
 
+// Preemption point (host/threads.c runtime_core_checkpoint): a guest thread whose core a better thread waits for gives
+// it up at its next indirect call or SVC, as Horizon would run the better thread at once. Without it the waiter got
+// the core only when the holder blocked or slept (totk-pc-recomp measured waits up to 26 ms; its rt_dispatch checks
+// the same way). rt_preempt_flag: the running thread's request flag, set by threads.c; one load and branch here.
+__thread volatile int *rt_preempt_flag;
+void (*rt_preempt_fn)(void);
+
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
+    if (__builtin_expect(rt_preempt_flag && *rt_preempt_flag, 0)) rt_preempt_fn();
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
     GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
     __attribute__((musttail)) return f(c);
