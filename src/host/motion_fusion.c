@@ -27,6 +27,7 @@ enum { MOTION_RING = 64 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeMotionState ring[MOTION_RING];
 static uint64_t produced, last_ns, logged, log_at, reads_logged;
+static uint64_t first;   /* produced at the last StartSixAxisSensor: older samples are not read */
 static double R[3][3];          /* controller -> reference; row i = reference axis i in controller coordinates */
 static double angle[3];
 static int restart = 1, live;
@@ -157,15 +158,22 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
     if (max <= 0) return 0;
     int n = 0;
     pthread_mutex_lock(&lock);
-    if (live && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
-        uint64_t have = produced < MOTION_RING ? produced : MOTION_RING;
+    if (live && produced > first && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
+        uint64_t have = produced - first < MOTION_RING ? produced - first : MOTION_RING;
         n = (int)(have < (uint64_t)max ? have : (uint64_t)max);
         for (int i = 0; i < n; i++) out[i] = ring[(produced - 1 - (uint64_t)i) % MOTION_RING];
     }
     pthread_mutex_unlock(&lock);
     return n;
 }
-void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
+/* StartSixAxisSensor (the bow drawn): the samples from before it are dropped, so a read in the same frame returned the
+   previous session's states as live and motion aim was dead, then lagged ~60 ms (totk-pc-recomp 7d89fde, MIT). Reads
+   return nothing until the next sample, which starts a fresh frame and angle; sampling numbers go on. */
+void runtime_motion_start(void) {
+    pthread_mutex_lock(&lock);
+    restart = 1; first = produced; last_ns = 0; memset(angle, 0, sizeof angle);
+    pthread_mutex_unlock(&lock);
+}
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }
