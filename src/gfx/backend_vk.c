@@ -1943,6 +1943,7 @@ static void trace_rt(void) {
 int vkb_pass_begin(VkExtent2D bare, uint32_t fb) { return pass_begin(bare, fb); }
 uint32_t vkb_pass_fb(void) { return g_in_pass ? g_pass_fb : 0; }
 vkb_cnt vkb_pass_end_n[PE_COUNT];   // passes ended, by reason (the per-frame log line)
+static int rt_keep(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_RT_KEEP"); on = !e || *e != '0'; } return on; }
 static void pass_end_why(int why) { if (g_in_pass) vkb_cnt_add(vkb_pass_end_n[why], 1); pass_end(); }
 void vkb_pass_end_r(int why) { pass_end_why(why); }
 void vkb_pass_end(void) { pass_end_why(PE_OTHER); }
@@ -2483,7 +2484,14 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             mtl_sub_copy(s, d, n);
             break;
         }
-        case OP_SET_RT: pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt); trace_rt(); break;
+        case OP_SET_RT:
+            // The same targets again (TOTK sets them before many draws): the pass goes on. Ending it stored and loaded
+            // every attachment and drained the GPU between draws into the same targets (totk-pc-recomp vk_exec.c set_rt
+            // compares the same way). TOTK_VK_RT_KEEP=0: a new pass every time, as before.
+            if (!(g_in_pass && rt_keep() && !memcmp(&g_rt, a, sizeof g_rt))) {
+                pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt);
+            }
+            trace_rt(); break;
         case OP_CLEAR_COLOR: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_ds((const p_clear_ds *)a); break;
         case OP_CLEAR_TEX: if (g_ok == 1) clear_tex((const p_clear_tex *)a); break;
