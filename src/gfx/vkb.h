@@ -143,7 +143,7 @@ void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hit
 int vkb_ucap_update(uint64_t addr, uint64_t n, const uint8_t *data);   // an inline uniform update: 1 when the copy keeps it
 void vkb_ucap_hazard(void);   // a reader of memory a kept update has not reached yet (counted)
 int vkb_ub_deferred(uint64_t addr, uint64_t size);   // backend_vk.c: a kept update of this pass overlaps (not yet in memory)
-void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_hits, uint64_t *hazards);
+void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_bytes, uint64_t *ver_hits, uint64_t *hazards);
 
 // ---- vkb_bc7.c: ASTC textures as BC7, from a cache by the contents of the ASTC blocks
 typedef struct { uint64_t a, b; } vkb_bc7_key;

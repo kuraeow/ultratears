@@ -116,7 +116,7 @@ static size_t *g_uoff;
 static ucap *g_cur;
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize cap; } arena_t;
 static arena_t g_arena[VKB_SLOTS];
-static vkb_cnt g_hits, g_versions, g_ver_hits, g_hazards;
+static vkb_cnt g_hits, g_versions, g_ver_hits, g_hazards, g_ver_bytes;
 static uint64_t g_drops, g_kept;
 static _Atomic uint64_t g_ugen;   // submissions snapshotted (keys the readers' version caches)
 // GPU writes of submissions recorded so far (inline updates, copies, stores), kept until the GPU has completed them: a
@@ -323,6 +323,7 @@ static int version(int i, uint64_t addr, uint64_t size, int top, VkBuffer *buf, 
     *v = (ver_t){addr, size, gen, top, rb, ro};
     *buf = rb; *off = ro;
     vkb_cnt_add(g_versions, 1);
+    vkb_cnt_add(g_ver_bytes, size);
     return 1;
 }
 
@@ -372,6 +373,6 @@ void vkb_ucap_drop(uint64_t addr, uint64_t len) {   // a GPU write to [addr, add
 void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hits, uint64_t *drops) {
     *caps = g_caps; *bytes = g_cap_bytes; *ns = g_cap_ns; *hits = vkb_cnt_sum(g_hits); *drops = g_drops;
 }
-void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_hits, uint64_t *hazards) {
-    *kept = g_kept; *versions = vkb_cnt_sum(g_versions); *ver_hits = vkb_cnt_sum(g_ver_hits); *hazards = vkb_cnt_sum(g_hazards);
+void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_bytes, uint64_t *ver_hits, uint64_t *hazards) {
+    *kept = g_kept; *versions = vkb_cnt_sum(g_versions); *ver_bytes = vkb_cnt_sum(g_ver_bytes); *ver_hits = vkb_cnt_sum(g_ver_hits); *hazards = vkb_cnt_sum(g_hazards);
 }

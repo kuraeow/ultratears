@@ -2355,12 +2355,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 VLOG("per frame: uniforms copied at submit %.2f MiB in %.0f submissions (%.2f ms on the game thread), bindings from the copy %.0f, dropped by GPU writes %.1f",
                      (double)(b - pb) / 1048576.0 / f, (double)(c - pc) / f, (double)(ns - pn) / 1e6 / f, (double)(h - ph) / f, (double)(d - pd) / f);
                 pc = c; pb = b; pn = ns; ph = h; pd = d;
-                static uint64_t pk, pv, pvh, pz;
-                uint64_t k, v, vh, z;
-                vkb_ucap_keep_stats(&k, &v, &vh, &z);
-                VLOG("per frame: inline uniform updates kept in the copy %.1f (versions built %.1f, reused %.1f), readers of memory not yet written %.2f",
-                     (double)(k - pk) / f, (double)(v - pv) / f, (double)(vh - pvh) / f, (double)(z - pz) / f);
-                pk = k; pv = v; pvh = vh; pz = z;
+                static uint64_t pk, pv, pvb, pvh, pz;
+                uint64_t k, v, vb, vh, z;
+                vkb_ucap_keep_stats(&k, &v, &vb, &vh, &z);
+                VLOG("per frame: inline uniform updates kept in the copy %.1f (versions built %.1f, %.2f MiB; reused %.1f), readers of memory not yet written %.2f",
+                     (double)(k - pk) / f, (double)(v - pv) / f, (double)(vb - pvb) / 1048576.0 / f, (double)(vh - pvh) / f, (double)(z - pz) / f);
+                pk = k; pv = v; pvb = vb; pvh = vh; pz = z;
             }
             if (vkb_pool_copies()) {
                 static uint64_t pci, pcw, pcb, pcn, pck, pcs;
