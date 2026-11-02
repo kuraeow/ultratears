@@ -217,6 +217,7 @@ static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHY
 static VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
 static VkPhysicalDeviceCustomBorderColorFeaturesEXT fcbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
 static VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+static VkPhysicalDeviceRobustness2FeaturesEXT frb2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
 static VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
 static VkPhysicalDeviceConditionalRenderingFeaturesEXT fcr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
 static VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
@@ -268,9 +269,13 @@ static int create_device(void) {
         {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
         // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
         {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
+        // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
+        {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},
     };
+    const char *robust = getenv("TOTK_VK_ROBUST");
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
+        if (want[i].features == &frb2 && !(robust && !strcmp(robust, "2"))) continue;
         if ((want[i].flag == &vkc.has_checkpoints || want[i].flag == &vkc.has_buffer_marker) && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
@@ -324,9 +329,16 @@ static int create_device(void) {
     fcbc.customBorderColors = (VkBool32)vkc.has_custom_border;   // the features enabled are the ones used
     fcbc.customBorderColorWithoutFormat = (VkBool32)vkc.has_custom_border;
     // TOTK_VK_ROBUST=1 (development): bounds-checked buffer access, to tell a shader's out-of-range access from other
-    // causes of a lost device
-    if (!getenv("TOTK_VK_ROBUST")) f2.features.robustBufferAccess = VK_FALSE;
-    else LOG("robust buffer access %s (TOTK_VK_ROBUST)", f2.features.robustBufferAccess ? "on" : "not supported");
+    // causes of a lost device; =2 with robustBufferAccess2: a read past the bound range gives 0 (vertex fetch: 0 or
+    // (0,0,0,1)), as on AMD, whose buffer descriptors check the range in hardware whatever the device enables
+    frb2.robustImageAccess2 = frb2.nullDescriptor = VK_FALSE;
+    if (!robust) f2.features.robustBufferAccess = VK_FALSE;
+    else LOG("robust buffer access %s%s (TOTK_VK_ROBUST)", f2.features.robustBufferAccess ? "on" : "not supported",
+             frb2.robustBufferAccess2 ? ", reads past the range give 0 (robustBufferAccess2)" : "");
+    if (f2.features.robustBufferAccess && vkc.has_descriptor_buffer) {   // robust buffer descriptors may be larger
+        vkc.db.uniformBufferDescriptorSize = vkc.db.robustUniformBufferDescriptorSize;
+        vkc.db.storageBufferDescriptorSize = vkc.db.robustStorageBufferDescriptorSize;
+    }
     vkc.has_descriptor_buffer = vkc.has_descriptor_buffer && fdb.descriptorBuffer;
     if (vkc.has_descriptor_buffer) fdb.descriptorBufferCaptureReplay = VK_FALSE;   // tools only, costs driver work
     if (vkc.has_descriptor_buffer)
