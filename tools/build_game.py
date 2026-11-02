@@ -51,7 +51,8 @@ GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 # Linux (--platform linux): the kit is deps/linux in a builder, else dev-local/linux-cross (ULTRS_LINUX_KIT overrides).
 LINUX_KIT = pathlib.Path(os.environ.get('ULTRS_LINUX_KIT') or next(
     (p for p in (ROOT / 'deps/linux', ROOT / 'dev-local/linux-cross') if (p / 'sysroot').is_dir()), ROOT / 'deps/linux'))
-LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c']
+LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c',
+                 'src/runtime/envcache.c']
 
 
 # The rpath of the Linux programs, as ninja writes it into a command: on Linux ninja runs commands through sh, which
@@ -68,7 +69,8 @@ def linux_flags():
 def linux_libs():
     # SDL3 shared (beside the game: the sysroot's static one is not position-independent); Opus, libvpx, zstd and
     # libstdc++ static, so the game needs only glibc, the Vulkan loader and that SDL3.
-    return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc -lSDL3 '
+    return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
+            '-Wl,--wrap=getenv,--wrap=setenv,--wrap=unsetenv,--wrap=putenv -lSDL3 '   # src/runtime/envcache.c
             '-l:libopus.a -l:libvpx.a -l:libzstd.a -l:libstdc++.a -lm -lpthread -ldl')
 
 
