@@ -568,7 +568,7 @@ int svc_thread(int num, uint64_t *regs) {
         if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
-                if (cnt <= 0) nv = nw > 0 ? val - 1 : val + 1;
+                if (cnt <= 0) nv = nw > 0 ? val - 2 : val + 1;   // Horizon: value - 2 when it wakes all waiters
                 else nv = nw == 0 ? val + 1 : nw <= cnt ? val - 1 : val;
             }
             uint32_t e = (uint32_t)val;
@@ -608,15 +608,19 @@ int svc_thread(int num, uint64_t *regs) {
         g_lock();
         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
         int64_t r; int idx = -1;
+        // Horizon's order (KSynchronizationObject::Wait): a signalled object, then timeout 0, then a pending cancel. A
+        // poll or a wait on a signalled object leaves the cancel to the next wait that would block.
         for (;;) {
-            if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
             int bad = 0;
             for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
             if (bad) { r = R_BAD_HANDLE; break; }
             if (idx >= 0) { r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
-            if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
-            if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+            if (ns == 0 || (ns > 0 && left <= 0)) { r = R_TIMEOUT; break; }
+            if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
+            int64_t w = block(t, 4, left);
+            if (w == R_TIMEOUT) { r = R_TIMEOUT; break; }
+            if (w == (int64_t)R_CANCELLED) { t->cancel = 0; r = R_CANCELLED; break; }
         }
         g_unlock();
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
@@ -624,7 +628,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
         g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
+        if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, (int64_t)R_CANCELLED); }
         g_unlock();
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }

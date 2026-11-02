@@ -984,10 +984,22 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 sourcesList.Add(context.BitwiseAnd(packedParams, Const(0xffff)));
             }
 
-            // Derivatives (X and Y).
-            for (int dIndex = 0; dIndex < 2 * coordsCount; dIndex++)
+            // Derivatives (X and Y). UltraTears: the registers hold them per coordinate (du/dx, du/dy, dv/dx, dv/dy, as
+            // yuzu reads them), and the sources want all X derivatives, then all Y. Taking the registers in order gave a
+            // 2D lookup (du/dx, du/dy) as dPdx, so terrain picked mip levels from the wrong derivatives and crawled.
+            Operand[] derivs = new Operand[2 * coordsCount];
+
+            for (int dIndex = 0; dIndex < derivs.Length; dIndex++)
             {
-                sourcesList.Add(Rb());
+                derivs[dIndex] = Rb();
+            }
+
+            for (int axis = 0; axis < 2; axis++)
+            {
+                for (int index = 0; index < coordsCount; index++)
+                {
+                    sourcesList.Add(derivs[index * 2 + axis]);
+                }
 
                 if (is1DTo2D)
                 {
