@@ -37,11 +37,25 @@
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
-static VkDescriptorSetLayout g_layout[2];   // 0 graphics, 1 compute
+// Layouts (VKB_LAYOUT_*): graphics, compute, and with split sets the graphics buffers' (set 1).
+static VkDescriptorSetLayout g_layout[VKB_LAYOUTS];
 static VkPipelineLayout g_playout[2];
 
+// Graphics descriptors in two sets (descriptor buffers only): set 0 the textures and images, set 1 the buffers. A draw's
+// textures are those of the draw before ~76 % of the time, its buffers ~6 % (uniform offsets per object; Lookout Landing
+// and a Depths forest, 2026-11-03): with one set every draw wrote and looked up all of them again. The shaders' buffer
+// variables are moved to set 1 at load (load_module). TOTK_VK_SPLIT_SETS=0: one set, as before.
+int vkb_split_sets(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_SPLIT_SETS"); v = vkb_db_on() && !(e && *e == '0'); }
+    return v;
+}
+static int is_buffer_binding(uint32_t b) { return b % VKB_STAGE_BINDINGS < VKB_B_TEX; }
+
 static void make_layouts(void) {
-    for (int compute = 0; compute < 2; compute++) {
+    for (int id = 0; id < VKB_LAYOUTS; id++) {
+        int compute = id == VKB_LAYOUT_COMPUTE;
+        if (id == VKB_LAYOUT_BUFFERS && !vkb_split_sets()) continue;
         VkDescriptorSetLayoutBinding b[128];
         VkDescriptorBindingFlags fl[128];
         uint32_t n = 0;
@@ -54,7 +68,9 @@ static void make_layouts(void) {
                 {VKB_B_IMG, VKB_NIMG, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
             for (unsigned k = 0; k < sizeof r / sizeof *r; k++)
                 for (uint32_t i = 0; i < r[k].count; i++) {
-                    b[n] = (VkDescriptorSetLayoutBinding){base + r[k].off + i, r[k].type, 1, sf, NULL};
+                    uint32_t at = base + r[k].off + i;
+                    if (!compute && vkb_split_sets() && is_buffer_binding(at) != (id == VKB_LAYOUT_BUFFERS)) continue;
+                    b[n] = (VkDescriptorSetLayoutBinding){at, r[k].type, 1, sf, NULL};
                     fl[n++] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;   // only what the shaders use is written
                 }
         }
@@ -62,13 +78,24 @@ static void make_layouts(void) {
                                                           .bindingCount = n, .pBindingFlags = fl};
         VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &fi, .bindingCount = n, .pBindings = b};
         if (vkb_db_on()) { ci.pNext = NULL; ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT; }   // vkb_desc.c
-        if (!vk_check(vk.vkCreateDescriptorSetLayout(vkc.device, &ci, NULL, &g_layout[compute]), "descriptor set layout")) die("layout");
-        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g_layout[compute]};
+        if (!vk_check(vk.vkCreateDescriptorSetLayout(vkc.device, &ci, NULL, &g_layout[id]), "descriptor set layout")) die("layout");
+    }
+    for (int compute = 0; compute < 2; compute++) {
+        VkDescriptorSetLayout sets[2];
+        uint32_t n = vkb_set_layouts(compute, sets);
+        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = n, .pSetLayouts = sets};
         if (!vk_check(vk.vkCreatePipelineLayout(vkc.device, &pi, NULL, &g_playout[compute]), "pipeline layout")) die("layout");
     }
     if (vkb_db_on()) vkb_db_layouts(g_layout);
 }
 VkDescriptorSetLayout vkb_set_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_layout[compute]; }
+uint32_t vkb_set_layouts(int compute, VkDescriptorSetLayout out[2]) {   // a pipeline's sets: their count
+    if (!g_layout[0]) make_layouts();
+    out[0] = g_layout[compute];
+    if (compute || !vkb_split_sets()) return 1;
+    out[1] = g_layout[VKB_LAYOUT_BUFFERS];
+    return 2;
+}
 VkPipelineLayout vkb_pipeline_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_playout[compute]; }
 
 // ---------------- the reflection (<key>.res.json): a small reader for its fixed shape ----------------
@@ -302,11 +329,12 @@ static size_t drop_cull_distance(uint32_t *w, size_t n) {
 static _Atomic uint64_t g_from_bin, g_from_spv, g_bin_refused, g_obj_live, g_obj_destroyed;
 static VkResult make_object(const char *key, const vkb_shbin_variant *v, VkShaderStageFlagBits stage, const uint32_t *spv,
                             size_t bytes, VkShaderEXT *obj) {
-    VkDescriptorSetLayout layout = vkb_set_layout(stage == VK_SHADER_STAGE_COMPUTE_BIT);
+    VkDescriptorSetLayout layouts[2];
+    uint32_t nlayouts = vkb_set_layouts(stage == VK_SHADER_STAGE_COMPUTE_BIT, layouts);
     VkShaderCreateInfoEXT ci = {VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = stage,
         .nextStage = stage == VK_SHADER_STAGE_VERTEX_BIT ? VK_SHADER_STAGE_FRAGMENT_BIT : 0,
         .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = bytes, .pCode = spv, .pName = "main",
-        .setLayoutCount = 1, .pSetLayouts = &layout};
+        .setLayoutCount = nlayouts, .pSetLayouts = layouts};
     // 32 lanes, as the translator assumes, where the driver would pick (vk.c: vkc.subgroup_pin); the binaries on disk
     // were made the same way (their file header holds the pin, vkb_shbin.c)
     VkShaderRequiredSubgroupSizeCreateInfoEXT lanes = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
@@ -423,6 +451,7 @@ static int dref_clamp(void) {
 static uint32_t stamp_fold(uint64_t h) {
     if (dref_clamp()) h ^= 0x5BD1E995ull << 32;   // binaries made before the clamp are not used (the halves fold below)
     if (!vkc.has_interlock) h ^= 0x27D4EB2Full << 32;   // nor those of modules with the interlock (vkb_spv_drop_interlock)
+    if (vkb_split_sets()) h ^= 0x2F0B3C51ull << 32;   // nor those made with one descriptor set (buffers in set 1 now)
     return (uint32_t)(h ^ h >> 32) | 1;   // never 0
 }
 static uint32_t stamp_of(uint64_t mtime_s, uint64_t size) {
@@ -521,6 +550,8 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
     if (dref_clamp() && vkb_spv_clamp_dref(spv, nw, &clamped, &ncl)) { free(spv); spv = clamped; nw = ncl; }
     if (!vkc.has_interlock) nw = vkb_spv_drop_interlock(spv, nw);   // a device without it refused these modules (RX 570)
     nspv = nw * 4;
+    int split = nvn_stage <= 1 && vkb_split_sets();   // vertex and fragment shaders (compute keeps one set)
+    uint32_t bound = spv[3], *in_set1 = split ? calloc((bound + 31) / 32, 4) : NULL;   // ids of buffer variables
     for (size_t i = 5; i < nw;) {
         uint32_t op = spv[i] & 0xffff, wc = spv[i] >> 16;
         if (!wc || i + wc > nw) break;
@@ -529,10 +560,20 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
             if (old > 255 || remap[old] == UINT32_MAX) {
                 VLOG("shader %s: binding %u not in its reflection", key, old);
                 s->unsupported = 1;
-            } else spv[i + 3] = remap[old];
+            } else {
+                spv[i + 3] = remap[old];
+                if (in_set1 && spv[i + 1] < bound && is_buffer_binding(remap[old])) in_set1[spv[i + 1] / 32] |= 1u << (spv[i + 1] % 32);
+            }
         }
         i += wc;
     }
+    for (size_t i = 5; in_set1 && i < nw;) {   // OpDecorate %id DescriptorSet n (decoration 34)
+        uint32_t op = spv[i] & 0xffff, wc = spv[i] >> 16;
+        if (!wc || i + wc > nw) break;
+        if (op == 71 && wc == 4 && spv[i + 2] == 34 && spv[i + 1] < bound && (in_set1[spv[i + 1] / 32] >> (spv[i + 1] % 32) & 1)) spv[i + 3] = 1;
+        i += wc;
+    }
+    free(in_set1);
     // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
     s->in_mask = vkb_spv_input_mask(spv, nw);
     s->out_mask = vkb_spv_output_mask(spv, nw);

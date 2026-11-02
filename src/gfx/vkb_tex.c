@@ -486,6 +486,7 @@ static int create(vkb_image *im, const tex_t *t) {
     }
     vk.vkBindImageMemory(vkc.device, im->img, im->mem, 0);
     im->serial = t->serial; im->d = *d; im->format = f; im->aspect = aspect; im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
     im->width = w; im->height = h; im->depth = depth; im->layers = layers; im->levels = levels; im->astc = astc;
     im->storage = t->mem;
     im->usage = usage;
@@ -751,10 +752,13 @@ static vkb_trk_e *trk_add(vkb_trk *t, vkb_image *im, VkImageLayout l) {
     t->tab[h] = t->n++;
     return e;
 }
+// Layout epochs (vkb.h): this thread's chunk changed a layout it tracks, or an image's own layout changed.
+__thread uint32_t vkb_layout_epoch;
+_Atomic uint32_t vkb_layout_epoch_all;
 int vkb_layout_is(vkb_image *im, VkImageLayout l) {
     if (!t_trk) return im->layout == l;
     vkb_trk_e *e = trk_find(t_trk, im);
-    if (!e) { trk_add(t_trk, im, l); return 1; }
+    if (!e) { trk_add(t_trk, im, l); vkb_layout_epoch++; return 1; }
     return e->cur == l;
 }
 VkImageLayout vkb_layout(vkb_image *im) {
@@ -767,10 +771,11 @@ void vkb_image_use(VkCommandBuffer cb, vkb_image *im, VkImageLayout layout, VkPi
     VkImageLayout old = im->layout;
     if (t_trk) {
         vkb_trk_e *e = trk_find(t_trk, im);
+        vkb_layout_epoch++;
         if (!e) { trk_add(t_trk, im, layout); return; }   // its first use in the chunk: the barrier between chunks
         old = e->cur;
         e->cur = layout;
-    } else im->layout = layout;
+    } else { im->layout = layout; atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed); }
     // [temporary] every use waits for all earlier work on the image: precise per-pass barriers come with the pass tracker
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = stage, .dstAccessMask = access, .oldLayout = old,
@@ -1197,6 +1202,7 @@ static int to_bc7(vkb_image *im, int srgb, int fmt) {
     vkb_destroy_later(VK_NULL_HANDLE, im->img, im->mem);   // the RGBA8 image no command has used
     im->img = img; im->mem = mem; im->format = f; im->usage = usage; im->cube = (int)(ci.flags != 0); im->compressed = 1; im->bc7 = fmt == VKB_BC_1 ? 2 : 1;
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
     return 1;
 }
 typedef struct {

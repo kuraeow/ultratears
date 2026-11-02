@@ -2987,6 +2987,7 @@ static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
         }
     }
     for (int k = 0; k < t->n; k++) t->e[k].im->layout = t->e[k].cur;
+    if (t->n) atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
 }
 
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits

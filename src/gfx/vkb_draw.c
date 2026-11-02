@@ -216,16 +216,20 @@ static __thread struct {
 // Bumped by every change of S that the dynamic state reads (set_dynamic_state: unchanged since its last call in this
 // command buffer, nothing to compare).
 static __thread uint32_t t_sgen;
+// Bumped by the bindings a driver bank holds ([bank][stage]: 0 storage buffers, compute uniform buffers; 1 textures and
+// images) and, for all of them, by a chunk's start state and a reset (t_bgen_all): driver_bank compares these first.
+static __thread uint32_t t_bgen[2][6], t_bgen_all;
+static vkb_cnt g_tex_kept;   // write_stage: texture descriptors of the draw before
 
 void vkb_state_reset(void) {
-    t_sgen++;
+    t_sgen++; t_bgen_all++;
     memset(&S, 0, sizeof S);
     for (int f = 0; f < 2; f++) { S.stencil[f].value_mask = 0xFF; S.stencil[f].write_mask = 0xFF; }
     S.chmask.mask = 0xFFFFFFFF;
 }
 size_t vkb_state_size(void) { return sizeof S; }
 void vkb_state_save(void *dst) { memcpy(dst, &S, sizeof S); }
-void vkb_state_load(const void *src) { memcpy(&S, src, sizeof S); t_sgen++; }
+void vkb_state_load(const void *src) { memcpy(&S, src, sizeof S); t_sgen++; t_bgen_all++; }
 
 void vkb_state(uint32_t op, const uint8_t *a) {
     switch (op) {   // bindings, programs and vertex input leave the dynamic state as it is
@@ -289,11 +293,20 @@ void vkb_state(uint32_t op, const uint8_t *a) {
         for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i];
         break;
     }
-    case OP_BIND_UBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage < 6 && b->index >= 0 && b->index < 18) S.ubo[b->stage][b->index] = *b; break; }
-    case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage < 6 && b->index >= 0 && b->index < 16) S.ssbo[b->stage][b->index] = *b; break; }
+    case OP_BIND_UBO: {
+        const p_bind_buf *b = (const p_bind_buf *)a;
+        if (b->stage < 6 && b->index >= 0 && b->index < 18) { S.ubo[b->stage][b->index] = *b; if (b->stage == 5) t_bgen[0][5]++; }
+        break;
+    }
+    case OP_BIND_SSBO: {
+        const p_bind_buf *b = (const p_bind_buf *)a;
+        if (b->stage < 6 && b->index >= 0 && b->index < 16) { S.ssbo[b->stage][b->index] = *b; t_bgen[0][b->stage]++; }
+        break;
+    }
     case OP_BIND_TEX: case OP_BIND_IMG: {
         const p_bind_handles *b = (const p_bind_handles *)a;
         if (b->stage < 0 || b->stage >= 6) break;
+        t_bgen[1][b->stage]++;
         uint64_t *dst = op == OP_BIND_TEX ? S.tex[b->stage] : S.img[b->stage];
         int max = op == OP_BIND_TEX ? 32 : 8;
         for (int i = 0; i < b->n && b->first + i < max; i++) dst[b->first + i] = b->h[i];
@@ -327,8 +340,10 @@ static void *grow(void *a, int *n, int need, size_t elem) {
     *n = m;
     return a;
 }
+static _Atomic uint32_t g_reg_gen;   // registrations so far (write_stage's texture descriptors kept while it stands)
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) return;
+    atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_release);
     vkb_rw_write(&g_reg_mu, LK_TEXREG);
     g_treg = grow(g_treg, &g_ntreg, id, sizeof *g_treg);
     treg_t *r = &g_treg[id];
@@ -340,6 +355,7 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
 }
 void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0 || id >= (1 << 12)) return;
+    atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_release);
     vkb_rw_write(&g_reg_mu, LK_TEXREG);
     g_sreg = grow(g_sreg, &g_nsreg, id, sizeof *g_sreg);
     sreg_t *r = &g_sreg[id];
@@ -798,11 +814,16 @@ static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDevice
 // table; bank 2: combined texture handles at 0x20, images at 0x120).
 // Rebuilt only when what it holds changed since the last one of that bank and stage in this submission (four 4 KiB
 // banks a draw were built and cleared before: ~96 MB a frame on the Great Sky Island).
-typedef struct { uint64_t rec; VkBuffer b; VkDeviceSize off; uint8_t src[1024]; size_t n; } bank_t;
+typedef struct { uint64_t rec; VkBuffer b; VkDeviceSize off; uint8_t src[1024]; size_t n; uint32_t gen, gen_all; } bank_t;
 static __thread bank_t (*t_bank)[6];
 static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
     if (!t_bank && !(t_bank = calloc(2, sizeof *t_bank))) die("driver banks");
     bank_t (*last)[6] = t_bank;
+    int bi = bank ? 1 : 0;
+    bank_t *l = &last[bi][stage];
+    if (l->rec == g_sub && l->gen == t_bgen[bi][stage] && l->gen_all == t_bgen_all && !no_cache())   // nothing bound since
+        return (VkDescriptorBufferInfo){l->b, l->off, 0x1000};
+    l->gen = t_bgen[bi][stage]; l->gen_all = t_bgen_all;
     uint8_t src[1024];
     size_t n = 0;
     if (bank == 0) {
@@ -812,7 +833,6 @@ static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
         memcpy(src, S.tex[stage], sizeof S.tex[stage]); n = sizeof S.tex[stage];
         memcpy(src + n, S.img[stage], sizeof S.img[stage]); n += sizeof S.img[stage];
     }
-    int bi = bank ? 1 : 0;
     if (last[bi][stage].rec == g_sub && last[bi][stage].n == n && !memcmp(last[bi][stage].src, src, n) && !no_cache())
         return (VkDescriptorBufferInfo){last[bi][stage].b, last[bi][stage].off, 0x1000};
     VkBuffer b;
@@ -860,7 +880,7 @@ typedef struct { const vkb_shader *sh; uint64_t rec; VkBuffer b; VkDeviceSize of
 typedef struct {
     struct { uint64_t rec, h1, h2; VkDescriptorSet set; } sets[2][SETS];
     // descriptor buffers (vkb_desc.c): the same reuse by contents, of offsets in the thread's descriptor memory
-    struct { uint64_t rec, gen, h1, h2; VkDeviceSize off; } dsets[2][SETS];
+    struct { uint64_t rec, gen, h1, h2; VkDeviceSize off; } dsets[3][SETS];   // VKB_LAYOUT_*
     struct { uint64_t serial; const vkb_shader *sh[6]; const char *bad_key; int ok; } progs[PROGS];
     struct { uint64_t rec; uint8_t valid[D_COUNT]; uint16_t len[D_COUNT]; uint8_t v[D_COUNT][2048]; } dc;
     c1_t c1[1024];   // the shaders' own constants (c1) in the command buffer's upload memory
@@ -1218,6 +1238,25 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         }
         put_buf(W, set, base + VKB_B_SBUF + (uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bi);
     }
+    // The texture and image descriptors of the stage's last draw in this command buffer, when nothing they come from
+    // changed: the shader, the stage's texture and image bindings, the registry, image layouts, the pass (feedback
+    // targets). ~76 % of draws sample what the draw before did; each looked up and checked every image again.
+    // Not for dispatches (their depth twins are copies made here). TOTK_VK_TEX_EVERY=1: every draw again.
+    static __thread struct {
+        const vkb_shader *sh; uint64_t rec, pass; uint32_t bgen, bgen_all, ep, ep_all, reg, fb; int n;
+        uint32_t binding[VKB_NTEX + VKB_NIMG]; VkDescriptorType type[VKB_NTEX + VKB_NIMG]; VkDescriptorImageInfo info[VKB_NTEX + VKB_NIMG];
+    } tc[2];
+    static int tex_every = -1;
+    if (tex_every < 0) tex_every = getenv("TOTK_VK_TEX_EVERY") != NULL || getenv("TOTK_AUDIT") != NULL;
+    int cacheable = stage < 2 && !tex_every && !no_cache() && !g_fbcopy;
+    uint32_t reg = atomic_load_explicit(&g_reg_gen, memory_order_acquire), ep_all = atomic_load_explicit(&vkb_layout_epoch_all, memory_order_acquire);
+    if (cacheable && tc[stage].sh == sh && tc[stage].rec == g_rec && tc[stage].pass == vkb_pass_serial() && tc[stage].bgen == t_bgen[1][stage] &&
+        tc[stage].bgen_all == t_bgen_all && tc[stage].ep == vkb_layout_epoch && tc[stage].ep_all == ep_all && tc[stage].reg == reg && tc[stage].fb == g_fb) {
+        for (int i = 0; i < tc[stage].n; i++) put_img(W, set, tc[stage].binding[i], tc[stage].type[i], tc[stage].info[i]);
+        vkb_cnt_add(g_tex_kept, 1);
+        return;
+    }
+    int first = W->n;
     for (int i = 0; i < sh->ntex; i++) {
         uint64_t h = sh->tex[i].separate ? 0 : S.tex[stage][sh->tex[i].slot];
         const view_t *v = NULL;
@@ -1251,6 +1290,15 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         VkDescriptorImageInfo info = {VK_NULL_HANDLE, view ? view : dummy_view(VK_IMAGE_VIEW_TYPE_2D), VK_IMAGE_LAYOUT_GENERAL};
         put_img(W, set, base + VKB_B_IMG + (uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, info);
     }
+    if (cacheable && W->n - first <= VKB_NTEX + VKB_NIMG) {   // the keys as of now: lookups above may have moved layouts
+        tc[stage].n = W->n - first;
+        for (int i = 0; i < tc[stage].n; i++) {
+            tc[stage].binding[i] = W->w[first + i].dstBinding; tc[stage].type[i] = W->w[first + i].descriptorType; tc[stage].info[i] = W->ii[first + i];
+        }
+        tc[stage].sh = sh; tc[stage].rec = g_rec; tc[stage].pass = vkb_pass_serial(); tc[stage].bgen = t_bgen[1][stage];
+        tc[stage].bgen_all = t_bgen_all; tc[stage].ep = vkb_layout_epoch; tc[stage].reg = atomic_load_explicit(&g_reg_gen, memory_order_acquire);
+        tc[stage].ep_all = atomic_load_explicit(&vkb_layout_epoch_all, memory_order_acquire); tc[stage].fb = g_fb;
+    } else if (cacheable) tc[stage].sh = NULL;
 }
 
 // A descriptor set with these writes: one made earlier in this submission with the same contents (two 64-bit hashes
@@ -1259,16 +1307,19 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
 static vkb_cnt g_sets_new, g_sets_reused;
 static __thread VkDescriptorSet g_bound[2];
 static __thread uint64_t g_bound_rec[2];
-static __thread struct { uint64_t rec, gen; VkDeviceSize off; } g_dbound[2];
+static __thread struct { uint64_t rec, gen; VkDeviceSize off, off1; } g_dbound[2];
 static void hmix(uint64_t *h1, uint64_t *h2, uint64_t v) {
     *h1 = (*h1 ^ v) * 0x100000001b3ull;
     *h2 = (*h2 + v) * 0x9e3779b97f4a7c15ull;
     *h2 ^= *h2 >> 29;
 }
-static VkDescriptorSet resolve_set(writes_t *W, int compute) {
+// layout: VKB_LAYOUT_*; part: the writes it takes (VKB_PART_*; descriptor buffers only).
+static VkDescriptorSet resolve_set(writes_t *W, int layout, int part) {
+    int compute = layout == VKB_LAYOUT_COMPUTE;
     uint64_t h1 = 0xcbf29ce484222325ull, h2 = 0x84222325cbf29ce4ull;
     for (int i = 0; i < W->n; i++) {
         const VkWriteDescriptorSet *w = &W->w[i];
+        if (part && (w->pBufferInfo != NULL) != (part == VKB_PART_BUFFERS)) continue;
         hmix(&h1, &h2, (uint64_t)w->dstBinding << 32 | (uint32_t)w->descriptorType);
         if (w->pBufferInfo) {
             hmix(&h1, &h2, (uint64_t)(uintptr_t)w->pBufferInfo->buffer);
@@ -1285,15 +1336,15 @@ static VkDescriptorSet resolve_set(writes_t *W, int compute) {
         uint64_t gen = vkb_db_gen();
         for (int probe = 0; probe < 8 && !no_cache(); probe++) {
             uint32_t k = (at + (uint32_t)probe) & (SETS - 1);
-            if (B->dsets[compute][k].rec == g_sub && B->dsets[compute][k].gen == gen && B->dsets[compute][k].h1 == h1 && B->dsets[compute][k].h2 == h2) {
+            if (B->dsets[layout][k].rec == g_sub && B->dsets[layout][k].gen == gen && B->dsets[layout][k].h1 == h1 && B->dsets[layout][k].h2 == h2) {
                 vkb_cnt_add(g_sets_reused, 1);
-                return (VkDescriptorSet)(uintptr_t)(B->dsets[compute][k].off + 1);
+                return (VkDescriptorSet)(uintptr_t)(B->dsets[layout][k].off + 1);
             }
-            if (B->dsets[compute][k].rec != g_sub || B->dsets[compute][k].gen != gen) { at = k; break; }
+            if (B->dsets[layout][k].rec != g_sub || B->dsets[layout][k].gen != gen) { at = k; break; }
         }
-        VkDeviceSize off = vkb_db_set(vkb_cmd(), vkb_slot(), g_rec, W->w, W->n, compute);
-        B->dsets[compute][at].rec = g_sub; B->dsets[compute][at].gen = vkb_db_gen(); B->dsets[compute][at].h1 = h1; B->dsets[compute][at].h2 = h2;
-        B->dsets[compute][at].off = off;
+        VkDeviceSize off = vkb_db_set(vkb_cmd(), vkb_slot(), g_rec, W->w, W->n, layout, part);
+        B->dsets[layout][at].rec = g_sub; B->dsets[layout][at].gen = vkb_db_gen(); B->dsets[layout][at].h1 = h1; B->dsets[layout][at].h2 = h2;
+        B->dsets[layout][at].off = off;
         vkb_cnt_add(g_sets_new, 1);
         return (VkDescriptorSet)(uintptr_t)(off + 1);
     }
@@ -1309,16 +1360,18 @@ static VkDescriptorSet resolve_set(writes_t *W, int compute) {
     vkb_cnt_add(g_sets_new, 1);
     return set;
 }
-static void bind_set(VkCommandBuffer cb, VkDescriptorSet set, int compute) {
+// set1: the buffers' set with split sets (graphics), else VK_NULL_HANDLE.
+static void bind_set(VkCommandBuffer cb, VkDescriptorSet set, int compute, VkDescriptorSet set1) {
     if (vkb_db_on()) {   // `set` is offset + 1 in descriptor memory
-        VkDeviceSize off = (VkDeviceSize)(uintptr_t)set - 1;
+        VkDeviceSize off[2] = {(VkDeviceSize)(uintptr_t)set - 1, set1 ? (VkDeviceSize)(uintptr_t)set1 - 1 : 0};
         uint64_t gen = vkb_db_gen();
-        if (g_dbound[compute].rec == g_rec && g_dbound[compute].gen == gen && g_dbound[compute].off == off && !no_cache()) return;
-        g_dbound[compute].rec = g_rec; g_dbound[compute].gen = gen; g_dbound[compute].off = off;
+        if (g_dbound[compute].rec == g_rec && g_dbound[compute].gen == gen && g_dbound[compute].off == off[0] &&
+            g_dbound[compute].off1 == off[1] && !no_cache()) return;
+        g_dbound[compute].rec = g_rec; g_dbound[compute].gen = gen; g_dbound[compute].off = off[0]; g_dbound[compute].off1 = off[1];
         vkb_db_bind(cb, vkb_slot(), g_rec);   // an offset made by an earlier command buffer of this thread: its memory bound here too
-        uint32_t idx = 0;
+        uint32_t idx[2] = {0, 0};
         vk.vkCmdSetDescriptorBufferOffsetsEXT(cb, compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                              vkb_pipeline_layout(compute), 0, 1, &idx, &off);
+                                              vkb_pipeline_layout(compute), 0, set1 ? 2 : 1, idx, off);
         return;
     }
     if (g_bound_rec[compute] == g_rec && g_bound[compute] == set && !no_cache()) return;
@@ -1764,8 +1817,8 @@ void vkb_draw_stats(uint64_t *draws, uint64_t *skipped) {
     uint64_t dc_calls = vkb_cnt_sum(g_dc_calls), dc_hits = vkb_cnt_sum(g_dc_hits);
     uint64_t gets = 0, hits = 0;
     if (vkb_db_on()) vkb_db_stats(&gets, &hits);
-    if (dc_calls) VLOG("recording caches: state %.0f %% not recorded again (%llu draws without a change), descriptor sets %llu made / %llu reused (descriptor bytes: %llu from the driver, %llu cached), mirrors %llu made / %llu sent back early, barriers inside passes %llu",
-                       100.0 * (double)dc_hits / (double)dc_calls, (unsigned long long)vkb_cnt_sum(g_dyn_skips), (unsigned long long)vkb_cnt_sum(g_sets_new), (unsigned long long)vkb_cnt_sum(g_sets_reused),
+    if (dc_calls) VLOG("recording caches: state %.0f %% not recorded again (%llu draws without a change), texture descriptors kept %llu, descriptor sets %llu made / %llu reused (descriptor bytes: %llu from the driver, %llu cached), mirrors %llu made / %llu sent back early, barriers inside passes %llu",
+                       100.0 * (double)dc_hits / (double)dc_calls, (unsigned long long)vkb_cnt_sum(g_dyn_skips), (unsigned long long)vkb_cnt_sum(g_tex_kept), (unsigned long long)vkb_cnt_sum(g_sets_new), (unsigned long long)vkb_cnt_sum(g_sets_reused),
                        (unsigned long long)gets, (unsigned long long)hits, (unsigned long long)g_mirrors_made, (unsigned long long)g_mirrors_evicted,
                        (unsigned long long)vkb_cnt_sum(g_local_barriers));
     *skipped = sk[0] + sk[1] + sk[2] + sk[3];
@@ -2149,7 +2202,8 @@ void vkb_draw(const uint8_t *a, int indexed) {
     W->n = 0;
     write_stage(W, VK_NULL_HANDLE, vs, 0);
     if (fs) write_stage(W, VK_NULL_HANDLE, fs, 1);
-    bind_set(cb, resolve_set(W, 0), 0);
+    if (vkb_split_sets()) bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_IMAGES), 0, resolve_set(W, VKB_LAYOUT_BUFFERS, VKB_PART_BUFFERS));
+    else bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_ALL), 0, VK_NULL_HANDLE);
     VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
     uint32_t sint, ints = int_attributes(&sint) & vs->in_mask;   // integer attributes: the vertex shader's variant for them
@@ -2253,7 +2307,7 @@ void vkb_dispatch(const uint8_t *a) {
     writes_t *W = &B->writes;
     W->n = 0;
     write_stage(W, VK_NULL_HANDLE, cs, 5);
-    VkDescriptorSet set = resolve_set(W, 1);
+    VkDescriptorSet set = resolve_set(W, VKB_LAYOUT_COMPUTE, VKB_PART_ALL);
     // [temporary] compute sees all earlier work and later work sees it: full barriers
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -2261,7 +2315,7 @@ void vkb_dispatch(const uint8_t *a) {
     VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vk.vkCmdPipelineBarrier2(cb, &dep);
     g_stores_pending = 0;   // the full barrier covers the draws' stores too
-    bind_set(cb, set, 1);
+    bind_set(cb, set, 1, VK_NULL_HANDLE);
     VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT;
     vk.vkCmdBindShadersEXT(cb, 1, &st, &cs->obj);
     int gq = gprof_begin();
