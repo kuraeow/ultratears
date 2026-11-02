@@ -197,8 +197,29 @@ def cooldown(gen, addr):   # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON) -> movi v1
     return word_or(gen, addr, 0x0f016681, 0x0f000401, fr('totk_fr_realtime'), 'equipment cooldown')
 
 
+# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c; sites from totk-pc-recomp
+# recomp/patches-v143.txt, MIT): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
+# (main+0x3a1e0) below goes to a host function, which hands what it does not take to the same guest function. Not
+# main+0x547a04: that caller (main+0x547964) resets a static DCtx of its own with which the game's zstd rejects some
+# valid frames, and the game relies on that result. TOTK_ZSTD_NATIVE=0: the guest decoder.
+def zstd_call(word, target, host):
+    def f(gen, addr):
+        expect(gen, addr, word, 'zstd call')
+        return (f'{{ extern int totk_zstd_native(void); extern void {host}(Cpu *c); extern void f_{target:x}(Cpu *c); '
+                f'c->x[30] = {addr + 4:#x}ull; if (totk_zstd_native()) {host}(c); else f_{target:x}(c); }}')
+    return f
+
+
+ZSTD_MULTI, ZSTD_DDICT = MAIN + 0x3a1f0, MAIN + 0x3a1e0
+ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MULTI), 0xbdc8e8: (0x97d17642, ZSTD_MULTI),
+              0x27ce4dc: (0x9761af45, ZSTD_MULTI), 0x5f574c: (0x97e912a5, ZSTD_DDICT), 0xbdc910: (0x97d17634, ZSTD_DDICT),
+              0x1852314: (0x979f9fb3, ZSTD_DDICT)}
+
+
 PATCHES = {
     MAIN + 0x2b036c: cooldown,
+    **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
+       for a, (w, t) in ZSTD_SITES.items()},
     0x8005843e0: drs_off,
     MAIN + 0x585e50: scene_size(0),
     MAIN + 0x585e60: scene_size(1),
