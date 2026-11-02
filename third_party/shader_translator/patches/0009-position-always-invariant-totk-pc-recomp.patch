@@ -1,0 +1,25 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -465,10 +465,9 @@
+ 
+             context.Decorate(perVertexStructType, Decoration.Block);
+ 
+-            if (context.HostCapabilities.ReducedPrecision)
+-            {
+-                context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
+-            }
++            // TOTK: Maxwell computes a position identically in every shader that runs the same code (a depth pre-pass drawn
++            // again with EQUAL), so the position is always invariant, not only with the ReducedPrecision job flag.
++            context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
+ 
+             context.MemberDecorate(perVertexStructType, 0, Decoration.BuiltIn, (LiteralInteger)BuiltIn.Position);
+             context.MemberDecorate(perVertexStructType, 1, Decoration.BuiltIn, (LiteralInteger)BuiltIn.PointSize);
+@@ -566,7 +565,7 @@
+                     context.Decorate(spvVar, Decoration.Patch);
+                 }
+ 
+-                if (context.HostCapabilities.ReducedPrecision && ioVariable == IoVariable.Position)
++                if (ioVariable == IoVariable.Position)
+                 {
+                     context.Decorate(spvVar, Decoration.Invariant);
+                 }

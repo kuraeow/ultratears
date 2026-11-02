@@ -1,0 +1,40 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/AttributeUsage.cs
+@@ -19,6 +19,7 @@
+         private readonly IGpuAccessor _gpuAccessor;
+ 
+         public UInt128 NextInputAttributesComponents { get; private set; }
++        public bool NextStageKnown { get; private set; }
+         public UInt128 ThisInputAttributesComponents { get; private set; }
+ 
+         public AttributeUsage(IGpuAccessor gpuAccessor)
+@@ -55,6 +56,7 @@
+ 
+         public void MergeFromtNextStage(bool gpPassthrough, bool nextUsesFixedFunctionAttributes, AttributeUsage nextStage)
+         {
++            NextStageKnown = true;
+             NextInputAttributesComponents = nextStage.ThisInputAttributesComponents;
+             NextUsedInputAttributesPerPatch = nextStage.UsedInputAttributesPerPatch;
+             NextUsesFixedFuncAttributes = nextUsesFixedFunctionAttributes;
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -210,6 +210,19 @@
+             }
+ 
+             UInt128 usedAttributes = context.TranslatorContext.AttributeUsage.NextInputAttributesComponents;
++
++            // TOTK (2026-10-22): the host translates each stage on its own (no SetNextStage), so the components the next
++            // stage reads are unknown. Maxwell reads an unwritten output component as (0, 0, 0, 1) (a VS writing xyz of a
++            // varying the FS divides by w); start every component of every written output there, as a linked pipeline would
++            // for the components the next stage reads. The host adds outputs the VS never writes (vk_pipeline.c).
++            if (!context.TranslatorContext.AttributeUsage.NextStageKnown)
++            {
++                for (int mask = context.TranslatorContext.AttributeUsage.UsedOutputAttributes; mask != 0; mask &= mask - 1)
++                {
++                    usedAttributes |= (UInt128)0xf << (int.TrailingZeroCount(mask) * 4);
++                }
++            }
++
+             while (usedAttributes != UInt128.Zero)
+             {
+                 int index = (int)UInt128.TrailingZeroCount(usedAttributes);

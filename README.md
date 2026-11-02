@@ -4,8 +4,8 @@
 
 # UltraTears
 
-**UltraTears** builds a native PC version of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3) for Windows and
-Linux / Steam Deck from your own copy of the game. It is not an emulator: the game's code is translated to native code
+**UltraTears** builds a native version of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3) for Windows, Linux
+and the Steam Deck from your own copy of the game. It is not an emulator: the game's code is translated to native code
 ahead of time, and its shaders and textures are prepared when the game is built, not while you play.
 
 > [!IMPORTANT]

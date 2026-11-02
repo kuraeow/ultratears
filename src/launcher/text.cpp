@@ -158,7 +158,7 @@ static const Text TEXTS[] = {
     {"row_counter", {"In-game FPS counter", "Счётчик FPS в игре"}},
     {"counter_key", {"F10 turns it on or off", "F10 включение или отключение"}},
     {"row_text", {"Text and subtitles", "Текст и субтитры"}},
-    {"lang_system", {"As in Windows", "Как в Windows"}},
+    {"lang_system", {"As in the system", "Как в системе"}},
     {"lang_ja", {"Japanese", "Японский"}},
     {"lang_ko", {"Korean", "Корейский"}},
     {"lang_zh", {"Chinese (Simplified)", "Китайский (упрощённый)"}},

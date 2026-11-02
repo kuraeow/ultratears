@@ -187,6 +187,17 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             {
                 context.AddEntryPoint(context.Definitions.Stage.Convert(), spvFunc, "main", context.GetMainInterface());
 
+                // UltraTears: 32-bit denormals as the translation is told (ULTRS_DENORM=preserve|ftz; unset: the driver's
+                // default). Maxwell keeps them unless an instruction says .FTZ; Mesa and AMD flush them by default.
+                string denorm = System.Environment.GetEnvironmentVariable("ULTRS_DENORM");
+                if (denorm == "preserve" || denorm == "ftz")
+                {
+                    bool preserve = denorm == "preserve";
+                    context.AddExtension("SPV_KHR_float_controls");
+                    context.AddCapability(preserve ? Capability.DenormPreserve : Capability.DenormFlushToZero);
+                    context.AddExecutionMode(spvFunc, preserve ? ExecutionMode.DenormPreserve : ExecutionMode.DenormFlushToZero, (SpvLiteralInteger)32);
+                }
+
                 if (context.Definitions.Stage == ShaderStage.TessellationControl)
                 {
                     context.AddExecutionMode(spvFunc, ExecutionMode.OutputVertices, (SpvLiteralInteger)context.Definitions.ThreadsPerInputPrimitive);

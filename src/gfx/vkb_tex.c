@@ -226,6 +226,17 @@ static void entry_drop(entry *e) {   // g_mu held: out of the indexes, destroyed
 static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);   // below
 static _Atomic uint64_t g_fb_copies;   // copies made (vkb_tex_feedback_copies)
 uint64_t vkb_tex_feedback_copies(void) { return g_fb_copies; }
+// Cube compatible only where a cube view can come: the game's cube textures, and square arrays of 6 layers or more it
+// renders to (the faces drawn as layers, sampled as a cube). AMD's drivers lay a cube compatible image out otherwise, and
+// every square array made so - TOTK's ground textures, 1024x1024 with 121 layers - showed blocks that moved with the mip
+// level on AMD (totk-pc-recomp 4d7fa27, MIT; Savage Wind Recomp issue #59). TOTK_VK_CUBE_ALL=1: every square array,
+// as before.
+static int cube_compatible(int target, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags usage) {
+    static int all = -1;
+    if (all < 0) { const char *e = getenv("TOTK_VK_CUBE_ALL"); all = e && *e == '1'; }
+    if (target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) return 1;
+    return layers >= 6 && w == h && (all || (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)));
+}
 static int twin_make(entry *src) {
     entry *t = calloc(1, sizeof *t);
     if (!t) return 0;
@@ -234,7 +245,7 @@ static int twin_make(entry *src) {
                        s->d.target == NVN_TEXTURE_TARGET_1D_ARRAY) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     int ms = s->d.target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || s->d.target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY;
     VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // as create()
-    if (type == VK_IMAGE_TYPE_2D && !ms && s->layers >= 6 && s->width == s->height) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (type == VK_IMAGE_TYPE_2D && !ms && s->cube) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;   // as its source
     if (type == VK_IMAGE_TYPE_3D) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = s->format,
         .extent = {s->width, s->height, s->depth}, .mipLevels = s->levels, .arrayLayers = s->layers,
@@ -448,7 +459,8 @@ static int create(vkb_image *im, const tex_t *t) {
        (vkb_tex_block_target), which needs neither. */
     int bc3d = compressed && type == VK_IMAGE_TYPE_3D;
     if (compressed && !bc3d) flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   // read a block as RGBA16UI / RG32UI (TOTK's GPU BC encoder)
-    if (type == VK_IMAGE_TYPE_2D && !ms && layers >= 6 && w == h) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    int cube = type == VK_IMAGE_TYPE_2D && !ms && cube_compatible(d->target, w, h, layers, usage);
+    if (cube) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (type == VK_IMAGE_TYPE_3D && !bc3d) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = f,
         .extent = {w, h, depth}, .mipLevels = levels, .arrayLayers = layers,
@@ -477,6 +489,7 @@ static int create(vkb_image *im, const tex_t *t) {
     im->width = w; im->height = h; im->depth = depth; im->layers = layers; im->levels = levels; im->astc = astc;
     im->storage = t->mem;
     im->usage = usage;
+    im->cube = cube;
     im->compressed = compressed;
     im->no_block_views = bc3d;
     return 1;
@@ -683,7 +696,9 @@ vkb_image *vkb_image_of(const tex_t *t) {
         g_all = e;
         g_images_made++;
     }
-    if (t->mem && getenv("TOTK_VK_SIZE_REFRESH")) refresh_mark(e);   // [experiment, off] picks transient aliases (see above)
+    static int size_refresh = -1;   // read once: this runs for every image a draw binds
+    if (size_refresh < 0) size_refresh = getenv("TOTK_VK_SIZE_REFRESH") != NULL;
+    if (t->mem && size_refresh) refresh_mark(e);   // [experiment, off] picks transient aliases (see above)
     e->refs++;
     if (s->serial == t->serial) g_tomb--; else s->serial = t->serial;
     s->e = e;
@@ -835,8 +850,8 @@ VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_ty
     int target = v && v->set_target ? v->target : im->d.target;
     VkImageViewType type = im->depth > 1 ? VK_IMAGE_VIEW_TYPE_3D
         : target == NVN_TEXTURE_TARGET_1D ? VK_IMAGE_VIEW_TYPE_1D : target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
-        : target == NVN_TEXTURE_TARGET_CUBEMAP && !attachment ? VK_IMAGE_VIEW_TYPE_CUBE
-        : target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && !attachment ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
+        : target == NVN_TEXTURE_TARGET_CUBEMAP && !attachment && im->cube ? VK_IMAGE_VIEW_TYPE_CUBE
+        : target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && !attachment && im->cube ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
         : nlay > 1 || target == NVN_TEXTURE_TARGET_2D_ARRAY || target == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
         : VK_IMAGE_VIEW_TYPE_2D;
     if (type == VK_IMAGE_VIEW_TYPE_3D && attachment) { type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; nlay = im->depth; }
@@ -844,6 +859,12 @@ VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_ty
         type = (VkImageViewType)view_type;
         if (((type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && nlay < 6) || type == VK_IMAGE_VIEW_TYPE_3D)
             vkb_audit(A_TEX_VIEW_ADJUSTED, NULL);
+        if ((type == VK_IMAGE_VIEW_TYPE_CUBE || type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !im->cube) {   // not made cube compatible
+            static int said;
+            if (!said++) VLOG("texture %llu (target %d, %ux%u, %u layers) sampled as a cube but not made cube compatible: a 2D array view",
+                             (unsigned long long)im->serial, im->d.target, im->width, im->height, im->layers);
+            type = nlay > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        }
         if ((type == VK_IMAGE_VIEW_TYPE_CUBE && nlay < 6) || (type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && nlay < 6))
             type = nlay > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         if (type == VK_IMAGE_VIEW_TYPE_CUBE) nlay = 6;
@@ -1159,7 +1180,7 @@ static int to_bc7(vkb_image *im, int srgb, int fmt) {
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return 0;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .flags = im->layers >= 6 && im->width == im->height ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+        .flags = cube_compatible(im->d.target, im->width, im->height, im->layers, usage) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
         .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {im->width, im->height, 1}, .mipLevels = im->levels,
         .arrayLayers = im->layers, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
@@ -1174,7 +1195,7 @@ static int to_bc7(vkb_image *im, int srgb, int fmt) {
     if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(vkc.device, &ai, NULL, &mem) != VK_SUCCESS) { vk.vkDestroyImage(vkc.device, img, NULL); return 0; }
     vk.vkBindImageMemory(vkc.device, img, mem, 0);
     vkb_destroy_later(VK_NULL_HANDLE, im->img, im->mem);   // the RGBA8 image no command has used
-    im->img = img; im->mem = mem; im->format = f; im->usage = usage; im->compressed = 1; im->bc7 = fmt == VKB_BC_1 ? 2 : 1;
+    im->img = img; im->mem = mem; im->format = f; im->usage = usage; im->cube = (int)(ci.flags != 0); im->compressed = 1; im->bc7 = fmt == VKB_BC_1 ? 2 : 1;
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     return 1;
 }

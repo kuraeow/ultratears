@@ -142,15 +142,25 @@ int window_init(void) {
 }
 
 // Motion: the controller's accelerometer and gyro (SDL_EVENT_GAMEPAD_SENSOR_UPDATE) go to motion_fusion.c.
+int deck_imu_start(void);   // deck_imu.c
 static void pad_attached(void) {   // pad_lock held; pad may be NULL
     if (!pad) { runtime_motion_live(0); return; }
     fprintf(stderr, "[totk] game controller: %s\n", SDL_GetGamepadName(pad));
+    {   // which device it is: a Steam Input virtual gamepad (Steam handle) gives no motion; the Deck's own controller,
+        // opened by SDL's HIDAPI driver (Steam Input off for the game), has a gyro
+        const char *path = SDL_GetGamepadPath(pad);
+        fprintf(stderr, "[totk]   type %d, vendor %04x product %04x, %s, path %s\n", (int)SDL_GetGamepadType(pad),
+                SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad),
+                SDL_GetGamepadSteamHandle(pad) ? "a Steam Input virtual gamepad" : "not through Steam Input", path ? path : "-");
+    }
     if (SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) &&
         SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
         const char *axes = getenv("TOTK_GYRO_AXES");
         if (runtime_motion_axes(axes) < 0) fprintf(stderr, "[totk] TOTK_GYRO_AXES=%s is not like \"-x,y,-z\": ignored\n", axes);
         runtime_motion_live(1);
         fprintf(stderr, "[totk] controller motion sensors on (%.0f Hz gyro)\n", SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_GYRO));
+    } else if (deck_imu_start()) {   // a Steam Input gamepad on the Steam Deck: the Deck's own motion (deck_imu.c)
+        runtime_motion_live(1);
     } else {
         runtime_motion_live(0);
         fprintf(stderr, "[totk] controller has no motion sensors: no gyro aiming\n");
@@ -169,7 +179,7 @@ static void pad_sensor(const SDL_GamepadSensorEvent *e) {
         acc[2] = -d[1] / SDL_STANDARD_GRAVITY;
     } else if (e->sensor == SDL_SENSOR_GYRO) {
         double gyro[3] = {d[0], -d[2], d[1]};
-        runtime_motion_feed(acc, gyro, runtime_now_ns());
+        runtime_motion_feed(acc, gyro, runtime_now_ns(), e->sensor_timestamp);
     }
 }
 

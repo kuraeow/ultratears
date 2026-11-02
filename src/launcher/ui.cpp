@@ -289,12 +289,18 @@ static Json setup_state() {   // data/setup.json of the install folder: setup.py
 // no builder, the AppImage is it, so a newer AppImage put in the folder makes the build stale. A folder of an older
 // layout (a builder copied in) is stale too once the AppImage that runs is a newer release than that copy.
 static bool has_package(const std::string &folder);
+// the package in `from` replaces the one in `to`: another build (the whole VERSION.txt line, so a rebuild with the same
+// number, 0.2.0-41-g... then 0.2.0, counts too), only never an older release over a newer one
+static bool package_replaces(const std::string &from, const std::string &to) {
+    std::string a = package_version_line(from), b = package_version_line(to);
+    return !a.empty() && a != b && !version_newer(package_version(to), package_version(from));
+}
 static bool stale() {
     std::string line = package_version_line(U.root);
 #ifdef _WIN32
     bool newer = false;   // the PC's launcher is in its package: an update replaces it with the package (apply_update.py)
 #else
-    bool newer = has_package(U.home) && has_package(U.install) && version_newer(package_version(U.home), package_version(U.install));
+    bool newer = has_package(U.home) && has_package(U.install) && package_replaces(U.home, U.install);
 #endif
     return installed() && ((!line.empty() && setup_state()["package"].str() != "UltraTears " + line) || newer);
 }
@@ -324,7 +330,7 @@ static bool has_package(const std::string &folder) { return path_is_file(path_jo
 static bool needs_copy() {
     if (same_path(U.install, U.home))
         return false;
-    return !has_package(U.install) || version_newer(package_version(U.home), package_version(U.install));
+    return !has_package(U.install) || package_replaces(U.home, U.install);
 }
 
 // GB a build needs free: the game, the package copy when it goes elsewhere, and for the Steam Deck its game, objects,
@@ -1909,7 +1915,8 @@ void ui_init(SDL_Window *w) {
         U.platform = win && lin ? "both" : lin ? "linux" : "windows";
     }
     update_cleanup(U.root);
-    // updates: one question to GitHub a day at most; a release found stays offered until it is installed
+    // updates: one question to GitHub at every start, in the background (no answer: nothing shown); a release found
+    // stays offered until it is installed
     U.upd.version = U.set.get("update_version");
     if (!U.upd.version.empty() && U.upd.version != U.version && !U.version.empty()) {
         U.upd.name = U.set.get("update_name"), U.upd.url = U.set.get("update_url");
@@ -1917,16 +1924,8 @@ void ui_init(SDL_Window *w) {
         U.upd.size = SDL_strtoull(U.set.get("update_size").c_str(), nullptr, 10);
         U.has_upd = !U.upd.url.empty() && !U.upd.sha256.empty();
     }
-    long long checked = SDL_strtoll(U.set.get("update_checked").c_str(), nullptr, 10);
-    SDL_Time now = 0;
-    SDL_GetCurrentTime(&now);
-    long long secs = (long long)(now / SDL_NS_PER_SECOND);
-    if (U.set.get("updates") != "off" && !U.version.empty() && !python_path(U.root).empty() &&
-        (secs - checked > 24 * 3600 || secs < checked)) {
-        U.set.set("update_checked", std::to_string(secs));
-        settings_save(U.set);
+    if (U.set.get("updates") != "off" && !U.version.empty() && !python_path(U.root).empty())
         update_check_start(U.version);
-    }
     ImGuiStyle &st = ImGui::GetStyle();
     st.WindowPadding = ImVec2(0, 0);
     st.WindowBorderSize = 0;

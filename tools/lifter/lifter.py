@@ -324,6 +324,13 @@ class Lifter:
             if crn == 3 and op1 == 3 and rt == 31:  # barriers
                 if op2 == 2:
                     return Insn('op', 'c->excl_addr = ~0ull;')
+                # DMB ...LD orders earlier loads before later loads and stores: an acquire fence. DMB ...ST orders
+                # stores before stores: a release fence is that and more. On x86 (TSO) both are compiler barriers, not
+                # an mfence; the full DMB and DSB keep the sequentially consistent fence (store-load order).
+                if op2 == 5 and crm & 3 == 1:
+                    return Insn('op', '__atomic_thread_fence(__ATOMIC_ACQUIRE);')
+                if op2 == 5 and crm & 3 == 2:
+                    return Insn('op', '__atomic_thread_fence(__ATOMIC_RELEASE);')
                 return Insn('op', '__atomic_thread_fence(__ATOMIC_SEQ_CST);')
             raise Unsupported(f'pstate/system {w:08x}')
         if op0 == 1:  # SYS

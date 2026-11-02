@@ -196,17 +196,37 @@ uint32_t vkb_shadow_alloc(VkDeviceSize size, VkBuffer *buf, VkDeviceSize *off) {
 void vkb_shadow_free(uint32_t h) { piece_free(&g_dev, h); }
 uint64_t vkb_shadow_bytes(void) { return g_dev.bytes; }
 
-// Host-visible memory for buf (a pool's own buffer), bound to it; *map: where the CPU sees it. Cached memory where the
-// device has it (the copies back of GPU writes read it on the CPU). 0: no memory.
+// Host-visible memory for buf (a pool's own buffer), bound to it; *map: where the CPU sees it. 0: no memory.
+// Which memory (TOTK_POOL_MEM, an A/B for the Steam Deck, where the GPU reads every vertex, index and uniform from these
+// copies): cached (default) - cached memory where the device has it, the copies back of GPU writes read it on the CPU;
+// on an AMD APU it is snooped system memory, which the GPU reads more slowly. uncached - host-visible memory without
+// CPU caching (write-combined), read faster by the GPU, slowly by the CPU's copies back. device - device-local and
+// host-visible (the APU's carve-out, a discrete GPU's BAR). A type that runs out falls back to the cached one.
+static int pool_mem_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("TOTK_POOL_MEM");
+        m = e && !strcmp(e, "uncached") ? 1 : e && !strcmp(e, "device") ? 2 : 0;
+        VLOG("pool copies in %s memory (TOTK_POOL_MEM)", m == 1 ? "uncached host" : m == 2 ? "device-local host-visible" : "cached host");
+    }
+    return m;
+}
+static uint32_t pool_mem_type(uint32_t bits, int mode) {
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (int pass = 0; pass < 2; pass++)   // the mode's kind first, then any host-visible coherent memory
+        for (uint32_t i = 0; i < vkc.memory.memoryTypeCount; i++) {
+            VkMemoryPropertyFlags f = vkc.memory.memoryTypes[i].propertyFlags;
+            if (!(bits & (1u << i)) || (f & want) != want) continue;
+            int cached = !!(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT), dev = !!(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (pass || (mode == 0 ? cached : mode == 1 ? !cached && !dev : dev)) return i;
+        }
+    return UINT32_MAX;
+}
 uint32_t vkb_poolmem_alloc(VkBuffer buf, uint8_t **map) {
     VkMemoryRequirements req;
     vk.vkGetBufferMemoryRequirements(vkc.device, buf, &req);
-    uint32_t type = UINT32_MAX, want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++)   // cached first
-        for (uint32_t i = 0; i < vkc.memory.memoryTypeCount && type == UINT32_MAX; i++) {
-            VkMemoryPropertyFlags f = vkc.memory.memoryTypes[i].propertyFlags;
-            if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && (pass || (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))) type = i;
-        }
+    int mode = pool_mem_mode();
+    uint32_t type = pool_mem_type(req.memoryTypeBits, mode);
     if (type == UINT32_MAX) { VLOG("pool copies: no host-visible memory type for a pool"); return 0; }
     VkDeviceSize size = (req.size + HOST_ALIGN - 1) & ~(VkDeviceSize)(HOST_ALIGN - 1);
     int own = req.alignment > HOST_ALIGN || size > BLOCK;   // a block of its own (its start meets any alignment)
@@ -216,10 +236,22 @@ uint32_t vkb_poolmem_alloc(VkBuffer buf, uint8_t **map) {
     int bi = own ? -1 : fit(&g_host, size, type, &at);
     if (bi < 0) {
         bi = host_block_new(own ? size : BLOCK, type);
+        if (bi < 0 && mode) {   // that memory ran out: the cached kind from here on
+            static int said;
+            uint32_t t0 = pool_mem_type(req.memoryTypeBits, 0);
+            if (!said++) VLOG("pool copies: TOTK_POOL_MEM memory ran out at %llu MiB, the rest in cached memory", (unsigned long long)(g_host.bytes >> 20));
+            if (t0 != UINT32_MAX && t0 != type) {
+                type = t0;
+                bi = own ? -1 : fit(&g_host, size, type, &at);
+                if (bi < 0) bi = host_block_new(own ? size : BLOCK, type);
+                else goto found;
+            }
+        }
         if (bi < 0) { pthread_mutex_unlock(&g_mu); return 0; }
         at = 0;
         take_first(&g_host.blocks[bi], size);
     }
+found:;
     uint32_t h = piece_new(&g_host, bi, at, size);
     block_t *b = &g_host.blocks[bi];
     VkResult r = vk.vkBindBufferMemory(vkc.device, buf, b->mem, at);

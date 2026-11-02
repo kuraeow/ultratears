@@ -32,8 +32,9 @@ TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
                     'src/host/audio_reverb.c', 'src/host/opus_codec.c', 'src/host/movie_host.c', 'src/host/hid_feedback.c',
                     'src/host/shared_font.c',
                     'src/host/window_sdl.c', 'src/vk/vk.c', 'src/vk/present.c', 'src/vk/fsr.c', 'src/vk/overlay.c', 'src/host/motion_fusion.c',
+                    'src/host/deck_imu.c',
                     'src/host/profiler.c', 'src/host/watch.c', 'src/host/frame_rate.c', 'src/host/render_res.c', 'src/host/ui_capture.c',
-                    'src/host/ui_aspect.c']}
+                    'src/host/ui_aspect.c', 'src/host/zstd_host.c']}
 # The graphics front end (MacNativeGames' NVN layer) with its macOS stand-ins: own include paths, own rule
 GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_ext.c', 'src/gfx/nvn/nvn_registry.c',
        'src/gfx/nvn/nvn_thunks.gen.c', 'src/gfx/nvn/nvn_dirty_win.c', 'src/gfx/nvn/totk_timeline_win.c',
@@ -51,7 +52,8 @@ GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 # Linux (--platform linux): the kit is deps/linux in a builder, else dev-local/linux-cross (ULTRS_LINUX_KIT overrides).
 LINUX_KIT = pathlib.Path(os.environ.get('ULTRS_LINUX_KIT') or next(
     (p for p in (ROOT / 'deps/linux', ROOT / 'dev-local/linux-cross') if (p / 'sysroot').is_dir()), ROOT / 'deps/linux'))
-LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c']
+LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c',
+                 'src/runtime/envcache.c']
 
 
 # The rpath of the Linux programs, as ninja writes it into a command: on Linux ninja runs commands through sh, which
@@ -68,7 +70,8 @@ def linux_flags():
 def linux_libs():
     # SDL3 shared (beside the game: the sysroot's static one is not position-independent); Opus, libvpx, zstd and
     # libstdc++ static, so the game needs only glibc, the Vulkan loader and that SDL3.
-    return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc -lSDL3 '
+    return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
+            '-Wl,--wrap=getenv,--wrap=setenv,--wrap=unsetenv,--wrap=putenv -lSDL3 '   # src/runtime/envcache.c
             '-l:libopus.a -l:libvpx.a -l:libzstd.a -l:libstdc++.a -lm -lpthread -ldl')
 
 
@@ -218,7 +221,9 @@ def main():
             # [temporary] a function with an unresolved computed branch is one switch over every
             # instruction; with thousands of labels clang -O1/-O2 takes from minutes to hours per file (main_376:
             # 20+ min at -O1), -O0 15 s. Such functions run unoptimized until their tables resolve.
-            if 'L_dispatch:' in text and text.count(chr(10) + 'L_') > 2000:
+            # Counted per function: a file's total once sent whole files of small dispatching functions to -O0
+            # (main_000 and sdk_130 of 1.4.3: ~630 functions unoptimized for dispatches of 133 and 385 labels).
+            if any('L_dispatch:' in f and f.count(chr(10) + 'L_') > 2000 for f in text.split(chr(10) + 'void f_')):
                 lines.append('  gameflags = ' + game_cflags.replace('-O2', '-O0'))
             game_objs.append(obj)
     if not game_objs:

@@ -57,6 +57,7 @@ typedef struct { uintptr_t lo, hi, base; VkBuffer buf; VkDeviceMemory mem; const
                  uint8_t *cmap; uint32_t ch; uint8_t cfilled; uint64_t cstamp; } pool_ent;
 static pool_ent *g_pools;
 static int g_npools, g_capools;
+static _Atomic uint64_t g_pool_gen;   // the table changed (a pool added, removed or made unshadowed): vkb_pool_use's cache
 static vkb_rw g_pool_mu;   // recording threads look pools up for every draw (read); changes write
 static uint64_t g_pool_bytes;
 
@@ -522,6 +523,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     g_pools[i] = (pool_ent){lo, hi, a, buf, dm, mem, b - a};
     g_pools[i].cmap = cmap; g_pools[i].ch = ch;
     g_npools++;
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     for (int j = i - 4; j <= i + 4; j++)   // overlapping pools: one copy each would diverge, so neither is copied
         if (j >= 0 && j < g_npools && j != i && g_pools[j].lo < hi && lo < g_pools[j].hi) {
             static int said;
@@ -549,6 +551,7 @@ void mtl_pool_del(const void *mem) {
             e = g_pools[i];
             memmove(&g_pools[i], &g_pools[i + 1], (size_t)(g_npools - i - 1) * sizeof *g_pools);
             g_npools--;
+            atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
             g_pool_bytes -= e.hi - e.lo;
             break;
         }
@@ -976,8 +979,20 @@ static pool_ent *pool_find_mut(uintptr_t addr, uint64_t len);
 // threads do not wait for each other's uniform updates and stores (the write lock is for bringing a copy up to date).
 static pthread_mutex_t g_wb_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_pool_use_n[3];   // the per-frame log line: write lock to update a copy / for a write / writes under the read lock
+// Per recording thread, the pool of its last read that needed nothing more in this submission: a draw's buffers mostly
+// lie in a few pools, and each look took the table's lock, searched it and wrote the pool's used_sub, one cache line
+// written by every recording thread (vkb_pool_use was ~6 % of each recording thread at Lookout Landing, 2026-11-02).
+static __thread struct { uint64_t lo, hi, sub, gen; } t_pool_hit;
+static void pool_hit_note(const pool_ent *p, uint64_t addr, uint64_t len, uint64_t sub, uint64_t gen) {
+    if (addr >= p->lo && addr + len <= p->hi) { t_pool_hit.lo = p->lo; t_pool_hit.hi = p->hi; t_pool_hit.sub = sub; t_pool_hit.gen = gen; }
+}
+static void used_mark(pool_ent *p, uint64_t sub) {   // read first: a store only when it changes
+    if (__atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
+}
 void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     if (g_ok != 1 || !addr || !len) return;
+    uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    if (!write && t_pool_hit.sub == sub && t_pool_hit.gen == gen && addr >= t_pool_hit.lo && addr + len <= t_pool_hit.hi) return;
     if (vkb_pool_copies()) {   // the pool is synced before the submission (pc_sync); a GPU write goes back after it
         vkb_rw_read(&g_pool_mu, LK_POOLS);
         // a range running on past its pool's end (GPU addresses, vkb_span_addr): the pool it starts in, up to its end
@@ -985,16 +1000,17 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
         if (!p) p = pool_find_mut((uintptr_t)addr, 1);
         VkBuffer b = p ? p->buf : VK_NULL_HANDLE;
         uint64_t n = p && addr + len > p->hi ? p->hi - addr : len;
-        if (p) __atomic_store_n(&p->used_sub, g_fence + 1, __ATOMIC_RELAXED);
+        if (p) used_mark(p, sub);
+        if (p && !write && !vkb_shadow_on()) pool_hit_note(p, addr, len, sub, gen);
         vkb_rw_read_end(&g_pool_mu);
         if (p && write) pc_pend_add(b, addr, n);
     }
     if (!vkb_shadow_on()) return;
-    uint64_t sub = g_fence + 1;
     vkb_rw_read(&g_pool_mu, LK_POOLS);   // the common cases: a pool already current in this submission, or not copied
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
     int done = !p || p->no_shadow || (p->sync_sub == sub && !write);
-    if (p) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
+    if (p) used_mark(p, sub);
+    if (p && done && !write) pool_hit_note(p, addr, len, sub, gen);
     if (!done && write && p->sync_sub == sub) {
         pthread_mutex_lock(&g_wb_mu);
         wb_add(p, addr, len);
@@ -1768,6 +1784,15 @@ static __thread uint64_t g_pass_serial;   // passes begun on this thread (vkb_pa
 uint64_t vkb_pass_serial(void) { return g_pass_serial; }
 static void shadow_presync(void);
 static void span_presync(void);
+// A pass's targets (2026-11-02): an image whose layout changes gets its barrier with the move (vkb_image_use); the others
+// none of their own, only one barrier for the whole pass from the target writes before (an earlier pass's) to this
+// pass's tests, output and sampling. Before, every target of every pass had its own barrier from ALL_COMMANDS: ~1700
+// full GPU drains a frame on the RTX 3060 (587 passes, 3600 barriers), costlier on AMD. TOTK_VK_PASS_BARRIER=1: as before.
+static int pass_barrier_old(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_PASS_BARRIER"); v = e && *e == '1'; }
+    return v;
+}
 static int pass_begin(VkExtent2D bare, uint32_t fb) {
     if (g_in_pass) return 1;
     shadow_presync();
@@ -1831,7 +1856,8 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         }
         int loop = (fb >> i) & 1;
         VkImageLayout layout = loop ? fb_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        vkb_image_use(cb, im, layout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
+        if (pass_barrier_old() || !vkb_layout_is(im, layout))
+            vkb_image_use(cb, im, layout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | (loop ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
         color[i].imageView = vkb_view(im, v, 1, -1);
         vkb_image_written(im);
@@ -1849,7 +1875,8 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         const view_t *v = g_rt.has_dview ? &g_rt.dview : NULL;
         int loop = (fb & VKB_FB_DEPTH) != 0;
         VkImageLayout layout = loop ? fb_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        vkb_image_use(cb, dim, layout,
+        if (pass_barrier_old() || !vkb_layout_is(dim, layout))
+            vkb_image_use(cb, dim, layout,
                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | (loop ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
         VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = vkb_view(dim, v, 1, -1),
@@ -1872,6 +1899,18 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = layers,
         .colorAttachmentCount = (uint32_t)ncolor, .pColorAttachments = color,
         .pDepthAttachment = depth.imageView ? &depth : NULL, .pStencilAttachment = stencil.imageView ? &stencil : NULL};
+    if (any && !pass_barrier_old()) {   // the target writes of earlier passes before this pass's (see pass_barrier_old)
+        const VkPipelineStageFlags2 att = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = att,
+            .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstStageMask = att | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+        VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vk.vkCmdPipelineBarrier2(cb, &dep);
+    }
     vkb_checkpoint("begin pass", NULL, NULL);
     pp_begin(cb, g_pass_extent);
     vk.vkCmdBeginRendering(cb, &ri);
@@ -1943,6 +1982,7 @@ static void trace_rt(void) {
 int vkb_pass_begin(VkExtent2D bare, uint32_t fb) { return pass_begin(bare, fb); }
 uint32_t vkb_pass_fb(void) { return g_in_pass ? g_pass_fb : 0; }
 vkb_cnt vkb_pass_end_n[PE_COUNT];   // passes ended, by reason (the per-frame log line)
+static int rt_keep(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_RT_KEEP"); on = !e || *e != '0'; } return on; }
 static void pass_end_why(int why) { if (g_in_pass) vkb_cnt_add(vkb_pass_end_n[why], 1); pass_end(); }
 void vkb_pass_end_r(int why) { pass_end_why(why); }
 void vkb_pass_end(void) { pass_end_why(PE_OTHER); }
@@ -2483,7 +2523,14 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             mtl_sub_copy(s, d, n);
             break;
         }
-        case OP_SET_RT: pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt); trace_rt(); break;
+        case OP_SET_RT:
+            // The same targets again (TOTK sets them before many draws): the pass goes on. Ending it stored and loaded
+            // every attachment and drained the GPU between draws into the same targets (totk-pc-recomp vk_exec.c set_rt
+            // compares the same way). TOTK_VK_RT_KEEP=0: a new pass every time, as before.
+            if (!(g_in_pass && rt_keep() && !memcmp(&g_rt, a, sizeof g_rt))) {
+                pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt);
+            }
+            trace_rt(); break;
         case OP_CLEAR_COLOR: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_ds((const p_clear_ds *)a); break;
         case OP_CLEAR_TEX: if (g_ok == 1) clear_tex((const p_clear_tex *)a); break;
@@ -2599,6 +2646,12 @@ uint64_t mtl_sub_commit(void) {
 // chunk waits for all earlier work and moves its images there. The submission is then one vkQueueSubmit2 of: the slot's
 // command buffer (GPU start time, captured uniforms, the move into the prologue's layouts), the prologue, and for each
 // chunk its move and itself, then the end (copies back).
+// Between chunks (2026-11-02): no wait for all earlier work. The game's own barriers are replayed inside the chunks
+// (OP_BARRIER), so a chunk boundary needs only what the cut itself adds: after the prologue everything (its uploads and
+// pool copies), into a pass cut inside its targets' writes (it begins again with LOAD), and after a chunk whose shaders
+// stored the storage writes (that flag is its recording thread's: the next chunk may be recorded on another). Before,
+// a full ALL_COMMANDS barrier drained the GPU before each of the 16-32 chunks of a frame (totk-pc-recomp splits with none,
+// vk_exec.c). TOTK_VK_CHUNK_BARRIER=1: the full barrier between all chunks, as before.
 // [temporary] Mirrors of written storage buffers are not made (one thread only); TOTK_VK_RECORD_THREADS=1 records as before.
 // A pass longer than 5/4 of the chunk size (the Great Sky Island's G-buffer pass: ~2100 draws, one chunk of 12 of the
 // submission's 14 ms while the other threads waited) is cut inside: the chunk ends its pass and the next one begins it
@@ -2618,6 +2671,7 @@ struct mt_chunk {
     VkCommandBuffer cb;
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
+    int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
 };
 static mt_chunk g_ch[MT_MAXCH];
 static int g_nch;
@@ -2740,6 +2794,7 @@ static void mt_record(mt_chunk *c) {
         if (chunk_end_at(c, i, p) || exec_ops(p, 0, EX_CHUNK, i, c)) break;
     }
     pass_end_why(PE_SUBMIT);
+    c->stores = vkb_stores_take();
     vk.vkEndCommandBuffer(c->cb);
     vkb_trk_set(NULL);
     t_recording = 0;
@@ -2785,6 +2840,7 @@ static void chunk_open(int hidx, const uint8_t *p) {   // a chunk starts at p, i
     c->rt = g_rt;
     c->render_off = g_render_off;
     c->stride = vkb_copy_stride_get();
+    c->split = 0;
     g_mt_draws = 0;
 }
 static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends before p: recording threads may take it
@@ -2803,6 +2859,7 @@ static int walk_op(const uint8_t *p, int hidx) {   // before a command at depth 
     if (((h.op == OP_SET_RT && g_mt_draws >= (uint64_t)g_chunk_draws) || split) && g_nch < MT_MAXCH - 1) {
         chunk_close(hidx, p);
         chunk_open(hidx, p);
+        g_ch[g_nch].split = split && h.op != OP_SET_RT;
     }
     return 0;
 }
@@ -2840,13 +2897,35 @@ static void walk_command(uint32_t op, const uint8_t *a) {
     }
 }
 
-// Before a chunk: everything earlier is done, and its images move into the layouts it needs first.
-static void glue(VkCommandBuffer cb, vkb_trk *t) {
+// Before a chunk: its images move into the layouts it needs first, with what the cut needs (see above). full: everything
+// earlier is done (after the prologue); attach: the targets' writes before a pass cut inside; stores: storage writes.
+enum { GLUE_FULL = 1, GLUE_ATTACH = 2, GLUE_STORES = 4 };
+static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
+    static int all = -1;
+    if (all < 0) { const char *e = getenv("TOTK_VK_CHUNK_BARRIER"); all = e && *e == '1'; }
+    if (all) need = GLUE_FULL;
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    if (!(need & GLUE_FULL)) {
+        mb.srcStageMask = mb.dstStageMask = 0; mb.srcAccessMask = mb.dstAccessMask = 0;
+        if (need & GLUE_ATTACH) {
+            const VkPipelineStageFlags2 att = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            mb.srcStageMask |= att; mb.dstStageMask |= att;
+            mb.srcAccessMask |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            mb.dstAccessMask |= VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+        if (need & GLUE_STORES) {   // as pass_begin's after storage writes
+            mb.srcStageMask |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            mb.dstAccessMask |= VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        }
+    }
     VkImageMemoryBarrier2 ib[64];
-    int ni = 0, first = 1;
+    int ni = 0, first = mb.srcStageMask != 0;
     for (int k = 0; k <= t->n; k++) {
         if (k < t->n) {
             vkb_trk_e *e = &t->e[k];
@@ -2858,7 +2937,7 @@ static void glue(VkCommandBuffer cb, vkb_trk *t) {
                 .subresourceRange = {e->im->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
             if (ni < 64) continue;
         }
-        if (ni || first) {
+        if (ni || first) {   // first: the memory barrier, with the first batch of moves or alone
             VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = first ? 1u : 0u, .pMemoryBarriers = &mb,
                                     .imageMemoryBarrierCount = (uint32_t)ni, .pImageMemoryBarriers = ib};
             vk.vkCmdPipelineBarrier2(cb, &dep);
@@ -2922,13 +3001,13 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     rec_ns += tt - tr;
     // in order: the slot's command buffer moves images into the prologue's layouts, then each chunk's move and the chunk
     vk.vkEndCommandBuffer(g_pro_cb);
-    glue(g_slots[g_cur].cb, &g_pro_trk);
+    glue(g_slots[g_cur].cb, &g_pro_trk, GLUE_FULL);
     g_mt_nlist = 0;
     g_mt_list[g_mt_nlist++] = g_pro_cb;
     for (int k = 0; k < g_nch; k++) {
         VkCommandBuffer m = wp_get(g_cur, VKB_MAXREC);
         glue_images += (uint64_t)g_ch[k].trk.n;
-        glue(m, &g_ch[k].trk);
+        glue(m, &g_ch[k].trk, k == 0 ? GLUE_FULL : (g_ch[k].split ? GLUE_ATTACH : 0) | (g_ch[k - 1].stores ? GLUE_STORES : 0));
         vk.vkEndCommandBuffer(m);
         g_mt_list[g_mt_nlist++] = m;
         g_mt_list[g_mt_nlist++] = g_ch[k].cb;

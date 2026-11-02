@@ -55,7 +55,8 @@ uint64_t guest_call_args(uint64_t fn, int n, const uint64_t *args) {
 }
 
 // Every `svc #imm` of the recompiled code lands here (cpu.h).
-void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_svc(imm, c->x, pc); }
+void runtime_core_checkpoint(void);   // threads.c: give the core up to a better waiting thread
+void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_core_checkpoint(); runtime_svc(imm, c->x, pc); }
 
 _Noreturn void runtime_fail(const char *message) {
     fprintf(stderr, "[totk] FATAL: %s\n", message);

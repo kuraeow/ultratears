@@ -379,8 +379,9 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static _Atomic int save_writers, save_dirty;
 static _Atomic uint64_t save_changed_ns;
 static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); }
+static _Atomic int sync_pending;   /* commits still being written to the disk (sync_later) */
 int runtime_fs_save_busy(void) {
-    if (atomic_load(&save_writers) > 0) return 1;
+    if (atomic_load(&save_writers) > 0 || atomic_load(&sync_pending) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
 }
 static void make_dir(const char *p) { if (make_dir_p(p) && errno != EEXIST) runtime_fail("create profile storage directory"); }
@@ -543,6 +544,36 @@ static void unmount(const char *name) {
     pthread_mutex_unlock(&lock);
     if (!romfs_owns(name) && strcmp(name, mount_name)) runtime_fail("unmount of unknown fs mount");
 }
+/* Commit writes the files to the disk on a thread of its own: fsync of every open file on the game's thread stopped it
+   for ~100 ms at each save (totk-pc-recomp measured 95-135 ms; its 6fca957 does it in the background, MIT). Each file
+   goes as a duplicate of its descriptor, so the game may close or reuse it meanwhile; until they are written the save
+   counts as busy (runtime_fs_save_busy), so leaving the game waits for them. */
+static pthread_mutex_t sync_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sync_cv = PTHREAD_COND_INITIALIZER;
+static int sync_q[64], sync_n, sync_started;
+static void *sync_main(void *p) {
+    (void)p;
+    for (;;) {
+        pthread_mutex_lock(&sync_mu);
+        while (!sync_n) pthread_cond_wait(&sync_cv, &sync_mu);
+        int fd = sync_q[--sync_n];
+        pthread_mutex_unlock(&sync_mu);
+        fsync(fd); close(fd);
+        atomic_fetch_sub(&sync_pending, 1);
+    }
+    return NULL;
+}
+static void sync_later(int fd) {
+    int d = dup(fd);
+    if (d < 0) { fsync(fd); return; }
+    pthread_mutex_lock(&sync_mu);
+    if (!sync_started) { pthread_t t; sync_started = !pthread_create(&t, NULL, sync_main, NULL); if (sync_started) pthread_detach(t); }
+    if (!sync_started || sync_n == (int)(sizeof sync_q / sizeof *sync_q)) { pthread_mutex_unlock(&sync_mu); fsync(d); close(d); return; }
+    sync_q[sync_n++] = d;
+    atomic_fetch_add(&sync_pending, 1);
+    pthread_cond_signal(&sync_cv);
+    pthread_mutex_unlock(&sync_mu);
+}
 static unsigned commit(const char *name) {
     pthread_mutex_lock(&lock);
     int found = 0, save = 0;
@@ -553,7 +584,7 @@ static unsigned commit(const char *name) {
         pthread_mutex_lock(&lock);
         int fd = files[i].fd;
         pthread_mutex_unlock(&lock);
-        if (fd > 0) fsync(fd);
+        if (fd > 0) sync_later(fd);
     }
     if (save) atomic_store(&save_dirty, 0);
     return 0;

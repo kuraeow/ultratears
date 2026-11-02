@@ -299,7 +299,8 @@ void vkb_state(uint32_t op, const uint8_t *a) {
 
 // ---------------- texture and sampler pools ----------------
 typedef struct { tex_t t; view_t v; uint8_t has_view, valid; } treg_t;
-typedef struct { samp_par p; VkSampler s; uint8_t valid, custom; } sreg_t;   // custom: s has its own border colour
+// custom: s has its own border colour; sp: its point-sampled form (sampler_of), made on first use
+typedef struct { samp_par p; VkSampler s, sp; uint8_t valid, custom, custom_p; } sreg_t;
 static treg_t *g_treg;
 static sreg_t *g_sreg;
 static int g_ntreg, g_nsreg;
@@ -332,16 +333,20 @@ void mtl_reg_samp(int id, const samp_par *p) {
     vkb_rw_write(&g_reg_mu, LK_TEXREG);
     g_sreg = grow(g_sreg, &g_nsreg, id, sizeof *g_sreg);
     sreg_t *r = &g_sreg[id];
-    VkSampler old = VK_NULL_HANDLE;
+    VkSampler old = VK_NULL_HANDLE, old_p = VK_NULL_HANDLE;
     int old_custom = 0;
-    if (r->s && (!p || memcmp(&r->p, p, sizeof *p))) { old = r->s; old_custom = r->custom; r->s = VK_NULL_HANDLE; r->custom = 0; }
+    if ((r->s || r->sp) && (!p || memcmp(&r->p, p, sizeof *p))) {
+        old = r->s; old_p = r->sp; old_custom = r->custom + r->custom_p;
+        r->s = r->sp = VK_NULL_HANDLE; r->custom = r->custom_p = 0;
+    }
     r->valid = p != NULL;
     if (p) r->p = *p;
     vkb_rw_write_end(&g_reg_mu);
-    if (old) {
+    if (old || old_p) {
         mtl_finish();   // [temporary] waits for the GPU
-        vk.vkDestroySampler(vkc.device, old, NULL);
-        if (old_custom) atomic_fetch_sub(&g_custom_borders, 1);
+        if (old) vk.vkDestroySampler(vkc.device, old, NULL);
+        if (old_p) vk.vkDestroySampler(vkc.device, old_p, NULL);
+        if (old_custom) atomic_fetch_sub(&g_custom_borders, old_custom);
     }
 }
 void mtl_set_tex_pool_n(int n) { (void)n; }
@@ -355,11 +360,15 @@ static VkSamplerAddressMode wrap(uint8_t w) {
     default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   // CLAMP (GL legacy), CLAMP_TO_EDGE
     }
 }
-static VkSampler sampler(int id) {
+// point: the sampler with nearest filtering and no anisotropy. A depth texture read without a compare lands on one
+// texel on the Switch whatever the sampler's filter, and TOTK binds linear samplers to depth it reads as data:
+// blending neighbouring depths put reconstructed positions in mid-air at object edges (MacNativeGames 6283599,
+// totk-pc-recomp 6029719, both MIT). TOTK_VK_DEPTH_POINT=0: the sampler as the game sets it.
+static VkSampler sampler_of(int id, int point) {
     static VkSampler fallback;   // made before threads record (vkb_draw_mt_init)
     vkb_rw_read(&g_reg_mu, LK_TEXREG);
     int valid = id >= 0 && id < g_nsreg && g_sreg[id].valid;
-    VkSampler have = valid ? g_sreg[id].s : VK_NULL_HANDLE;
+    VkSampler have = valid ? (point ? g_sreg[id].sp : g_sreg[id].s) : VK_NULL_HANDLE;
     samp_par par;
     if (valid) par = g_sreg[id].p;
     vkb_rw_read_end(&g_reg_mu);
@@ -371,6 +380,12 @@ static VkSampler sampler(int id) {
             vk.vkCreateSampler(vkc.device, &ci, NULL, &fallback);
         }
         return fallback;
+    }
+    samp_par reg = par;   // as registered: what a slot made meanwhile is compared with
+    if (point) {
+        par.magf = 0;
+        par.minf = par.minf == 1 ? 0 : par.minf >= 2 ? 2 : par.minf;
+        par.aniso = 1.0f;
     }
     const samp_par *p = &par;
     int mip = p->minf >= 2;
@@ -412,13 +427,15 @@ static VkSampler sampler(int id) {
     VkSampler s;
     if (!vk_check(vk.vkCreateSampler(vkc.device, &ci, NULL, &s), "sampler")) {
         if (custom) atomic_fetch_sub(&g_custom_borders, 1);
-        return sampler(-1);
+        return sampler_of(-1, 0);
     }
     vkb_rw_write(&g_reg_mu, LK_TEXREG);
-    int kept = id < g_nsreg && g_sreg[id].valid && !memcmp(&g_sreg[id].p, &par, sizeof par) && !g_sreg[id].s;
-    if (kept) { g_sreg[id].s = s; g_sreg[id].custom = (uint8_t)custom; }
-    else if (id < g_nsreg && g_sreg[id].valid && !memcmp(&g_sreg[id].p, &par, sizeof par) && g_sreg[id].s) {   // another thread made one meanwhile
-        VkSampler other = g_sreg[id].s;
+    int same = id < g_nsreg && g_sreg[id].valid && !memcmp(&g_sreg[id].p, &reg, sizeof reg);
+    VkSampler *slot = same ? (point ? &g_sreg[id].sp : &g_sreg[id].s) : NULL;
+    int kept = slot && !*slot;
+    if (kept) { *slot = s; if (point) g_sreg[id].custom_p = (uint8_t)custom; else g_sreg[id].custom = (uint8_t)custom; }
+    else if (slot) {   // another thread made one meanwhile
+        VkSampler other = *slot;
         vkb_rw_write_end(&g_reg_mu);
         vk.vkDestroySampler(vkc.device, s, NULL);
         if (custom) atomic_fetch_sub(&g_custom_borders, 1);
@@ -736,8 +753,13 @@ static int stand_in_first(const char *key, int kind) {
 }
 
 // A buffer range for a guest address: the imported pool (offset aligned as the descriptor type needs) or a copy now.
+// copy_ok: a uniform buffer (a misaligned one is bound from a copy; at most 64 KiB, the uniform range limit), else a
+// storage buffer. The kind is said, not taken from the alignment: where the uniform and storage alignments are the same
+// (AMD, Mesa: 4 and 4, against 64 and 16 on NVIDIA) storage buffers were cut to 64 KiB too, and TOTK's Depths terrain
+// and cave walls, whose patch tables lie 0x64000-0xf0000 into a range of ~200 MB, read zeros past it: their vertices
+// collapsed, the ground and walls were missing and Link was unlit (L20 on the Steam Deck and on a Linux RX 570).
 static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDeviceSize align, int copy_ok) {
-    if (size > 65536 && align == vkc.props.limits.minUniformBufferOffsetAlignment) size = 65536;
+    if (size > 65536 && copy_ok) size = 65536;
     VkBuffer buf;
     VkDeviceSize off;
     if (addr && size && vkb_ucap_range(addr, size, &buf, &off) && !(off % align))   // contents as of the submit call (stores dropped it)
@@ -1199,7 +1221,10 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
         else if (!im) vkb_audit(A_TEX_NO_IMAGE, sh->key);
         else if (!view) vkb_audit(A_TEX_NOT_READY, sh->key);
         else if (im->not_uploadable) vkb_audit(A_TEX_NOT_UPLOADED, sh->key);
-        VkDescriptorImageInfo info = {sampler((int)(h >> 20) & 0xFFF), view ? view : dummy_view(vt),
+        static int depth_point = -1;
+        if (depth_point < 0) { const char *e = getenv("TOTK_VK_DEPTH_POINT"); depth_point = !e || *e != '0'; }
+        int point = depth_point && view && (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && !(sh->tex[i].type & 0x400);   // sampler_of
+        VkDescriptorImageInfo info = {sampler_of((int)(h >> 20) & 0xFFF, point), view ? view : dummy_view(vt),
                                       view ? vkb_layout(im) : VK_IMAGE_LAYOUT_GENERAL};
         if (view && stage == 5 && (sh->tex[i].type & 0x400)) {   // a compare sampler in a dispatch: the depth twin
             VkImageView tv = twin_view(vkb_cmd(), im, vt);
@@ -1899,7 +1924,7 @@ void vkb_draw_mt_init(void) {
     if (!g_dummy) dummy_init();
     static const VkImageViewType types[] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY};
     for (unsigned t = 0; t < sizeof types / sizeof *types; t++) dummy_view(types[t]);   // (1D ones: as before, on first use)
-    sampler(-1);
+    sampler_of(-1, 0);
 }
 
 void vkb_draw(const uint8_t *a, int indexed) {

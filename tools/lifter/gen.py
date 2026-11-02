@@ -24,6 +24,8 @@ from unicorn import arm64_const as A
 from analyze import eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_RELATIVE
+import flags
+import regs
 
 SCRATCH_MEM = 0x7300000000
 PROBE_DELTA = 0x12345674   # Module.lift: changes the page and the low bits of an address
@@ -624,12 +626,150 @@ class Module:
             return ['return;']
         raise Unsupported(k)
 
+    # Functions lifted without locals: their hand-written C (tools/lifter/patches.py) reads and writes the Cpu, and the
+    # frame-rate controller (main+0x2db174) gets X21 changed by nvnWindowSetPresentInterval under it (hle_nvn.c).
+    NO_LOCALS_AT = (0x8002db2ec,)
+    reg_locals = 0       # set by main(): registers per function in C locals (tools/lifter/regs.py), 0: none
+    local_flags = False  # and NZCV in a local (tools/lifter/flags.py)
+
+    def emit_local(self, entry, end, labels, tables):
+        """The function [entry, end) with guest registers and flags in C locals (tools/lifter/regs.py, flags.py, the
+        scheme of totk-pc-recomp recomp/gen.py Emitter.function, MIT), or None where it keeps them in the Cpu: an
+        unresolved computed branch (any instruction is an entry), a patched site, an asm word, or flags the plan
+        cannot place (flags.FlagError)."""
+        if any(v == 'all' for v in tables.values()):
+            return None
+        if any(a in PATCHES or a in PRE_PATCHES for a in range(entry, end, 4)) or \
+                any(entry <= a < end for a in self.NO_LOCALS_AT):
+            return None
+        insns = [self.lift(a) for a in range(entry, end, 4)]
+        if any(ins.kind == 'asm' for ins in insns):
+            return None
+        n = len(insns)
+
+        def idx(t):
+            return [(t - entry) // 4] if entry <= t < end else []
+
+        succ = []
+        for i, ins in enumerate(insns):
+            k = ins.kind
+            if k in ('op', 'bl', 'blr'):
+                succ.append([i + 1])
+            elif k == 'b':
+                succ.append(idx(ins.target))
+            elif k == 'bcond':
+                succ.append(idx(ins.target) + [i + 1])
+            elif k == 'br':
+                jt = tables.get(entry + 4 * i)
+                succ.append([t for x in jt for t in idx(x)] if jt else [])
+            else:
+                succ.append([])   # ret, trap
+        succ.append([])   # n: falling into the next function
+        fp = None
+        if self.local_flags:
+            calls, exits, effects = set(), {n}, []
+            for i, ins in enumerate(insns):
+                k = ins.kind
+                if k in ('bl', 'blr'):
+                    calls.add(i)
+                elif (k in ('b', 'bcond') and not entry <= ins.target < end) or k == 'br':
+                    exits.add(i)
+                code = ins.cond if k == 'bcond' else ins.code if k in ('op', 'trap') else ''
+                effects.append(flags.effect(code or ''))
+            effects.append((False, None))
+            fp = flags.plan(effects, succ, calls, exits)
+            if not fp.used:
+                fp = None
+        locs = bool(self.reg_locals)
+        spill, reload, reload_call = (regs.SPILL, regs.RELOAD, regs.RELOAD_CALL) if locs else ('', '', '')
+        refs = set()
+
+        def fx(i, code):
+            return fp.rewrite(i, code) if fp else code
+
+        def publish(i):
+            return fp.publish(i) if fp else ''
+
+        def jump(t, i):
+            if entry <= t < end:
+                return f'goto L_{t:x};'
+            if not self.in_text(t):
+                return f'{publish(i)}{spill}c->pc = {hx(t)}; __attribute__((musttail)) return rt_dispatch(c);'
+            refs.add(t)
+            return f'{publish(i)}{spill}__attribute__((musttail)) return {fname(t)}(c);'
+
+        body = []   # (instruction index, or None for a label; line)
+        k = None
+        try:
+            for i, ins in enumerate(insns):
+                a = entry + 4 * i
+                if a in labels:
+                    body.append((None, f'L_{a:x}:;'))
+                k = ins.kind
+                if k == 'op':
+                    code = fx(i, ins.code)
+                    body.append((i, '    ' + (f'{spill}{code}{reload}' if regs.ESCAPE.search(code) else code)))
+                elif k == 'trap':
+                    body.append((i, f'    {spill}{fx(i, ins.code)}'))
+                elif k == 'b':
+                    body.append((i, '    ' + spin_gate(a, ins.target) + jump(ins.target, i)))
+                elif k == 'bcond':
+                    body.append((i, f'    if ({fx(i, ins.cond)}) {{ {spin_gate(a, ins.target)}{jump(ins.target, i)} }}'))
+                elif k == 'bl':
+                    t = ins.target
+                    if self.in_text(t):
+                        refs.add(t)
+                        body.append((i, f'    c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'))
+                    else:
+                        body.append((i, f'    c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'))
+                elif k == 'blr':
+                    body.append((i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}'))
+                elif k == 'br':
+                    jt = tables.get(a)
+                    if jt:
+                        cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
+                        body.append((i, f'    switch ({ins.target}) {{ {cases} default: break; }}'))
+                    body.append((i, f'    {publish(i)}{spill}c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);'))
+                elif k == 'ret':
+                    body.append((i, f'    {spill}return;'))
+                else:
+                    return None
+        except flags.FlagError:
+            self.stats['local_flag_errors'] += 1
+            return None
+        if k not in ('b', 'br', 'ret', 'trap'):   # falls through into the next function
+            body.append((n, '    ' + jump(end, n) if end < self.hi else f'    {spill}rt_udf(c, {hx(end)});'))
+        out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+        if fp:
+            out.append('    ' + fp.decl())
+        if locs:
+            texts = [''] * (n + 1)
+            for i, line in body:
+                if i is not None:
+                    texts[i] += line
+            clean = {i for i, ins in enumerate(insns)
+                     if ins.kind in ('bl', 'blr') or (ins.kind == 'op' and regs.RELOAD in texts[i])}
+            rp = regs.plan(texts, succ, clean, self.reg_locals)
+            if rp.regs:
+                out.append('    ' + rp.decl())
+            out += [line if i is None else rp.resolve(i, line) for i, line in body]
+        else:
+            out += [line for _, line in body]
+        out.append('}')
+        self.stats['local_functions'] += 1
+        self._refs = refs
+        return out
+
     def emit_function(self, entry, end, labels, tables, hle):
         out = [f'void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
             return out
+        if self.reg_locals or self.local_flags:
+            local = self.emit_local(entry, end, labels, tables)
+            if local:
+                return local
         out.append(f'    FN_ENTER({hx(entry)});')
         batch = []
         refs = set()
@@ -685,9 +825,9 @@ class Module:
             if k == 'op' or k == 'trap':
                 out.append('    ' + ins.code)
             elif k == 'b':
-                out.append('    ' + jump(ins.target))
+                out.append('    ' + spin_gate(a, ins.target) + jump(ins.target))
             elif k == 'bcond':
-                out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
+                out.append(f'    if ({ins.cond}) {{ {spin_gate(a, ins.target)}{jump(ins.target)} }}')
             elif k == 'bl':
                 t = ins.target
                 if self.in_text(t):
@@ -727,7 +867,7 @@ class Module:
         return out
 
 
-from patches import PATCHES, PRE_PATCHES
+from patches import PATCHES, PRE_PATCHES, SPINS
 
 
 def table_base(m, i, reg, window=40):
@@ -748,6 +888,11 @@ def table_base(m, i, reg, window=40):
     return False
 
 
+def spin_gate(a, target):
+    """rt_spin_gate before the back-edge of a spin wait (tools/lifter/spin_waits_v143.txt), else nothing."""
+    return f'rt_spin_gate(c, {hx(target)}); ' if SPINS.get(a) == target else ''
+
+
 def write_if_changed(path, text):
     """Leaves unchanged chunks untouched so make only recompiles what a patch affected. Lines end in LF on every system:
     the C lifted on Windows for a Steam Deck is the same file a lift on the Deck writes."""
@@ -761,31 +906,9 @@ def write_if_changed(path, text):
         f.write(text)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('name')
-    ap.add_argument('nso')
-    ap.add_argument('base', type=lambda s: int(s, 0))
-    ap.add_argument('outdir')
-    ap.add_argument('--hle')
-    ap.add_argument('--chunk', type=int, default=1500)  # functions per file at most
-    ap.add_argument('--chunk-bytes', type=int, default=1500000)  # and about this much C (even compile times)
-    ap.add_argument('--big-fn', type=int, default=100000)  # bytes of C from which a function gets its own file
-    ap.add_argument('--limit', type=int, default=0)
-    ap.add_argument('--simd', choices=('asm', 'c'),
-                    default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
-    args = ap.parse_args()
-
-    t0 = time.time()
-    m = Module(args.name, args.nso, args.base, args.simd)
-    starts = m.boundaries()
-    hle = {}
-    if args.hle and os.path.exists(args.hle):
-        want = {l.strip() for l in open(args.hle) if l.strip() and not l.startswith('#')}
-        for name, info, shndx, value, size in m.nso.syms:
-            if shndx and name in want:
-                hle[args.base + value] = name
-
+def partition(m, starts):
+    """{entry: (end, labels, tables)} of every function of the module, and the rounds it took (main(); the A/B check
+    of tools/lifter/ab_check.py)."""
     # Partition text into functions; any branch/call target outside its function becomes a new
     # boundary (splitting the containing function) until a fixpoint is reached.
     start_set = set(starts)
@@ -838,6 +961,39 @@ def main():
         end = order[i + 1] if i + 1 < len(order) else m.hi
         labels, ext, tables = scanned[(a, end)]
         entries[a] = (end, labels, tables)
+    return entries, rounds
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('name')
+    ap.add_argument('nso')
+    ap.add_argument('base', type=lambda s: int(s, 0))
+    ap.add_argument('outdir')
+    ap.add_argument('--hle')
+    ap.add_argument('--chunk', type=int, default=1500)  # functions per file at most
+    ap.add_argument('--chunk-bytes', type=int, default=1500000)  # and about this much C (even compile times)
+    ap.add_argument('--big-fn', type=int, default=100000)  # bytes of C from which a function gets its own file
+    ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--reg-locals', type=int, default=regs.LOCALS,
+                    help=f'guest registers per function kept in C locals (tools/lifter/regs.py; default {regs.LOCALS}, 0: none)')
+    ap.add_argument('--no-local-flags', action='store_true', help='keep NZCV in the Cpu (tools/lifter/flags.py off)')
+    ap.add_argument('--simd', choices=('asm', 'c'),
+                    default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
+    args = ap.parse_args()
+
+    t0 = time.time()
+    m = Module(args.name, args.nso, args.base, args.simd)
+    m.reg_locals, m.local_flags = args.reg_locals, not args.no_local_flags
+    starts = m.boundaries()
+    hle = {}
+    if args.hle and os.path.exists(args.hle):
+        want = {l.strip() for l in open(args.hle) if l.strip() and not l.startswith('#')}
+        for name, info, shndx, value, size in m.nso.syms:
+            if shndx and name in want:
+                hle[args.base + value] = name
+
+    entries, rounds = partition(m, starts)
     print(f'{args.name}: {len(starts)} boundaries, {len(entries)} functions, {rounds} rounds, {dict(m.stats)}, '
           f'{time.time() - t0:.0f}s', file=sys.stderr)
 
@@ -862,14 +1018,18 @@ def main():
                 r = getattr(m, '_refs', set())
                 m._refs = set()
             n = sum(len(l) + 1 for l in lines)
-            if n > args.big_fn and fns:  # (a big function gets a file of its own: they compile in parallel)
+            # A big function gets a file of its own (they compile in parallel), and so does one with a dispatch over
+            # thousands of labels: build_game.py compiles such a file at -O0, and every function sharing it ran
+            # unoptimized too (in 1.4.3 about 640 functions, 459 of them the SDK's, in 2 files).
+            alone = n > args.big_fn or ('L_dispatch:' in lines[-4:] and sum(l.startswith('L_') for l in lines) > 2000)
+            if alone and fns:
                 pending = (a, lines, r)
                 break
             body += lines
             size += n
             fns.append(a)
             refs |= r
-            if n > args.big_fn:
+            if alone:
                 break
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
         text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]

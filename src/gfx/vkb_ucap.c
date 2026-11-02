@@ -169,9 +169,17 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // repl
     for (int i = 0; i < c->n; i++) {
         at = ((at + 255) & ~(VkDeviceSize)255) + (c->r[i].lo & 255);
         g_u[i] = (urng){c->r[i].lo, c->r[i].hi, at, UINT64_MAX};
-        for (int j = 0; j < g_npend && g_u[i].drop_at; j++)   // a GPU write the capture predates: read memory
-            if (g_pend[j].fence > c->done && g_pend[j].lo < c->r[i].hi && c->r[i].lo < g_pend[j].hi) { g_u[i].drop_at = 0; g_drops++; }
         at += c->r[i].hi - c->r[i].lo;
+    }
+    // A GPU write the capture predates: the ranges it overlaps read memory. The ranges are sorted and disjoint, so each
+    // write finds its first one by binary search (each range against every pending write was ~27 % of the translation
+    // thread at Lookout Landing, 2026-11-02: thousands of ranges times thousands of writes a submission).
+    for (int j = 0; j < g_npend; j++) {
+        if (g_pend[j].fence <= c->done) continue;
+        int lo = 0, hi = c->n;   // the first range ending after the write's start
+        while (lo < hi) { int m = (lo + hi) / 2; if (c->r[m].hi <= g_pend[j].lo) lo = m + 1; else hi = m; }
+        for (int i = lo; i < c->n && c->r[i].lo < g_pend[j].hi; i++)
+            if (g_u[i].drop_at) { g_u[i].drop_at = 0; g_drops++; }
     }
     int slot = vkb_slot();
     if (!arena_get(slot, at)) return;

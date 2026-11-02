@@ -1,0 +1,47 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitBitfield.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitBitfield.cs
+@@ -142,13 +142,26 @@ namespace Ryujinx.Graphics.Shader.Instructions
+ 
+             Operand size = context.BitfieldExtractU32(srcB, Const(8), Const(8));
+ 
++            // UltraTears: a field that runs past bit 31 is cut there, and one that starts past it is empty (Maxwell, as
++            // PTX bfe: 0, or for a signed field bit 31 repeated). SPIR-V leaves both undefined: AMD's driver takes the
++            // position modulo 32 and reads other bits. TOTK's Depths terrain vertex shaders read a 5-bit field at
++            // (2y + x) * 8 of a patch word, up to 96 for the vertices on a patch's far edges (0 there on the Switch):
++            // on AMD those vertices moved, and walls and ground of the Depths were missing (L20 on the Steam Deck).
++            Operand clampedPosition = context.IMinimumU32(position, Const(32));
++            Operand clampedSize = context.IMinimumU32(size, context.ISubtract(Const(32), clampedPosition));
++
+             Operand res = isSigned
+-                ? context.BitfieldExtractS32(srcA, position, size)
+-                : context.BitfieldExtractU32(srcA, position, size);
++                ? context.BitfieldExtractS32(srcA, clampedPosition, clampedSize)
++                : context.BitfieldExtractU32(srcA, clampedPosition, clampedSize);
++
++            Operand startsPast = context.ICompareGreaterOrEqualUnsigned(position, Const(32));
++
++            res = context.ConditionalSelect(startsPast, isSigned ? context.ShiftRightS32(srcA, Const(31)) : Const(0), res);
++            res = context.ConditionalSelect(context.ICompareEqual(size, Const(0)), Const(0), res);
+ 
+             context.Copy(GetDest(rd), res);
+ 
+-            // TODO: CC, X, corner cases.
++            // TODO: CC, X.
+         }
+ 
+         private static void EmitBfi(EmitterContext context, Operand srcA, Operand srcB, Operand srcC, int rd)
+@@ -157,7 +170,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
+ 
+             Operand size = context.BitfieldExtractU32(srcB, Const(8), Const(8));
+ 
+-            Operand res = context.BitfieldInsert(srcC, srcA, position, size);
++            // UltraTears: as in EmitBfe, the field is cut at bit 31 (none past it: C unchanged), defined in SPIR-V too.
++            Operand clampedPosition = context.IMinimumU32(position, Const(32));
++            Operand clampedSize = context.IMinimumU32(size, context.ISubtract(Const(32), clampedPosition));
++
++            Operand res = context.BitfieldInsert(srcC, srcA, clampedPosition, clampedSize);
++
++            res = context.ConditionalSelect(context.ICompareGreaterOrEqualUnsigned(position, Const(32)), srcC, res);
+ 
+             context.Copy(GetDest(rd), res);
+         }
