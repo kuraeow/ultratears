@@ -4,8 +4,8 @@
 
 # UltraTears
 
-**UltraTears** собирает нативную ПК-версию *The Legend of Zelda: Tears of the Kingdom* (версия 1.4.3) для Windows и
-Linux / Steam Deck из вашей собственной копии игры. Это не эмулятор: код игры заранее переводится в нативный, а шейдеры и
+**UltraTears** собирает нативную версию *The Legend of Zelda: Tears of the Kingdom* (версия 1.4.3) для Windows, Linux
+и Steam Deck из вашей собственной копии игры. Это не эмулятор: код игры заранее переводится в нативный, а шейдеры и
 текстуры готовятся при сборке игры, а не во время игры.
 
 > [!IMPORTANT]
