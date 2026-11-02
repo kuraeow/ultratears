@@ -980,12 +980,17 @@ static pool_ent *pool_find_mut(uintptr_t addr, uint64_t len);
 // threads do not wait for each other's uniform updates and stores (the write lock is for bringing a copy up to date).
 static pthread_mutex_t g_wb_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_pool_use_n[3];   // the per-frame log line: write lock to update a copy / for a write / writes under the read lock
-// Per recording thread, the pool of its last read that needed nothing more in this submission: a draw's buffers mostly
-// lie in a few pools, and each look took the table's lock, searched it and wrote the pool's used_sub, one cache line
-// written by every recording thread (vkb_pool_use was ~6 % of each recording thread at Lookout Landing, 2026-11-02).
-static __thread struct { uint64_t lo, hi, sub, gen; } t_pool_hit;
+// Per recording thread, the pools of its last reads that needed nothing more in this submission: a draw's buffers mostly
+// lie in a few pools (uniforms, vertices, indices, storage), and each look took the table's lock, searched it and wrote
+// the pool's used_sub, one cache line written by every recording thread (vkb_pool_use was ~6 % of each recording thread
+// at Lookout Landing, 2026-11-02; with one pool remembered still ~5 %).
+enum { POOL_HITS = 8 };
+static __thread struct { uint64_t lo, hi, sub, gen; } t_pool_hit[POOL_HITS];
+static __thread unsigned t_pool_hit_next;
 static void pool_hit_note(const pool_ent *p, uint64_t addr, uint64_t len, uint64_t sub, uint64_t gen) {
-    if (addr >= p->lo && addr + len <= p->hi) { t_pool_hit.lo = p->lo; t_pool_hit.hi = p->hi; t_pool_hit.sub = sub; t_pool_hit.gen = gen; }
+    if (addr < p->lo || addr + len > p->hi) return;
+    unsigned k = t_pool_hit_next++ % POOL_HITS;
+    t_pool_hit[k].lo = p->lo; t_pool_hit[k].hi = p->hi; t_pool_hit[k].sub = sub; t_pool_hit[k].gen = gen;
 }
 static void used_mark(pool_ent *p, uint64_t sub) {   // read first: a store only when it changes
     if (__atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
@@ -993,7 +998,9 @@ static void used_mark(pool_ent *p, uint64_t sub) {   // read first: a store only
 void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     if (g_ok != 1 || !addr || !len) return;
     uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
-    if (!write && t_pool_hit.sub == sub && t_pool_hit.gen == gen && addr >= t_pool_hit.lo && addr + len <= t_pool_hit.hi) return;
+    if (!write)
+        for (int k = 0; k < POOL_HITS; k++)
+            if (t_pool_hit[k].sub == sub && t_pool_hit[k].gen == gen && addr >= t_pool_hit[k].lo && addr + len <= t_pool_hit[k].hi) return;
     if (vkb_pool_copies()) {   // the pool is synced before the submission (pc_sync); a GPU write goes back after it
         vkb_rw_read(&g_pool_mu, LK_POOLS);
         // a range running on past its pool's end (GPU addresses, vkb_span_addr): the pool it starts in, up to its end
