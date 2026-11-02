@@ -753,8 +753,13 @@ static int stand_in_first(const char *key, int kind) {
 }
 
 // A buffer range for a guest address: the imported pool (offset aligned as the descriptor type needs) or a copy now.
+// copy_ok: a uniform buffer (a misaligned one is bound from a copy; at most 64 KiB, the uniform range limit), else a
+// storage buffer. The kind is said, not taken from the alignment: where the uniform and storage alignments are the same
+// (AMD, Mesa: 4 and 4, against 64 and 16 on NVIDIA) storage buffers were cut to 64 KiB too, and TOTK's Depths terrain
+// and cave walls, whose patch tables lie 0x64000-0xf0000 into a range of ~200 MB, read zeros past it: their vertices
+// collapsed, the ground and walls were missing and Link was unlit (L20 on the Steam Deck and on a Linux RX 570).
 static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDeviceSize align, int copy_ok) {
-    if (size > 65536 && align == vkc.props.limits.minUniformBufferOffsetAlignment) size = 65536;
+    if (size > 65536 && copy_ok) size = 65536;
     VkBuffer buf;
     VkDeviceSize off;
     if (addr && size && vkb_ucap_range(addr, size, &buf, &off) && !(off % align))   // contents as of the submit call (stores dropped it)
