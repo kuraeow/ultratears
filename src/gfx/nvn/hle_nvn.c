@@ -323,6 +323,7 @@ NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool
 // TOTK: logging switches checked on per-call paths (command memory, recording, submits) are read once.
 static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CMD_LOG") != NULL; return on; }
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
+static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CHAIN_LOG") != NULL; return on; }   // read once: EndRecording and Submit run hundreds of times a frame
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
@@ -925,11 +926,13 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
-static uint8_t *flatten_recording(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
-    int bulk_ok = 1; uint32_t last_size = 0;
-    if (!out) die("command copy allocation");
-    for (;;) {
+// Two passes (as totk-pc-recomp's flatten_recording): the first walks the ops and measures, the second copies each run
+// between jumps with one memcpy into one allocation of the exact size. Copying op by op into a buffer that doubled
+// and was trimmed at the end cost the game thread a realloc chain per recording.
+static uint8_t *flatten_recording(const uint8_t *start) {
+    size_t n = sizeof(copy_prefix);
+    int bulk_ok = 1; uint32_t last_size = 0, end_size = 0;
+    for (const uint8_t *p = start;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
@@ -937,18 +940,28 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN) bulk_ok = 0;
         else if (h.op != OP_END) last_size = h.size;
-        if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-        memcpy(out + n, p, h.size); n += h.size;
-        if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
-            size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
-            c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
-            c->last_size = c->body_bytes ? last_size : 0;
-            g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
-        }
+        n += h.size;
+        if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
     }
+    uint8_t *out = malloc(n);
+    if (!out) die("command copy allocation");
+    size_t at = sizeof(copy_prefix);
+    for (const uint8_t *p = start, *run = start;;) {   // run: the start of the ops not yet copied
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op == OP_JUMP) {
+            memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run);
+            memcpy(&p, p + 8, 8); run = p; continue;
+        }
+        p += h.size;
+        if (h.op == OP_END) { memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run); break; }
+    }
+    if (at != n) die("command copy: %zu bytes copied of %zu measured", at, n);
+    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+    size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+    c->last_size = c->body_bytes ? last_size : 0;
+    g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
 }
 /* Track handle use for diagnostics; lifetime depends on control-memory reuse, never elapsed frames. */
 static void copy_touch(NVNcommandHandle h, uint64_t now) {
@@ -1057,7 +1070,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
-    if (getenv("TOTK_CHAIN_LOG")) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
+    if (chainlog_env()) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
     return (NVNcommandHandle)copy;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -2288,7 +2301,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
             LOG("[shape]   calls %u: draws in calls %u (outside %u), largest %u, calls with 100+: %u; per call:%s", ncall, inc, tot - inc, cmx, cbig, line);
         }
       } }
-    if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
+    if (chainlog_env()) { static int k; if (k++ < 20) guest_chain("Submit"); }
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);

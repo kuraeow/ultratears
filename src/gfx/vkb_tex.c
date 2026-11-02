@@ -696,7 +696,9 @@ vkb_image *vkb_image_of(const tex_t *t) {
         g_all = e;
         g_images_made++;
     }
-    if (t->mem && getenv("TOTK_VK_SIZE_REFRESH")) refresh_mark(e);   // [experiment, off] picks transient aliases (see above)
+    static int size_refresh = -1;   // read once: this runs for every image a draw binds
+    if (size_refresh < 0) size_refresh = getenv("TOTK_VK_SIZE_REFRESH") != NULL;
+    if (t->mem && size_refresh) refresh_mark(e);   // [experiment, off] picks transient aliases (see above)
     e->refs++;
     if (s->serial == t->serial) g_tomb--; else s->serial = t->serial;
     s->e = e;
