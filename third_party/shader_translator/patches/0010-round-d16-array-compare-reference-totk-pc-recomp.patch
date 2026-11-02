@@ -1,0 +1,21 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1283,6 +1283,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             if (isShadow)
+             {
+                 dRef = Src(AggregateType.FP32);
++
++                // TOTK: the shadow cascades are D16 array textures. Maxwell rounds the compare reference to the texture's
++                // 16-bit precision before the compare; Vulkan drivers may compare the full float (AMD does), so a lit
++                // surface fails its own compare by a fraction of a step and the whole face reads as shadowed. Array
++                // compares only: in TotK those are the D16 cascades (MacNativeGames 6283599 rounds the same ones).
++                if (isArray)
++                {
++                    SpvInstruction d16Fp32 = context.TypeFP32();
++                    SpvInstruction d16Clamped = context.GlslFClamp(d16Fp32, dRef, context.Constant(d16Fp32, 0f), context.Constant(d16Fp32, 1f));
++                    SpvInstruction d16Scaled = context.FAdd(d16Fp32, context.FMul(d16Fp32, d16Clamped, context.Constant(d16Fp32, 65535f)), context.Constant(d16Fp32, 0.5f));
++                    dRef = context.FMul(d16Fp32, context.GlslFloor(d16Fp32, d16Scaled), context.Constant(d16Fp32, 1f / 65535f));
++                }
+             }
+ 
+             SpvInstruction[] derivatives = null;

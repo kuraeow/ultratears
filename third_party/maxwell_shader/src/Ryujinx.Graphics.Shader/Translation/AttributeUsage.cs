@@ -19,6 +19,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         private readonly IGpuAccessor _gpuAccessor;
 
         public UInt128 NextInputAttributesComponents { get; private set; }
+        public bool NextStageKnown { get; private set; }
         public UInt128 ThisInputAttributesComponents { get; private set; }
 
         public AttributeUsage(IGpuAccessor gpuAccessor)
@@ -55,6 +56,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public void MergeFromtNextStage(bool gpPassthrough, bool nextUsesFixedFunctionAttributes, AttributeUsage nextStage)
         {
+            NextStageKnown = true;
             NextInputAttributesComponents = nextStage.ThisInputAttributesComponents;
             NextUsedInputAttributesPerPatch = nextStage.UsedInputAttributesPerPatch;
             NextUsesFixedFuncAttributes = nextUsesFixedFunctionAttributes;

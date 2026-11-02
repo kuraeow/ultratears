@@ -33,8 +33,13 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         {
             foreach (AstOperand local in function.Locals)
             {
-                SpvInstruction localPointerType = context.TypePointer(StorageClass.Function, context.GetType(local.VarType));
-                SpvInstruction spvLocal = context.Variable(localPointerType, StorageClass.Function);
+                SpvInstruction localType = context.GetType(local.VarType);
+                SpvInstruction localPointerType = context.TypePointer(StorageClass.Function, localType);
+
+                // UltraTears: a register the program reads on a path where it was not written is 0, not undefined. The
+                // NVIDIA driver gives 0 there; Mesa (RADV) takes an undefined value as any value and folds what it
+                // reaches, so such a shader computed something else on AMD.
+                SpvInstruction spvLocal = context.Variable(localPointerType, StorageClass.Function, context.ConstantNull(localType));
 
                 context.AddLocalVariable(spvLocal);
                 context.DeclareLocal(local, spvLocal);
@@ -473,10 +478,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.Decorate(perVertexStructType, Decoration.Block);
 
-            if (context.HostCapabilities.ReducedPrecision)
-            {
-                context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
-            }
+            // TOTK: Maxwell computes a position identically in every shader that runs the same code (a depth pre-pass drawn
+            // again with EQUAL), so the position is always invariant, not only with the ReducedPrecision job flag.
+            context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
 
             context.MemberDecorate(perVertexStructType, 0, Decoration.BuiltIn, (LiteralInteger)BuiltIn.Position);
             context.MemberDecorate(perVertexStructType, 1, Decoration.BuiltIn, (LiteralInteger)BuiltIn.PointSize);
@@ -574,7 +578,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     context.Decorate(spvVar, Decoration.Patch);
                 }
 
-                if (context.HostCapabilities.ReducedPrecision && ioVariable == IoVariable.Position)
+                if (ioVariable == IoVariable.Position)
                 {
                     context.Decorate(spvVar, Decoration.Invariant);
                 }
