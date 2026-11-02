@@ -764,6 +764,7 @@ static VkDescriptorBufferInfo guest_range(uint64_t addr, uint64_t size, VkDevice
     VkDeviceSize off;
     if (addr && size && vkb_ucap_range(addr, size, &buf, &off) && !(off % align))   // contents as of the submit call (stores dropped it)
         return (VkDescriptorBufferInfo){buf, off, size};
+    if (addr && size && vkb_ub_deferred(addr, size)) vkb_ucap_hazard();   // memory without this pass's kept updates yet
     if (addr && size && vkb_gpu_addr(addr, size, &buf, &off)) {
         if (!(off % align)) return (VkDescriptorBufferInfo){buf, off, size};
         if (copy_ok) {   // [temporary] misaligned for this GPU: a copy of the current contents (later GPU-ordered updates missed)

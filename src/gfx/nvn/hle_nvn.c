@@ -2870,6 +2870,12 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "maximum interpolation: uncapped, one interpolated frame per game frame" : "maximum interpolation: game interval, one interpolated frame per game frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game interval"); was = m; }
     if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
+    {   /* TOTK_FPS_UNCAP_AT=<frame> (development): unlimited from that frame on. Input scripts count frames from the
+           title at the limit; the measurement windows after it show what the frame takes. */
+        static long long at = -2;
+        if (at == -2) { const char *u = getenv("TOTK_FPS_UNCAP_AT"); at = u && *u ? atoll(u) : -1; }
+        if (at >= 0 && g_frame >= (uint64_t)at) return 0;
+    }
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 /* Exercise production policy, including the shrine's interval=2 and the

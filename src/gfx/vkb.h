@@ -140,6 +140,10 @@ void vkb_ucap_drop(uint64_t addr, uint64_t len);
 void vkb_ucap_inline(uint64_t addr, uint64_t n, const uint8_t *data);   // an inline uniform update, for later CPU reads
 int vkb_ucap_why(uint64_t addr, uint64_t size);          // a GPU write: copies it overlaps are no longer used
 void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hits, uint64_t *drops);
+int vkb_ucap_update(uint64_t addr, uint64_t n, const uint8_t *data);   // an inline uniform update: 1 when the copy keeps it
+void vkb_ucap_hazard(void);   // a reader of memory a kept update has not reached yet (counted)
+int vkb_ub_deferred(uint64_t addr, uint64_t size);   // backend_vk.c: a kept update of this pass overlaps (not yet in memory)
+void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_hits, uint64_t *hazards);
 
 // ---- vkb_bc7.c: ASTC textures as BC7, from a cache by the contents of the ASTC blocks
 typedef struct { uint64_t a, b; } vkb_bc7_key;

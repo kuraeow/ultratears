@@ -46,6 +46,7 @@ static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 void mtl_finish(void);
 static void pass_end(void);
 static void pass_end_why(int why);
+static int pass_open(void);
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static uint64_t gpu_ticks(void) { return runtime_now_ns() * 12 / 625; }   // the Switch's 19.2 MHz counter
 
@@ -1639,6 +1640,34 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     full_barrier(cb);
 }
 
+// Inline updates kept in the copy (vkb_ucap.c) while a pass is open: written to memory when it ends, all at once.
+typedef struct { uint64_t dst, n; const uint8_t *data; } ub_t;
+static __thread ub_t *t_ub;
+static __thread int t_nub, t_capub;
+static void ub_write(VkCommandBuffer cb, uint64_t dst, uint64_t n, const uint8_t *data) {   // between full barriers
+    VkBuffer db; VkDeviceSize off;
+    if (!vkb_gpu_addr(dst, n, &db, &off)) return;
+    // vkCmdUpdateBuffer: 4-byte aligned, at most 65536 bytes per call
+    if (!(off & 3) && !(n & 3)) {
+        for (uint64_t k = 0; k < n; k += 65536) vk.vkCmdUpdateBuffer(cb, db, off + k, n - k < 65536 ? n - k : 65536, data + k);
+    } else {
+        vkb_audit(A_UPDATE_SKIPPED, NULL);
+        static int said; if (said++ < 4) VLOG("[temporary] unaligned uniform update %#llx+%llu: skipped", (unsigned long long)dst, (unsigned long long)n);
+    }
+}
+static void ub_flush(VkCommandBuffer cb) {   // the pass has ended
+    if (!t_nub) return;
+    for (int i = 0; i < t_nub; i++) { vkb_mirrors_evict(t_ub[i].dst, t_ub[i].n); vkb_pool_use(t_ub[i].dst, t_ub[i].n, 1); }
+    full_barrier(cb);
+    for (int i = 0; i < t_nub; i++) ub_write(cb, t_ub[i].dst, t_ub[i].n, t_ub[i].data);
+    full_barrier(cb);
+    t_nub = 0;
+}
+int vkb_ub_deferred(uint64_t addr, uint64_t size) {   // a kept update of this pass not yet in memory overlaps the range
+    for (int i = 0; i < t_nub; i++) if (t_ub[i].dst < addr + size && addr < t_ub[i].dst + t_ub[i].n) return 1;
+    return 0;
+}
+
 static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
     if (watched(dst, n)) {
         static int said;
@@ -1650,22 +1679,20 @@ static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
     }
     if (g_ok != 1) { memcpy((void *)(uintptr_t)dst, data, n); return; }
     if (!n) return;
+    // Kept in the copy: later draws read a version with it, CPU reads see it (vkb_ucap.c); else later draws read the
+    // updated memory and CPU reads (pointers) the updated bytes.
+    int kept = vkb_ucap_update(dst, n, data);
+    if (kept && pass_open()) {
+        if (t_nub == t_capub) { t_capub = t_capub ? t_capub * 2 : 256; if (!(t_ub = realloc(t_ub, sizeof *t_ub * (size_t)t_capub))) die("kept uniform updates"); }
+        t_ub[t_nub++] = (ub_t){dst, n, data};
+        return;
+    }
     pass_end_why(PE_UPDATE);
     vkb_mirrors_evict(dst, n);
     vkb_pool_use(dst, n, 1);
-    vkb_ucap_drop(dst, n);   // an inline uniform update: later draws read the updated memory
-    vkb_ucap_inline(dst, n, data);   // ... and CPU reads of it (pointers) the updated bytes
-    VkBuffer db; VkDeviceSize off;
-    if (!vkb_gpu_addr(dst, n, &db, &off)) return;
     VkCommandBuffer cb = vkb_cmd();
     full_barrier(cb);
-    // vkCmdUpdateBuffer: 4-byte aligned, at most 65536 bytes per call
-    if (!(off & 3) && !(n & 3)) {
-        for (uint64_t k = 0; k < n; k += 65536) vk.vkCmdUpdateBuffer(cb, db, off + k, n - k < 65536 ? n - k : 65536, data + k);
-    } else {
-        vkb_audit(A_UPDATE_SKIPPED, NULL);
-        static int said; if (said++ < 4) VLOG("[temporary] unaligned uniform update %#llx+%llu: skipped", (unsigned long long)dst, (unsigned long long)n);
-    }
+    ub_write(cb, dst, n, data);
     full_barrier(cb);
 }
 
@@ -1675,6 +1702,7 @@ static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
 static __thread p_set_rt g_rt;       // current render targets (per recording thread)
 static _Atomic uint64_t g_ticket;   // presents so far
 static __thread int g_in_pass;
+static int pass_open(void) { return g_in_pass; }
 static __thread uint32_t g_pass_fb;      // the current pass's feedback targets (vkb.h)
 static __thread VkExtent2D g_pass_extent;
 
@@ -1768,6 +1796,7 @@ static void pass_end(void) {
     pp_end(vkb_cmd());
     vkb_tex_block_flush(vkb_cmd());
     g_in_pass = 0;
+    ub_flush(vkb_cmd());   // the pass's kept uniform updates reach memory
 }
 
 static uint32_t level_size(uint32_t v, const view_t *view) {
@@ -2326,6 +2355,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 VLOG("per frame: uniforms copied at submit %.2f MiB in %.0f submissions (%.2f ms on the game thread), bindings from the copy %.0f, dropped by GPU writes %.1f",
                      (double)(b - pb) / 1048576.0 / f, (double)(c - pc) / f, (double)(ns - pn) / 1e6 / f, (double)(h - ph) / f, (double)(d - pd) / f);
                 pc = c; pb = b; pn = ns; ph = h; pd = d;
+                static uint64_t pk, pv, pvh, pz;
+                uint64_t k, v, vh, z;
+                vkb_ucap_keep_stats(&k, &v, &vh, &z);
+                VLOG("per frame: inline uniform updates kept in the copy %.1f (versions built %.1f, reused %.1f), readers of memory not yet written %.2f",
+                     (double)(k - pk) / f, (double)(v - pv) / f, (double)(vh - pvh) / f, (double)(z - pz) / f);
+                pk = k; pv = v; pvh = vh; pz = z;
             }
             if (vkb_pool_copies()) {
                 static uint64_t pci, pcw, pcb, pcn, pck, pcs;
@@ -2873,7 +2908,7 @@ static void walk_command(uint32_t op, const uint8_t *a) {
     }
     case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
     case OP_COPY_B2B: { uint64_t d, n; memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); if (n) vkb_ucap_drop(d, n); break; }   // GPU writes
-    case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) { vkb_ucap_drop(d, n); vkb_ucap_inline(d, n, a + 16); } break; }
+    case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) vkb_ucap_update(d, n, a + 16); break; }
     case OP_COPY_T2B: { uint64_t ad, len; if (vkb_copy_t2b_range((const p_copy_b2t *)a, &ad, &len)) vkb_ucap_drop(ad, len); break; }
     case OP_COPY_STRIDE: vkb_copy_stride(((const p_copy_stride *)a)->stride); break;
     case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); break;
