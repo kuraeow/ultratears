@@ -1768,6 +1768,15 @@ static __thread uint64_t g_pass_serial;   // passes begun on this thread (vkb_pa
 uint64_t vkb_pass_serial(void) { return g_pass_serial; }
 static void shadow_presync(void);
 static void span_presync(void);
+// A pass's targets (2026-11-02): an image whose layout changes gets its barrier with the move (vkb_image_use); the others
+// none of their own, only one barrier for the whole pass from the target writes before (an earlier pass's) to this
+// pass's tests, output and sampling. Before, every target of every pass had its own barrier from ALL_COMMANDS: ~1700
+// full GPU drains a frame on the RTX 3060 (587 passes, 3600 barriers), costlier on AMD. TOTK_VK_PASS_BARRIER=1: as before.
+static int pass_barrier_old(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_PASS_BARRIER"); v = e && *e == '1'; }
+    return v;
+}
 static int pass_begin(VkExtent2D bare, uint32_t fb) {
     if (g_in_pass) return 1;
     shadow_presync();
@@ -1831,7 +1840,8 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         }
         int loop = (fb >> i) & 1;
         VkImageLayout layout = loop ? fb_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        vkb_image_use(cb, im, layout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
+        if (pass_barrier_old() || !vkb_layout_is(im, layout))
+            vkb_image_use(cb, im, layout, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | (loop ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
         color[i].imageView = vkb_view(im, v, 1, -1);
         vkb_image_written(im);
@@ -1849,7 +1859,8 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         const view_t *v = g_rt.has_dview ? &g_rt.dview : NULL;
         int loop = (fb & VKB_FB_DEPTH) != 0;
         VkImageLayout layout = loop ? fb_layout : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        vkb_image_use(cb, dim, layout,
+        if (pass_barrier_old() || !vkb_layout_is(dim, layout))
+            vkb_image_use(cb, dim, layout,
                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | (loop ? VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT : 0),
                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | (loop ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
         VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = vkb_view(dim, v, 1, -1),
@@ -1872,6 +1883,18 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = layers,
         .colorAttachmentCount = (uint32_t)ncolor, .pColorAttachments = color,
         .pDepthAttachment = depth.imageView ? &depth : NULL, .pStencilAttachment = stencil.imageView ? &stencil : NULL};
+    if (any && !pass_barrier_old()) {   // the target writes of earlier passes before this pass's (see pass_barrier_old)
+        const VkPipelineStageFlags2 att = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = att,
+            .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstStageMask = att | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+        VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vk.vkCmdPipelineBarrier2(cb, &dep);
+    }
     vkb_checkpoint("begin pass", NULL, NULL);
     pp_begin(cb, g_pass_extent);
     vk.vkCmdBeginRendering(cb, &ri);
