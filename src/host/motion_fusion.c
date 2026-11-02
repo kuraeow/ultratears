@@ -35,15 +35,23 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
-/* [port] Zero-rate calibration (L12, GitHub #39, 2026-10-31): with a Pro Controller the aim crept to one side and then the
-   other with the controller at rest - its gyro's bias, which nothing took off (yaw has no reference). While the
-   controller is still (rotation under STILL_RAD and acceleration within 5 % of 1 G for STILL_S) the bias follows the
-   gyro's reading, and it is subtracted from every sample, as the Switch, Steam Input and SDL games do. Moving, the bias
-   stays as it was. TOTK_GYRO_CALIBRATE=0 turns it off. */
-#define STILL_RAD (4.0 * M_PI / 180)
-#define STILL_S 0.4
-static double bias[3], still_s;
-static int calibrate = -1, bias_set;
+/* [port] Zero-rate calibration (L12, GitHub #39): with a Pro Controller the aim crept to one side and then the other with
+   the controller at rest - its gyro's bias, which nothing took off (yaw has no reference). The bias is subtracted from
+   every sample, as the Switch, Steam Input and SDL games do. Still is told by steadiness, not by size: the player's Pro
+   Controller read a constant 7.9 deg/s at rest and 0.76 G of gravity (2026-11-02), so "rotation under 4 deg/s and
+   acceleration within 5 % of 1 G" (the rule before) never held and no bias was ever taken. Now the gyro's running mean
+   and spread over about half a second (STILL_TAU) are kept; when the spread stays under STILL_SPREAD, the acceleration's
+   size stays within 3 % of its own mean and the mean is a plausible bias (under BIAS_MAX), for STILL_S, the controller
+   is still: the first time the bias becomes that mean, later it follows it over BIAS_TAU. While the game has its sensor
+   on (StartSixAxisSensor to StopSixAxisSensor: aiming) the bias stays as it is, so a slow steady aim is not learnt.
+   TOTK_GYRO_CALIBRATE=0 turns it off. */
+#define STILL_TAU 0.5
+#define STILL_SPREAD (1.5 * M_PI / 180)
+#define BIAS_MAX (20.0 * M_PI / 180)
+#define STILL_S 0.6
+#define BIAS_TAU 4.0
+static double bias[3], still_s, mean[3], var[3], amean;
+static int calibrate = -1, bias_set, sensor_on, stats_set;
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -104,7 +112,8 @@ static void integrate(const double gyro[3], const double acc[3], double dt) {
     }
     memcpy(R, out, sizeof R); orthonormalize();
 }
-void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
+void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now, uint64_t sample_ns) {
+    static uint64_t last_sample;
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
     for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
@@ -114,19 +123,32 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         deadzone = v * M_PI / 180;
         if (e) fprintf(stderr, "[gyro] dead zone %.2f deg/s (TOTK_GYRO_DEADZONE)\n", v);
     }
-    double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
+    /* dt from the sensor's own clock (SDL's sensor_timestamp): SDL hands several samples of one report over at once, so
+       the time they were handled gave the first one the whole gap and the others none; else from now */
+    double dt = sample_ns && last_sample && sample_ns > last_sample ? (sample_ns - last_sample) / 1e9
+              : last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
+    last_sample = sample_ns;
     if (calibrate < 0) { const char *e = getenv("TOTK_GYRO_CALIBRATE"); calibrate = !(e && !strcmp(e, "0")); }
     if (calibrate) {
-        double g[3] = {gyro[0] - bias[0], gyro[1] - bias[1], gyro[2] - bias[2]}, a = norm3(acc);
-        if (norm3(g) < STILL_RAD && fabs(a - 1) < 0.05) still_s += dt; else still_s = 0;
-        if (still_s >= STILL_S) {   /* still: the bias follows the reading (about a second; at once the first time) */
-            double k = bias_set ? dt / 1.0 : 1;
-            for (int i = 0; i < 3; i++) bias[i] += (gyro[i] - bias[i]) * k;
+        double a = norm3(acc), k = dt / STILL_TAU, spread = 0;
+        if (!stats_set) { memcpy(mean, gyro, sizeof mean); memset(var, 0, sizeof var); amean = a; stats_set = 1; }
+        for (int i = 0; i < 3; i++) {
+            double d = gyro[i] - mean[i];
+            mean[i] += d * k;
+            var[i] += (d * d - var[i]) * k;
+            spread += var[i];
+        }
+        amean += (a - amean) * k;
+        if (sqrt(spread) < STILL_SPREAD && fabs(a - amean) < 0.03 * amean && norm3(mean) < BIAS_MAX) still_s += dt;
+        else still_s = 0;
+        if (still_s >= STILL_S && !sensor_on) {   /* still and not aiming: the bias is the mean (at once the first time) */
+            double f = bias_set ? dt / BIAS_TAU : 1;
+            for (int i = 0; i < 3; i++) bias[i] += (mean[i] - bias[i]) * f;
             if (!bias_set) {
                 bias_set = 1;
-                fprintf(stderr, "[gyro] at rest: zero-rate bias %.2f %.2f %.2f deg/s taken off (TOTK_GYRO_CALIBRATE=0: off)\n",
-                        bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI);
+                fprintf(stderr, "[gyro] at rest: zero-rate bias %.2f %.2f %.2f deg/s taken off, gravity read as %.2f G "
+                        "(TOTK_GYRO_CALIBRATE=0: off)\n", bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI, amean);
             }
         }
         for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
@@ -147,9 +169,9 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     if (!log_at) log_at = now;
     if (now - log_at >= 30000000000ull) {
         uint64_t values, reads; runtime_hid_feedback_stats(&values, &reads);
-        fprintf(stderr, "[gyro] last 30 s: %llu samples (%.0f a second), the game read the states %llu times; now acc (%+.2f %+.2f %+.2f) G, gyro (%+.3f %+.3f %+.3f) rev/s\n",
+        fprintf(stderr, "[gyro] last 30 s: %llu samples (%.0f a second), the game read the states %llu times; now acc (%+.2f %+.2f %+.2f) G, gyro (%+.3f %+.3f %+.3f) rev/s; bias (%.2f %.2f %.2f) deg/s\n",
                 (unsigned long long)(produced - logged), (produced - logged) / ((now - log_at) / 1e9), (unsigned long long)(reads - reads_logged),
-                s->acc[0], s->acc[1], s->acc[2], s->gyro[0], s->gyro[1], s->gyro[2]);
+                s->acc[0], s->acc[1], s->acc[2], s->gyro[0], s->gyro[1], s->gyro[2], bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI);
         logged = produced; reads_logged = reads; log_at = now;
     }
     pthread_mutex_unlock(&lock);
@@ -171,9 +193,11 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
    return nothing until the next sample, which starts a fresh frame and angle; sampling numbers go on. */
 void runtime_motion_start(void) {
     pthread_mutex_lock(&lock);
-    restart = 1; first = produced; last_ns = 0; memset(angle, 0, sizeof angle);
+    restart = 1; first = produced; last_ns = 0; memset(angle, 0, sizeof angle); sensor_on = 1;
     pthread_mutex_unlock(&lock);
 }
+/* StopSixAxisSensor: the bias may follow the controller at rest again. */
+void runtime_motion_stop(void) { pthread_mutex_lock(&lock); sensor_on = 0; pthread_mutex_unlock(&lock); }
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }

@@ -169,7 +169,7 @@ static void pad_sensor(const SDL_GamepadSensorEvent *e) {
         acc[2] = -d[1] / SDL_STANDARD_GRAVITY;
     } else if (e->sensor == SDL_SENSOR_GYRO) {
         double gyro[3] = {d[0], -d[2], d[1]};
-        runtime_motion_feed(acc, gyro, runtime_now_ns());
+        runtime_motion_feed(acc, gyro, runtime_now_ns(), e->sensor_timestamp);
     }
 }
 

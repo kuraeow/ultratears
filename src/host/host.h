@@ -65,9 +65,10 @@ typedef struct { uint64_t sampling, delta_ns; float acc[3], gyro[3], angle[3], d
 void runtime_rumble_set(unsigned side, float amp_low, float freq_low, float amp_high, float freq_high);   // side 0 left, 1 right
 int runtime_motion_read(RuntimeMotionState *out, int max);   // newest first; 0 = no motion now
 void runtime_motion_start(void);   // the game (re)started its sensor: angle and direction start over
+void runtime_motion_stop(void);    // the game stopped its sensor (the zero-rate bias may follow the controller again)
 // One sample in the Switch six-axis frame (x right, y toward the top edge, z out of the face): acceleration in G with
 // gravity (face up reads z = -1), rotation in rad/s.
-void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);
+void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns, uint64_t sample_ns);   // sample_ns: the sensor's time, 0 = none
 int runtime_motion_axes(const char *spec);   // TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed
 void runtime_motion_deadzone_default(double deg_s);
 void runtime_motion_live(int on);   // a controller with motion attached (1) / detached (0)

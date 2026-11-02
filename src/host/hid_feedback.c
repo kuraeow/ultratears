@@ -104,7 +104,7 @@ static uint32_t six_start(const uint32_t *h) {
     six_axis_check(h); static _Atomic int once; note_once(&once, "the game started the six-axis sensor", *h);
     runtime_motion_start(); return 0;
 }
-static uint32_t six_stop(const uint32_t *h) { six_axis_check(h); return 0; }
+static uint32_t six_stop(const uint32_t *h) { six_axis_check(h); runtime_motion_stop(); return 0; }
 /* Newest first, like the hid service's ring. No motion (no controller with sensors, or muted): one state of a controller
    lying still, not marked connected. */
 static uint32_t six_states(int *out, SixAxisState *s, int max, const uint32_t *h) {
