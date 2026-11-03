@@ -598,6 +598,17 @@ class Module:
                     # unresolved table jump: allow jumping to any instruction of the function
                     tables[a] = 'all'
                     self.stats['br_all_labels'] += 1
+                    # [TOTK] The targets of every table its register can hold (as _jump_table_other_bases checks
+                    # them) are tried first, the fallback after them: a guess cannot go wrong (the switch compares
+                    # the computed target), and a hot table that only failed the emulation stays in the optimized
+                    # body. main 0x80065b710: its table base is loaded far before the br, and the emulation's
+                    # in-order replay of the function's adrp/add left another page in the register - every pass
+                    # went through fb_80065b710 (up to 2.7 % of a game thread, 2026-11-04).
+                    g = self._jump_table_other_bases(a, entry, end) if getattr(self, '_table_count', 0) else set()
+                    if len(g) >= 2:
+                        self.guesses[a] = sorted(g)
+                        labels.update(g)
+                        self.stats['br_all_guessed'] += 1
                 else:
                     self.stats['br_dispatch'] += 1
             terminated = ins.kind in ('b', 'br', 'ret', 'trap')
@@ -635,6 +646,7 @@ class Module:
     NO_LOCALS_AT = (0x8002db2ec,)
     reg_locals = 0       # set by main(): registers per function in C locals (tools/lifter/regs.py), 0: none
     split_all = True     # set by main(): functions with an unresolved branch get their dispatch in fb_<entry>
+    guesses = {}         # scan(): an unresolved br's likely targets (tried before its fallback)
     _fb = None           # emit_function: the fb_<entry> copy of the function just emitted, or None
     local_flags = False  # and NZCV in a local (tools/lifter/flags.py)
 
@@ -670,7 +682,8 @@ class Module:
                 succ.append(idx(ins.target) + [i + 1])
             elif k == 'br':
                 jt = tables.get(entry + 4 * i)
-                succ.append([t for x in jt for t in idx(x)] if jt and jt != 'all' else [])
+                jt = self.guesses.get(entry + 4 * i, []) if jt == 'all' else jt
+                succ.append([t for x in jt for t in idx(x)] if jt else [])
             else:
                 succ.append([])   # ret, trap
         succ.append([])   # n: falling into the next function
@@ -735,7 +748,9 @@ class Module:
                     body.append((i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}'))
                 elif k == 'br':
                     jt = tables.get(a)
-                    if jt and jt != 'all':
+                    if jt == 'all':
+                        jt = self.guesses.get(a)
+                    if jt:
                         cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
                         body.append((i, f'    switch ({ins.target}) {{ {cases} default: break; }}'))
                     leave = f'{fbname(entry)}(c)' if fb else 'rt_dispatch(c)'
@@ -878,6 +893,9 @@ class Module:
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
+                    if a in self.guesses:
+                        cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in self.guesses[a])
+                        out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     out.append(f'    c->pc = {ins.target}; {fallback}')
                     continue
                 if jt:
