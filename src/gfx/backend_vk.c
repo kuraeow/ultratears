@@ -217,6 +217,14 @@ static void memory_log(void) {
          "host %.0f MiB (peak %.0f); game memory imported %.0f MiB", drv[0] ? drv : " -", atomic_load(&g_mem_bytes[MK_DEVICE]) / 1048576.0,
          (unsigned long long)atomic_load(&g_mem_count[MK_DEVICE]), atomic_load(&g_mem_peak[MK_DEVICE]) / 1048576.0, vkb_shadow_bytes() / 1048576.0,
          atomic_load(&g_mem_bytes[MK_HOST]) / 1048576.0, atomic_load(&g_mem_peak[MK_HOST]) / 1048576.0, atomic_load(&g_mem_bytes[MK_IMPORT]) / 1048576.0);
+    {   // ours by use (vkb_mtag)
+        static const char *const nm[MT_N] = {"other", "images", "upload rings", "descriptors", "pool copies", "mirrors", "uniform copies",
+                                             "write-back", "copy back"};
+        char line[512]; int n = 0;
+        for (int t = 0; t < MT_N && n < (int)sizeof line - 48; t++)
+            n += snprintf(line + n, sizeof line - (size_t)n, " %s %.0f MiB;", nm[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
+        VLOG("memory: ours by use:%s", line);
+    }
     vkb_shader_report();
     uint64_t rc, rb, rp, rpk, rmade, rfreed;
     vkb_ring_stats(&rc, &rb, &rp);

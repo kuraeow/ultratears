@@ -46,7 +46,9 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 // play the rings grow at every burst of texture uploads and gave the memory back seconds later, so each burst made
 // chunks again - vkAllocateMemory of tens of MiB of mapped device memory, up to ~100 ms in one submission (2026-11-03,
 // the user's play log: hitches of 60-370 ms while moving). Out of memory (vkb_ring_reclaim) frees them too.
-enum { SPARE_MAX = 256u << 20, NSPARE = 64 };
+// 128 MiB: without resizable BAR the rings are system memory, and 256 left a PC 0.2 GiB closer to its commit limit
+// (2026-11-04: out of memory after 10 min; rings 340-400 MiB with the spares).
+enum { SPARE_MAX = 128u << 20, NSPARE = 64 };
 static chunk_t g_spare[NSPARE];
 static int g_nspare;
 static VkDeviceSize g_spare_bytes;
