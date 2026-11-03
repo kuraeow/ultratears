@@ -28,17 +28,21 @@ int vkb_db_on(void) {
     return v;
 }
 
-// ---- the layouts: size and the offset of every binding
-static VkDeviceSize g_size[2], g_off[2][128];
-void vkb_db_layouts(const VkDescriptorSetLayout layout[2]) {
-    for (int c = 0; c < 2; c++) {
+// ---- the layouts (VKB_LAYOUT_*): size and the offset of every binding
+static VkDeviceSize g_size[VKB_LAYOUTS], g_off[VKB_LAYOUTS][128];
+void vkb_db_layouts(const VkDescriptorSetLayout layout[VKB_LAYOUTS]) {
+    for (int c = 0; c < VKB_LAYOUTS; c++) {
+        if (!layout[c]) continue;
         vk.vkGetDescriptorSetLayoutSizeEXT(vkc.device, layout[c], &g_size[c]);
         for (uint32_t b = 0; b < 128; b++) {
-            int used = b % VKB_STAGE_BINDINGS < VKB_B_IMG + VKB_NIMG && (!c || b < VKB_STAGE_BINDINGS);   // compute: one stage
+            uint32_t k = b % VKB_STAGE_BINDINGS;
+            int used = k < VKB_B_IMG + VKB_NIMG && (c != VKB_LAYOUT_COMPUTE || b < VKB_STAGE_BINDINGS);   // compute: one stage
+            if (c != VKB_LAYOUT_COMPUTE && vkb_split_sets() && (k < VKB_B_TEX) != (c == VKB_LAYOUT_BUFFERS)) used = 0;
             if (used) vk.vkGetDescriptorSetLayoutBindingOffsetEXT(vkc.device, layout[c], b, &g_off[c][b]);
         }
     }
-    VLOG("descriptor buffer: set sizes %llu (graphics) / %llu (compute) bytes", (unsigned long long)g_size[0], (unsigned long long)g_size[1]);
+    VLOG("descriptor buffer: set sizes %llu (graphics%s) / %llu (compute) / %llu (graphics buffers) bytes", (unsigned long long)g_size[0],
+         vkb_split_sets() ? ": textures and images" : "", (unsigned long long)g_size[1], (unsigned long long)g_size[2]);
 }
 
 // ---- descriptor memory: per command slot and recording thread (vkb_mt.c), host-visible (device-local with resizable
@@ -58,6 +62,7 @@ static __thread uint64_t g_bound_rec, g_bound_gen;
 static uint32_t g_type = UINT32_MAX;   // the same answer whichever thread finds it
 
 static int dmem_new(dmem_t *m, VkDeviceSize size) {
+    uint64_t t0 = runtime_now_ns();
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
@@ -85,6 +90,7 @@ static int dmem_new(dmem_t *m, VkDeviceSize size) {
     if (!vk_check(vk.vkMapMemory(vkc.device, m->mem, 0, VK_WHOLE_SIZE, 0, &p), "map descriptor memory")) return 0;
     VkBufferDeviceAddressInfo ad = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = m->buf};
     m->map = p; m->size = size; m->used = 0; m->addr = vk.vkGetBufferDeviceAddress(vkc.device, &ad);
+    vkb_step_add(PK_ALLOC, t0);
     return 1;
 }
 static void dmem_free(dmem_t *m) {
@@ -196,8 +202,9 @@ void vkb_db_bind(VkCommandBuffer cb, int slot, uint64_t rec) {
     vk.vkCmdBindDescriptorBuffersEXT(cb, 1, &bb);
     g_bound_rec = rec; g_bound_gen = g_gen;
 }
-// A draw's descriptors (the writes' dstSet is ignored) in the slot's descriptor memory: their offset there.
-VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWriteDescriptorSet *w, int n, int compute) {
+// A draw's descriptors (the writes' dstSet is ignored) in the slot's descriptor memory: their offset there. layout: a
+// VKB_LAYOUT_*; part: VKB_PART_* (the writes of the other part are left out).
+VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWriteDescriptorSet *w, int n, int compute, int part) {
     int wk = vkb_worker();
     dmem_t *m = &g_mem[slot][wk];
     VkDeviceSize a = vkc.db.descriptorBufferOffsetAlignment ? vkc.db.descriptorBufferOffsetAlignment : 64;
@@ -221,6 +228,7 @@ VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWrit
     uint64_t sub = mtl_last_fence() + 1;   // the bytes stay valid for the submission (rec: this command buffer)
     uint8_t *base = m->map + at;
     for (int i = 0; i < n; i++) {
+        if (part && (w[i].pBufferInfo != NULL) != (part == VKB_PART_BUFFERS)) continue;
         size_t len;
         const uint8_t *d = descriptor(&w[i], sub, &len);
         memcpy(base + g_off[compute][w[i].dstBinding], d, len);

@@ -1,5 +1,6 @@
 // Internal interface of the Vulkan NVN replayer (backend_vk.c, vkb_tex.c).
 #pragma once
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "nvn/nvn_mtl.h"
@@ -33,6 +34,8 @@ uint64_t vkb_draw_count(void);   // draws and dispatches recorded so far   // vk
 // Destroys a view / an image and its memory once the GPU has finished every submission that may use them: the one being
 // recorded now included (its earlier commands may already refer to them).
 void vkb_destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem);
+void vkb_destroy_image_later(VkImage img, VkDeviceMemory mem, uint32_t imem);   // imem != 0: back to its block (vkb_imem_free)
+void vkb_imem_free(uint32_t imem);   // vkb_tex.c: image memory in a shared block given back
 void vkb_passprof_note(const char *key);   // TOTK_GPU_PASSPROF: names the open pass by its first shader
 void vkb_checkpoint(const char *what, const char *k1, const char *k2);   // TOTK_VK_CHECKPOINTS: names the next GPU command
 int vkb_in_pass(void);
@@ -55,6 +58,7 @@ typedef struct vkb_image {
     nvn_texdesc d;
     VkImage img;
     VkDeviceMemory mem;
+    uint32_t imem;                 // its memory's place in a shared block (vkb_tex.c imem_alloc; 0: an allocation of its own)
     VkFormat format;
     VkImageAspectFlags aspect;
     VkImageLayout layout;          // the whole image's current layout (replay thread)
@@ -140,6 +144,12 @@ void vkb_ucap_drop(uint64_t addr, uint64_t len);
 void vkb_ucap_inline(uint64_t addr, uint64_t n, const uint8_t *data);   // an inline uniform update, for later CPU reads
 int vkb_ucap_why(uint64_t addr, uint64_t size);          // a GPU write: copies it overlaps are no longer used
 void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hits, uint64_t *drops);
+int vkb_ucap_update(uint64_t addr, uint64_t n, const uint8_t *data);   // an inline uniform update: 1 when the copy keeps it
+extern __thread uint32_t vkb_layout_epoch;   // vkb_tex.c: bumped when this thread's chunk changes a layout it tracks
+extern _Atomic uint32_t vkb_layout_epoch_all;   // and when an image's own layout changes (any thread)
+void vkb_ucap_hazard(void);   // a reader of memory a kept update has not reached yet (counted)
+int vkb_ub_deferred(uint64_t addr, uint64_t size);   // backend_vk.c: a kept update of this pass overlaps (not yet in memory)
+void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_bytes, uint64_t *ver_hits, uint64_t *hazards);
 
 // ---- vkb_bc7.c: ASTC textures as BC7, from a cache by the contents of the ASTC blocks
 typedef struct { uint64_t a, b; } vkb_bc7_key;
@@ -158,10 +168,11 @@ void vkb_bc7_stats(uint64_t *hits, uint64_t *misses, uint64_t *encoded, uint64_t
 
 // ---- vkb_desc.c: descriptors in buffers (VK_EXT_descriptor_buffer)
 int vkb_db_on(void);
-void vkb_db_layouts(const VkDescriptorSetLayout layout[2]);
+void vkb_db_layouts(const VkDescriptorSetLayout layout[3]);   // VKB_LAYOUTS (vkb_shader.h)
+enum { VKB_PART_ALL, VKB_PART_IMAGES, VKB_PART_BUFFERS };   // which writes go into a set (split sets)
 void vkb_db_slot_reset(int slot);
 uint64_t vkb_db_gen(void);   // changes when offsets made before are void (descriptor memory replaced)
-VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWriteDescriptorSet *w, int n, int compute);
+VkDeviceSize vkb_db_set(VkCommandBuffer cb, int slot, uint64_t rec, const VkWriteDescriptorSet *w, int n, int layout, int part);
 void vkb_db_bind(VkCommandBuffer cb, int slot, uint64_t rec);   // the memory offsets refer to, bound to this command buffer
 void vkb_db_stats(uint64_t *get_calls, uint64_t *cache_hits);
 

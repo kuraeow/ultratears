@@ -49,6 +49,10 @@ def fname(a):
     return f'f_{a:x}'
 
 
+def fbname(a):
+    return f'fb_{a:x}'
+
+
 def sanitize(sym):
     return 'hle_' + re.sub(r'[^A-Za-z0-9_]', '_', sym)
 
@@ -630,15 +634,20 @@ class Module:
     # frame-rate controller (main+0x2db174) gets X21 changed by nvnWindowSetPresentInterval under it (hle_nvn.c).
     NO_LOCALS_AT = (0x8002db2ec,)
     reg_locals = 0       # set by main(): registers per function in C locals (tools/lifter/regs.py), 0: none
+    split_all = True     # set by main(): functions with an unresolved branch get their dispatch in fb_<entry>
+    _fb = None           # emit_function: the fb_<entry> copy of the function just emitted, or None
     local_flags = False  # and NZCV in a local (tools/lifter/flags.py)
 
-    def emit_local(self, entry, end, labels, tables):
+    def emit_local(self, entry, end, labels, tables, fb=False):
         """The function [entry, end) with guest registers and flags in C locals (tools/lifter/regs.py, flags.py, the
         scheme of totk-pc-recomp recomp/gen.py Emitter.function, MIT), or None where it keeps them in the Cpu: an
         unresolved computed branch (any instruction is an entry), a patched site, an asm word, or flags the plan
-        cannot place (flags.FlagError)."""
-        if any(v == 'all' for v in tables.values()):
+        cannot place (flags.FlagError). fb: the body of a split function (emit_function), whose unresolved branches
+        leave for fb_<entry> with the registers and flags in the Cpu, as any exit."""
+        if any(v == 'all' for v in tables.values()) and not fb:
             return None
+        if fb:   # the resolved tables' targets are labels here
+            labels = set(labels) | {t for v in tables.values() if v != 'all' for t in v}
         if any(a in PATCHES or a in PRE_PATCHES for a in range(entry, end, 4)) or \
                 any(entry <= a < end for a in self.NO_LOCALS_AT):
             return None
@@ -661,7 +670,7 @@ class Module:
                 succ.append(idx(ins.target) + [i + 1])
             elif k == 'br':
                 jt = tables.get(entry + 4 * i)
-                succ.append([t for x in jt for t in idx(x)] if jt else [])
+                succ.append([t for x in jt for t in idx(x)] if jt and jt != 'all' else [])
             else:
                 succ.append([])   # ret, trap
         succ.append([])   # n: falling into the next function
@@ -726,10 +735,11 @@ class Module:
                     body.append((i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}'))
                 elif k == 'br':
                     jt = tables.get(a)
-                    if jt:
+                    if jt and jt != 'all':
                         cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
                         body.append((i, f'    switch ({ins.target}) {{ {cases} default: break; }}'))
-                    body.append((i, f'    {publish(i)}{spill}c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);'))
+                    leave = f'{fbname(entry)}(c)' if fb else 'rt_dispatch(c)'
+                    body.append((i, f'    {publish(i)}{spill}c->pc = {ins.target}; __attribute__((musttail)) return {leave};'))
                 elif k == 'ret':
                     body.append((i, f'    {spill}return;'))
                 else:
@@ -770,7 +780,33 @@ class Module:
             local = self.emit_local(entry, end, labels, tables)
             if local:
                 return local
-        out.append(f'    FN_ENTER({hx(entry)});')
+        self._fb = None
+        if self.split_all and any(v == 'all' for v in tables.values()) and (end - entry) // 4 > 2000:
+            # [TOTK] A function with an unresolved computed branch: its body without the all-instruction dispatch
+            # (compiled at -O2 like any other), and the dispatch in a copy of it, fb_<entry>, that a target outside the
+            # known labels enters by a tail call with c->pc set (build_game.py compiles that copy's file at -O0). The
+            # whole function used to be the -O0 one: 1.4.3's hottest game function (main 0x801547400) ran unoptimized
+            # with an 8 MiB stack frame that __chkstk walked page by page on every call.
+            fb = self.emit_body(entry, end, labels, tables, all_mode=True)
+            refs = self._refs
+            body = None
+            if self.reg_locals or self.local_flags:
+                body = self.emit_local(entry, end, labels, tables, fb=True)
+            if not body:
+                body = self.emit_body(entry, end, labels, tables, all_mode=False)
+            self._refs |= refs
+            self._fb = fb
+            return body
+        return self.emit_body(entry, end, labels, tables, all_mode=None)
+
+    def emit_body(self, entry, end, labels, tables, all_mode):
+        """all_mode None: as the function's tables say; True: fb_<entry>, the copy with the all-instruction dispatch, which
+        starts at it; False: the function itself, whose unresolved branches tail-call that copy."""
+        if all_mode:
+            out = [f'void {fbname(entry)}(Cpu *c) {{', '    goto L_dispatch;']
+        else:
+            out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+        fallback = f'__attribute__((musttail)) return {fbname(entry)}(c);' if all_mode is False else 'goto L_dispatch;'
         batch = []
         refs = set()
 
@@ -791,9 +827,11 @@ class Module:
         # gave it to every function with a jump table: thousands of labels made clang take hours on single functions
         # (main_127.c: 15 880 labels, >2.5 h at -O2) and kept it from optimizing them. A resolved table's targets are
         # complete (each index was emulated); an index outside them reaches rt_dispatch and fails loudly.
-        all_labels = any(v == 'all' for v in tables.values())
+        all_labels = any(v == 'all' for v in tables.values()) if all_mode is None else all_mode
         if all_labels:
             labels = set(range(entry, end, 4))
+        elif all_mode is False:   # the resolved tables' targets: labels here, as in a function without an 'all'
+            labels = set(labels) | {t for v in tables.values() if v != 'all' for t in v}
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
@@ -840,13 +878,13 @@ class Module:
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
-                    out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                    out.append(f'    c->pc = {ins.target}; {fallback}')
                     continue
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    if all_labels:
-                        out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                    if all_labels or all_mode is False:
+                        out.append(f'    c->pc = {ins.target}; {fallback}')
                     else:
                         out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
                     continue
@@ -1003,13 +1041,12 @@ def main():
         order = order[:args.limit]
     nchunks = 0
     ci = 0
-    pending = None  # (address, lines, refs) of a big function that starts the next file
+    pending = []  # (address, lines, refs, fallback copy) of functions that start the next file
     while ci < len(order) or pending:
-        body, refs, size, fns = [], set(), 0, []
+        body, refs, size, fns, fbs = [], set(), 0, [], set()
         while (pending or ci < len(order)) and len(fns) < args.chunk and size < args.chunk_bytes:
             if pending:
-                a, lines, r = pending
-                pending = None
+                a, lines, r, fb = pending.pop(0)
             else:
                 a = order[ci]
                 ci += 1
@@ -1017,24 +1054,31 @@ def main():
                 lines = m.emit_function(a, end, labels, tables, hle)
                 r = getattr(m, '_refs', set())
                 m._refs = set()
+                fb = m._fb
+                m._fb = None
+                if fb:   # the copy: a file of its own, after this function's
+                    pending.append((None, fb, set(r), None))
             n = sum(len(l) + 1 for l in lines)
             # A big function gets a file of its own (they compile in parallel), and so does one with a dispatch over
             # thousands of labels: build_game.py compiles such a file at -O0, and every function sharing it ran
             # unoptimized too (in 1.4.3 about 640 functions, 459 of them the SDK's, in 2 files).
             alone = n > args.big_fn or ('L_dispatch:' in lines[-4:] and sum(l.startswith('L_') for l in lines) > 2000)
             if alone and fns:
-                pending = (a, lines, r)
+                pending.insert(0, (a, lines, r, fb))
                 break
             body += lines
             size += n
             fns.append(a)
             refs |= r
+            if fb and a is not None:
+                fbs.add(a)
             if alone:
                 break
         path = os.path.join(args.outdir, f'{args.name}_{nchunks:03d}.c')
         text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
         text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
-        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
+        text += [f'void {fbname(a)}(Cpu *c);\n' for a in sorted(fbs)]
+        text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(f for f in fns if f is not None))]
         text += ['\n'.join(body), '\n']
         write_if_changed(path, ''.join(text))
         nchunks += 1

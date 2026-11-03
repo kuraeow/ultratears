@@ -107,7 +107,8 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {   // game thread, in the 
 }
 
 // The replay's table: the captured ranges in device memory of the slot (per-slot buffer, grown as needed).
-typedef struct { uint64_t lo, hi; VkDeviceSize dev; _Atomic uint64_t drop_at; } urng;   // drop_at: the first position not served (UINT64_MAX: none)
+// drop_at: the first position not served (UINT64_MAX: none); last: its newest kept inline update (g_inl, -1: none)
+typedef struct { uint64_t lo, hi; VkDeviceSize dev; _Atomic uint64_t drop_at; _Atomic int last; } urng;
 static urng *g_u;
 static int g_nu, g_capu, g_uslot = -1;
 static const uint8_t *g_ubytes;   // the captured bytes (CPU reads of pointers kept in uniform buffers)
@@ -115,18 +116,29 @@ static size_t *g_uoff;
 static ucap *g_cur;
 typedef struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize cap; } arena_t;
 static arena_t g_arena[VKB_SLOTS];
-static vkb_cnt g_hits;
-static uint64_t g_drops;
+static vkb_cnt g_hits, g_versions, g_ver_hits, g_hazards, g_ver_bytes;
+static uint64_t g_drops, g_kept;
+static _Atomic uint64_t g_ugen;   // submissions snapshotted (keys the readers' version caches)
 // GPU writes of submissions recorded so far (inline updates, copies, stores), kept until the GPU has completed them: a
 // capture taken before that holds the bytes from before the write, so ranges such a write overlaps read memory (the GPU
-// timeline) instead of the copy.
-typedef struct { uint64_t lo, hi, fence; } pend_t;
+// timeline) instead of the copy. An inline update's bytes are known: it is applied to the capture instead (data: its
+// own copy, the command memory is the game's again after the submission). TOTK updates the same uniform buffers every
+// frame and the GPU runs a frame behind, so ~680 updates a frame at Lookout Landing found their range dropped this way.
+typedef struct { uint64_t lo, hi, fence; uint8_t *data; } pend_t;
 static pend_t *g_pend;
 static int g_npend, g_cappend;
+static void pend_add(uint64_t lo, uint64_t hi, const uint8_t *data) {   // data: an inline update's bytes, or NULL
+    if (g_npend == g_cappend) { g_cappend = g_cappend ? g_cappend * 2 : 1024; if (!(g_pend = realloc(g_pend, sizeof *g_pend * (size_t)g_cappend))) die("pending GPU writes"); }
+    uint8_t *d = NULL;
+    if (data && hi - lo <= (64u << 10) && (d = malloc((size_t)(hi - lo)))) memcpy(d, data, (size_t)(hi - lo));
+    g_pend[g_npend++] = (pend_t){lo, hi, mtl_last_fence() + 1, d};
+}
+static int keep_on(void);
 
 static int arena_get(int slot, VkDeviceSize need) {
     arena_t *a = &g_arena[slot];
     if (a->cap >= need) return 1;
+    uint64_t t0 = runtime_now_ns();
     if (a->buf) { vk.vkDestroyBuffer(vkc.device, a->buf, NULL); vk.vkFreeMemory(vkc.device, a->mem, NULL); }   // the slot's last submission is done
     *a = (arena_t){0};
     VkDeviceSize cap = 1u << 20;
@@ -148,38 +160,50 @@ static int arena_get(int slot, VkDeviceSize need) {
     }
     vk.vkBindBufferMemory(vkc.device, a->buf, a->mem, 0);
     a->cap = cap;
+    vkb_step_add(PK_ALLOC, t0);
     return 1;
 }
 
 static _Atomic int g_ninl;   // inline updates logged (below)
+static void snapshot(const uint64_t *h, int n, void *capv);
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // replay thread, the submission just begun
+    uint64_t t0 = runtime_now_ns();
+    snapshot(h, n, capv);
+    vkb_step_add(PK_UCAP, t0);
+}
+static void snapshot(const uint64_t *h, int n, void *capv) {
     ucap *c = capv ? capv : mtl_sub_capture_ubos(h, n);   // without the translation thread: the replay is in the submit call
     if (g_cur) { free(g_cur->r); free(g_cur->off); free(g_cur->bytes); free(g_cur); g_cur = NULL; }
     g_nu = 0; g_uslot = -1; g_ubytes = NULL; g_uoff = NULL;
     atomic_store_explicit(&g_ninl, 0, memory_order_release);   // a new submission: its own inline updates
+    atomic_fetch_add_explicit(&g_ugen, 1, memory_order_release);
     if (!c) return;
     g_cur = c;
     if (!c->n || vkb_slot() < 0) return;
     if (g_capu < c->n) { g_capu = c->n; if (!(g_u = realloc(g_u, sizeof *g_u * (size_t)g_capu))) die("uniform copy table"); }
-    uint64_t done = mtl_done();
-    int k = 0;
-    for (int i = 0; i < g_npend; i++) if (g_pend[i].fence > done) g_pend[k++] = g_pend[i];   // completed writes are in memory
+    int k = 0;   // writes completed before the capture are in its bytes (one completed since is not: kept for this one)
+    for (int i = 0; i < g_npend; i++) if (g_pend[i].fence > c->done) g_pend[k++] = g_pend[i]; else free(g_pend[i].data);
     g_npend = k;
     VkDeviceSize at = 0;   // each range keeps its address's position within 256 bytes: bindings stay aligned as in the pool
     for (int i = 0; i < c->n; i++) {
         at = ((at + 255) & ~(VkDeviceSize)255) + (c->r[i].lo & 255);
-        g_u[i] = (urng){c->r[i].lo, c->r[i].hi, at, UINT64_MAX};
+        g_u[i] = (urng){c->r[i].lo, c->r[i].hi, at, UINT64_MAX, -1};
         at += c->r[i].hi - c->r[i].lo;
     }
     // A GPU write the capture predates: the ranges it overlaps read memory. The ranges are sorted and disjoint, so each
     // write finds its first one by binary search (each range against every pending write was ~27 % of the translation
     // thread at Lookout Landing, 2026-11-02: thousands of ranges times thousands of writes a submission).
+    // In order: an inline update overlays its bytes on the ranges not dropped by an earlier write.
     for (int j = 0; j < g_npend; j++) {
-        if (g_pend[j].fence <= c->done) continue;
+        const pend_t *w = &g_pend[j];
         int lo = 0, hi = c->n;   // the first range ending after the write's start
-        while (lo < hi) { int m = (lo + hi) / 2; if (c->r[m].hi <= g_pend[j].lo) lo = m + 1; else hi = m; }
-        for (int i = lo; i < c->n && c->r[i].lo < g_pend[j].hi; i++)
-            if (g_u[i].drop_at) { g_u[i].drop_at = 0; g_drops++; }
+        while (lo < hi) { int m = (lo + hi) / 2; if (c->r[m].hi <= w->lo) lo = m + 1; else hi = m; }
+        for (int i = lo; i < c->n && c->r[i].lo < w->hi; i++) {
+            if (!g_u[i].drop_at) continue;
+            if (!w->data || !keep_on()) { g_u[i].drop_at = 0; g_drops++; continue; }
+            uint64_t a = w->lo > c->r[i].lo ? w->lo : c->r[i].lo, b = w->hi < c->r[i].hi ? w->hi : c->r[i].hi;
+            memcpy(c->bytes + c->off[i] + (a - c->r[i].lo), w->data + (a - w->lo), (size_t)(b - a));
+        }
     }
     int slot = vkb_slot();
     if (!arena_get(slot, at)) return;
@@ -203,16 +227,20 @@ void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *capv) {   // repl
 // one piece's corners: the far terrain in shards. Appended by the walk of the submission (or by the replay on one
 // thread) before any reader at a later position runs; a fixed array, so readers on other threads never see it move.
 enum { INLINE_MAX = 1 << 16 };
-typedef struct { uint64_t seq, addr, n; const uint8_t *data; } inl_t;
+typedef struct { uint64_t seq, addr, n; const uint8_t *data; int prev; } inl_t;   // prev: the range's older kept update
 static inl_t *g_inl;
 static _Atomic int g_ninl;
-void vkb_ucap_inline(uint64_t addr, uint64_t n, const uint8_t *data) {
-    if (vkb_mt_recording()) return;   // the walk of the submission logged it already (as vkb_ucap_drop)
+static int inl_add(uint64_t addr, uint64_t n, const uint8_t *data, int prev) {   // its index, -1 when the list is full
     if (!g_inl && !(g_inl = malloc(sizeof *g_inl * INLINE_MAX))) die("inline uniform updates");
     int k = atomic_load_explicit(&g_ninl, memory_order_relaxed);
-    if (k == INLINE_MAX) { static int said; if (!said++) VLOG("[temporary] more than %d inline uniform updates in a submission: later ones not seen by CPU reads", INLINE_MAX); return; }
-    g_inl[k] = (inl_t){vkb_seq(), addr, n, data};
+    if (k == INLINE_MAX) { static int said; if (!said++) VLOG("[temporary] more than %d inline uniform updates in a submission: later ones not seen by CPU reads", INLINE_MAX); return -1; }
+    g_inl[k] = (inl_t){vkb_seq(), addr, n, data, prev};
     atomic_store_explicit(&g_ninl, k + 1, memory_order_release);
+    return k;
+}
+void vkb_ucap_inline(uint64_t addr, uint64_t n, const uint8_t *data) {
+    if (vkb_mt_recording()) return;   // the walk of the submission logged it already (as vkb_ucap_drop)
+    inl_add(addr, n, data, -1);
 }
 static void inline_overlay(uint64_t addr, uint8_t *out, size_t n) {   // the updates before this position, newest last
     int cnt = atomic_load_explicit(&g_ninl, memory_order_acquire);
@@ -237,10 +265,87 @@ static int find(uint64_t a) {   // the first range ending above a
     while (lo < hi) { int m = (lo + hi) / 2; if (g_u[m].hi <= a) lo = m + 1; else hi = m; }
     return lo;
 }
+// Inline uniform updates kept in the copy. TOTK updates uniform buffers between the draws of a pass ~430 times a frame at
+// Lookout Landing (2026-11-02); vkCmdUpdateBuffer cannot be recorded in a render pass, so each one ended the pass and began
+// it again: two thirds of all passes, and beginning passes was the driver's largest share of recording. An update that
+// lies inside a range of the copy (not dropped) is kept instead: readers after it bind a version of their range with it
+// applied (built once per range and newest update, in the upload ring), CPU reads see it (inline_overlay), and the write
+// to memory waits for the end of the pass (backend_vk.c update_buffer), where later submissions and other readers need it.
+// TOTK_VK_UB_KEEP=0: every update ends the pass, as before.
+static int keep_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_VK_UB_KEEP"); on = !(e && *e == '0'); VLOG("inline uniform updates inside a pass: %s", on ? "kept in the copy" : "end the pass (A/B)"); }
+    return on;
+}
+static int keep_range(uint64_t addr, uint64_t n) {   // the range of the copy that takes this update at this position, or -1
+    if (!keep_on() || !g_nu || g_uslot != vkb_slot() || (addr & 3) || (n & 3)) return -1;
+    int i = find(addr);
+    return i < g_nu && addr >= g_u[i].lo && addr + n <= g_u[i].hi && !dropped(&g_u[i]) ? i : -1;
+}
+int vkb_ucap_update(uint64_t addr, uint64_t n, const uint8_t *data) {
+    // The walk of the submission (or the replay on one thread) decides at the update's position; a recording thread at
+    // the same position later finds the same answer: a range the walk did not keep was dropped there.
+    int i = keep_range(addr, n);
+    if (vkb_mt_recording()) return i >= 0;
+    int k = i >= 0 ? inl_add(addr, n, data, atomic_load_explicit(&g_u[i].last, memory_order_relaxed)) : -1;
+    if (k < 0) {   // memory from here on; later submissions apply it to their capture
+        uint64_t at = vkb_seq();
+        for (int j = find(addr); j < g_nu && g_u[j].lo < addr + n; j++)
+            if (atomic_load(&g_u[j].drop_at) > at) { atomic_store_explicit(&g_u[j].drop_at, at, memory_order_release); g_drops++; }
+        if (vkb_ucap_on()) pend_add(addr, addr + n, data);
+        vkb_ucap_inline(addr, n, data);
+        return 0;
+    }
+    atomic_store_explicit(&g_u[i].last, k, memory_order_release);
+    g_kept++;
+    pend_add(addr, addr + n, data);   // later submissions: applied to their capture until the GPU wrote it
+    return 1;
+}
+void vkb_ucap_hazard(void) { vkb_cnt_add(g_hazards, 1); }
+
+// A reader's version of [addr, addr+size) in range i with the kept updates before its position, newest top.
+typedef struct { uint64_t addr, size, gen; int top; VkBuffer b; VkDeviceSize off; } ver_t;
+static __thread ver_t *t_ver;
+static int version(int i, uint64_t addr, uint64_t size, int top, VkBuffer *buf, VkDeviceSize *off) {
+    enum { NV = 1024, NUP = 4096 };
+    if (!t_ver && !(t_ver = calloc(NV, sizeof *t_ver))) die("uniform versions");
+    uint64_t gen = atomic_load_explicit(&g_ugen, memory_order_acquire);
+    ver_t *v = &t_ver[((addr >> 4) ^ (size * 0x9E3779B1u) ^ ((uint64_t)top * 0x85EBCA6Bu)) & (NV - 1)];
+    if (v->gen == gen && v->addr == addr && v->size == size && v->top == top) { *buf = v->b; *off = v->off; vkb_cnt_add(g_ver_hits, 1); return 1; }
+    int ups[NUP], nup = 0;   // the overlapping kept updates, newest first
+    for (int k = top; k >= 0; k = g_inl[k].prev) {
+        if (g_inl[k].addr >= addr + size || addr >= g_inl[k].addr + g_inl[k].n) continue;
+        if (nup == NUP) return 0;
+        ups[nup++] = k;
+    }
+    VkBuffer rb;
+    VkDeviceSize ro;
+    uint8_t *p = (uint8_t *)vkb_ring_alloc(size + 256, 256, &rb, &ro) + (addr & 255);   // the address's place within 256 bytes, as in the copy
+    ro += addr & 255;
+    memcpy(p, g_ubytes + g_uoff[i] + (addr - g_u[i].lo), size);
+    for (int j = nup - 1; j >= 0; j--) {
+        const inl_t *u = &g_inl[ups[j]];
+        uint64_t lo = u->addr > addr ? u->addr : addr, hi = u->addr + u->n < addr + size ? u->addr + u->n : addr + size;
+        memcpy(p + (lo - addr), u->data + (lo - u->addr), (size_t)(hi - lo));
+    }
+    *v = (ver_t){addr, size, gen, top, rb, ro};
+    *buf = rb; *off = ro;
+    vkb_cnt_add(g_versions, 1);
+    vkb_cnt_add(g_ver_bytes, size);
+    return 1;
+}
+
 int vkb_ucap_range(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (!g_nu || g_uslot != vkb_slot()) return 0;   // another slot (a split submission): its copy is not this one's
     int i = find(addr);
     if (i >= g_nu || addr < g_u[i].lo || addr + size > g_u[i].hi || dropped(&g_u[i])) return 0;
+    uint64_t at = vkb_seq();
+    for (int k = atomic_load_explicit(&g_u[i].last, memory_order_acquire); k >= 0; k = g_inl[k].prev)   // newest first
+        if (g_inl[k].seq < at && g_inl[k].addr < addr + size && addr < g_inl[k].addr + g_inl[k].n) {
+            if (size > (64u << 10) || !version(i, addr, size, k, buf, off)) return 0;   // memory (guest_range counts it if not yet written)
+            vkb_cnt_add(g_hits, 1);
+            return 1;
+        }
     *buf = g_arena[g_uslot].buf;
     *off = g_u[i].dev + (addr - g_u[i].lo);
     vkb_cnt_add(g_hits, 1);
@@ -256,7 +361,11 @@ int vkb_ucap_why(uint64_t addr, uint64_t size) {   // development: 0 in the copy
 void vkb_ucap_read(uint64_t addr, void *out, size_t n) {   // CPU reads of uniform memory (pointers in uniform buffers)
     if (g_nu) {
         int i = find(addr);
-        if (i < g_nu && addr >= g_u[i].lo && addr + n <= g_u[i].hi && !dropped(&g_u[i])) { memcpy(out, g_ubytes + g_uoff[i] + (addr - g_u[i].lo), n); return; }
+        if (i < g_nu && addr >= g_u[i].lo && addr + n <= g_u[i].hi && !dropped(&g_u[i])) {
+            memcpy(out, g_ubytes + g_uoff[i] + (addr - g_u[i].lo), n);
+            inline_overlay(addr, out, n);   // the kept updates before this position
+            return;
+        }
     }
     memcpy(out, (const void *)(uintptr_t)addr, n);
     inline_overlay(addr, out, n);
@@ -267,9 +376,11 @@ void vkb_ucap_drop(uint64_t addr, uint64_t len) {   // a GPU write to [addr, add
     for (int i = find(addr); i < g_nu && g_u[i].lo < addr + len; i++)
         if (atomic_load(&g_u[i].drop_at) > at) { atomic_store_explicit(&g_u[i].drop_at, at, memory_order_release); g_drops++; }
     if (!vkb_ucap_on()) return;
-    if (g_npend == g_cappend) { g_cappend = g_cappend ? g_cappend * 2 : 1024; if (!(g_pend = realloc(g_pend, sizeof *g_pend * (size_t)g_cappend))) die("pending GPU writes"); }
-    g_pend[g_npend++] = (pend_t){addr, addr + len, mtl_last_fence() + 1};
+    pend_add(addr, addr + len, NULL);
 }
 void vkb_ucap_stats(uint64_t *caps, uint64_t *bytes, uint64_t *ns, uint64_t *hits, uint64_t *drops) {
     *caps = g_caps; *bytes = g_cap_bytes; *ns = g_cap_ns; *hits = vkb_cnt_sum(g_hits); *drops = g_drops;
+}
+void vkb_ucap_keep_stats(uint64_t *kept, uint64_t *versions, uint64_t *ver_bytes, uint64_t *ver_hits, uint64_t *hazards) {
+    *kept = g_kept; *versions = vkb_cnt_sum(g_versions); *ver_bytes = vkb_cnt_sum(g_ver_bytes); *ver_hits = vkb_cnt_sum(g_ver_hits); *hazards = vkb_cnt_sum(g_hazards);
 }

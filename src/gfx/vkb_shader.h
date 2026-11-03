@@ -50,7 +50,10 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no transla
 // The vertex shader object for integer attributes at intmask (signed: sintmask) and drawn with the fragment shader fs
 // (NULL: none): outputs added for the inputs of fs it does not write. See vkb_spv.c.
 VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask, const vkb_shader *fs);
-VkDescriptorSetLayout vkb_set_layout(int compute);
+enum { VKB_LAYOUT_GRAPHICS, VKB_LAYOUT_COMPUTE, VKB_LAYOUT_BUFFERS, VKB_LAYOUTS };   // vkb_set_layout ids
+VkDescriptorSetLayout vkb_set_layout(int id);   // with split sets VKB_LAYOUT_GRAPHICS holds the textures and images only
+uint32_t vkb_set_layouts(int compute, VkDescriptorSetLayout out[2]);   // a pipeline's set layouts: their count
+int vkb_split_sets(void);   // graphics descriptors in two sets: 0 textures and images, 1 buffers
 VkPipelineLayout vkb_pipeline_layout(int compute);
 void vkb_shader_stats(uint64_t *loaded, uint64_t *missing);
 int vkb_prepare_shaders(void);   // UltraTears --prepare-shaders: every shader compiled by this driver; the exit code

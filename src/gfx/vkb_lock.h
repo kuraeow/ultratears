@@ -9,7 +9,9 @@ enum { LK_TEXREG, LK_IMAGES, LK_POOLS, LK_COUNT };   // texture registry (vkb_dr
 extern _Atomic uint64_t vkb_lock_wait_ns[LK_COUNT], vkb_lock_waits[LK_COUNT];
 uint64_t runtime_now_ns(void);
 // Time spent in some replay steps (development measurement, the per-frame log line)
-enum { PK_CREATE, PK_UPLOAD, PK_SUBMIT, PK_COUNT };   // new images (vkCreateImage + memory), uploads from game memory, queue submits
+// new images (vkCreateImage + memory), uploads from game memory, queue submits; memory for the upload rings, descriptors
+// and uniform copies; the uniform snapshot at a submission's start; pool copies brought up to date before a submit
+enum { PK_CREATE, PK_UPLOAD, PK_SUBMIT, PK_ALLOC, PK_UCAP, PK_SYNC, PK_COUNT };
 extern _Atomic uint64_t vkb_step_ns[PK_COUNT], vkb_step_n[PK_COUNT];
 static inline void vkb_step_add(int kind, uint64_t t0) {
     atomic_fetch_add_explicit(&vkb_step_ns[kind], runtime_now_ns() - t0, memory_order_relaxed);
