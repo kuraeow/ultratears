@@ -2519,7 +2519,10 @@ __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n =
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
 uint64_t g_frame_pub;
-static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
+static uint64_t g_acq_wait_ns, g_pq_wait_ns;
+// UltraTears: the waits in the acquire over the timing window (the frame interval line): the pacing slot, the replay
+// of the image's previous present, the GPU's copy of it
+static uint64_t g_win_pace_ns, g_win_xjob_ns, g_win_pq_ns;   // (with the two last ~0 on 6 and 8 CPUs, 2026-11-04)   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
@@ -2543,12 +2546,14 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace < 0) { const char *e = getenv("DM_DETCLOCK_PACE"), *d = getenv("DM_DETCLOCK"); step = d ? strtoull(d, 0, 0) : 0; pace = e && atoi(e) && step; }
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
-    g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    g_acq_wait_ns += wait; g_win_pace_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
+    uint64_t xw0 = now_ns();
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
+    g_win_xjob_ns += now_ns() - xw0;
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; g_win_pq_ns += now_ns() - w0; }
     /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above
        already waited until the GPU finished the present copy that last read this texture, and every later use of it is
        ordered after that copy on the one Metal queue. Fencing the sync to the newest submission instead (the D2R behaviour,
@@ -2641,7 +2646,10 @@ static void tsummary(uint64_t frame) {
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
       unsigned hitch = 0;   // UltraTears: frames over 25 ms, the hitches a player sees at 60 fps
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) { over += v[i] > 16.7; hitch += v[i] > 25.0; }
-        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, >25 ms for %u, p99 %.2f ms", frame, over, n, hitch, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, >25 ms for %u, p99 %.2f ms; acquire waits per frame: slot %.2f ms, "
+            "replay of the image's last present %.2f ms, its GPU copy %.2f ms", frame, over, n, hitch, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1],
+            g_win_pace_ns / 1e6 / n, g_win_xjob_ns / 1e6 / n, g_win_pq_ns / 1e6 / n);
+        g_win_pace_ns = g_win_xjob_ns = g_win_pq_ns = 0; } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
