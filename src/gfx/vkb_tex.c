@@ -1288,6 +1288,10 @@ static void astc_run(void) {   // the gathered items, decoded; then the batch is
 }
 
 static int tex_upload(VkCommandBuffer cb, vkb_image *im);
+typedef struct { uint32_t level, layer, lw, lh, ld, row, rows_h; VkBuffer buf; VkDeviceSize off; } psurf;
+typedef struct { psurf *s; int ns, bc; uint64_t stamp, vgen; } uplan;   // bc: VKB_BC_* of cached blocks, -1: texels
+static int plan_prepare(vkb_image *im, uplan *P);
+static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P);
 // Several threads recording: into the submission's prologue, which runs before every chunk (the CPU wrote the bytes
 // before the submission, so earlier is as good; a GPU write to the image in a chunk still comes after it).
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;   // one upload at a time: the ASTC batch is shared
@@ -1302,11 +1306,16 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     uint64_t t0 = runtime_now_ns();
     int r;
     if (vkb_mt_recording()) {
+        uplan P;
+        int planned = plan_prepare(im, &P);   // the bytes, outside the lock
         pthread_mutex_lock(&g_up_mu);
         vkb_pro_begin();
-        r = tex_upload(vkb_cmd(), im);   // checks again: another thread may have uploaded it meanwhile
+        r = planned ? plan_record(vkb_cmd(), im, &P) : 0;
+        if (r == 2) r = 0;
+        else if (!r) r = tex_upload(vkb_cmd(), im);   // checks again: another thread may have uploaded it meanwhile
         vkb_pro_end();
         pthread_mutex_unlock(&g_up_mu);
+        free(P.s);
     } else r = tex_upload(cb, im);
     vkb_step_add(PK_UPLOAD, t0);
     return r;
@@ -1480,6 +1489,107 @@ static void slow_upload_log(const vkb_image *im, const char *why, uint64_t t0, u
          im->d.format, im->width, im->height, im->depth, im->levels, im->layers, size / 1048576.0, vpool ? ", in a virtual pool" : "",
          im->astc ? ", ASTC" : "", dt / 1e6, why);
 }
+
+
+
+// ---- uploads prepared outside g_up_mu (several threads recording). An upload held the lock for all of its work, and the
+// other recording threads that needed one waited: 300-450 ms of 850-1100 ms of uploads loading Lookout Landing
+// (2026-11-03). The bytes are made first, in this thread's own upload memory - texels laid out, a virtual pool gathered,
+// an ASTC texture's cached BC7 blocks read - and only the layout change and the copies, into the shared prologue, take
+// the lock. Textures this cannot take (untracked memory, an ASTC surface not in the cache, depth) upload as before.
+// TOTK_VK_UPLOAD_LOCKED=1: all under the lock, as before.
+static int plan_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_UPLOAD_LOCKED"); v = !(e && *e == '1'); }
+    return v;
+}
+static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in upload memory, P says where
+    memset(P, 0, sizeof *P);
+    const nvn_texdesc *d = &im->d;
+    if (!plan_on() || !im->storage || im->gpu_written || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    if (im->upload_stamp && !vkb_tex_stale(im)) return 0;
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    if (!bpb || (d->format >= 0x19 && d->format <= 0x24) || (im->astc && (!vkb_bc7_on() || bpb != 16))) return 0;
+    if (im->astc && (im->depth > 1 || d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY)) return 0;
+    nvn_texlayout L;
+    nvn_tex_layout(d, &L);
+    uintptr_t at = (uintptr_t)im->storage;
+    int vpool = totk_vpool_gather(at, 0, NULL);
+    if (!vpool && (at < 0x0800000000ull || at + L.size > 0x8000000000ull || !nvn_dirty_tracked(im->storage, L.size))) return 0;
+    int ns = (int)(im->levels * im->layers);
+    if (!ns || !(P->s = calloc((size_t)ns, sizeof *P->s))) return 0;
+    P->ns = ns; P->bc = -1;
+    if (!vpool) nvn_dirty_protect(im->storage, L.size);
+    P->stamp = nvn_dirty_now();   // before reading: a write meanwhile shows as dirty
+    P->vgen = vpool ? totk_vpool_generation() : 0;
+    const uint8_t *src = im->storage;
+    uint8_t *gathered = NULL;
+    if (vpool) {
+        if (!(gathered = malloc(L.size ? L.size : 1))) die("texture gather");
+        totk_vpool_gather(at, L.size, gathered);
+        src = gathered;
+    }
+    int srgb = d->format >= 0x87 && d->format <= 0x94, ok = 1, k = 0, fmt = -1;
+    for (uint32_t level = 0; level < im->levels && ok; level++) {
+        uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
+        uint32_t ld = im->depth >> level ? im->depth >> level : 1;
+        uint32_t bx = (lw + bw - 1) / bw, by = (lh + bh - 1) / bh, pitch = bx * (uint32_t)bpb;
+        VkDeviceSize bytes = (VkDeviceSize)pitch * by * ld;
+        for (uint32_t layer = 0; layer < im->layers && ok; layer++, k++) {
+            psurf *s = &P->s[k];
+            *s = (psurf){level, layer, lw, lh, ld, bx * (uint32_t)bw, by * (uint32_t)bh, VK_NULL_HANDLE, 0};
+            if (!im->astc) {   // the texels, laid out straight into upload memory
+                uint8_t *rows = vkb_ring_alloc(bytes, 16, &s->buf, &s->off);
+                ok = !nvn_deswizzle(d, level, layer, src, rows, pitch);
+                continue;
+            }
+            // ASTC: the blocks in ordinary memory for the key (upload memory reads slowly), then the cached BC7 blocks
+            static __thread uint8_t *blk;
+            static __thread size_t blk_cap;
+            if (bytes > blk_cap) { free(blk); blk_cap = (size_t)bytes; if (!(blk = malloc(blk_cap))) die("ASTC blocks"); }
+            ok = !nvn_deswizzle(d, level, layer, src, blk, pitch);
+            if (!ok) break;
+            vkb_bc7_key key = vkb_bc7_key_of(blk, (size_t)bytes, lw, lh, ld, (uint32_t)bw, (uint32_t)bh, srgb);
+            size_t len;
+            int f;
+            ok = vkb_bc7_lookup(key, &f, &len) && (fmt < 0 || f == fmt) && len == (f == VKB_BC_1 ? bc1_size(lw, lh, ld) : bc7_size(lw, lh, ld));
+            if (!ok) break;
+            fmt = f;
+            uint8_t *out = vkb_ring_alloc(len, 16, &s->buf, &s->off);
+            ok = vkb_bc7_read(key, out, len);
+            s->row = (lw + 3) / 4 * 4; s->rows_h = (lh + 3) / 4 * 4;
+        }
+    }
+    free(gathered);
+    if (im->astc) P->bc = fmt;
+    if (!ok) { free(P->s); P->s = NULL; return 0; }
+    return 1;
+}
+// Under g_up_mu, into the prologue: 1 when recorded, 0 to upload as before, 2 when another thread uploaded it meanwhile.
+static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P) {
+    if (im->upload_stamp && !vkb_tex_stale(im)) return 2;
+    if (P->bc >= 0 && !im->bc7) {
+        int srgb = im->d.format >= 0x87 && im->d.format <= 0x94;
+        if (!to_bc7(im, srgb, P->bc)) return 0;
+        g_bc7_images++;
+    }
+    if ((P->bc >= 0) != (im->bc7 != 0) || (P->bc >= 0 && (im->bc7 == 2) != (P->bc == VKB_BC_1)) || P->ns != (int)(im->levels * im->layers)) return 0;
+    if (P->vgen && P->vgen != totk_vpool_generation()) return 0;   // remapped meanwhile
+    im->stale = 0; im->cpu_written = 0;
+    im->upload_stamp = P->stamp;
+    im->vpool_gen = P->vgen;
+    im->content_hash = 0; im->hash_sub = 0;
+    vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    for (int i = 0; i < P->ns; i++) {
+        const psurf *s = &P->s[i];
+        VkBufferImageCopy r = {.bufferOffset = s->off, .bufferRowLength = s->row, .bufferImageHeight = s->rows_h,
+                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s->level, s->layer, 1}, .imageExtent = {s->lw, s->lh, s->ld}};
+        vkb_checkpoint("upload texture (prepared)", NULL, NULL);
+        vk.vkCmdCopyBufferToImage(cb, s->buf, im->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    }
+    return 1;
+}
+
 static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (!im->storage || im->gpu_written) return 0;
     const nvn_texdesc *d = &im->d;
