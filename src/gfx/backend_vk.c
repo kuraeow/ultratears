@@ -1340,7 +1340,7 @@ static void checkpoint_report(void) {
 // the device was lost (TOTK's item-get screen, 2026-10-24). Now each waits for the first submission after it was given up.
 // Deleted memory pools' imports too (mtl_pool_del): another game thread's submission, recorded while the pool was being
 // deleted, brought the copies of recently used pools up to date from it (2026-10-27, L16).
-typedef struct dead { uint64_t fence; VkImageView view; VkImage img; VkDeviceMemory mem; VkBuffer buf; VkShaderEXT sh; struct dead *next; } dead;
+typedef struct dead { uint64_t fence; VkImageView view; VkImage img; VkDeviceMemory mem; VkBuffer buf; VkShaderEXT sh; struct dead *next; uint32_t imem; } dead;
 static dead *g_dead_new, *g_dead;   // given up since the last submission (no fence yet) / waiting for their fence
 static pthread_mutex_t g_dead_mu = PTHREAD_MUTEX_INITIALIZER;
 static void destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem, VkBuffer buf) {
@@ -1352,6 +1352,16 @@ static void destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem, VkB
     pthread_mutex_unlock(&g_dead_mu);
 }
 void vkb_destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem) { destroy_later(view, img, mem, VK_NULL_HANDLE); }
+void vkb_destroy_image_later(VkImage img, VkDeviceMemory mem, uint32_t imem) {
+    if (!imem) { destroy_later(VK_NULL_HANDLE, img, mem, VK_NULL_HANDLE); return; }
+    dead *d = malloc(sizeof *d);
+    if (!d) die("deferred destruction");
+    *d = (dead){0, VK_NULL_HANDLE, img, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, NULL};
+    d->imem = imem;
+    pthread_mutex_lock(&g_dead_mu);
+    d->next = g_dead_new; g_dead_new = d;
+    pthread_mutex_unlock(&g_dead_mu);
+}
 // A shader object no program holds any more (vkb_shader.c): the submission being recorded may still bind it.
 void vkb_destroy_shader_later(VkShaderEXT sh) {
     dead *d = malloc(sizeof *d);
@@ -1380,6 +1390,7 @@ static void dead_reap(uint64_t done) {   // the GPU finished up to `done`
         if (d->img) vk.vkDestroyImage(vkc.device, d->img, NULL);
         if (d->buf) vk.vkDestroyBuffer(vkc.device, d->buf, NULL);
         if (d->mem) vk.vkFreeMemory(vkc.device, d->mem, NULL);
+        if (d->imem) vkb_imem_free(d->imem);   // after the image that was bound to it
         free(d);
     }
 }

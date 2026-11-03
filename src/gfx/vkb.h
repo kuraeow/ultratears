@@ -34,6 +34,8 @@ uint64_t vkb_draw_count(void);   // draws and dispatches recorded so far   // vk
 // Destroys a view / an image and its memory once the GPU has finished every submission that may use them: the one being
 // recorded now included (its earlier commands may already refer to them).
 void vkb_destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem);
+void vkb_destroy_image_later(VkImage img, VkDeviceMemory mem, uint32_t imem);   // imem != 0: back to its block (vkb_imem_free)
+void vkb_imem_free(uint32_t imem);   // vkb_tex.c: image memory in a shared block given back
 void vkb_passprof_note(const char *key);   // TOTK_GPU_PASSPROF: names the open pass by its first shader
 void vkb_checkpoint(const char *what, const char *k1, const char *k2);   // TOTK_VK_CHECKPOINTS: names the next GPU command
 int vkb_in_pass(void);
@@ -56,6 +58,7 @@ typedef struct vkb_image {
     nvn_texdesc d;
     VkImage img;
     VkDeviceMemory mem;
+    uint32_t imem;                 // its memory's place in a shared block (vkb_tex.c imem_alloc; 0: an allocation of its own)
     VkFormat format;
     VkImageAspectFlags aspect;
     VkImageLayout layout;          // the whole image's current layout (replay thread)

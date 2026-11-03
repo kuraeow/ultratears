@@ -194,7 +194,7 @@ static void wbq_remove(entry *e) {    // g_wbq_mu held
 enum { BLK_LEVELS = 16 };
 static void side_free(entry *t) {    // an image kept beside an entry (twin, block target): destroyed when the GPU is done with it
     for (int i = 0; i < t->nviews; i++) vkb_destroy_later(t->view[i], VK_NULL_HANDLE, VK_NULL_HANDLE);
-    vkb_destroy_later(VK_NULL_HANDLE, t->im.img, t->im.mem);
+    vkb_destroy_image_later(t->im.img, t->im.mem, t->im.imem);
     free(t);
 }
 static void entry_drop(entry *e) {   // g_mu held: out of the indexes, destroyed when the GPU is done with it
@@ -208,7 +208,7 @@ static void entry_drop(entry *e) {   // g_mu held: out of the indexes, destroyed
     *e->all_pprev = e->all_next;
     if (e->all_next) e->all_next->all_pprev = e->all_pprev;
     for (int i = 0; i < e->nviews; i++) vkb_destroy_later(e->view[i], VK_NULL_HANDLE, VK_NULL_HANDLE);
-    vkb_destroy_later(VK_NULL_HANDLE, e->im.img, e->im.mem);
+    vkb_destroy_image_later(e->im.img, e->im.mem, e->im.imem);
     if (e->twin) side_free(e->twin);
     if (e->blk) {
         for (int l = 0; l < BLK_LEVELS; l++) if (e->blk[l]) side_free(e->blk[l]);
@@ -267,7 +267,7 @@ static int twin_make(entry *src) {
     VkImage img = t->im.img;
     VkDeviceMemory mem = t->im.mem;
     t->im = *s;   // the source's description (format, size, NVN texture for its views) ...
-    t->im.img = img; t->im.mem = mem; t->im.layout = VK_IMAGE_LAYOUT_UNDEFINED;   // ... with its own image
+    t->im.img = img; t->im.mem = mem; t->im.imem = 0; t->im.layout = VK_IMAGE_LAYOUT_UNDEFINED;   // ... with its own image
     t->im.usage = ci.usage; t->im.gpu_written = 1; t->im.storage = NULL; t->im.cpu_visible = 0; t->im.wb_pending = 0;
     t->im.refresh_from = NULL; t->im.uploading = 0;
     src->twin = t;
@@ -341,7 +341,7 @@ static entry *blk_make(const entry *src, uint32_t level, VkFormat f, int nvn_for
     VkImage img = t->im.img;
     VkDeviceMemory mem = t->im.mem;
     t->im = *s;   // the texture's description, as a single-level 2D (array) texture of the view format
-    t->im.img = img; t->im.mem = mem; t->im.layout = VK_IMAGE_LAYOUT_UNDEFINED; t->im.format = f; t->im.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    t->im.img = img; t->im.mem = mem; t->im.imem = 0; t->im.layout = VK_IMAGE_LAYOUT_UNDEFINED; t->im.format = f; t->im.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     t->im.width = w; t->im.height = h; t->im.depth = 1; t->im.layers = layers; t->im.levels = 1;
     t->im.astc = t->im.bc7 = t->im.compressed = 0; t->im.usage = ci.usage; t->im.gpu_written = 1; t->im.storage = NULL;
     t->im.cpu_visible = 0; t->im.wb_pending = 0; t->im.refresh_from = NULL; t->im.uploading = 0;
@@ -425,6 +425,133 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     return UINT32_MAX;
 }
 
+// ---- image memory: textures up to IMEM_ALONE bytes share blocks of IMEM_BLOCK (one vkAllocateMemory per block, not per
+// texture). Each texture had an allocation of its own: ~1 ms each on the Steam Deck (RADV), up to 15 ms a frame and
+// 0.1-1 s in one submission when Lookout Landing came into view (2026-11-03). Only optimal-tiling images live in the
+// blocks, so bufferImageGranularity does not apply. TOTK_VK_IMAGE_BLOCKS=0: an allocation per texture, as before.
+enum { IMEM_BLOCK = 64u << 20, IMEM_ALONE = 16u << 20, IMEM_MAXB = 256 };
+typedef struct { VkDeviceSize off, size; } irange;
+typedef struct { VkDeviceMemory mem; uint32_t type; VkDeviceSize used; irange *fr; int nfr, cfr; } iblock;   // fr: free ranges, sorted
+typedef struct { uint16_t block; VkDeviceSize off, size; } ialloc;   // imem - 1 indexes g_ia
+static iblock g_ib[IMEM_MAXB];
+static int g_nib;
+static ialloc *g_ia;
+static uint32_t *g_ia_free;
+static int g_nia, g_cia, g_nia_free;
+static pthread_mutex_t g_imem_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_imem_blocks_made, g_imem_shared;
+static int imem_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_IMAGE_BLOCKS"); v = !(e && *e == '0'); }
+    return v;
+}
+static void range_insert(iblock *b, VkDeviceSize off, VkDeviceSize size) {   // merged with its neighbours
+    int i = 0;
+    while (i < b->nfr && b->fr[i].off < off) i++;
+    if (i > 0 && b->fr[i - 1].off + b->fr[i - 1].size == off) {
+        b->fr[i - 1].size += size;
+        if (i < b->nfr && off + size == b->fr[i].off) { b->fr[i - 1].size += b->fr[i].size; memmove(&b->fr[i], &b->fr[i + 1], (size_t)(--b->nfr - i) * sizeof *b->fr); }
+        return;
+    }
+    if (i < b->nfr && off + size == b->fr[i].off) { b->fr[i].off = off; b->fr[i].size += size; return; }
+    if (b->nfr == b->cfr) { b->cfr = b->cfr ? b->cfr * 2 : 16; if (!(b->fr = realloc(b->fr, sizeof *b->fr * (size_t)b->cfr))) die("image memory ranges"); }
+    memmove(&b->fr[i + 1], &b->fr[i], (size_t)(b->nfr - i) * sizeof *b->fr);
+    b->fr[i] = (irange){off, size};
+    b->nfr++;
+}
+static int block_take(iblock *b, VkDeviceSize size, VkDeviceSize align, VkDeviceSize *off) {   // first fit
+    for (int i = 0; i < b->nfr; i++) {
+        VkDeviceSize at = (b->fr[i].off + align - 1) & ~(align - 1), end = b->fr[i].off + b->fr[i].size;
+        if (at + size > end) continue;
+        VkDeviceSize lo = b->fr[i].off;
+        memmove(&b->fr[i], &b->fr[i + 1], (size_t)(--b->nfr - i) * sizeof *b->fr);
+        if (at > lo) range_insert(b, lo, at - lo);
+        if (end > at + size) range_insert(b, at + size, end - at - size);
+        *off = at;
+        b->used += size;
+        return 1;
+    }
+    return 0;
+}
+// The image's memory: a place in a shared block (returns its imem, > 0) or 0 when it needs an allocation of its own.
+static uint32_t imem_alloc(VkImage img, const VkMemoryRequirements *req, uint32_t type, VkDeviceMemory *mem, VkDeviceSize *off) {
+    (void)img;   // (an allocation of its own is required only for external memory, which these images never are)
+    if (!imem_on() || req->size > IMEM_ALONE || req->alignment > IMEM_BLOCK) return 0;
+    VkDeviceSize align = req->alignment ? req->alignment : 1;
+    pthread_mutex_lock(&g_imem_mu);
+    int bi = -1;
+    for (int i = 0; i < g_nib && bi < 0; i++) if (g_ib[i].mem && g_ib[i].type == type && block_take(&g_ib[i], req->size, align, off)) bi = i;
+    if (bi < 0 && g_nib < IMEM_MAXB) {   // a new block (the lock is held: blocks are rare, ~one per 20-60 textures)
+        int i = 0;
+        while (i < g_nib && g_ib[i].mem) i++;
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = IMEM_BLOCK, .memoryTypeIndex = type};
+        vkb_mtag = MT_IMAGE;
+        VkDeviceMemory m;
+        if (vk.vkAllocateMemory(vkc.device, &ai, NULL, &m) == VK_SUCCESS) {
+            iblock *b = &g_ib[i];
+            b->mem = m; b->type = type; b->used = 0; b->nfr = 0;
+            range_insert(b, 0, IMEM_BLOCK);
+            if (i == g_nib) g_nib++;
+            atomic_fetch_add(&g_imem_blocks_made, 1);
+            if (block_take(b, req->size, align, off)) bi = i;
+        }
+    }
+    uint32_t id = 0;
+    if (bi >= 0) {
+        if (g_nia_free) id = g_ia_free[--g_nia_free];
+        else {
+            if (g_nia == g_cia) {
+                g_cia = g_cia ? g_cia * 2 : 4096;
+                if (!(g_ia = realloc(g_ia, sizeof *g_ia * (size_t)g_cia)) || !(g_ia_free = realloc(g_ia_free, sizeof *g_ia_free * (size_t)g_cia))) die("image memory table");
+            }
+            id = (uint32_t)++g_nia;
+        }
+        g_ia[id - 1] = (ialloc){(uint16_t)bi, *off, req->size};
+        *mem = g_ib[bi].mem;
+        atomic_fetch_add(&g_imem_shared, 1);
+    }
+    pthread_mutex_unlock(&g_imem_mu);
+    return id;
+}
+void vkb_imem_free(uint32_t imem) {   // no command uses the image any more (deferred destruction)
+    pthread_mutex_lock(&g_imem_mu);
+    ialloc a = g_ia[imem - 1];
+    iblock *b = &g_ib[a.block];
+    range_insert(b, a.off, a.size);
+    b->used -= a.size;
+    g_ia_free[g_nia_free++] = imem;
+    if (!b->used) {   // an empty block goes back when another empty one of its type is kept
+        int other = 0;
+        for (int i = 0; i < g_nib && !other; i++) other = &g_ib[i] != b && g_ib[i].mem && g_ib[i].type == b->type && !g_ib[i].used;
+        if (other) { vk.vkFreeMemory(vkc.device, b->mem, NULL); b->mem = VK_NULL_HANDLE; b->nfr = 0; }
+    }
+    pthread_mutex_unlock(&g_imem_mu);
+}
+// Memory for an image just made: in a shared block or an allocation of its own; bound. 0: none.
+static int image_memory(vkb_image *im) {
+    VkMemoryRequirements req;
+    vk.vkGetImageMemoryRequirements(vkc.device, im->img, &req);
+    uint32_t type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) return 0;
+    VkDeviceSize off = 0;
+    im->imem = imem_alloc(im->img, &req, type, &im->mem, &off);
+    if (!im->imem) {
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        vkb_mtag = MT_IMAGE;
+        if (!vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &im->mem), "image memory")) return 0;
+    }
+    vk.vkBindImageMemory(vkc.device, im->img, im->mem, off);
+    return 1;
+}
+
+static int create(vkb_image *im, const tex_t *t);
+static void entry_discard(entry *e) {   // made by create() and never used: destroyed at once
+    vk.vkDestroyImage(vkc.device, e->im.img, NULL);
+    if (e->im.imem) vkb_imem_free(e->im.imem);
+    else vk.vkFreeMemory(vkc.device, e->im.mem, NULL);
+    free(e);
+}
+
 static int create(vkb_image *im, const tex_t *t) {
     const nvn_texdesc *d = &t->d;
     VkImageAspectFlags aspect;
@@ -474,17 +601,10 @@ static int create(vkb_image *im, const tex_t *t) {
                               (unsigned long long)t->serial, d->format, d->target, w, h, depth, levels, layers, (int)r);
         return 0;
     }
-    VkMemoryRequirements req;
-    vk.vkGetImageMemoryRequirements(vkc.device, im->img, &req);
-    // [temporary] one allocation per texture; a suballocator before the open world (thousands of textures)
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
-                               .memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-    vkb_mtag = MT_IMAGE;
-    if (ai.memoryTypeIndex == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &im->mem), "image memory")) {
+    if (!image_memory(im)) {   // a shared block (textures up to 16 MiB) or an allocation of its own
         vk.vkDestroyImage(vkc.device, im->img, NULL);
         return 0;
     }
-    vk.vkBindImageMemory(vkc.device, im->img, im->mem, 0);
     im->serial = t->serial; im->d = *d; im->format = f; im->aspect = aspect; im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
     im->width = w; im->height = h; im->depth = depth; im->layers = layers; im->levels = levels; im->astc = astc;
@@ -636,12 +756,20 @@ vkb_image *vkb_image_of(const tex_t *t) {
         c = &t_icache[(t->serial * 0x9E3779B97F4A7C15ull) >> 54];
         if (c->serial == t->serial && c->sub == sub) return c->im;
     }
+    // A new image is made outside the lock (vkCreateImage and its memory took the other recording threads' turns: 12 ms
+    // a frame of waits on the Steam Deck, 2026-11-03), then the lookup runs again: what another thread made meanwhile
+    // wins and this one is destroyed unused. TOTK_VK_IMAGE_LOCKED=1: made under the lock, as before.
+    static int locked = -1;
+    if (locked < 0) { const char *lk = getenv("TOTK_VK_IMAGE_LOCKED"); locked = lk && *lk == '1'; }
+    entry *pre = NULL;
+retry:
     vkb_lock(&g_mu, LK_IMAGES);
     if ((g_n + g_tomb + 1) * 2 >= g_cap) grow();
     tslot *s = slot(t->serial);
     if (s->serial == t->serial && s->e) {
         vkb_image *found = &s->e->im;
         pthread_mutex_unlock(&g_mu);
+        if (pre) entry_discard(pre);
         if (c) *c = (icache_t){t->serial, sub, found};
         return found;
     }
@@ -679,13 +807,25 @@ vkb_image *vkb_image_of(const tex_t *t) {
                  wrote ? "game memory written meanwhile: uploaded from it again" : "contents kept", (unsigned long long)vkb_frame());
         g_images_taken_back++;
     } else if (e) g_images_shared++;
-    if (!e) {
-        e = calloc(1, sizeof *e);
-        if (!e) die("image entry");
+    if (!e && !pre && !locked) {
+        pthread_mutex_unlock(&g_mu);
+        if (!(pre = calloc(1, sizeof *pre))) die("image entry");
         uint64_t t0 = runtime_now_ns();
-        int ok = create(&e->im, t);
+        int ok = create(&pre->im, t);
         vkb_step_add(PK_CREATE, t0);
-        if (!ok) { free(e); pthread_mutex_unlock(&g_mu); return NULL; }
+        if (!ok) { free(pre); return NULL; }
+        goto retry;
+    }
+    if (!e) {
+        if (pre) { e = pre; pre = NULL; }
+        else {
+            e = calloc(1, sizeof *e);
+            if (!e) die("image entry");
+            uint64_t t0 = runtime_now_ns();
+            int ok = create(&e->im, t);
+            vkb_step_add(PK_CREATE, t0);
+            if (!ok) { free(e); pthread_mutex_unlock(&g_mu); return NULL; }
+        }
         e->has_layout = t->has_layout;
         memcpy(e->layout, t->layout, sizeof e->layout);
         e->im.cpu_visible = t->mem && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS);
@@ -705,6 +845,7 @@ vkb_image *vkb_image_of(const tex_t *t) {
     s->e = e;
     g_n++;
     pthread_mutex_unlock(&g_mu);
+    if (pre) entry_discard(pre);   // an image over the same memory was found meanwhile
     if (c) *c = (icache_t){t->serial, sub, &e->im};
     return &e->im;
 }
@@ -1199,8 +1340,8 @@ static int to_bc7(vkb_image *im, int srgb, int fmt) {
     vkb_mtag = MT_IMAGE;
     if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(vkc.device, &ai, NULL, &mem) != VK_SUCCESS) { vk.vkDestroyImage(vkc.device, img, NULL); return 0; }
     vk.vkBindImageMemory(vkc.device, img, mem, 0);
-    vkb_destroy_later(VK_NULL_HANDLE, im->img, im->mem);   // the RGBA8 image no command has used
-    im->img = img; im->mem = mem; im->format = f; im->usage = usage; im->cube = (int)(ci.flags != 0); im->compressed = 1; im->bc7 = fmt == VKB_BC_1 ? 2 : 1;
+    vkb_destroy_image_later(im->img, im->mem, im->imem);   // the RGBA8 image no command has used
+    im->img = img; im->mem = mem; im->imem = 0; im->format = f; im->usage = usage; im->cube = (int)(ci.flags != 0); im->compressed = 1; im->bc7 = fmt == VKB_BC_1 ? 2 : 1;
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
     return 1;
