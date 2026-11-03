@@ -232,6 +232,21 @@ ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MU
               0x1852314: (0x979f9fb3, ZSTD_DDICT)}
 
 
+# ability_target_guard: Recall and Ultrahand crashed (c0000005 "accessing 0xffffffffffffffff", four times in 9 to 23
+# minutes of play) in main+0x1bd0138, which, once the owner's request at +0x678 says ready (status +0x6a0 == 2), takes
+# the target actor from the request's result record (x8 = [x19+0x6b0], x21 = [x8]), links it (main+0x155ec), reads
+# [[x21+0x228]+0xb0] (main+0x9a89d4) and takes a reference on that (main+0x2b8464, +0x90). The record had been reused:
+# x21 pointed into .rodata, outside the address space, or at heap memory that held other data. Before x21 is used it
+# must pass the game's own test of a live actor, the one main+0x155ec relies on: its link record [x21+0x1a8] points back
+# to it (+0x40) and carries its id (+0x48 == [x21+0x10]). Else the target is skipped for this frame, as a null or
+# tagged one is, and the skip is logged (totk_ability_target_ok, src/gfx/nvn/hle_nvn.c).
+def ability_target_guard(gen, addr):   # cbz x21, #0x801bd01f0
+    expect(gen, addr - 4, 0xf9400115, 'ability target guard')   # ldr x21, [x8]
+    expect(gen, addr, 0xb4000155, 'ability target guard')       # cbz x21, #0x801bd01f0
+    return ('{ extern int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor); '
+            'if (c->x[21] == 0 || !totk_ability_target_ok(c->x[19], c->x[8], c->x[21])) { goto L_801bd01f0; } }')
+
+
 PATCHES = {
     MAIN + 0x2b036c: cooldown,
     **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
@@ -250,6 +265,7 @@ PATCHES = {
     MAIN + 0x246eac: cloth_inline(0x1e200940, 0, 10, 0x364),   # fmul s0, s10, s0 (factor s10, ratio slot sp+0x364)
     MAIN + 0x345904: cloth_inline(0x1e210801, 1, 0, 0x114),    # fmul s1, s0, s1 (factor s0, ratio slot sp+0x114)
     MAIN + 0xa7ac4: fade(8), MAIN + 0x95dd24: fade(8), MAIN + 0x6155e4: fade(10), MAIN + 0x615660: fade(10),
+    MAIN + 0x1bd01c8: ability_target_guard,
 }
 PRE_PATCHES = {
     MAIN + 0x3e5658: rt_step_ticks,
