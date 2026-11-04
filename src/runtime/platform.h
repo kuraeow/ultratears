@@ -27,6 +27,9 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // MEM_WRITE_WATCH), their addresses into pages[] (at most max), and the tracking reset for the range. Returns the
 // count (max: maybe more), or -1 where there is no tracking (macOS, Linux). Page size: *page.
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page);
+// Linux: the write watch's frozen regions (not scanned, read-only until written): MiB frozen now, thaws by a write so
+// far, MiB of scans skipped so far. Zeros elsewhere.
+void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *skipped_mib);
 // Development (TOTK_MEMMAP=1): the process's committed memory by kind (guest window, heaps, other private, mapped,
 // images) and its largest private regions, to stderr. Slow (walks the address space and the heaps).
 void plat_memory_map(void);

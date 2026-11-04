@@ -321,8 +321,12 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
+    int tries = 0;
     while (done < n) {
         ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
+        // EFAULT: a region of the write watch was being frozen read-only as the read began (Linux, platform/linux.c);
+        // writable again, the read goes on
+        if (r < 0 && errno == EFAULT && tries++ < 8) { guest_prepare_write((uint8_t *)buffer + done, n - done); continue; }
         need(r > 0, "RomFS image read");
         done += (uint64_t)r;
     }
@@ -632,8 +636,10 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
     guest_prepare_write(buffer, size);
     uint64_t done = 0;
+    int tries = 0;
     while (done < size) {
         ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done);
+        if (n < 0 && errno == EFAULT && tries++ < 8) { guest_prepare_write((uint8_t *)buffer + done, size - done); continue; }   // as above
         if (n < 0) runtime_fail("host save read failure");
         if (!n) break;
         done += (uint64_t)n;

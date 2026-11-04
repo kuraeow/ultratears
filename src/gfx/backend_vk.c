@@ -749,6 +749,9 @@ static int sync_gather(pool_ent *p, uint64_t sub, int may_end) {
     p->filled = 1;
     p->stamp = stamp;
     p->sync_sub = sub;
+    // pool copies (Linux, a discrete GPU): the device copy is filled from the pool's copy, which pc_sync brings up to
+    // date right before the submission - for the pools used in it, so this one counts as used
+    if (p->cmap && __atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
     return 1;
 }
 // What a GPU write's range held before it, for wb_merge: in a page the CPU also wrote, the GPU gets every byte the CPU
@@ -924,25 +927,38 @@ static int wb_bytes(uint64_t p, uint64_t e, const uint8_t *gpu, const wb_snap_t 
     if (tok) nvn_dirty_gpu_write_end(tok);
     return tok != NULL;
 }
+// Pool copies with device copies (Linux, a discrete GPU): what the copy back put into game memory goes into the pool's
+// own copy too. Reads of a pool without a current device copy (in a pass, before its update) go to that copy, which is
+// game memory as it was at the last sync; on Windows they read game memory itself, which has the GPU's writes by then.
+static void wb_to_pool_copy(uint64_t a, uint64_t len) {
+    if (!vkb_pool_copies()) return;
+    vkb_rw_read(&g_pool_mu, LK_POOLS);
+    const pool_ent *p = pool_find((uintptr_t)a, len);
+    if (p && p->cmap) memcpy(p->cmap + (a - p->base), (const void *)(uintptr_t)a, len);
+    vkb_rw_read_end(&g_pool_mu);
+}
+static void wb_merge_one(uint64_t a, uint64_t len, uint64_t stamp, const uint8_t *src, const wb_snap_t *snaps, int nsnaps) {
+    if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src, len); g_wb_pages += (len + 4095) / 4096; return; }
+    for (uint64_t p = a; p < a + len;) {   // page by page
+        uint64_t e = ((p >> 12) + 1) << 12;
+        if (e > a + len) e = a + len;
+        g_wb_pages++;
+        if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
+            if (wb_bytes(p, e, src + (p - a), snaps, nsnaps)) { g_wb_byte_pages++; p = e; continue; }
+            g_wb_kept_pages++;
+            static int logged, want = -1;   // TOTK_WB_LOG=1 (development): which GPU writes the CPU's pages replaced
+            if (want < 0) want = getenv("TOTK_WB_LOG") != NULL;
+            if (want && logged++ < 2000)
+                VLOG("[wb] GPU write %#llx+%llu: page %#llx kept for the CPU's writes (frame %llu)", (unsigned long long)a,
+                     (unsigned long long)len, (unsigned long long)p, (unsigned long long)vkb_frame());
+        } else wb_put(p, src + (p - a), e - p);
+        p = e;
+    }
+}
 static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb_snap_t *snaps, int nsnaps) {
     for (int k = 0; k < n; k++, r += 4) {
-        uint64_t a = r[0], len = r[1], stamp = r[2];
-        if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src + r[3], len); g_wb_pages += (len + 4095) / 4096; continue; }
-        for (uint64_t p = a; p < a + len;) {   // page by page
-            uint64_t e = ((p >> 12) + 1) << 12;
-            if (e > a + len) e = a + len;
-            g_wb_pages++;
-            if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
-                if (wb_bytes(p, e, src + r[3] + (p - a), snaps, nsnaps)) { g_wb_byte_pages++; p = e; continue; }
-                g_wb_kept_pages++;
-                static int logged, want = -1;   // TOTK_WB_LOG=1 (development): which GPU writes the CPU's pages replaced
-                if (want < 0) want = getenv("TOTK_WB_LOG") != NULL;
-                if (want && logged++ < 2000)
-                    VLOG("[wb] GPU write %#llx+%llu: page %#llx kept for the CPU's writes (frame %llu)", (unsigned long long)a,
-                         (unsigned long long)len, (unsigned long long)p, (unsigned long long)vkb_frame());
-            } else wb_put(p, src + r[3] + (p - a), e - p);
-            p = e;
-        }
+        wb_merge_one(r[0], r[1], r[2], src + r[3], snaps, nsnaps);
+        wb_to_pool_copy(r[0], r[1]);
     }
 }
 static void shadow_writeback(VkCommandBuffer cb) {   // end of a submission: GPU writes to the slot's host memory
@@ -1033,24 +1049,30 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     if (!write)
         for (int k = 0; k < POOL_HITS; k++)
             if (t_pool_hit[k].sub == sub && t_pool_hit[k].gen == gen && addr >= t_pool_hit[k].lo && addr + len <= t_pool_hit[k].hi) return;
+    int shadow = vkb_shadow_on();
+    VkBuffer pc_buf = VK_NULL_HANDLE;   // pool copies: a GPU write that lands in the pool's copy itself (pc_pend_add)
+    uint64_t pc_n = 0;
+    int pc_added = 0;
     if (vkb_pool_copies()) {   // the pool is synced before the submission (pc_sync); a GPU write goes back after it
         vkb_rw_read(&g_pool_mu, LK_POOLS);
         // a range running on past its pool's end (GPU addresses, vkb_span_addr): the pool it starts in, up to its end
-        pool_ent *p = pool_find_mut((uintptr_t)addr, len);
-        if (!p) p = pool_find_mut((uintptr_t)addr, 1);
-        VkBuffer b = p ? p->buf : VK_NULL_HANDLE;
-        uint64_t n = p && addr + len > p->hi ? p->hi - addr : len;
+        pool_ent *strict = pool_find_mut((uintptr_t)addr, len), *p = strict ? strict : pool_find_mut((uintptr_t)addr, 1);
+        pc_buf = p ? p->buf : VK_NULL_HANDLE;
+        pc_n = p && addr + len > p->hi ? p->hi - addr : len;
         if (p) used_mark(p, sub);
-        if (p && !write && !vkb_shadow_on()) pool_hit_note(p, addr, len, sub, gen);
+        if (p && !write && !shadow) pool_hit_note(p, addr, len, sub, gen);
+        // with device copies (a discrete GPU) the write goes to the pool's device copy unless it has none
+        pc_added = p && write && !(shadow && strict && !strict->no_shadow);
         vkb_rw_read_end(&g_pool_mu);
-        if (p && write) pc_pend_add(b, addr, n);
+        if (pc_added) pc_pend_add(pc_buf, addr, pc_n);
     }
-    if (!vkb_shadow_on()) return;
+    if (!shadow) return;
     vkb_rw_read(&g_pool_mu, LK_POOLS);   // the common cases: a pool already current in this submission, or not copied
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
     int done = !p || p->no_shadow || (p->sync_sub == sub && !write);
     if (p) used_mark(p, sub);
     if (p && done && !write) pool_hit_note(p, addr, len, sub, gen);
+    int late = p && write && p->no_shadow && !pc_added && pc_buf == p->buf;   // lost its device copy since the look above
     if (!done && write && p->sync_sub == sub) {
         pthread_mutex_lock(&g_wb_mu);
         wb_add(p, addr, len);
@@ -1059,18 +1081,22 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
         done = 1;
     }
     vkb_rw_read_end(&g_pool_mu);
+    if (late) pc_pend_add(pc_buf, addr, pc_n);
     if (done) return;
     atomic_fetch_add_explicit(&g_pool_use_n[write ? 1 : 0], 1, memory_order_relaxed);
     vkb_rw_write(&g_pool_mu, LK_POOLS);
     p = pool_find_mut((uintptr_t)addr, len);   // the table may have changed between the locks
+    int to_copy = 0;
     if (p) {
         p->used_sub = sub;
         // threads recording: the copies go into the prologue, before every chunk (no pass to end)
         int ok = p->sync_sub == sub || sync_gather(p, sub, write || t_recording);
         sync_flush();
         if (ok && write) wb_add(p, addr, len);
+        to_copy = !ok && write && !pc_added && pc_buf == p->buf;   // pool copies: no device copy, so the write lands in its copy
     }
     vkb_rw_write_end(&g_pool_mu);
+    if (to_copy) pc_pend_add(pc_buf, addr, pc_n);
 }
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (g_ok != 1) return 0;
@@ -2444,6 +2470,15 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                      (double)(cn - pcn) / 1e6 / f, (double)(cc - pcc) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f,
                      (double)(cs - pcs) / 1048576.0 / f, (double)(ck - pck) / f, pend);
                 pci = ci; pcw = cw; pcb = cb; pcn = cn; pck = ck; pcs = cs; pcc = cc;
+                {   // runtime/platform/linux.c: regions of the write watch not scanned (read-only until written)
+                    void plat_watch_freeze_stats(uint64_t *, uint64_t *, uint64_t *);
+                    static uint64_t pth, psk;
+                    uint64_t fm, th, sk;
+                    plat_watch_freeze_stats(&fm, &th, &sk);
+                    if (fm || th) VLOG("per frame: write watch: %llu MiB frozen (not scanned), %.0f MiB of scans skipped, %.2f thaws by a write",
+                                       (unsigned long long)fm, (double)(sk - psk) / f, (double)(th - pth) / f);
+                    pth = th; psk = sk;
+                }
             }
             if (vkb_shadow_on()) {
                 static uint64_t pin, pib, pob, pdf, psc, pwp, pwk, pwb, pu0, pu1, pu2;

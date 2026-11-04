@@ -33,10 +33,13 @@ int vkb_shadow_on(void) {   // discrete GPUs: game memory is across PCIe from th
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_VK_POOL_SHADOW");
-        // with pool copies (Linux) the pools are Vulkan memory already, which the GPU of a discrete card reads across
-        // PCIe as it read the imported pools: [temporary] no device-local copies on top of them yet
-        v = vkb_pool_copies() ? 0 : e && *e ? *e != '0' : vkc.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        VLOG("copies of game memory in device memory: %s", v ? "on (discrete GPU)" : vkb_pool_copies() ? "off (pool copies)" : "off (memory shared with the GPU)");
+        // With pool copies (Linux) the pools are host-visible Vulkan memory, which a discrete card reads across PCIe as
+        // it read imported game memory: device copies on top of them, filled from them (backend_vk.c sync_gather; a
+        // friend's discrete GPU on Linux spent 11-20 ms a frame of GPU time at 800-1500 draws without, 2026-11-04).
+        // The Steam Deck (integrated) has none.
+        v = e && *e ? *e != '0' : vkc.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        VLOG("copies of game memory in device memory: %s", v ? (vkb_pool_copies() ? "on (discrete GPU, over the pool copies)" : "on (discrete GPU)")
+                                                             : "off (memory shared with the GPU)");
     }
     return v;
 }

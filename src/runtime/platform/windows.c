@@ -68,6 +68,8 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
     return (int)n;
 }
 
+void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *skipped_mib) { *frozen_mib = *thaws = *skipped_mib = 0; }
+
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     return VirtualFree((void *)(uintptr_t)lo, hi - lo, MEM_DECOMMIT) != 0;

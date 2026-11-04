@@ -1161,6 +1161,13 @@ static int tex_content_changed(vkb_image *im, size_t size, uint64_t sub) {
     return 1;
 }
 
+// One thread checks an image per submission, the others wait for its answer - on a lock of that image's own stripe:
+// under the images lock g_mu (as before 2026-11-04) the check's write watch scan or content hash held every recording
+// thread's image lookups (4 ms a frame of waits on the Steam Deck, 140-150 of them).
+enum { STALE_STRIPES = 64 };
+static pthread_mutex_t g_stale_mu[STALE_STRIPES];
+static pthread_once_t g_stale_once = PTHREAD_ONCE_INIT;
+static void stale_init(void) { for (int i = 0; i < STALE_STRIPES; i++) pthread_mutex_init(&g_stale_mu[i], NULL); }
 int vkb_tex_stale(vkb_image *im) {
     uint64_t sub = mtl_last_fence() + 1;
     if (!im->upload_stamp || im->gpu_written || !im->storage) return 0;
@@ -1168,9 +1175,12 @@ int vkb_tex_stale(vkb_image *im) {
     if (im->vpool_gen && im->vpool_gen != totk_vpool_generation()) return 1;   // a virtual pool's mapping changed
     if (__atomic_load_n(&im->dirty_checked, __ATOMIC_ACQUIRE) != sub) {
         int mt = vkb_mt_recording();
+        pthread_mutex_t *m = NULL;
         if (mt) {   // one thread checks; the others wait for its answer
-            vkb_lock(&g_mu, LK_IMAGES);
-            if (im->dirty_checked == sub) { pthread_mutex_unlock(&g_mu); return im->stale; }
+            pthread_once(&g_stale_once, stale_init);
+            m = &g_stale_mu[((uintptr_t)im * 0x9E3779B97F4A7C15ull) >> 58];
+            vkb_lock(m, LK_IMAGES);
+            if (im->dirty_checked == sub) { pthread_mutex_unlock(m); return im->stale; }
         }
         nvn_texlayout L;
         nvn_tex_layout(&im->d, &L);
@@ -1187,7 +1197,7 @@ int vkb_tex_stale(vkb_image *im) {
                  (unsigned long long)sub, nvn_dirty_tracked(im->storage, L.size), im->stale, (unsigned long long)im->upload_stamp,
                  (unsigned long long)nvn_dirty_now());
         __atomic_store_n(&im->dirty_checked, sub, __ATOMIC_RELEASE);
-        if (mt) pthread_mutex_unlock(&g_mu);
+        if (m) pthread_mutex_unlock(m);
     }
     return im->stale;
 }

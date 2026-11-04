@@ -92,6 +92,10 @@ static void deck_defaults(void) {
     setenv("TOTK_OUTPUT_RES", "1280x800", 0);
     setenv("TOTK_WINDOW", "fullscreen", 0);
     setenv("TOTK_FPS_LIMIT", "40", 0);
+    // Two recording threads (3 by the general rule): the same frame times on the Deck as three (2026-11-04, Lookout
+    // Landing, 120 s each: p50 26.5 / 25.8 ms, p95 35.3 / 35.2) with a quarter less CPU for recording, which shares the
+    // Deck's four cores with the game's three
+    setenv("TOTK_VK_RECORD_THREADS", "2", 0);
     fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps (the Deck's defaults where ultratears.cfg sets none)\n",
             getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"));
 #endif
