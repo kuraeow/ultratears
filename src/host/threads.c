@@ -119,7 +119,7 @@ typedef struct thr {
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
     // UltraTears (runtime_threads_report, TOTK_STATS): time blocked by wait kind (1 lock 2 condition 3 address 4 sync),
     // waiting for a virtual core, and from a wake to running again (the host's scheduling latency)
-    uint64_t st_block_ns[5], st_blocks, st_core_ns, st_core_waits, st_wake_ns, st_wakes, woke_ns;
+    uint64_t st_block_ns[5], st_blocks, st_core_ns, st_core_waits, st_wake_ns, st_wakes, woke_ns, st_hold_ns;
     uint64_t blk_t0, blk_cred, core_t0, core_cred; int blk_kind;   // a wait in progress: since when, counted up to when
 } thr_t;
 static thr_t *g_all;
@@ -186,16 +186,49 @@ static thr_t *g_core_wait;
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+/* Horizon's priority inheritance (UltraTears, 2026-11-04): a thread that owns a guest mutex counts at the priority of
+   the best thread blocked on it, for handing out cores and for preemption. Without it a low-priority owner of a mutex
+   the game's main thread waits for (the Steam Deck's log: 4.4 ms a frame blocked on locks) queued for a core behind
+   workers of middling priority. The owner is read from the mutex word, so it follows hand-offs; one level only (an
+   owner blocked on another mutex passes nothing on). As totk-pc-recomp runtime/kernel.c eff_prio (MIT).
+   TOTK_PRIO_INHERIT=0: raw priorities, as before. Holding G. */
+static int pi_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = !(e && *e == '0'); }
+    return on;
+}
+static int eff_prio(const thr_t *o) {
+    int p = o->prio;
+    if (!pi_on()) return p;
+    for (const thr_t *w = g_wait; w; w = w->next)
+        if (w->wkind == 1 && w->prio < p && w->waddr &&
+            (__atomic_load_n((const uint32_t *)(uintptr_t)w->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT) == o->handle)
+            p = w->prio;
+    return p;
+}
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
-    for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
-        if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
+    int bprio = 0;
+    for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) {
+        if (!core_allowed(*p, c)) continue;
+        int pr = eff_prio(*p);
+        if (!b || pr < bprio || (pr == bprio && (*p)->cseq < b->cseq)) { b = *p; bp = p; bprio = pr; }
+    }
     if (!b) return;
     *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; gc_signal(&b->cv);
 }
+// t waits for a core: the owners of the cores it may run on that count worse give theirs up at their next checkpoint
+// (holding G)
+static void core_kick(const thr_t *t) {
+    int tp = eff_prio(t);
+    for (int i = 0; i < NCORE; i++)
+        if (core_allowed(t, i) && g_core_owner[i] && eff_prio(g_core_owner[i]) > tp) g_core_owner[i]->preempt = 1;
+}
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL;
+    t->st_hold_ns += now_ns() - t->core_since;
+    core_grant(c);
 }
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
@@ -204,16 +237,36 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    core_kick(t);
     t->core_t0 = t->core_cred = now_ns();
+    // A short spin before sleeping (TOTK_CORE_SPIN_US, 20 by default; 0: none): a core often comes free within
+    // microseconds (a worker's job ends, an SVC hands it over), and a sleep costs the host's wake latency on top
+    // (15-20 us on the Steam Deck, 2026-11-04). core_grant sets cur_core under G; reading it here without G is a hint.
+    static int64_t spin_ns = -1;
+    if (spin_ns < 0) { const char *e = getenv("TOTK_CORE_SPIN_US"); spin_ns = (e && *e ? atoll(e) : 20) * 1000; }
+    if (spin_ns > 0) {
+        g_unlock();
+        uint64_t s0 = now_ns();
+        while (__atomic_load_n(&t->cur_core, __ATOMIC_ACQUIRE) < 0 && now_ns() - s0 < (uint64_t)spin_ns) __builtin_ia32_pause();
+        g_lock();
+    }
     while (t->cur_core < 0) gc_wait(&t->cv);
     t->st_core_ns += now_ns() - t->core_cred, t->st_core_waits++;
     t->core_t0 = 0;
 }
 static thr_t *me_or_null(void) { return t_self; }
 static int core_better_waiter(const thr_t *t, int c) {   // holding G: a waiter for core c better than t
-    for (const thr_t *w = g_core_wait; w; w = w->cnext) if (core_allowed(w, c) && w->prio < t->prio) return 1;
+    int tp = eff_prio(t);
+    for (const thr_t *w = g_core_wait; w; w = w->cnext) if (core_allowed(w, c) && eff_prio(w) < tp) return 1;
     return 0;
+}
+// A thread blocks on the guest mutex at its waddr (holding G, linked into g_wait): the owner now counts at least at
+// its priority, so if the owner is queued for a core, worse owners of the cores it may use give them up.
+static void pi_lock_wait(const thr_t *t) {
+    if (!pi_on() || !cores_enabled() || !t->waddr) return;
+    uint32_t h = __atomic_load_n((const uint32_t *)(uintptr_t)t->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT;
+    for (const thr_t *o = g_core_wait; o; o = o->cnext)
+        if (o->handle == h) { core_kick(o); return; }
 }
 void runtime_thread_note_hle(unsigned i) { thr_t *t = me_or_null(); if (t) t->last_hle = (int)i + 1; }   // hle_stack.c, while tracing
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
@@ -229,8 +282,13 @@ void runtime_core_back(int *away) {
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
 // Called at every SVC (guest.c rt_svc) and indirect call (runtime/dispatch.c rt_dispatch). The request may be stale:
 // the waiter got another core meanwhile, and giving this one up would hand it to a worse thread.
+// Horizon's preemption disable: the SDK's spin locks count TLR+0x100 (disable_count) while they try or hold the lock.
+// Such a thread keeps its core (the request stays for its next checkpoint): taking the core of a spin lock's holder
+// leaves a better thread spinning on that lock (totk-pc-recomp runtime/kernel.c, ap_disabled, from MacNativeGames).
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
+    Cpu *c = guest_cpu();
+    if (c && c->tpidrro && pi_on() && *(volatile uint16_t *)(uintptr_t)(c->tpidrro + 0x100)) return;
     g_lock();
     if (t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) { core_put(t); core_take(t); }   // core_put clears the request
     else t->preempt = 0;
@@ -278,8 +336,10 @@ int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_cor
 void runtime_threads_report(unsigned frames) {
     if (!frames) return;
     enum { N = 256 };
-    static struct { uint32_t h; uint64_t b[5], core, cw, wake, wakes, blocks; } last[N];
-    typedef struct { uint32_t h; int prio; double b[5], all, core, cw, wake, wakes, blocks; } row;
+    // matched by thread id: a handle comes back for a new thread once the old one is gone, and its smaller totals went
+    // negative (61489146967 ms in the Deck's log of 2026-11-04)
+    static struct { uint64_t id; uint64_t b[5], core, cw, wake, wakes, blocks, hold; } last[N];
+    typedef struct { uint32_t h; int prio; double b[5], all, core, cw, wake, wakes, blocks, hold; } row;
     row r[N];
     int n = 0;
     static uint64_t last_ns;   // the window's wall time per frame: what a thread did not wait, it ran (or waited on the host)
@@ -291,11 +351,16 @@ void runtime_threads_report(unsigned frames) {
         if (t->exited || !t->started) continue;
         if (t->blk_t0) t->st_block_ns[t->blk_kind] += now - t->blk_cred, t->blk_cred = now;   // waits in progress
         if (t->core_t0) t->st_core_ns += now - t->core_cred, t->core_cred = now;
+        if (t->cur_core >= 0 && now > t->core_since) t->st_hold_ns += now - t->core_since, t->core_since = now;
         int k = 0;
-        while (k < N && last[k].h && last[k].h != t->handle) k++;
-        if (k == N) continue;
-        if (!last[k].h) memset(&last[k], 0, sizeof last[k]), last[k].h = t->handle;
+        while (k < N && last[k].id && last[k].id != t->id) k++;
+        if (k == N) {   // the table is full of threads seen before: start it over (one window of rows goes missing)
+            memset(last, 0, sizeof last);
+            k = 0;
+        }
+        if (!last[k].id) memset(&last[k], 0, sizeof last[k]), last[k].id = t->id;
         row *x = &r[n++];
+        x->hold = (double)(t->st_hold_ns - last[k].hold) / 1e6 / frames, last[k].hold = t->st_hold_ns;
         x->h = t->handle, x->prio = t->prio, x->all = 0;
         for (int i = 0; i < 5; i++) x->b[i] = (double)(t->st_block_ns[i] - last[k].b[i]) / 1e6 / frames, x->all += x->b[i], last[k].b[i] = t->st_block_ns[i];
         x->core = (double)(t->st_core_ns - last[k].core) / 1e6 / frames, last[k].core = t->st_core_ns;
@@ -305,17 +370,22 @@ void runtime_threads_report(unsigned frames) {
         x->blocks = (double)(t->st_blocks - last[k].blocks) / frames, last[k].blocks = t->st_blocks;
     }
     g_unlock();
-    for (int i = 0; i < n; i++)   // the busiest first: the least time blocked (a core wait is a thread with work to do)
+    double core_all = 0, wake_all = 0, wakes_all = 0, hold_all = 0;
+    for (int i = 0; i < n; i++) core_all += r[i].core, wake_all += r[i].wake, wakes_all += r[i].wakes, hold_all += r[i].hold;
+    for (int i = 0; i < n; i++)   // the rows: the threads that held the virtual cores longest first
         for (int j = i + 1; j < n; j++)
-            if (r[j].all < r[i].all) { row t = r[i]; r[i] = r[j]; r[j] = t; }
-    double core_all = 0, wake_all = 0, wakes_all = 0;
-    for (int i = 0; i < n; i++) core_all += r[i].core, wake_all += r[i].wake, wakes_all += r[i].wakes;
-    fprintf(stderr, "[totk] guest threads per frame: waiting for a virtual core %.2f ms in all, wake latency %.0f us average (%.0f wakes a frame)\n",
-            core_all, wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames);
-    for (int i = 0; i < n && i < 8; i++)
-        fprintf(stderr, "[totk]   thread %#x prio %d: ran %.1f ms, core wait %.2f ms (%.1f), blocked %.1f ms (lock %.1f, cond %.1f, address %.1f, sync %.1f; %.1f waits), "
-                "wake latency %.0f us\n", r[i].h, r[i].prio, frame_ms > 0 ? frame_ms - r[i].all - r[i].core : 0.0, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
-                r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0);
+            if (r[j].hold > r[i].hold) { row t = r[i]; r[i] = r[j]; r[j] = t; }
+    // "on a core": the time holding a virtual core (the three cores give at most 3x the frame); "away": neither on a
+    // core nor in a guest wait - a host service that gave its core up (GPU, audio, files), or the host not running it
+    fprintf(stderr, "[totk] guest threads per frame: virtual cores held %.2f of %.2f ms, waiting for a virtual core %.2f ms in all, "
+            "wake latency %.0f us average (%.0f wakes a frame)\n", hold_all, 3 * frame_ms, core_all,
+            wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames);
+    for (int i = 0; i < n && i < 10; i++) {
+        double away = frame_ms > 0 ? frame_ms - r[i].all - r[i].core - r[i].hold : 0.0;
+        fprintf(stderr, "[totk]   thread %#x prio %d: on a core %.1f ms, core wait %.2f ms (%.1f), blocked %.1f ms (lock %.1f, cond %.1f, address %.1f, sync %.1f; %.1f waits), "
+                "away %.1f ms, wake latency %.0f us\n", r[i].h, r[i].prio, r[i].hold, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
+                away > 0 ? away : 0.0, r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0);
+    }
 }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
@@ -338,6 +408,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {   // with the stati
 static int64_t block_inner2(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+    if (kind == 1) pi_lock_wait(t);
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
@@ -539,7 +610,8 @@ int svc_thread(int num, uint64_t *regs) {
             if (me && me->nsvc != me->yrun_svc + 1) me->yrun_ns = y0;   // another SVC since the last yield: a new run
             if (me) me->yrun_svc = me->nsvc;
             g_lock();   // Horizon yield: hand the core to a waiting thread of equal or higher priority
-            int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
+            int give = 0, mp = me->cur_core >= 0 ? eff_prio(me) : 0;
+            for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && eff_prio(w) <= mp;
             if (give) { core_put(me); core_take(me); }
             g_unlock();
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;

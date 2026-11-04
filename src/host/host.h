@@ -76,5 +76,6 @@ void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 
 // ---- profiler.c: sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>])
 void runtime_profiler_start(void);
+void runtime_profiler_stop(void);   // the game is closing: a profile still sampling writes its report now
 uint64_t runtime_symbolize(uint64_t rip, char *out, size_t n);   // host address -> function (f_<guest> + guest symbol)
 void runtime_watch_tick(uint64_t present);   // TOTK_WATCH: arms / reports the memory write watch (watch.c)

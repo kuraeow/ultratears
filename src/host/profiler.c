@@ -274,6 +274,7 @@ static void report(const char *path, double seconds) {
 
 static double start_s, duration_s;
 static char out_path[512] = "diag/profile.txt";
+static volatile int prof_stop, prof_state;   // runtime_profiler_stop; 1 sampling, 2 report written
 
 static DWORD WINAPI profiler(void *unused) {
     (void)unused;
@@ -283,13 +284,16 @@ static DWORD WINAPI profiler(void *unused) {
     DWORD self = GetCurrentThreadId();
     uint64_t t0 = runtime_now_ns(), end = t0 + (uint64_t)(duration_s * 1e9);
     uint64_t listed = 0, passes = 0;
-    for (uint64_t now; (now = runtime_now_ns()) < end; passes++) {
+    prof_state = 1;
+    for (uint64_t now; (now = runtime_now_ns()) < end && !prof_stop; passes++) {
         if (now - listed >= 500000000ull) { list_threads(self); listed = now; }
         sample_all();
         Sleep(1);
     }
-    fprintf(stderr, "[prof] %.0f passes a second\n", passes / duration_s);
-    report(out_path, (runtime_now_ns() - t0) / 1e9);
+    double secs = (runtime_now_ns() - t0) / 1e9;
+    fprintf(stderr, "[prof] %.0f passes a second\n", passes / secs);
+    report(out_path, secs);
+    prof_state = 2;
     return 0;
 }
 
@@ -538,6 +542,7 @@ static void report(const char *path, double seconds) {
 
 static double start_s, duration_s;
 static char out_path[512] = "diag/profile.txt";
+static volatile int prof_stop, prof_state;   // runtime_profiler_stop; 1 sampling, 2 report written
 static void *profiler(void *unused) {
     (void)unused;
     struct timespec ts = {(time_t)start_s, (long)((start_s - (time_t)start_s) * 1e9)};
@@ -549,16 +554,18 @@ static void *profiler(void *unused) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPROF, &sa, NULL);
     atomic_store(&sampling, 1);
+    prof_state = 1;
     uint64_t t0 = runtime_now_ns(), end = t0 + (uint64_t)(duration_s * 1e9);
-    while (runtime_now_ns() < end) {
-        arm_all();
-        struct timespec half = {0, 500000000};
-        nanosleep(&half, NULL);
+    for (int k = 0; runtime_now_ns() < end && !prof_stop; k++) {
+        if (k % 10 == 0) arm_all();   // new threads every 0.5 s
+        struct timespec step = {0, 50000000};
+        nanosleep(&step, NULL);
     }
     atomic_store(&sampling, 0);
     unsigned n = atomic_load(&nthreads);
     for (unsigned i = 0; i < n; i++) syscall(SYS_timer_delete, timers[i]);
     report(out_path, (runtime_now_ns() - t0) / 1e9);
+    prof_state = 2;
     return NULL;
 }
 void runtime_profiler_start(void) {
@@ -576,3 +583,19 @@ void runtime_profiler_start(void) {
     fprintf(stderr, "[prof] armed: %.0f s from now, for %.0f s, report %s\n", start_s, duration_s, out_path);
 }
 #endif
+
+// The game is closing (window_sdl.c, before _Exit): a profile still sampling stops and writes what it has, rather than
+// nothing (the Steam Deck's run of 2026-11-04 closed 18 s before its window ended). Waits up to 10 s for the report.
+void runtime_profiler_stop(void) {
+    if (prof_state != 1) return;
+    prof_stop = 1;
+    fprintf(stderr, "[prof] the game closes: writing the profile so far\n");
+    for (int i = 0; i < 1000 && prof_state != 2; i++) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+#endif
+    }
+}

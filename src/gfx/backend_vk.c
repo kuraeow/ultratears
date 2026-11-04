@@ -401,16 +401,21 @@ static void pc_put(const pool_ent *p, uint64_t a, uint64_t b, int i, int whole) 
     memcpy(p->cmap + (a - p->base), (const void *)(uintptr_t)a, b - a);
     g_pc_in_bytes += b - a;
 }
+static uint64_t g_pc_copy_ns;   // of g_pc_ns: copying (the rest is the write watch's scan; the log line, g_pc_mu)
 static void pc_run(void *ctx, size_t off, size_t n) {   // nvn_dirty_runs: off from the pool's start
     const pool_ent *p = ctx;
+    uint64_t t0 = runtime_now_ns();
     pc_put(p, p->lo + off, p->lo + off + n, 0, 0);
+    g_pc_copy_ns += runtime_now_ns() - t0;
 }
 // Before submission `fence` is submitted (g_pool_mu read, g_pc_mu held): the pools it used brought up to date.
 static void pc_sync_pool(pool_ent *p) {
     if (!p->cfilled) {   // the first use: all of it (writes up to now are in it)
         nvn_dirty_since((const void *)p->lo, p->hi - p->lo, UINT64_MAX);
         p->cstamp = nvn_dirty_now();
+        uint64_t t0 = runtime_now_ns();
         pc_put(p, p->lo, p->hi, 0, 1);
+        g_pc_copy_ns += runtime_now_ns() - t0;
         p->cfilled = 1;
         return;
     }
@@ -430,6 +435,7 @@ static void pc_sync(uint64_t fence) {
     pthread_mutex_lock(&g_pc_mu);
     for (int i = 0; i < g_npools; i++)
         if (g_pools[i].cmap && __atomic_load_n(&g_pools[i].used_sub, __ATOMIC_RELAXED) == fence) pc_sync_pool(&g_pools[i]);
+    uint64_t ts = runtime_now_ns();
     for (int k = 0; k < g_npc_pend; k++) {   // this submission's GPU writes: game memory as the GPU starts from it
         pc_range *r = &g_pc_pend[k];
         if (r->fence) continue;
@@ -439,6 +445,7 @@ static void pc_sync(uint64_t fence) {
             g_pc_snap_bytes += r->hi - r->lo;
         }
     }
+    g_pc_copy_ns += runtime_now_ns() - ts;
     g_pc_ns += runtime_now_ns() - t0;
     pthread_mutex_unlock(&g_pc_mu);
     vkb_rw_read_end(&g_pool_mu);
@@ -2425,16 +2432,18 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             if (vkb_pool_copies()) {
                 static uint64_t pci, pcw, pcb, pcn, pck, pcs;
                 pthread_mutex_lock(&g_pc_mu);
-                uint64_t ci = g_pc_in_bytes, cw = g_pc_whole, cb = g_pc_back_bytes, cn = g_pc_ns, ck = g_pc_kept, cs = g_pc_snap_bytes;
+                uint64_t ci = g_pc_in_bytes, cw = g_pc_whole, cb = g_pc_back_bytes, cn = g_pc_ns, ck = g_pc_kept, cs = g_pc_snap_bytes,
+                         cc = g_pc_copy_ns;
                 int pend = g_npc_pend;
                 pthread_mutex_unlock(&g_pc_mu);
+                static uint64_t pcc;
                 VLOG("per frame: pool copies (%.1f MiB of host-visible memory) brought up to date %.2f MiB (%.1f pools untracked: whole) "
-                     "in %.2f ms before the submits, GPU writes into game memory %.3f MiB (snapshots %.3f MiB, %.1f pages with "
-                     "the CPU's newer bytes kept); %d GPU writes not back yet",
+                     "in %.2f ms before the submits (copying %.2f ms, the rest the write watch's scan), GPU writes into game memory "
+                     "%.3f MiB (snapshots %.3f MiB, %.1f pages with the CPU's newer bytes kept); %d GPU writes not back yet",
                      (double)vkb_poolmem_bytes() / 1048576.0, (double)(ci - pci) / 1048576.0 / f, (double)(cw - pcw) / f,
-                     (double)(cn - pcn) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f, (double)(cs - pcs) / 1048576.0 / f,
-                     (double)(ck - pck) / f, pend);
-                pci = ci; pcw = cw; pcb = cb; pcn = cn; pck = ck; pcs = cs;
+                     (double)(cn - pcn) / 1e6 / f, (double)(cc - pcc) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f,
+                     (double)(cs - pcs) / 1048576.0 / f, (double)(ck - pck) / f, pend);
+                pci = ci; pcw = cw; pcb = cb; pcn = cn; pck = ck; pcs = cs; pcc = cc;
             }
             if (vkb_shadow_on()) {
                 static uint64_t pin, pib, pob, pdf, psc, pwp, pwk, pwb, pu0, pu1, pu2;
