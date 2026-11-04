@@ -1098,15 +1098,35 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     vkb_rw_write_end(&g_pool_mu);
     if (to_copy) pc_pend_add(pc_buf, addr, pc_n);
 }
+// Per recording thread, the last pools whose GPU address cannot change for the rest of the submission (no device copy
+// may come: none on this machine or the pool has none for good, or its copy is current): the table's lock and search
+// were taken for every buffer a draw binds (the read lock alone ~7 % of each recording thread on the Steam Deck,
+// 2026-11-04). Valid for one submission and one version of the table (g_pool_gen).
+enum { ADDR_HITS = 4 };
+static __thread struct { uint64_t lo, hi, sub, gen, base; VkBuffer buf; VkDeviceSize boff; } t_addr_hit[ADDR_HITS];
+static __thread unsigned t_addr_next;
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (g_ok != 1) return 0;
+    uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    static int on = -1;   // TOTK_POOL_ADDR_CACHE=0: the table every time, as before (A/B)
+    if (on < 0) { const char *e = getenv("TOTK_POOL_ADDR_CACHE"); on = !(e && *e == '0'); }
+    for (int k = 0; k < ADDR_HITS && on; k++)
+        if (t_addr_hit[k].sub == sub && t_addr_hit[k].gen == gen && addr >= t_addr_hit[k].lo && addr + len <= t_addr_hit[k].hi) {
+            *buf = t_addr_hit[k].buf; *off = t_addr_hit[k].boff + (addr - t_addr_hit[k].base);
+            return 1;
+        }
     vkb_rw_read(&g_pool_mu, LK_POOLS);
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
     if (p) {
-        uint64_t sub = g_fence + 1;
         __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
-        if (p->sh && p->sync_sub == sub) { *buf = p->sbuf; *off = p->soff + (addr - p->base); }
+        int shadow = p->sh && p->sync_sub == sub;
+        if (shadow) { *buf = p->sbuf; *off = p->soff + (addr - p->base); }
         else { *buf = p->buf; *off = addr - p->base; }
+        if (on && (shadow || !vkb_shadow_on() || p->no_shadow)) {
+            unsigned k = t_addr_next++ % ADDR_HITS;
+            t_addr_hit[k].lo = p->lo; t_addr_hit[k].hi = p->hi; t_addr_hit[k].sub = sub; t_addr_hit[k].gen = gen; t_addr_hit[k].base = p->base;
+            t_addr_hit[k].buf = *buf; t_addr_hit[k].boff = shadow ? p->soff : 0;
+        }
     }
     vkb_rw_read_end(&g_pool_mu);
     return p != NULL;
@@ -2984,6 +3004,7 @@ static void *mt_thread(void *arg) {
     snprintf(name, sizeof name, "totk-record-%d", t_worker);
     pthread_setname_np(name);
     { void plat_thread_boost(void); plat_thread_boost(); }   // the frame waits for these, as for the translation thread
+    { const char *e = getenv("TOTK_DIRTY_SHARED"); if (!(e && *e == '0')) nvn_dirty_epoch_reader(); }   // its texture checks use the submission's write watch scans (nvn_dirty_win.c; =0: own scans, as before)
     for (;;) {
         pthread_mutex_lock(&g_mt_mu);
         while (g_mt_next >= g_mt_avail) pthread_cond_wait(&g_mt_cv, &g_mt_mu);
