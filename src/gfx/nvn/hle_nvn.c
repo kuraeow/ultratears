@@ -2466,6 +2466,48 @@ int totk_drs_enabled(void) {
     if (on < 0) { const char *e = getenv("TOTK_DRS"); on = e && atoi(e) > 0; LOG("[nvn] dynamic resolution %s (TOTK_DRS)", on ? "on" : "off: fixed scene size"); }
     return on;
 }
+/* Recall / Ultrahand target (tools/lifter/patches.py, ability_target_guard): is the actor the ability is about to use
+   a live one? Its link record must point back to it and carry its id, the test the game's own link code relies on
+   (main+0x155ec). Every pointer is checked to lie in the guest window before it is read. The first target that passes
+   and each one skipped (the first 20, then at powers of two) are logged, a skip with the owner's request (+0x678:
+   status +0x28, slot +0x30, index and counters +0x34..+0x37) and the first words of the result record and the actor.
+   TOTK_ABILITY_GUARD=0: the shipping code (no test). */
+static int totk_guest_ptr(uint64_t p, uint64_t span) { return p >= 0x800000000ull && p + span < 0x8000000000ull && !(p & 7); }
+static uint64_t totk_peek64(uint64_t p) { return totk_guest_ptr(p, 8) ? *(volatile uint64_t *)(uintptr_t)p : 0; }
+int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor) {
+    static int on = -1;
+    static _Atomic uint64_t checked, skipped;
+    if (on < 0) { const char *e = getenv("TOTK_ABILITY_GUARD"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return 1;
+    uint64_t k = ++checked;
+    const char *why = NULL;
+    uint64_t link = 0, comp = 0, sub = 0;
+    if (!totk_guest_ptr(actor, 0x230)) why = "actor address";
+    else if (link = *(volatile uint64_t *)(uintptr_t)(actor + 0x1a8), !totk_guest_ptr(link, 0x50)) why = "link record address";
+    else if (*(volatile uint64_t *)(uintptr_t)(link + 0x40) != actor) why = "link record does not point back";
+    else if (*(volatile uint32_t *)(uintptr_t)(link + 0x48) != *(volatile uint32_t *)(uintptr_t)(actor + 0x10)) why = "actor id";
+    else if ((comp = *(volatile uint64_t *)(uintptr_t)(actor + 0x228)) && !totk_guest_ptr(comp, 0xb8)) why = "component address";
+    else if (comp && (sub = *(volatile uint64_t *)(uintptr_t)(comp + 0xb0)) && !totk_guest_ptr(sub, 0x98)) why = "component target address";
+    if (!why) {
+        if (k == 1) LOG("[totk] ability target: first one checked, live (TOTK_ABILITY_GUARD=0: no test)");
+        return 1;
+    }
+    uint64_t n = ++skipped;
+    if (n <= 20 || !(n & (n - 1))) {
+        uint64_t rq = owner + 0x678, w28 = totk_peek64(rq + 0x28), w30 = totk_peek64(rq + 0x30);
+        LOG("[totk] ability target: stale one skipped (%s): owner %#llx result %#llx actor %#llx link %#llx; %llu skipped of "
+            "%llu; request status %u slot %d index %d counters %02x %02x %02x; result record %016llx %016llx %016llx %016llx; "
+            "actor %016llx %016llx %016llx %016llx", why, (unsigned long long)owner, (unsigned long long)result,
+            (unsigned long long)actor, (unsigned long long)link, (unsigned long long)n, (unsigned long long)k,
+            (unsigned)(uint32_t)w28, (int)(uint32_t)w30, (int)(int8_t)(w30 >> 32), (unsigned)(uint8_t)(w30 >> 40),
+            (unsigned)(uint8_t)(w30 >> 48), (unsigned)(uint8_t)(w30 >> 56), (unsigned long long)totk_peek64(result),
+            (unsigned long long)totk_peek64(result + 8), (unsigned long long)totk_peek64(result + 16),
+            (unsigned long long)totk_peek64(result + 24), (unsigned long long)totk_peek64(actor),
+            (unsigned long long)totk_peek64(actor + 8), (unsigned long long)totk_peek64(actor + 16),
+            (unsigned long long)totk_peek64(actor + 24));
+    }
+    return 0;
+}
 
 #define FRAME_CONTROLLER_LR 0x8002db2ecull
 static uint64_t g_frame_ctl;   // the controller's state (guest address)
