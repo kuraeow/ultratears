@@ -227,6 +227,7 @@ static int fz_thaw(uint64_t i) {
     if (s == FZ_FROZEN) atomic_fetch_sub(&g_fz_frozen_now, 1);
     return 1;
 }
+static volatile int g_fz_diag_rc, g_fz_diag_b;   // fz_report: the last unfrozen fault's mprotect errno, how many
 // SIGSEGV at fa (crash_handler, any thread): a write into a frozen region. Async-signal-safe (atomics, mprotect).
 static int fz_fault(uint64_t fa) {
     if (!g_fz_on || fa < g_watch_lo || fa >= g_watch_hi) return 0;
@@ -238,13 +239,37 @@ static int fz_fault(uint64_t fa) {
         static __thread uint64_t last;
         if (atomic_load(&g_fz_strikes[i]) == 255 || last == fa) { last = 0; return 0; }
         last = fa;
-        mprotect((void *)(uintptr_t)fz_lo(i), fz_hi(i) - fz_lo(i), PROT_READ | PROT_WRITE);
+        g_fz_diag_rc = mprotect((void *)(uintptr_t)fz_lo(i), fz_hi(i) - fz_lo(i), PROT_READ | PROT_WRITE) ? errno : 0;
+        g_fz_diag_b++;
         return 1;
     }
     uint8_t k = atomic_load(&g_fz_strikes[i]);
     if (k < 254) atomic_store(&g_fz_strikes[i], k + 1);
     atomic_fetch_add(&g_fz_thaws, 1);
     return 1;
+}
+// A fault in the guest window that fz_fault did not cure (crash_handler, the process ends after it): what the frozen
+// regions knew of it and the kernel's mapping there, for the log (the Steam Deck's signal 11 of 2026-11-04).
+#include <sys/utsname.h>
+static void fz_report(uint64_t fa, int code, long err) {
+    if (!g_fz_on || fa < g_watch_lo || fa >= g_watch_hi) return;
+    uint64_t i = (fa - g_watch_lo) >> FZ_SHIFT;
+    struct utsname u;
+    if (uname(&u)) u.release[0] = 0;
+    fprintf(stderr, "[fz] fault %#llx (si_code %d, error %#lx): region %llu state %u strikes %u hold %s; unfrozen faults %d, "
+                    "last mprotect errno %d; frozen %llu MiB, thaws %llu; kernel %s\n",
+            (unsigned long long)fa, code, err, (unsigned long long)i, (unsigned)atomic_load(&g_fz[i]),
+            (unsigned)atomic_load(&g_fz_strikes[i]), atomic_load(&g_fz_hold[i]) > plat_now_ns() ? "on" : "off", g_fz_diag_b,
+            g_fz_diag_rc, (unsigned long long)atomic_load(&g_fz_frozen_now) * 2, (unsigned long long)atomic_load(&g_fz_thaws),
+            u.release);
+    FILE *m = fopen("/proc/self/maps", "r");   // the mappings around it
+    char line[512];
+    while (m && fgets(line, sizeof line, m)) {
+        unsigned long long lo, hi;
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && hi > fz_lo(i) - (4ull << 20) && lo < fz_hi(i) + (4ull << 20))
+            fprintf(stderr, "[fz]   %s", line);
+    }
+    if (m) fclose(m);
 }
 static void fz_thaw_range(uint64_t lo, uint64_t hi, int hold) {
     if (!g_fz_on || hi <= g_watch_lo || lo >= g_watch_hi) return;
@@ -518,6 +543,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     if (sig != SIGSEGV || (fa & ~0xFFFull) != (sp & ~0xFFFull)) lr = *(uint64_t *)(uintptr_t)sp;
 #endif
     if (sig == SIGSEGV && fz_fault(fa)) return;   // a write into a frozen region of the write watch
+#if defined(__x86_64__)
+    if (sig == SIGSEGV) fz_report(fa, si->si_code, (long)uc->uc_mcontext.gregs[REG_ERR]);
+#else
+    if (sig == SIGSEGV) fz_report(fa, si->si_code, 0);
+#endif
     if (rt_fault_watch(fa, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
