@@ -1527,14 +1527,15 @@ static void gpu_time_end(int slot, VkCommandBuffer cb) {   // into the submissio
 // A submission whose recording took over 100 ms: where the time went (log line "long submission"). The game waits for
 // its recording at the present: these are the hitches when new parts of the world arrive.
 extern uint64_t vkb_astc_ns, vkb_shader_load_ns;
-static uint64_t g_sub_t0, g_sub_snap[11];
-static void sub_snap(uint64_t v[11]) {
+static uint64_t g_sub_t0, g_sub_snap[14];
+static void sub_snap(uint64_t v[14]) {
     v[0] = vkb_step_ns[PK_CREATE]; v[1] = vkb_step_ns[PK_UPLOAD]; v[2] = vkb_astc_ns; v[3] = vkb_shader_load_ns;
     v[4] = g_sh_scan_ns; v[5] = g_sh_in_bytes;
     v[6] = vkb_step_ns[PK_ALLOC]; v[7] = vkb_step_ns[PK_UCAP]; v[8] = vkb_step_ns[PK_SYNC]; v[9] = vkb_step_ns[PK_SUBMIT]; v[10] = g_slot_wait_ns;
+    v[11] = vkb_step_ns[PK_UPWAIT]; v[12] = vkb_step_ns[PK_SLOWDRAW]; v[13] = vkb_step_n[PK_SLOWDRAW];
 }
 static void sub_long_check(uint64_t fence) {
-    uint64_t now = runtime_now_ns(), v[11];
+    uint64_t now = runtime_now_ns(), v[14];
     if (!g_sub_t0 || now - g_sub_t0 < 100000000ull) return;
     sub_snap(v);
     static int said;
@@ -1546,6 +1547,9 @@ static void sub_long_check(uint64_t fence) {
              (v[2] - g_sub_snap[2]) / 1e6, (v[3] - g_sub_snap[3]) / 1e6, (v[6] - g_sub_snap[6]) / 1e6, (v[7] - g_sub_snap[7]) / 1e6,
              (v[4] - g_sub_snap[4]) / 1e6, (v[5] - g_sub_snap[5]) / 1048576.0, (unsigned long long)vkb_draw_count(),
              (v[9] - g_sub_snap[9]) / 1e6, (v[8] - g_sub_snap[8]) / 1e6);
+    if (said <= 64)
+        VLOG("long submission %llu: uploads waiting for one another %.0f ms; draw calls over 1 ms after a shader change %llu, %.0f ms",
+             (unsigned long long)fence, (v[11] - g_sub_snap[11]) / 1e6, (unsigned long long)(v[13] - g_sub_snap[13]), (v[12] - g_sub_snap[12]) / 1e6);
 }
 
 int mtl_slot_free(void) {   // a submission can begin without waiting for the GPU (work that can wait checks first)

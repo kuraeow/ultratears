@@ -1367,10 +1367,16 @@ static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P);
 // Several threads recording: into the submission's prologue, which runs before every chunk (the CPU wrote the bytes
 // before the submission, so earlier is as good; a GPU write to the image in a chunk still comes after it).
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;   // one upload at a time: the ASTC batch is shared
+static void up_lock(void) {   // g_up_mu; a wait for another thread's upload counts (the long-submission line)
+    if (!pthread_mutex_trylock(&g_up_mu)) return;
+    uint64_t t0 = runtime_now_ns();
+    pthread_mutex_lock(&g_up_mu);
+    vkb_step_add(PK_UPWAIT, t0);
+}
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     uint64_t stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     if (vkb_mt_recording() && __atomic_load_n(&im->uploading, __ATOMIC_ACQUIRE)) {   // another thread is uploading it: its
-        pthread_mutex_lock(&g_up_mu);                                                 // image may change (BC7), wait
+        up_lock();                                                                     // image may change (BC7), wait
         pthread_mutex_unlock(&g_up_mu);
         stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     }
@@ -1380,7 +1386,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (vkb_mt_recording()) {
         uplan P;
         int planned = plan_prepare(im, &P);   // the bytes, outside the lock
-        pthread_mutex_lock(&g_up_mu);
+        up_lock();
         vkb_pro_begin();
         r = planned ? plan_record(vkb_cmd(), im, &P) : 0;
         if (r == 2) r = 0;

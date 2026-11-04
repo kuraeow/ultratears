@@ -2445,7 +2445,8 @@ void vkb_draw(const uint8_t *a, int indexed) {
     if (S.has_ms && S.ms.enable && S.ms.samples > 1) vkb_audit(A_MULTISAMPLE, fs ? fs->key : vs->key);
     if (vkb_render_suppressed()) vkb_audit(A_RENDER_DISABLED, fs ? fs->key : vs->key);
     VkShaderEXT objs[5] = {vobj, fs ? fs->obj : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    if (dyn(D_SHADERS, objs, sizeof objs)) vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
+    int shaders_changed = 0;
+    if (dyn(D_SHADERS, objs, sizeof objs)) { shaders_changed = 1; vk.vkCmdBindShadersEXT(cb, 5, stages, objs); }
     set_dynamic_state(cb, vkb_rt_count(), vkb_rt_extent(), topo);
     if (vkc.has_feedback_dynamic) {   // required state with shader objects once the feature is enabled
         VkImageAspectFlags loop = (g_fb & 0xFF ? VK_IMAGE_ASPECT_COLOR_BIT : 0) | (g_fb & VKB_FB_DEPTH ? g_fb_rt[8]->aspect : 0);
@@ -2490,6 +2491,9 @@ void vkb_draw(const uint8_t *a, int indexed) {
         }
         VkIndexType it = di->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         vk.vkCmdBindIndexBuffer(cb, buf, off, it);
+    }
+    uint64_t draw_t0 = shaders_changed ? runtime_now_ns() : 0;
+    if (indexed) {
         int gq = gprof_begin();
         vk.vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         gprof_end(gq, fs ? fs : vs, 0, (uint32_t)di->count, inst);
@@ -2497,6 +2501,10 @@ void vkb_draw(const uint8_t *a, int indexed) {
         int gq = gprof_begin();
         vk.vkCmdDraw(cb, (uint32_t)dr->count, inst, (uint32_t)dr->first, (uint32_t)dr->base_instance);
         gprof_end(gq, fs ? fs : vs, 0, (uint32_t)dr->count, inst);
+    }
+    if (draw_t0) {   // the long-submission line: a draw call after a shader change that took over 1 ms (the driver)
+        uint64_t dt = runtime_now_ns() - draw_t0;
+        if (dt > 1000000) { atomic_fetch_add_explicit(&vkb_step_ns[PK_SLOWDRAW], dt, memory_order_relaxed); atomic_fetch_add_explicit(&vkb_step_n[PK_SLOWDRAW], 1, memory_order_relaxed); }
     }
     obj_motion_draw(cb, vs, indexed, di, dr, inst, int_inputs, sint);   // a moving object's motion (FSR 3.1)
     if (vs->stores || (fs && fs->stores)) {

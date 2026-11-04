@@ -675,7 +675,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (fstat(fd, &st)) runtime_fail("host save stat");
     if ((uint64_t)offset + size > (uint64_t)st.st_size && !(mode & OPEN_APPEND)) return R_APPEND_REQUIRED;
     if (f->save) save_touched();
-    uint64_t done = 0;
+    uint64_t done = 0, t0 = runtime_now_ns();
     while (done < size) {
         ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done);
         if (n <= 0) {
@@ -686,7 +686,12 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         }
         done += (uint64_t)n;
     }
-    if (option && (*option & 1)) fsync(fd);
+    // The write is in the system's cache (later reads see it); a flush goes to the disk on the sync thread, as Commit
+    // does: on the game's thread it stopped the game for 0.5-0.8 s at each autosave on the Steam Deck (2026-11-05:
+    // pairs of long frames with no file read, decompression or GPU wait in them).
+    if (option && (*option & 1)) sync_later(fd);
+    atomic_fetch_add(&g_fs_ns, runtime_now_ns() - t0);
+    atomic_fetch_add(&g_fs_bytes, size);
     return 0;
 }
 static unsigned file_size(int64_t *out, uint64_t h) {
@@ -704,7 +709,7 @@ static unsigned set_file_size(uint64_t h, int64_t size) {
     if (files[h - FILE_BASE].save) save_touched();
     return _chsize_s(fd, size) ? errno_result() : 0;
 }
-static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fsync(fd); return 0; }
+static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; sync_later(fd); return 0; }   // (as above)
 static void close_file(uint64_t h) {
     if (romfs_handle(h)) { romfs_close(h); return; }
     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");

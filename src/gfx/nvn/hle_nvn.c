@@ -3092,7 +3092,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
               if (r->fs_ms >= 1 || r->zstd_ms >= 1 || r->gw_ms >= 1) {   // what the game itself waited for (all its threads)
-                  char gb[128]; snprintf(gb, sizeof gb, "; game: file reads %.1f ms (%.1f MiB), decompression %.1f ms, GPU waits %.1f ms",
+                  char gb[128]; snprintf(gb, sizeof gb, "; game: file I/O %.1f ms (%.1f MiB), decompression %.1f ms, GPU waits %.1f ms",
                                          r->fs_ms, r->fs_mb, r->zstd_ms, r->gw_ms); strlcat(b, gb, sizeof b); }
               if (r->log_ms >= 0.1) {   // the log's own writes this frame (unbuffered: each one a write to the file)
                   char lb[64]; snprintf(lb, sizeof lb, "; log %u writes / %.1f ms", r->log_n, r->log_ms); strlcat(b, lb, sizeof b); }
