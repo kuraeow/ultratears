@@ -377,6 +377,7 @@ void plat_sleep_until_ns(uint64_t t) {
 // vsync thread on time while the guest threads load every core.
 void plat_thread_boost(void) {}   // [temporary] Linux / Steam Deck: nice / SCHED_* for the replay thread - with the Deck port
 void plat_thread_background(void) { setpriority(PRIO_PROCESS, (id_t)gettid(), 10); }   // (per thread on Linux)
+void plat_thread_nice(int n) { if (n > 0) setpriority(PRIO_PROCESS, (id_t)gettid(), n > 19 ? 19 : n); }
 // (a page the game protected - SetMemoryPermission - fails the copy instead of faulting)
 #include <sys/uio.h>
 int plat_safe_read(void *dst, const void *src, size_t n) {

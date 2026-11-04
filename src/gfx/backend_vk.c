@@ -3004,7 +3004,10 @@ static void *mt_thread(void *arg) {
     snprintf(name, sizeof name, "totk-record-%d", t_worker);
     pthread_setname_np(name);
     { void plat_thread_boost(void); plat_thread_boost(); }   // the frame waits for these, as for the translation thread
-    { const char *e = getenv("TOTK_DIRTY_SHARED"); if (!(e && *e == '0')) nvn_dirty_epoch_reader(); }   // its texture checks use the submission's write watch scans (nvn_dirty_win.c; =0: own scans, as before)
+    { const char *e = getenv("TOTK_DIRTY_SHARED"); if (!(e && *e == '0')) nvn_dirty_epoch_reader(); }
+    // TOTK_RECORD_NICE=<n> (experiment): this thread below the game's threads, which hold the three virtual cores and
+    // waited 55-86 ms a frame for one on the Steam Deck while the cores were 68 % busy (2026-11-05)
+    { const char *e = getenv("TOTK_RECORD_NICE"); void plat_thread_nice(int); if (e && *e) plat_thread_nice(atoi(e)); }   // its texture checks use the submission's write watch scans (nvn_dirty_win.c; =0: own scans, as before)
     for (;;) {
         pthread_mutex_lock(&g_mt_mu);
         while (g_mt_next >= g_mt_avail) pthread_cond_wait(&g_mt_cv, &g_mt_mu);

@@ -214,6 +214,7 @@ void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIO
 
 void plat_thread_start(void) {}   // the vectored exception handler needs no stack of its own
 void plat_thread_background(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+void plat_thread_nice(int n) { if (n > 0) SetThreadPriority(GetCurrentThread(), n >= 10 ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_BELOW_NORMAL); }
 // (decommitted pages of the guest window: the copy fails instead of raising an access violation)
 int plat_safe_read(void *dst, const void *src, size_t n) {
     SIZE_T got = 0;
