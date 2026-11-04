@@ -229,6 +229,7 @@ void vkb_tsr_rec_rt(void);                             // recording, after a ren
 int vkb_tsr_jitter(const p_set_rt *rt, float *jx, float *jy);   // the viewport offset of a draw into these targets
 int vkb_tsr_rec_draw(const p_set_rt *rt);              // recording a draw: 1 when FSR ran in place of it (skip it)
 int vkb_tsr_fs_easu(const char *key);
+float vkb_tsr_lod_bias(void);                          // added to mipmapped samplers' LOD bias while FSR 3.1 is on
 
 // ---- vkb_mt.c: submissions recorded by several threads (2026-10-24)
 // The translation thread walks a submission once in order (vkb_mt_submit): render state, events and counters,

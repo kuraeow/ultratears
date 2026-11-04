@@ -488,7 +488,8 @@ static VkSampler sampler_of(int id, int point) {
         .minFilter = p->minf == 1 || p->minf == 3 || p->minf == 5 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .mipmapMode = p->minf == 4 || p->minf == 5 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = wrap(p->ws), .addressModeV = wrap(p->wt), .addressModeW = wrap(p->wr),
-        .mipLodBias = p->lod_bias, .anisotropyEnable = p->aniso > 1.0f, .maxAnisotropy = p->aniso > 16.0f ? 16.0f : p->aniso,
+        .mipLodBias = p->lod_bias + (mip ? vkb_tsr_lod_bias() : 0.0f),   // a lower scene size under FSR 3.1: sharper mips
+        .anisotropyEnable = p->aniso > 1.0f, .maxAnisotropy = p->aniso > 16.0f ? 16.0f : p->aniso,
         .compareEnable = p->cmp_mode == 1, .compareOp = (VkCompareOp)(p->cmp_func ? p->cmp_func - 1 : 7),
         .minLod = p->lod_min, .maxLod = mip ? p->lod_max : 0.25f,   // no mipmap filter: the base level only (GL)
         .borderColor = border};
@@ -2073,8 +2074,29 @@ void vkb_draw_tsr_walk(void) {
     vkb_tsr_walk_draw(vkb_rt(), S.ubo[0][1].addr, S.ubo[0][1].size, fs);
 }
 
+// The game's FXAA under FSR 3.1 (vkb_tsr.c): its source, the tonemapped scene, copied into its target (the light target)
+// as it is; FSR anti-aliases it instead. 0: not done (the FXAA draw goes ahead).
+static int fxaa_copy(void) {
+    if (!resolve_program() || !S.sh[1] || S.sh[1]->ntex < 1) return 0;
+    const p_set_rt *rt = vkb_rt();
+    const view_t *v = NULL;
+    vkb_image *src = handle_image(S.tex[1][S.sh[1]->tex[0].slot], &v), *dst = rt->n > 0 && rt->color[0] ? vkb_image_of(rt->color[0]) : NULL;
+    if (!src || !dst || src == dst || src->format != dst->format || src->width != dst->width || src->height != dst->height) return 0;
+    vkb_pass_end_r(PE_OTHER);
+    VkCommandBuffer cb = vkb_cmd();
+    vkb_image_use(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    vkb_image_use(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy c = {{src->aspect, 0, 0, 1}, {0, 0, 0}, {dst->aspect, 0, 0, 1}, {0, 0, 0}, {dst->width, dst->height, 1}};
+    vk.vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    vkb_image_written(dst);
+    return 1;
+}
+
 void vkb_draw(const uint8_t *a, int indexed) {
-    if (vkb_tsr_rec_draw(vkb_rt())) return;   // the game's EASU draw, replaced by FSR 3.1 (vkb_tsr.c)
+    {   // FSR 3.1 (vkb_tsr.c): 1 it ran in place of the game's EASU draw; 2 the game's FXAA draw is replaced by a copy
+        int t = vkb_tsr_rec_draw(vkb_rt());
+        if (t == 1 || (t == 2 && fxaa_copy())) return;
+    }
     big_init();
     fixed_buffers();
     vkb_audit_draw_begin();

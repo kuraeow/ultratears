@@ -47,8 +47,10 @@
 
 int totk_output_size(uint64_t *packed);   // host/render_res.c
 
-// The game's FSR 1 EASU fragment shader (the scaling draw FSR 3.1 replaces), by the key's first hex digits.
+// The game's FSR 1 EASU fragment shader (the scaling draw FSR 3.1 replaces) and its FXAA (after the tonemap, into the
+// light target: replaced by a copy of its source, FSR 3.1 anti-aliases instead), by the key's first hex digits.
 static const char *const EASU_FS[] = {"ac58fc18eda5"};
+static const char *const FXAA_FS[] = {"22a61cb1ec73"};
 enum { CAM_BYTES = 0x940, SCENE_MIN_W = 640 };
 
 // ---------------------------------------------------------------- settings
@@ -67,9 +69,28 @@ static int mode(void) {
 }
 int vkb_tsr_on(void) { return mode() == 1 && vkb_ready(); }
 
+// The texture LOD bias for a scene drawn smaller than the output (AMD's advice for FSR: log2(render / display) - 1),
+// from the scale setting at the start (render_res.c: unset is the game's 5/6). TOTK_AA_LODBIAS=<value> overrides.
+float vkb_tsr_lod_bias(void) {
+    static float bias = 1e9f;
+    if (bias > 1e8f) {
+        bias = 0;
+        if (mode() == 1) {
+            const char *s = getenv("TOTK_RENDER_SCALE"), *o = getenv("TOTK_AA_LODBIAS");
+            double k = s && *s ? atof(s) / 100.0 : 5.0 / 6.0;
+            if (k < 0.25 || k > 4) k = 5.0 / 6.0;
+            bias = (float)(log2(k) - 1.0);
+            if (bias > 0) bias = 0;
+            if (o && *o) bias = (float)atof(o);
+            VLOG("antialiasing: texture LOD bias %.2f", bias);
+        }
+    }
+    return bias;
+}
+
 // ---------------------------------------------------------------- the walk: where the scene is
 enum { PH_IDLE, PH_SCENE, PH_ARMED, PH_ENDED, PH_DONE };
-enum { EV_JIT_ON = 1, EV_JIT_OFF, EV_FSR };
+enum { EV_JIT_ON = 1, EV_JIT_OFF, EV_FSR, EV_FXAA };
 typedef struct {
     tex_t color, depth;      // the light target and the scene depth (copies: the game copies texture objects by value)
     float m[16];             // this frame's clip space to last frame's, column-major (tsr_mv.comp)
@@ -309,6 +330,12 @@ void vkb_tsr_walk_draw(const p_set_rt *rt, uint64_t c4_addr, uint64_t c4_size, c
         if (c4_size == CAM_BYTES && c4_addr && !W.cam_addr) W.cam_addr = c4_addr;
         return;
     }
+    // the game's FXAA into the light target, after the scene: a copy of its source instead (vkb_draw.c fxaa_copy)
+    if (W.phase == PH_ENDED && W.have_color && rt->n == 1 && rt->color[0] && rt->color[0]->mem == W.color.mem && fs_key &&
+        !strncmp(fs_key, FXAA_FS[0], strlen(FXAA_FS[0]))) {
+        ev_add(EV_FXAA, -1);
+        return;
+    }
     if ((W.phase == PH_ENDED || W.phase == PH_ARMED) && W.have_color && rt->n == 1 && !rt->depth && rt->color[0]) {
         uint32_t ow, oh;
         output_size(&ow, &oh);
@@ -439,7 +466,18 @@ static void img_free(gimg *g) {
     memset(g, 0, sizeof *g);
 }
 
+static const fsr3_pass_code *g_passes = fsr3_passes;   // fsr3_passes_h where the GPU does half maths (pipelines)
+
 static int pipelines(void) {
+    {   // the SDK's 16-bit permutation where the GPU takes it (shaderFloat16, shaderInt16): faster on AMD (the Steam Deck)
+        VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+        vk.vkGetPhysicalDeviceFeatures2(vkc.gpu, &f2);
+        const char *e = getenv("TOTK_AA_FP16");
+        int half = f12.shaderFloat16 && f2.features.shaderInt16 && !(e && *e == '0');
+        g_passes = half ? fsr3_passes_h : fsr3_passes;
+        VLOG("antialiasing: FSR 3.1 with %s maths", half ? "16-bit" : "32-bit");
+    }
     VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 0}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0},
                                   {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0}, {VK_DESCRIPTOR_TYPE_SAMPLER, 0}};
     for (int p = 0; p < NPASS; p++) {
@@ -449,7 +487,7 @@ static int pipelines(void) {
         size_t size;
         VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
         if (p < FSR3_NPASS) {
-            const fsr3_pass_code *pc = &fsr3_passes[p];
+            const fsr3_pass_code *pc = &g_passes[p];
             for (uint32_t i = 0; i < pc->nb && nb < 24; i++) {
                 static const VkDescriptorType kt[] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                                       VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLER};
@@ -473,7 +511,7 @@ static int pipelines(void) {
                                     .setLayoutCount = 1, .pSetLayouts = &F.dsl[p], .pushConstantRangeCount = p == FSR3_NPASS,
                                     .pPushConstantRanges = &pr};
         if (vk.vkCreateShadersEXT(vkc.device, 1, &ci, NULL, &F.sh[p]) != VK_SUCCESS) {
-            VLOG("antialiasing: the %s pass could not be made", p < FSR3_NPASS ? fsr3_passes[p].name : "motion");
+            VLOG("antialiasing: the %s pass could not be made", p < FSR3_NPASS ? g_passes[p].name : "motion");
             return 0;
         }
     }
@@ -591,7 +629,7 @@ static int resource_of(const char *n, const bind_ctx *x, VkImageView *view) {   
 }
 
 static void dispatch(VkCommandBuffer cb, VkDescriptorSet set, int p, const bind_ctx *x, uint32_t gx, uint32_t gy) {
-    const fsr3_pass_code *pc = &fsr3_passes[p];
+    const fsr3_pass_code *pc = &g_passes[p];
     VkWriteDescriptorSet w[24];
     VkDescriptorImageInfo ii[24];
     VkDescriptorBufferInfo bi[24];
@@ -799,8 +837,9 @@ out:
 }
 
 // A draw being recorded: 1 when it is the EASU draw FSR replaced (FSR ran; the draw is skipped).
-int vkb_tsr_rec_draw(const p_set_rt *rt) {
+int vkb_tsr_rec_draw(const p_set_rt *rt) {   // 1: FSR ran in place of this draw; 2: the FXAA draw (vkb_draw.c copies)
     if (!atomic_load_explicit(&g_nev, memory_order_relaxed)) return 0;
+    if (ev_here(EV_FXAA)) return 2;
     const tsr_event *e = ev_here(EV_FSR);
     if (!e || e->job < 0 || rt->n < 1 || !rt->color[0]) return 0;
     vkb_image *target = vkb_image_of(rt->color[0]);
