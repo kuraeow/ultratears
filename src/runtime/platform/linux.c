@@ -191,7 +191,7 @@ static int scan_range(uint64_t at, uint64_t end, uint64_t *pages, int n, int max
    thaws again and again waits longer each time (the threshold doubles, up to FZ_MAX). The kernel's own writes would not
    fault but fail (EFAULT), so plat_commit (called before file reads into guest memory) thaws and holds regions for
    2 s; a region the game changes the protection of (plat_protect) is never frozen. As totk-pc-recomp's 2 MiB
-   snapshot regions (runtime/vk_memory.c), our own code. TOTK_WATCH_FREEZE=0: off. */
+   snapshot regions (runtime/vk_memory.c), our own code. TOTK_WATCH_FREEZE=1: on (off by default, see fz_init). */
 enum { FZ_SHIFT = 21, FZ_IDLE = 8, FZ_MAX = 240, FZ_FREEZING = 254, FZ_FROZEN = 255 };
 static _Atomic uint8_t *g_fz;          // per region: scans in a row with nothing written, or FZ_FREEZING / FZ_FROZEN
 static _Atomic uint8_t *g_fz_strikes;  // per region: thaws by a write (255: never freeze)
@@ -201,8 +201,10 @@ static int g_fz_on;
 static _Atomic uint64_t g_fz_frozen_now, g_fz_thaws, g_fz_skipped;
 
 static void fz_init(void) {
+    // [temporary] off by default (=1: on): on the Steam Deck (2026-11-04) the main thread's write into a thawed region
+    // faulted again and again (signal 11 at the title menu, 584 MiB frozen) - not understood yet
     const char *e = getenv("TOTK_WATCH_FREEZE");
-    if (e && !strcmp(e, "0")) return;
+    if (!(e && !strcmp(e, "1"))) return;
     g_fz_n = (g_watch_hi - g_watch_lo + (1ull << FZ_SHIFT) - 1) >> FZ_SHIFT;
     g_fz = calloc(g_fz_n, 1);
     g_fz_strikes = calloc(g_fz_n, 1);
