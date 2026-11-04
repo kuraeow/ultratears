@@ -194,7 +194,9 @@ static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1
    TOTK_PRIO_INHERIT=0: raw priorities, as before. Holding G. */
 static int pi_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = !(e && *e == '0'); }
+    // [temporary] off by default (=1: on): on the PC, 2026-11-04 evening, the game itself stalled 65-420 ms ~8x as
+    // often as the night before with it (and the spin below) on; to be told apart and measured before it comes back
+    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = e && *e == '1'; }
     return on;
 }
 static int eff_prio(const thr_t *o) {
@@ -243,7 +245,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     // microseconds (a worker's job ends, an SVC hands it over), and a sleep costs the host's wake latency on top
     // (15-20 us on the Steam Deck, 2026-11-04). core_grant sets cur_core under G; reading it here without G is a hint.
     static int64_t spin_ns = -1;
-    if (spin_ns < 0) { const char *e = getenv("TOTK_CORE_SPIN_US"); spin_ns = (e && *e ? atoll(e) : 20) * 1000; }
+    if (spin_ns < 0) { const char *e = getenv("TOTK_CORE_SPIN_US"); spin_ns = (e && *e ? atoll(e) : 0) * 1000; }   // [temporary] 0 by default, see pi_on
     if (spin_ns > 0) {
         g_unlock();
         uint64_t s0 = now_ns();
