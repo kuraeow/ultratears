@@ -376,6 +376,13 @@ void plat_sleep_until_ns(uint64_t t) {
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.
 void plat_thread_boost(void) {}   // [temporary] Linux / Steam Deck: nice / SCHED_* for the replay thread - with the Deck port
+void plat_thread_background(void) { setpriority(PRIO_PROCESS, (id_t)gettid(), 10); }   // (per thread on Linux)
+// (a page the game protected - SetMemoryPermission - fails the copy instead of faulting)
+#include <sys/uio.h>
+int plat_safe_read(void *dst, const void *src, size_t n) {
+    struct iovec l = {dst, n}, r = {(void *)src, n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+}
 
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;

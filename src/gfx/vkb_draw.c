@@ -55,6 +55,7 @@ static VkDeviceSize g_spare_bytes;
 static pthread_mutex_t g_spare_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_ring_reused;
 static void chunk_destroy(chunk_t *c);
+static __thread int t_reserving;   // vkb_ring_reserve's thread making chunks ahead
 static int spare_take(chunk_t *c, VkDeviceSize size) {   // the smallest spare chunk of at least size
     pthread_mutex_lock(&g_spare_mu);
     int best = -1;
@@ -71,7 +72,7 @@ static int spare_take(chunk_t *c, VkDeviceSize size) {   // the smallest spare c
     return best >= 0;
 }
 static int chunk_new(chunk_t *c, VkDeviceSize size) {
-    if (spare_take(c, size)) return 1;
+    if (!t_reserving && spare_take(c, size)) return 1;
     uint64_t t0 = runtime_now_ns();
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -96,8 +97,48 @@ static int chunk_new(chunk_t *c, VkDeviceSize size) {
     uint64_t now = atomic_fetch_add(&g_ring_bytes, size) + size, p = atomic_load(&g_ring_peak);
     while (now > p && !atomic_compare_exchange_weak(&g_ring_peak, &p, now)) {}
     atomic_fetch_add(&g_ring_made, 1);
-    vkb_step_add(PK_ALLOC, t0);
+    if (!t_reserving) vkb_step_add(PK_ALLOC, t0);   // (made ahead: no submission waited for it)
     return 1;
+}
+// Upload memory made ahead, off the recording threads (vkb_tex.c's prefetch thread, when textures were initialized that
+// will be uploaded soon): a burst of uploads - a place streaming in, a respawn - grew the rings by hundreds of MiB in one
+// submission, made by the driver there (memory made 24-200 ms in one submission, 2026-11-04). Chunks of RING_MAX up to
+// `bytes` (at most RESERVE_MAX) wait among the spares; past SPARE_MAX they go back RESERVE_HOLD after the last reserve.
+enum { RESERVE_MAX = 256u << 20 };
+#define RESERVE_HOLD 5000000000ull
+static _Atomic uint64_t g_reserve_at, g_reserved;
+void vkb_ring_reserve(uint64_t bytes) {
+    if (bytes > RESERVE_MAX) bytes = RESERVE_MAX;
+    atomic_store(&g_reserve_at, runtime_now_ns());
+    for (;;) {
+        pthread_mutex_lock(&g_spare_mu);
+        int room = g_spare_bytes < bytes && g_nspare < NSPARE;
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!room) return;
+        chunk_t c;
+        t_reserving = 1;
+        int made = chunk_new(&c, RING_MAX);
+        t_reserving = 0;
+        if (!made) return;
+        pthread_mutex_lock(&g_spare_mu);
+        int kept = g_nspare < NSPARE;
+        if (kept) { g_spare[g_nspare++] = c; g_spare_bytes += c.size; }
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!kept) { chunk_destroy(&c); return; }
+        atomic_fetch_add(&g_reserved, 1);
+    }
+}
+static void spare_expire(void) {   // the reserve's extra spares, a while after the last reserve
+    if (runtime_now_ns() - atomic_load(&g_reserve_at) < RESERVE_HOLD) return;
+    pthread_mutex_lock(&g_spare_mu);
+    while (g_spare_bytes > SPARE_MAX && g_nspare) {
+        chunk_t c = g_spare[--g_nspare];
+        g_spare_bytes -= c.size;
+        pthread_mutex_unlock(&g_spare_mu);
+        chunk_destroy(&c);
+        pthread_mutex_lock(&g_spare_mu);
+    }
+    pthread_mutex_unlock(&g_spare_mu);
 }
 static void chunk_free(chunk_t *c) {   // no submission uses it (its slot's last one is done): to the spares if they have room
     pthread_mutex_lock(&g_spare_mu);
@@ -155,6 +196,7 @@ void vkb_slot_reset(int slot) {   // the slot's previous submission has complete
     pthread_mutex_lock(&g_ring_mu);
     for (int w = 0; w < VKB_MAXREC; w++) ring_trim(&g_res[slot][w]);
     pthread_mutex_unlock(&g_ring_mu);
+    spare_expire();
     for (int w = 0; w < VKB_MAXREC; w++) {
         slot_res *r = &g_res[slot][w];
         for (int i = 0; i < r->n; i++) r->c[i].used = 0;

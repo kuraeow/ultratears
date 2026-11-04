@@ -1575,6 +1575,109 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
     if (!ok) { free(P->s); P->s = NULL; return 0; }
     return 1;
 }
+// ---- the BC7 cache warmed ahead of uploads. An ASTC texture's first upload reads its BC7 blocks from the mapped
+// cache (several GiB): pages not in memory yet are read from the disk right there, in the recording thread. On the
+// Steam Deck that was most of 100-470 ms of uploads in one submission when a place streamed in (2026-11-04: the uploads
+// took 0.3 % of the CPU time but most of those submissions' wall time). The game initializes a texture some frames
+// before it draws with it, so at nvnTextureInitialize the texture is queued, and a thread below the game's threads
+// computes its surfaces' cache keys and reads their pages; the upload then finds them in memory. It changes nothing
+// the upload does: not warmed in time (or the game had not written the texture yet) it reads the disk as before.
+// TOTK_TEX_PREFETCH=0: off.
+enum { PF_QUEUE = 512, PF_SEEN = 4096 };
+static tex_t g_pfq[PF_QUEUE];
+static int g_pf_head, g_pf_n;
+static uint64_t g_pf_seen[PF_SEEN];   // recently queued textures (storage and shape): queued once
+static pthread_mutex_t g_pf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pf_cv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_pf_queued, g_pf_dropped, g_pf_surfaces;
+static void prefetch_one(const tex_t *t) {
+    const nvn_texdesc *d = &t->d;
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    nvn_texlayout L;
+    nvn_tex_layout(d, &L);
+    uint32_t levels = d->levels ? d->levels : 1, layers = L.layers ? L.layers : 1;
+    int srgb = d->format >= 0x87 && d->format <= 0x94;
+    uint32_t w = d->width ? d->width : 1, h = d->height ? d->height : 1;
+    static uint8_t *blk, *copy;
+    static size_t cap, copy_cap;
+    // the texture's bytes copied first: the game may have released its memory since it was queued (plat_safe_read)
+    int plat_safe_read(void *dst, const void *src, size_t n);
+    if (!L.size || L.size > (256u << 20)) return;
+    if (L.size > copy_cap) { free(copy); copy_cap = (size_t)L.size; if (!(copy = malloc(copy_cap))) { copy_cap = 0; return; } }
+    if (!plat_safe_read(copy, t->mem, (size_t)L.size)) return;
+    for (uint32_t level = 0; level < levels; level++) {
+        uint32_t lw = w >> level ? w >> level : 1, lh = h >> level ? h >> level : 1;
+        uint32_t bx = (lw + bw - 1) / bw, by = (lh + bh - 1) / bh, pitch = bx * (uint32_t)bpb;
+        size_t bytes = (size_t)pitch * by;
+        if (bytes > cap) { free(blk); cap = bytes; if (!(blk = malloc(cap))) { cap = 0; return; } }
+        for (uint32_t layer = 0; layer < layers; layer++) {
+            if (nvn_deswizzle(d, level, layer, copy, blk, pitch)) return;
+            if (vkb_bc7_touch(vkb_bc7_key_of(blk, bytes, lw, lh, 1, (uint32_t)bw, (uint32_t)bh, srgb))) atomic_fetch_add(&g_pf_surfaces, 1);
+        }
+    }
+}
+static void *prefetch_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("totk-tex-prefetch");
+    { void plat_thread_background(void); plat_thread_background(); }
+    uint64_t coming = 0;   // upload memory the textures warmed since the queue was last empty will need (BC7: 1 byte a texel)
+    for (;;) {
+        pthread_mutex_lock(&g_pf_mu);
+        if (!g_pf_n && coming) {   // a batch done: the upload memory for it made now, not in the submission that uploads it
+            pthread_mutex_unlock(&g_pf_mu);
+            if (coming >= (32u << 20) && vkb_ready()) vkb_ring_reserve(coming);
+            coming = 0;
+            continue;
+        }
+        while (!g_pf_n) pthread_cond_wait(&g_pf_cv, &g_pf_mu);
+        tex_t t = g_pfq[g_pf_head];
+        g_pf_head = (g_pf_head + 1) % PF_QUEUE;
+        g_pf_n--;
+        pthread_mutex_unlock(&g_pf_mu);
+        prefetch_one(&t);
+        nvn_texlayout L;
+        nvn_tex_layout(&t.d, &L);
+        coming += (uint64_t)(t.d.width ? t.d.width : 1) * (t.d.height ? t.d.height : 1) * (L.layers ? L.layers : 1) * 4 / 3;
+    }
+    return NULL;
+}
+static void *prefetch_thread(void *unused);
+static void prefetch_start(void) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, prefetch_thread, NULL) == 0) pthread_detach(th);
+}
+void vkb_tex_prefetch(const tex_t *t) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_TEX_PREFETCH"); on = !(e && *e == '0') && vkb_bc7_on(); }
+    if (!on || !t || !t->mem) return;
+    const nvn_texdesc *d = &t->d;
+    VkImageAspectFlags aspect;
+    int astc = 0, bw = 1, bh = 1;
+    // ASTC 2D / 2D array / cube textures in game memory (the kinds an upload takes from the cache), not in a virtual pool
+    if (d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY || d->target == NVN_TEXTURE_TARGET_3D ||
+        d->target == NVN_TEXTURE_TARGET_BUFFER || nvn_fmt_bpb(d->format, &bw, &bh) != 16) return;
+    vkb_format(d->format, &aspect, &astc);
+    uintptr_t at = (uintptr_t)t->mem;
+    if (!astc || at < 0x0800000000ull || at + t->L.size > 0x8000000000ull || totk_vpool_gather(at, 0, NULL)) return;
+    uint64_t key = (uint64_t)at * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_mutex_lock(&g_pf_mu);
+    uint64_t *seen = &g_pf_seen[(key >> 20) % PF_SEEN];
+    int fresh = *seen != key;
+    if (fresh && g_pf_n < PF_QUEUE) {
+        *seen = key;
+        g_pfq[(g_pf_head + g_pf_n) % PF_QUEUE] = *t;
+        g_pf_n++;
+        pthread_cond_signal(&g_pf_cv);
+        atomic_fetch_add(&g_pf_queued, 1);
+    } else if (fresh) atomic_fetch_add(&g_pf_dropped, 1);
+    pthread_mutex_unlock(&g_pf_mu);
+    if (fresh) pthread_once(&once, prefetch_start);
+}
+void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfaces) {
+    *queued = atomic_load(&g_pf_queued); *dropped = atomic_load(&g_pf_dropped); *surfaces = atomic_load(&g_pf_surfaces);
+}
+
 // Under g_up_mu, into the prologue: 1 when recorded, 0 to upload as before, 2 when another thread uploaded it meanwhile.
 static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P) {
     if (im->upload_stamp && !vkb_tex_stale(im)) return 2;

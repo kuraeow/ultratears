@@ -44,6 +44,7 @@ void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDevice
 void vkb_ring_stats(uint64_t *chunks, uint64_t *bytes, uint64_t *pairs);   // upload memory now: chunks, bytes, slot x thread pairs
 void vkb_ring_counts(uint64_t *peak, uint64_t *made, uint64_t *freed);   // its peak bytes; chunks made and given back so far
 uint64_t vkb_ring_reclaim(void);   // out of memory: idle slots' upload memory back (bytes freed)
+void vkb_ring_reserve(uint64_t bytes);   // upload memory made ahead for uploads coming (vkb_draw.c)
 int vkb_slot_idle(int slot);   // the GPU has finished the slot's submission and it does not record now (backend_vk.c)
 // What the next vkAllocateMemory of this thread is for (the memory log counts by it; reset by the allocation).
 enum { MT_OTHER, MT_IMAGE, MT_RING, MT_DESC, MT_POOL_COPY, MT_MIRROR, MT_UCAP, MT_WRITEBACK, MT_COPY_BACK, MT_N };
@@ -160,6 +161,9 @@ enum { VKB_BC_7 = 0, VKB_BC_1 = 1 };                         // the format of a 
 int vkb_bc7_lookup(vkb_bc7_key k, int *fmt, size_t *len);    // in the cache: its format and length
 int vkb_bc7_has(vkb_bc7_key k, size_t n);                    // n bytes of BC7 blocks for it in the cache
 int vkb_bc7_read(vkb_bc7_key k, uint8_t *out, size_t n);
+int vkb_bc7_touch(vkb_bc7_key k);                         // its bytes into memory ahead of the upload; 1: in the cache
+void vkb_bc7_read_stats(uint64_t *read_ns, uint64_t *touched);
+void vkb_tex_prefetch(const tex_t *t);                    // nvnTextureInitialize: warm the BC7 cache for it (vkb_tex.c)
 void vkb_bc7_store(vkb_bc7_key k, const uint8_t *data, size_t n);
 void vkb_bc_store(vkb_bc7_key k, const uint8_t *data, size_t n, int fmt);
 void vkb_bc7_queue(vkb_bc7_key k, const uint8_t *rgba, uint32_t w, uint32_t h, uint32_t d, int srgb);   // encoded in the background

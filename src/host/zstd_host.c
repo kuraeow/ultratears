@@ -48,7 +48,7 @@ typedef struct { uint64_t guest, content, size, print; ZSTD_DDict *dd; } Dict;
 static Dict dicts[NDICT];
 static int ndicts;
 static pthread_rwlock_t dict_lock = PTHREAD_RWLOCK_INITIALIZER;
-static _Atomic uint64_t s_calls, s_in, s_out, s_guest, s_inplace;
+static _Atomic uint64_t s_calls, s_in, s_out, s_guest, s_inplace, s_ns;
 
 // Size, both ends and a sample of the middle: what tells a new dictionary at a reused address from the old one.
 static uint64_t fingerprint(const uint8_t *p, uint64_t n) {
@@ -111,11 +111,14 @@ static size_t host_decode(uint64_t dst, uint64_t cap, uint64_t src, uint64_t siz
     if (!dctx && !(dctx = ZSTD_createDCtx())) return 0;
     *ok = 1;
     int away = size >= AWAY_BYTES ? runtime_core_away() : 0;
+    uint64_t t0 = runtime_now_ns();
     size_t r = dd ? ZSTD_decompress_usingDDict(dctx, gp(dst), (size_t)cap, gp(src), (size_t)size, dd)
                   : ZSTD_decompressDCtx(dctx, gp(dst), (size_t)cap, gp(src), (size_t)size);
+    s_ns += runtime_now_ns() - t0;
     runtime_core_back(&away);
     return r;
 }
+void runtime_zstd_cost(uint64_t *ns) { *ns = s_ns; }   // decompression time, all threads
 
 // At the call: x0 dctx, x1 dst, x2 capacity, x3 src, x4 size, then (dict, dict size, ddict) as the entry has them; x30
 // the return address. guest: the guest decoder for what the host does not take.

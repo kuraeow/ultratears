@@ -491,6 +491,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     }
     o->serial = nvn_new_serial();
     live_put(o);
+    { void vkb_tex_prefetch(const tex_t *t); vkb_tex_prefetch(o); }   // its BC7 cache pages read ahead of its upload (vkb_tex.c)
     if (totk_life_match(o)) totk_life_log("init tex=%p ser=%llu mem=%p", (void *)t, (unsigned long long)o->serial, (void *)o->mem);
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
@@ -722,6 +723,7 @@ NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f)
 // TOTK_SYNC_LOG=1: CPU waits by kind (0 fence sync, 1 window-acquire sync): calls, calls that had to block, blocked time,
 // and calls whose fence was the newest committed one (a full drain of the queue).
 _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
+static _Atomic uint64_t g_gpu_wait_ns;   // the game's SyncWaits that blocked, all threads (the long-frame line)
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
@@ -731,12 +733,14 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
     if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
-    uint64_t t0 = lg ? now_ns() : 0;
+    uint64_t t0 = now_ns();   // (a wait that blocks: the long-frame line counts the game's waits for the GPU)
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
     int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
-    if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
+    uint64_t waited = now_ns() - t0;
+    atomic_fetch_add(&g_gpu_wait_ns, waited);
+    if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], waited); }
     if (ok) survey_after_wait(s);
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
@@ -2618,7 +2622,10 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, log_ms; unsigned pso, lib, up, rup, log_n; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, log_ms, fs_ms, fs_mb, zstd_ms, gw_ms; unsigned pso, lib, up, rup, log_n; int ls; } lf_rec;
+// The game's own waits in a frame, for the long-frame line (host/fs.c: file reads; host/zstd_host.c: decompression);
+// zeros where the host has none (graphics unit tests)
+__attribute__((weak)) void runtime_io_cost(uint64_t *fs_ns, uint64_t *fs_bytes, uint64_t *zstd_ns) { *fs_ns = *fs_bytes = *zstd_ns = 0; }   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
@@ -3060,6 +3067,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             void runtime_log_cost(uint64_t *writes, uint64_t *ns);   // runtime/logcost.c: the log's writes and their time
             static uint64_t plw, plt; uint64_t lw, lt; runtime_log_cost(&lw, &lt);
             r->log_n = (unsigned)(lw - plw); r->log_ms = (lt - plt) / 1e6; plw = lw; plt = lt;
+            static uint64_t pfs, pfb, pzs, pgw; uint64_t fs, fb, zs, gw = atomic_load(&g_gpu_wait_ns); runtime_io_cost(&fs, &fb, &zs);
+            r->fs_ms = (fs - pfs) / 1e6; r->fs_mb = (fb - pfb) / 1048576.0; r->zstd_ms = (zs - pzs) / 1e6; r->gw_ms = (gw - pgw) / 1e6;
+            pfs = fs; pfb = fb; pzs = zs; pgw = gw;
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -3074,12 +3084,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[768];
               snprintf(b, sizeof b, "frame %llu (%.2f s): total %.1f ms, submit+present %.1f ms, GPU %.1f ms; %u new pipelines + %u shader libraries in %.1f ms; texture uploads %u first + %u repeated, %.1f MB / %.1f ms",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
+              if (r->fs_ms >= 1 || r->zstd_ms >= 1 || r->gw_ms >= 1) {   // what the game itself waited for (all its threads)
+                  char gb[128]; snprintf(gb, sizeof gb, "; game: file reads %.1f ms (%.1f MiB), decompression %.1f ms, GPU waits %.1f ms",
+                                         r->fs_ms, r->fs_mb, r->zstd_ms, r->gw_ms); strlcat(b, gb, sizeof b); }
               if (r->log_ms >= 0.1) {   // the log's own writes this frame (unbuffered: each one a write to the file)
                   char lb[64]; snprintf(lb, sizeof lb, "; log %u writes / %.1f ms", r->log_n, r->log_ms); strlcat(b, lb, sizeof b); }
               if (hidden) strlcat(b, "; next to a loading screen, not visible", sizeof b);

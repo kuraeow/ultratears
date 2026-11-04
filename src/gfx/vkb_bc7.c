@@ -61,6 +61,7 @@ static uint64_t g_map_size;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_open;   // 1 open, -1 cannot be used
 static uint64_t g_hits, g_misses, g_encoded, g_dropped, g_encode_ns;
+static _Atomic uint64_t g_read_ns, g_touched;   // uploads' reads of the mapped pack; surfaces warmed ahead (vkb_bc7_touch)
 
 static rec_t *slot(uint64_t a, uint64_t b) {   // g_mu held, g_cap a power of two
     size_t h = (size_t)(a ^ (b * 0x9E3779B97F4A7C15ull)) & (g_cap - 1);
@@ -143,8 +144,33 @@ int vkb_bc7_read(vkb_bc7_key k, uint8_t *out, size_t n) {
     if (ok && !mapped) ok = !_fseeki64(g_pack, (int64_t)r.off, SEEK_SET) && fread(out, 1, n, g_pack) == n;
     if (ok) g_hits++; else g_misses++;
     pthread_mutex_unlock(&g_mu);
-    if (mapped) memcpy(out, g_map + r.off, n);   // (the mapped part is never written again)
+    if (mapped) {   // (the mapped part is never written again)
+        uint64_t t0 = runtime_now_ns();
+        memcpy(out, g_map + r.off, n);   // pages not in memory yet: read from the disk here
+        atomic_fetch_add_explicit(&g_read_ns, runtime_now_ns() - t0, memory_order_relaxed);
+    }
     return ok;
+}
+// The cache's bytes for key k into memory ahead of the upload that reads them (vkb_tex_prefetch's thread): one read per
+// page of the mapped pack, which waits for the disk here instead of in the recording thread. 1: in the cache.
+int vkb_bc7_touch(vkb_bc7_key k) {
+    pthread_mutex_lock(&g_mu);
+    int ok = open_files() && g_cap;
+    rec_t r = {0};
+    if (ok) { r = *slot(k.a, k.b); ok = (r.a || r.b) && r.len && r.off + r.len <= g_map_size; }
+    pthread_mutex_unlock(&g_mu);
+    if (!ok) return 0;
+    volatile uint8_t sink = 0;
+    const uint8_t *p = g_map + r.off, *e = p + r.len;
+    for (; p < e; p += 4096) sink ^= *p;
+    sink ^= e[-1];
+    (void)sink;
+    atomic_fetch_add_explicit(&g_touched, 1, memory_order_relaxed);
+    return 1;
+}
+void vkb_bc7_read_stats(uint64_t *read_ns, uint64_t *touched) {
+    *read_ns = atomic_load(&g_read_ns);
+    *touched = atomic_load(&g_touched);
 }
 void vkb_bc7_store(vkb_bc7_key k, const uint8_t *data, size_t n) { vkb_bc_store(k, data, n, VKB_BC_7); }
 void vkb_bc_store(vkb_bc7_key k, const uint8_t *data, size_t n, int fmt) {

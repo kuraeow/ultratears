@@ -42,6 +42,9 @@ uint64_t plat_now_ns(void);                // monotonic
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);
 void plat_thread_start(void);   // first thing on a new thread (Linux: its own signal stack for the fault handler)
+void plat_thread_background(void);   // work nothing waits for: below the game's threads (it takes idle CPU only)
+// n bytes of guest memory that may have been released meanwhile into dst: 0 (and no fault) where any is not readable
+int plat_safe_read(void *dst, const void *src, size_t n);
 void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers  // periodic timing thread (vsync): don't coalesce its timers
 
 // ---- process

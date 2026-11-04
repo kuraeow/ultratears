@@ -2517,6 +2517,16 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                      "(%.1f ms each), %.1f MiB queued, %llu dropped", (double)(bi - pi) / f, (double)(h - ph) / f, (double)(mi - pmi) / f,
                      (double)(en - pe) / f, en > pe ? (double)(ens - pens) / 1e6 / (double)(en - pe) : 0.0, q / 1048576.0, (unsigned long long)dr);
                 ph = h; pmi = mi; pe = en; pi = bi; pens = ens;
+                // uploads waiting for the cache's pages (the disk), and the warming ahead of them (vkb_tex_prefetch)
+                static uint64_t prn, ptc, ppq, ppd;
+                uint64_t rn, tc, pq, pd, psf;
+                vkb_bc7_read_stats(&rn, &tc);
+                void vkb_tex_prefetch_stats(uint64_t *, uint64_t *, uint64_t *);
+                vkb_tex_prefetch_stats(&pq, &pd, &psf);
+                VLOG("per frame: BC7 cache reads by uploads %.2f ms; warmed ahead: %.1f textures queued, %.1f surfaces read, %.1f not queued (queue full)",
+                     (double)(rn - prn) / 1e6 / f, (double)(pq - ppq) / f, (double)(tc - ptc) / f, (double)(pd - ppd) / f);
+                prn = rn; ptc = tc; ppq = pq; ppd = pd;
+                (void)psf;
             }
             static uint64_t pm, psh, ptb;
             uint64_t im_made, im_shared, im_back;

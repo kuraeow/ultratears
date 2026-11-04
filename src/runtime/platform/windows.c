@@ -213,6 +213,12 @@ void plat_sleep_until_ns(uint64_t t) {
 void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 
 void plat_thread_start(void) {}   // the vectored exception handler needs no stack of its own
+void plat_thread_background(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+// (decommitted pages of the guest window: the copy fails instead of raising an access violation)
+int plat_safe_read(void *dst, const void *src, size_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), src, dst, n, &got) && got == n;
+}
 
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;

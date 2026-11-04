@@ -304,6 +304,13 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     pthread_mutex_unlock(&rom_lock);
     runtime_fail("RomFS handle table full");
 }
+// The game's RomFS reads: their time (all threads) and bytes, for the long-frame line (gfx/nvn/hle_nvn.c)
+static _Atomic uint64_t g_fs_ns, g_fs_bytes;
+void runtime_zstd_cost(uint64_t *ns);   // host/zstd_host.c
+void runtime_io_cost(uint64_t *fs_ns, uint64_t *fs_bytes, uint64_t *zstd_ns) {
+    *fs_ns = atomic_load(&g_fs_ns); *fs_bytes = atomic_load(&g_fs_bytes);
+    runtime_zstd_cost(zstd_ns);
+}
 static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     if (!out || offset < 0 || (!buffer && size)) return R_ROM_INVALID;
     uint64_t i = rom_handles[h - ROM_BASE];
@@ -322,6 +329,7 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
     int tries = 0;
+    uint64_t t0 = runtime_now_ns();
     while (done < n) {
         ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
         // EFAULT: a region of the write watch was being frozen read-only as the read began (Linux, platform/linux.c);
@@ -330,6 +338,8 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
         need(r > 0, "RomFS image read");
         done += (uint64_t)r;
     }
+    atomic_fetch_add(&g_fs_ns, runtime_now_ns() - t0);
+    atomic_fetch_add(&g_fs_bytes, n);
     *out = n;
     return 0;
 }
