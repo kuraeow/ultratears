@@ -117,6 +117,10 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    // UltraTears (runtime_threads_report, TOTK_STATS): time blocked by wait kind (1 lock 2 condition 3 address 4 sync),
+    // waiting for a virtual core, and from a wake to running again (the host's scheduling latency)
+    uint64_t st_block_ns[5], st_blocks, st_core_ns, st_core_waits, st_wake_ns, st_wakes, woke_ns;
+    uint64_t blk_t0, blk_cred, core_t0, core_cred; int blk_kind;   // a wait in progress: since when, counted up to when
 } thr_t;
 static thr_t *g_all;
 
@@ -166,7 +170,7 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; gc_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; t->woke_ns = now_ns(); gc_signal(&t->cv); }
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -201,7 +205,10 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
+    t->core_t0 = t->core_cred = now_ns();
     while (t->cur_core < 0) gc_wait(&t->cv);
+    t->st_core_ns += now_ns() - t->core_cred, t->st_core_waits++;
+    t->core_t0 = 0;
 }
 static thr_t *me_or_null(void) { return t_self; }
 static int core_better_waiter(const thr_t *t, int c) {   // holding G: a waiter for core c better than t
@@ -265,11 +272,70 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+// UltraTears (TOTK_STATS, with the frame interval line): the guest threads that waited most over the last `frames`
+// frames: blocked in a wait by kind, waiting for a virtual core, and the host's latency from a wake to running again.
+// Where a frame's time goes when no thread is busy (the Steam Deck's profile of 2026-11-04: ~2.8 of 8 CPUs).
+void runtime_threads_report(unsigned frames) {
+    if (!frames) return;
+    enum { N = 256 };
+    static struct { uint32_t h; uint64_t b[5], core, cw, wake, wakes, blocks; } last[N];
+    typedef struct { uint32_t h; int prio; double b[5], all, core, cw, wake, wakes, blocks; } row;
+    row r[N];
+    int n = 0;
+    static uint64_t last_ns;   // the window's wall time per frame: what a thread did not wait, it ran (or waited on the host)
+    uint64_t now = now_ns();
+    double frame_ms = last_ns ? (double)(now - last_ns) / 1e6 / frames : 0;
+    last_ns = now;
+    g_lock();
+    for (thr_t *t = g_all; t && n < N; t = t->all) {
+        if (t->exited || !t->started) continue;
+        if (t->blk_t0) t->st_block_ns[t->blk_kind] += now - t->blk_cred, t->blk_cred = now;   // waits in progress
+        if (t->core_t0) t->st_core_ns += now - t->core_cred, t->core_cred = now;
+        int k = 0;
+        while (k < N && last[k].h && last[k].h != t->handle) k++;
+        if (k == N) continue;
+        if (!last[k].h) memset(&last[k], 0, sizeof last[k]), last[k].h = t->handle;
+        row *x = &r[n++];
+        x->h = t->handle, x->prio = t->prio, x->all = 0;
+        for (int i = 0; i < 5; i++) x->b[i] = (double)(t->st_block_ns[i] - last[k].b[i]) / 1e6 / frames, x->all += x->b[i], last[k].b[i] = t->st_block_ns[i];
+        x->core = (double)(t->st_core_ns - last[k].core) / 1e6 / frames, last[k].core = t->st_core_ns;
+        x->cw = (double)(t->st_core_waits - last[k].cw) / frames, last[k].cw = t->st_core_waits;
+        x->wake = (double)(t->st_wake_ns - last[k].wake), last[k].wake = t->st_wake_ns;
+        x->wakes = (double)(t->st_wakes - last[k].wakes), last[k].wakes = t->st_wakes;
+        x->blocks = (double)(t->st_blocks - last[k].blocks) / frames, last[k].blocks = t->st_blocks;
+    }
+    g_unlock();
+    for (int i = 0; i < n; i++)   // the busiest first: the least time blocked (a core wait is a thread with work to do)
+        for (int j = i + 1; j < n; j++)
+            if (r[j].all < r[i].all) { row t = r[i]; r[i] = r[j]; r[j] = t; }
+    double core_all = 0, wake_all = 0, wakes_all = 0;
+    for (int i = 0; i < n; i++) core_all += r[i].core, wake_all += r[i].wake, wakes_all += r[i].wakes;
+    fprintf(stderr, "[totk] guest threads per frame: waiting for a virtual core %.2f ms in all, wake latency %.0f us average (%.0f wakes a frame)\n",
+            core_all, wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames);
+    for (int i = 0; i < n && i < 8; i++)
+        fprintf(stderr, "[totk]   thread %#x prio %d: ran %.1f ms, core wait %.2f ms (%.1f), blocked %.1f ms (lock %.1f, cond %.1f, address %.1f, sync %.1f; %.1f waits), "
+                "wake latency %.0f us\n", r[i].h, r[i].prio, frame_ms > 0 ? frame_ms - r[i].all - r[i].core : 0.0, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
+                r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0);
+}
+
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
 }
-static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
+static int64_t block_inner2(thr_t *t, int kind, int64_t ns);
+static int64_t block_inner(thr_t *t, int kind, int64_t ns) {   // with the statistics (runtime_threads_report)
+    int k = kind >= 1 && kind <= 4 ? kind : 0;
+    if (ns) t->blk_kind = k, t->blk_t0 = t->blk_cred = now_ns();   // (under G: the report reads them)
+    int64_t r = block_inner2(t, kind, ns);
+    uint64_t t1 = now_ns();
+    if (ns) {
+        t->st_block_ns[k] += t1 - t->blk_cred, t->st_blocks++;
+        t->blk_t0 = 0;
+        if (t->woke && t->woke_ns && t1 > t->woke_ns) t->st_wake_ns += t1 - t->woke_ns, t->st_wakes++;
+    }
+    return r;
+}
+static int64_t block_inner2(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;

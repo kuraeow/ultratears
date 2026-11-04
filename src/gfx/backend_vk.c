@@ -453,26 +453,43 @@ static void pc_back(const pool_ent *p, const pc_range *r, int k) {
     const uint8_t *c = p->cmap + (r->lo - p->base);
     uint8_t *g = (uint8_t *)(uintptr_t)r->lo;
     uint64_t n = r->hi - r->lo, kept = 0;
+    // the first byte the CPU kept on each page (marked written again below), up to KMAX; more: found by a scan
+    enum { KMAX = 64 };
+    uint64_t kept_at[KMAX];
+    // Blocks of 4 KiB where game memory still holds the snapshot (nearly all: the CPU rarely writes what the GPU
+    // writes) go over whole; a block that differs, by 64 bytes; only a 64-byte piece that differs, byte by byte (the
+    // retire thread took ~18 % of a Steam Deck core byte by byte, 2026-11-04).
     if (!r->was) memcpy(g, c, n);
     else
         for (uint64_t x = 0, kept_page = UINT64_MAX; x < n;) {
-            uint64_t m = n - x < 64 ? n - x : 64;
-            if (!memcmp(g + x, r->was + x, m)) { memcpy(g + x, c + x, m); x += m; continue; }
-            for (uint64_t e = x + m; x < e; x++) {
-                if (g[x] == r->was[x]) { g[x] = c[x]; continue; }
-                uint64_t page = (r->lo + x) >> 12;
-                if (page != kept_page) { kept_page = page; kept++; }
+            uint64_t big = n - x < 4096 ? n - x : 4096;
+            if (!memcmp(g + x, r->was + x, big)) { memcpy(g + x, c + x, big); x += big; continue; }
+            for (uint64_t eb = x + big; x < eb;) {
+                uint64_t m = eb - x < 64 ? eb - x : 64;
+                if (!memcmp(g + x, r->was + x, m)) { memcpy(g + x, c + x, m); x += m; continue; }
+                for (uint64_t e = x + m; x < e; x++) {
+                    if (g[x] == r->was[x]) { g[x] = c[x]; continue; }
+                    uint64_t page = (r->lo + x) >> 12;
+                    if (page != kept_page) { if (kept < KMAX) kept_at[kept] = x; kept_page = page; kept++; }
+                }
             }
         }
     nvn_dirty_gpu_write_end(tok);   // before the marks below: they are the CPU's
-    for (uint64_t x = 0; kept && x < n; x++)   // the first kept byte of each page
-        if (g[x] != c[x]) { __atomic_fetch_or(&g[x], 0, __ATOMIC_RELAXED); x += 0xfff - ((r->lo + x) & 0xfff); }
+    if (kept <= KMAX)
+        for (uint64_t i = 0; i < kept; i++) __atomic_fetch_or(&g[kept_at[i]], 0, __ATOMIC_RELAXED);
+    else
+        for (uint64_t x = 0; x < n; x++)   // the first kept byte of each page
+            if (g[x] != c[x]) { __atomic_fetch_or(&g[x], 0, __ATOMIC_RELAXED); x += 0xfff - ((r->lo + x) & 0xfff); }
     g_pc_kept += kept;
-    for (int j = k; j < g_npc_pend; j++) {
+    for (int j = k; j < g_npc_pend; j++) {   // the GPU's bytes into the snapshots of later writes over them
         pc_range *o = &g_pc_pend[j];
         if (o == r || !o->was || o->buf != r->buf || o->lo >= r->hi || o->hi <= r->lo) continue;
         uint64_t lo = o->lo > r->lo ? o->lo : r->lo, hi = o->hi < r->hi ? o->hi : r->hi;
-        for (uint64_t a = lo; a < hi; a++) if (g[a - r->lo] == c[a - r->lo]) o->was[a - o->lo] = c[a - r->lo];
+        for (uint64_t a = lo; a < hi;) {   // where game memory now holds the copy's bytes (all but the kept ones): whole
+            uint64_t m = hi - a < 4096 ? hi - a : 4096;
+            if (!memcmp(g + (a - r->lo), c + (a - r->lo), m)) { memcpy(o->was + (a - o->lo), c + (a - r->lo), m); a += m; continue; }
+            for (uint64_t e = a + m; a < e; a++) if (g[a - r->lo] == c[a - r->lo]) o->was[a - o->lo] = c[a - r->lo];
+        }
     }
     g_pc_back_bytes += n;
 }
