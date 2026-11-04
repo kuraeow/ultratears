@@ -1043,12 +1043,32 @@ static void pool_hit_note(const pool_ent *p, uint64_t addr, uint64_t len, uint64
 static void used_mark(pool_ent *p, uint64_t sub) {   // read first: a store only when it changes
     if (__atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
 }
+// Per recording thread, the last GPU writes it recorded (exact ranges): a shader that stores to the same buffer draw
+// after draw registered the same write every time, through the table's write path and its lock, though the first one
+// in a submission already holds it (its copy back, its snapshot of what was there before: wb_add, pc_pend_add).
+// TOTK_POOL_WRITE_MEMO=0: every time, as before (A/B).
+enum { POOL_WRS = 8 };
+static __thread struct { uint64_t lo, hi, sub, gen; } t_pool_wr[POOL_WRS];
+static __thread unsigned t_pool_wr_next;
+static void pool_use_impl(uint64_t addr, uint64_t len, int write, uint64_t sub, uint64_t gen);
 void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     if (g_ok != 1 || !addr || !len) return;
     uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
     if (!write)
         for (int k = 0; k < POOL_HITS; k++)
             if (t_pool_hit[k].sub == sub && t_pool_hit[k].gen == gen && addr >= t_pool_hit[k].lo && addr + len <= t_pool_hit[k].hi) return;
+    static int memo = -1;
+    if (memo < 0) { const char *e = getenv("TOTK_POOL_WRITE_MEMO"); memo = !(e && *e == '0'); }
+    if (write && memo)
+        for (int k = 0; k < POOL_WRS; k++)
+            if (t_pool_wr[k].sub == sub && t_pool_wr[k].gen == gen && t_pool_wr[k].lo == addr && t_pool_wr[k].hi == addr + len) return;
+    pool_use_impl(addr, len, write, sub, gen);
+    if (write && memo) {
+        unsigned k = t_pool_wr_next++ % POOL_WRS;
+        t_pool_wr[k].lo = addr; t_pool_wr[k].hi = addr + len; t_pool_wr[k].sub = sub; t_pool_wr[k].gen = gen;
+    }
+}
+static void pool_use_impl(uint64_t addr, uint64_t len, int write, uint64_t sub, uint64_t gen) {
     int shadow = vkb_shadow_on();
     VkBuffer pc_buf = VK_NULL_HANDLE;   // pool copies: a GPU write that lands in the pool's copy itself (pc_pend_add)
     uint64_t pc_n = 0;
