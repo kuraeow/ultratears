@@ -116,7 +116,9 @@ def disk_case(folder, linux=False):
     have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps', 'build-linux', 'linux') if (folder / d).is_dir())
     if (folder / DECK_TAR).is_file():
         have += (folder / DECK_TAR).stat().st_size
-    need = max(0, (INSTALL_GB + (LINUX_GB if linux else 0)) * 2**30 - have)
+    # LINUX_GB is what a Windows build adds for the Steam Deck (its tar above all); built on Linux - a Linux PC or the
+    # Deck itself - the game is built in place, with no tar: INSTALL_GB alone (0.3.1 asked 71 GB there, issue of a player)
+    need = max(0, (INSTALL_GB + (LINUX_GB if linux and os.name == 'nt' else 0)) * 2**30 - have)
     probe = folder
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
