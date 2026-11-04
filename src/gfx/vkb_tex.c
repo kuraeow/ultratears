@@ -407,9 +407,37 @@ void vkb_tex_block_flush(VkCommandBuffer cb) {
     }
     t_nblk = 0;
 }
+// Video memory short (#31): images the game released wait aside RECYCLE_FRAMES for a texture object to take them back;
+// with the device-local heaps over 90 % of the driver's budget (VK_EXT_memory_budget, looked at every 120 presents) they
+// go at once, and no image block is made ahead (vkb_image_blocks_reserve) - a card with little memory (4 GiB) does not
+// run out for them. (An empty block already goes back when another empty one is kept: vkb_imem_free.)
+static _Atomic int g_vram_tight;
+static void aside_purge(void);
+void vkb_tex_vram_check(void) {   // once a present (hle_nvn.c)
+    static uint64_t n;
+    if (!vkb_ready() || !vkc.has_memory_budget || n++ % 120) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+    vk.vkGetPhysicalDeviceMemoryProperties2(vkc.gpu, &p);
+    int tight = 0;
+    for (uint32_t h = 0; h < p.memoryProperties.memoryHeapCount; h++)
+        if ((p.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && b.heapBudget[h] &&
+            b.heapUsage[h] > b.heapBudget[h] / 10 * 9) tight = 1;
+    if (tight && !atomic_exchange(&g_vram_tight, 1)) {
+        static int said;
+        if (said++ < 8) VLOG("video memory over 90 %% of the budget: released images and empty image blocks go at once");
+    }
+    if (!tight) atomic_store(&g_vram_tight, 0);
+    if (tight) {
+        vkb_lock(&g_mu, LK_IMAGES);
+        aside_purge();
+        pthread_mutex_unlock(&g_mu);
+    }
+}
 static void aside_purge(void) {   // g_mu held: entries aside too long (or too many) go
     uint64_t now = vkb_frame();
-    while (g_naside && (g_naside >= RECYCLE_MAX || g_aside[0]->released + RECYCLE_FRAMES < now)) {
+    int tight = atomic_load(&g_vram_tight);
+    while (g_naside && (tight || g_naside >= RECYCLE_MAX || g_aside[0]->released + RECYCLE_FRAMES < now)) {
         entry *e = g_aside[0];
         memmove(g_aside, g_aside + 1, (size_t)--g_naside * sizeof g_aside[0]);
         entry_drop(e);
@@ -472,6 +500,40 @@ static int block_take(iblock *b, VkDeviceSize size, VkDeviceSize align, VkDevice
         return 1;
     }
     return 0;
+}
+// A block made ahead (vkb_tex.c's prefetch thread, after a batch of new textures): when the blocks have less than half a
+// block free, one more is made here, outside the lock, instead of in the recording thread that next needs room (new
+// images 34-151 ms in one submission when a place streamed in, 2026-11-04). Of the type the blocks already have.
+void vkb_image_blocks_reserve(void) {
+    if (!imem_on() || atomic_load(&g_vram_tight)) return;
+    pthread_mutex_lock(&g_imem_mu);
+    uint32_t type = g_nib ? g_ib[0].type : UINT32_MAX;
+    VkDeviceSize free_bytes = 0;
+    int room = 0;
+    for (int i = 0; i < g_nib; i++) {
+        if (!g_ib[i].mem) { room = 1; continue; }
+        if (g_ib[i].type == type) free_bytes += IMEM_BLOCK - g_ib[i].used;
+    }
+    room |= g_nib < IMEM_MAXB;
+    pthread_mutex_unlock(&g_imem_mu);
+    if (type == UINT32_MAX || !room || free_bytes >= IMEM_BLOCK / 2) return;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = IMEM_BLOCK, .memoryTypeIndex = type};
+    vkb_mtag = MT_IMAGE;
+    VkDeviceMemory m;
+    if (vk.vkAllocateMemory(vkc.device, &ai, NULL, &m) != VK_SUCCESS) return;
+    pthread_mutex_lock(&g_imem_mu);
+    int i = 0;
+    while (i < g_nib && g_ib[i].mem) i++;
+    if (i < IMEM_MAXB) {
+        iblock *b = &g_ib[i];
+        b->mem = m; b->type = type; b->used = 0; b->nfr = 0;
+        range_insert(b, 0, IMEM_BLOCK);
+        if (i == g_nib) g_nib++;
+        atomic_fetch_add(&g_imem_blocks_made, 1);
+        m = VK_NULL_HANDLE;
+    }
+    pthread_mutex_unlock(&g_imem_mu);
+    if (m) vk.vkFreeMemory(vkc.device, m, NULL);
 }
 // The image's memory: a place in a shared block (returns its imem, > 0) or 0 when it needs an allocation of its own.
 static uint32_t imem_alloc(VkImage img, const VkMemoryRequirements *req, uint32_t type, VkDeviceMemory *mem, VkDeviceSize *off) {
@@ -1625,7 +1687,8 @@ static void *prefetch_thread(void *unused) {
         pthread_mutex_lock(&g_pf_mu);
         if (!g_pf_n && coming) {   // a batch done: the upload memory for it made now, not in the submission that uploads it
             pthread_mutex_unlock(&g_pf_mu);
-            if (coming >= (32u << 20) && vkb_ready()) vkb_ring_reserve(coming);
+            if (coming >= (32u << 20) && vkb_ready() && !atomic_load(&g_vram_tight)) vkb_ring_reserve(coming);
+            if (vkb_ready()) vkb_image_blocks_reserve();   // and room for their images
             coming = 0;
             continue;
         }
