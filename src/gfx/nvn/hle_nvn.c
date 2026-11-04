@@ -2473,7 +2473,13 @@ int totk_drs_enabled(void) {
    status +0x28, slot +0x30, index and counters +0x34..+0x37) and the first words of the result record and the actor.
    TOTK_ABILITY_GUARD=0: the shipping code (no test). */
 static int totk_guest_ptr(uint64_t p, uint64_t span) { return p >= 0x800000000ull && p + span < 0x8000000000ull && !(p & 7); }
-static uint64_t totk_peek64(uint64_t p) { return totk_guest_ptr(p, 8) ? *(volatile uint64_t *)(uintptr_t)p : 0; }
+/* A pointer inside the guest window can still be unmapped or released memory: every read goes through plat_safe_read
+   (0, no fault, where the bytes are not readable), so the test itself cannot crash. Called only while an ability picks
+   a target, so the system call per read costs nothing measurable. */
+int plat_safe_read(void *dst, const void *src, size_t n);   // (runtime/platform.h)
+static int totk_rd64(uint64_t p, uint64_t *v) { *v = 0; return totk_guest_ptr(p, 8) && plat_safe_read(v, (const void *)(uintptr_t)p, 8); }
+static int totk_rd32(uint64_t p, uint32_t *v) { *v = 0; return totk_guest_ptr(p & ~7ull, 8) && plat_safe_read(v, (const void *)(uintptr_t)p, 4); }
+static uint64_t totk_peek64(uint64_t p) { uint64_t v; totk_rd64(p, &v); return v; }
 int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor) {
     static int on = -1;
     static _Atomic uint64_t checked, skipped;
@@ -2481,13 +2487,16 @@ int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor) {
     if (!on) return 1;
     uint64_t k = ++checked;
     const char *why = NULL;
-    uint64_t link = 0, comp = 0, sub = 0;
+    uint64_t link = 0, comp = 0, sub = 0, back = 0;
+    uint32_t link_id = 0, actor_id = 0;
     if (!totk_guest_ptr(actor, 0x230)) why = "actor address";
-    else if (link = *(volatile uint64_t *)(uintptr_t)(actor + 0x1a8), !totk_guest_ptr(link, 0x50)) why = "link record address";
-    else if (*(volatile uint64_t *)(uintptr_t)(link + 0x40) != actor) why = "link record does not point back";
-    else if (*(volatile uint32_t *)(uintptr_t)(link + 0x48) != *(volatile uint32_t *)(uintptr_t)(actor + 0x10)) why = "actor id";
-    else if ((comp = *(volatile uint64_t *)(uintptr_t)(actor + 0x228)) && !totk_guest_ptr(comp, 0xb8)) why = "component address";
-    else if (comp && (sub = *(volatile uint64_t *)(uintptr_t)(comp + 0xb0)) && !totk_guest_ptr(sub, 0x98)) why = "component target address";
+    else if (!totk_rd64(actor + 0x1a8, &link)) why = "actor not readable";
+    else if (!totk_guest_ptr(link, 0x50)) why = "link record address";
+    else if (!totk_rd64(link + 0x40, &back) || back != actor) why = "link record does not point back";
+    else if (!totk_rd32(link + 0x48, &link_id) || !totk_rd32(actor + 0x10, &actor_id) || link_id != actor_id) why = "actor id";
+    else if (!totk_rd64(actor + 0x228, &comp)) why = "actor not readable";
+    else if (comp && !totk_guest_ptr(comp, 0xb8)) why = "component address";
+    else if (comp && (!totk_rd64(comp + 0xb0, &sub) || (sub && !totk_guest_ptr(sub, 0x98)))) why = "component target address";
     if (!why) {
         if (k == 1) LOG("[totk] ability target: first one checked, live (TOTK_ABILITY_GUARD=0: no test)");
         return 1;
