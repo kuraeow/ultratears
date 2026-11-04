@@ -164,6 +164,11 @@ def say(msg):
 
 
 def is_checkout():
+    # A builder package (tools/make_package.py lists its files in package-files.txt) is never the source, even with a
+    # .git in its folder: a player's package was taken for a checkout, its files were copied into build\, clang was
+    # installed there again and the build failed at the shader translator, which a package does not carry (2026-11-03)
+    if (ROOT / 'package-files.txt').is_file():
+        return False
     try:
         r = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
     except OSError:   # git not installed: a builder package, not a checkout
@@ -238,8 +243,16 @@ def choose_dump(home, requested):
     return (ROOT / 'dump').resolve()
 
 
+# Files only the source has (tools/make_package.py NOT_IN_PACKAGE): without them this is no full checkout
+SOURCE_ONLY = ('tools/build_xlate.py', 'tools/make_package.py', 'src/launcher')
+
+
 def build_from_checkout(a):
     home = (a.output or ROOT / 'build').resolve()
+    missing = [f for f in SOURCE_ONLY if not (ROOT / f).exists()]
+    if missing:   # a .git over a folder that is not the whole source: say so now, not at a step that needs them
+        sys.exit(f'This folder has a Git repository but not the UltraTears source ({", ".join(missing)} missing). '
+                 f'If it is a downloaded release, extract it again into a new, empty folder.')
     try:
         changed, removed = sync_source(home)
         say(f'UltraTears source -> {home}: {changed} files updated, {removed} removed')

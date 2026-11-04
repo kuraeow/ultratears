@@ -38,10 +38,10 @@ def build_tool(env):
         return exe
     objs = []
     arch = cpu_arch()   # as the game: x86-64-v2 on CPUs without AVX2 (it was always v3: illegal instruction there)
-    kit = ''
+    kit = []
     if linux:
-        from build_game import LINUX_KIT, linux_flags
-        kit = linux_flags()
+        from build_game import LINUX_KIT, linux_flag_args
+        kit = linux_flag_args()   # (a list: the kit's path may hold spaces, issue #55)
     (ROOT / 'build/obj').mkdir(parents=True, exist_ok=True)
     for s in SOURCES_C + SOURCES_CXX:
         cxx = s.endswith('.cpp')
@@ -50,13 +50,13 @@ def build_tool(env):
         if cxx:
             cmd += ['-std=c++17', '-fno-exceptions', '-fno-rtti']
         if linux:   # bc7build.c seeks with the MSVCRT names (as PR #42)
-            cmd += kit.split() + ['-D_FILE_OFFSET_BITS=64', '-D_fseeki64=fseeko', '-D_ftelli64=ftello']
+            cmd += kit + ['-D_FILE_OFFSET_BITS=64', '-D_fseeki64=fseeko', '-D_ftelli64=ftello']
             if cxx:
                 cmd += ['-stdlib=libstdc++']
         subprocess.run(cmd, check=True, env=env)
         objs.append(str(obj))
     if linux:
-        link = [str(CLANG64 / 'clang++'), *kit.split(), '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
+        link = [str(CLANG64 / 'clang++'), *kit, '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
                 '-static-libstdc++', '-o', str(exe)] + objs + [f'-L{LINUX_KIT.as_posix()}/lib', '-l:libzstd.a', '-pthread', '-lm']
     else:
         link = [str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-o', str(exe)] + objs + ['-static', '-pthread', '-lzstd', '-lc++']

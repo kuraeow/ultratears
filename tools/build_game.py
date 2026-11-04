@@ -62,15 +62,33 @@ LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/
 RPATH = '$$ORIGIN' if os.name == 'nt' else "'$$ORIGIN'"
 
 
-def linux_flags():
+def ninja_arg(a):
+    """One argument in a ninja command, as the command runs: on Linux ninja runs it through sh, on Windows it hands the
+    line to the program, which splits it by the C runtime's rules. The kit's path is inside the game folder, and a
+    folder with a space in its name ("The Legend of Zelda") split it into two arguments (issue #55). '$' is ninja's."""
+    a = a.replace('$', '$$')
+    if os.name == 'nt':
+        return f'"{a}"' if any(c in a for c in ' \t"') else a
+    return "'" + a.replace("'", "'\\''") + "'" if any(c in a for c in ' \t\'"\\;&|()<>*?[]#~`!') else a
+
+
+def ninja_args(args):
+    return ' '.join(ninja_arg(a) for a in args)
+
+
+def linux_flag_args():
     kit = LINUX_KIT.as_posix()
-    return f'--target=x86_64-linux-gnu --sysroot={kit}/sysroot -I{kit}/include'
+    return ['--target=x86_64-linux-gnu', f'--sysroot={kit}/sysroot', f'-I{kit}/include']
+
+
+def linux_flags():   # for a ninja command (quoted); linux_flag_args() for a program run directly
+    return ninja_args(linux_flag_args())
 
 
 def linux_libs():
     # SDL3 shared (beside the game: the sysroot's static one is not position-independent); Opus, libvpx, zstd and
     # libstdc++ static, so the game needs only glibc, the Vulkan loader and that SDL3.
-    return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
+    return (f'{ninja_arg("-L" + LINUX_KIT.as_posix() + "/lib")} -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
             '-Wl,--wrap=getenv,--wrap=setenv,--wrap=unsetenv,--wrap=putenv -lSDL3 '   # src/runtime/envcache.c
             '-l:libopus.a -l:libvpx.a -l:libzstd.a -l:libstdc++.a -lm -lpthread -ldl')
 

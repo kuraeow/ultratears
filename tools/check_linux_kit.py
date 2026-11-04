@@ -8,6 +8,7 @@ usage: python tools/check_linux_kit.py <build folder with build-linux/build.ninj
 import concurrent.futures
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,10 +30,11 @@ def main():
     jobs = re.findall(r'^build build-linux/obj/src_\S+: (cc|gfxcc) (\S+)$', text, re.M)
     clang = shutil.which('clang') or 'C:/msys64/clang64/bin/clang'
 
-    def fix(f):
-        f = re.sub(r'--sysroot=\S+', '--sysroot=' + kit.as_posix() + '/sysroot', f)
-        f = re.sub(r'-I\S+deps/linux/include', '-I' + kit.as_posix() + '/include', f)
-        return f.split() + ['-I' + (home / 'build-linux').as_posix()]
+    def fix(f):   # the build's flags with the kit's paths (quoted in build.ninja where they have spaces) for this kit's
+        args = shlex.split(f.replace('$$', '$'), posix=True)
+        args = ['--sysroot=' + kit.as_posix() + '/sysroot' if a.startswith('--sysroot=') else
+                '-I' + kit.as_posix() + '/include' if a.startswith('-I') and a.endswith('deps/linux/include') else a for a in args]
+        return args + ['-I' + (home / 'build-linux').as_posix()]
 
     def run(job):
         rule, src = job
