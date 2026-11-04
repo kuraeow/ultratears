@@ -1,0 +1,6 @@
+{
+ "_": "Free space a build needs, in GB: the one place for it. tools/hw_check.py stops a build below it; the launcher (src/launcher/ui.cpp need_gb) shows it beside the folder. build_gb: the game built from nothing, at its peak (data ~28, objects ~3, tools ~1, the shader export); copy_gb: the builder copied into another folder first (the launcher only: the check runs after the copy); deck_gb: a build on Windows for the Steam Deck on top (its tar ~29, the Linux game, objects, the Linux builder). A build on Linux (a Linux PC or the Deck itself) makes no tar: build_gb alone.",
+ "build_gb": 40,
+ "copy_gb": 1,
+ "deck_gb": 36
+}

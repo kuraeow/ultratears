@@ -333,9 +333,24 @@ static bool needs_copy() {
     return !has_package(U.install) || package_replaces(U.home, U.install);
 }
 
-// GB a build needs free: the game, the package copy when it goes elsewhere, and for the Steam Deck its game, objects,
-// shaders, the Linux builder and the ~29 GB tar (tools/hw_check.py LINUX_GB)
-static double need_gb() { return (needs_copy() ? 41 : 40) + (for_deck() ? 36 : 0); }
+// GB a build needs free: the game, the package copy when it goes elsewhere, and on Windows for the Steam Deck its tar,
+// game and builder (for_deck: never on Linux, where the game is built in place). The numbers are tools/disk_space.json
+// of the launcher's package, as tools/hw_check.py, which stops a build below them, reads them.
+static double need_gb() {
+    static double build = -1, copy = 1, deck = 36;
+    if (build < 0) {
+        build = 40;
+        size_t n = 0;
+        char *s = (char *)SDL_LoadFile(path_join(U.home, "tools/disk_space.json").c_str(), &n);
+        if (s) {
+            Json d;
+            json_parse(std::string(s, n), d);
+            SDL_free(s);
+            build = d["build_gb"].num(40), copy = d["copy_gb"].num(1), deck = d["deck_gb"].num(36);
+        }
+    }
+    return build + (needs_copy() ? copy : 0) + (for_deck() ? deck : 0);
+}
 
 static void check_dump(const std::string &path);
 
