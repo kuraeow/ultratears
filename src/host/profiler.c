@@ -322,9 +322,7 @@ void runtime_profiler_start(void) {
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
-#include <elf.h>
 #include <fcntl.h>
-#include <link.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -398,6 +396,17 @@ static void arm_all(void) {
 }
 
 // ---- symbols: the executable's .symtab (functions), sorted by address
+// The few ELF64 records read here and dl_iterate_phdr, declared from the ELF and glibc ABIs: <elf.h> and <link.h> are
+// not in the Linux kit a player's build compiles against (deps/linux, tools/linux_used.py), which the build of
+// 2026-11-04 found the hard way.
+typedef struct { unsigned char e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version; uint64_t e_entry, e_phoff, e_shoff;
+                 uint32_t e_flags; uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx; } elf64_ehdr;
+typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offset, sh_size; uint32_t sh_link, sh_info;
+                 uint64_t sh_addralign, sh_entsize; } elf64_shdr;
+typedef struct { uint32_t st_name; unsigned char st_info, st_other; uint16_t st_shndx; uint64_t st_value, st_size; } elf64_sym;
+enum { ELF_SHT_SYMTAB = 2, ELF_STT_FUNC = 2 };
+struct dl_phdr_info { uint64_t dlpi_addr; const char *dlpi_name; const void *dlpi_phdr; uint16_t dlpi_phnum; };   // its first members
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data);
 typedef struct { uint64_t lo, hi; const char *name; } sym_t;
 static sym_t *syms;
 static size_t nsyms;
@@ -414,16 +423,16 @@ static void sym_init(void) {
     const uint8_t *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (m == MAP_FAILED) return;
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)m;
-    const Elf64_Shdr *sh = (const Elf64_Shdr *)(m + eh->e_shoff);
+    const elf64_ehdr *eh = (const elf64_ehdr *)m;
+    const elf64_shdr *sh = (const elf64_shdr *)(m + eh->e_shoff);
     for (unsigned i = 0; i < eh->e_shnum; i++) {
-        if (sh[i].sh_type != SHT_SYMTAB) continue;
-        const Elf64_Sym *s = (const Elf64_Sym *)(m + sh[i].sh_offset);
+        if (sh[i].sh_type != ELF_SHT_SYMTAB) continue;
+        const elf64_sym *s = (const elf64_sym *)(m + sh[i].sh_offset);
         const char *str = (const char *)(m + sh[sh[i].sh_link].sh_offset);
         size_t n = sh[i].sh_size / sizeof *s;
         if (!(syms = malloc(sizeof *syms * n))) return;
         for (size_t k = 0; k < n; k++)
-            if (ELF64_ST_TYPE(s[k].st_info) == STT_FUNC && s[k].st_value)
+            if ((s[k].st_info & 0xf) == ELF_STT_FUNC && s[k].st_value)
                 syms[nsyms++] = (sym_t){exe_base + s[k].st_value, exe_base + s[k].st_value + (s[k].st_size ? s[k].st_size : 1), str + s[k].st_name};
         qsort(syms, nsyms, sizeof *syms, sym_cmp);
         break;
