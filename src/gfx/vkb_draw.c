@@ -2070,6 +2070,7 @@ void vkb_draw_mt_init(void) {
 // The walk's look at a draw for the temporal upscaler (vkb_tsr.c): the scene camera (vertex c4) and the fragment shader.
 void vkb_draw_tsr_walk(void) {
     if (!vkb_tsr_on()) return;
+    big_init();   // one recording thread: called before vkb_draw, which makes this thread's state (B) otherwise
     const char *fs = resolve_program() && S.sh[1] ? S.sh[1]->key : NULL;
     static int said;   // once: the depth convention of the scene's draws (FSR 3.1 is built for one)
     if (!said && vkb_rt()->n >= 3 && vkb_rt()->depth && S.has_ds && S.ds.dw && S.ubo[0][1].size == 0x940) {
