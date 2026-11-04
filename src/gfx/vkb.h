@@ -221,7 +221,7 @@ void vkb_draw_tsr_walk(void);                   // the walk's look at a draw for
 int vkb_tsr_on(void);
 void vkb_tsr_sub_begin(void);                          // a submission starts (its command positions from 0)
 void vkb_tsr_walk_rt(const p_set_rt *rt);             // the walk, at a render target change
-void vkb_tsr_walk_draw(const p_set_rt *rt, uint64_t c4_addr, uint64_t c4_size, const char *fs_key);   // ...at a draw
+void vkb_tsr_walk_draw(const p_set_rt *rt, const p_bind_buf *vubo, const char *fs_key);   // ...at a draw (vubo: vertex c3..)
 size_t vkb_tsr_state_size(void);                       // the jitter state a chunk starts with (saved by the walk)
 void vkb_tsr_state_save(void *dst);
 void vkb_tsr_rec_begin(const void *state);             // a recording thread starts a chunk (NULL: one thread)
@@ -229,7 +229,14 @@ void vkb_tsr_rec_rt(void);                             // recording, after a ren
 int vkb_tsr_jitter(const p_set_rt *rt, float *jx, float *jy);   // the viewport offset of a draw into these targets
 int vkb_tsr_rec_draw(const p_set_rt *rt);              // recording a draw: 1 when FSR ran in place of it (skip it)
 int vkb_tsr_fs_easu(const char *key);
-float vkb_tsr_lod_bias(void);                          // added to mipmapped samplers' LOD bias while FSR 3.1 is on
+float vkb_tsr_lod_bias(void);
+// per-object motion (vkb_tsr.c): the object motion target of a pass being begun (its slot), last frame's copy of a block,
+// the fragment shader of a motion draw (its input location, the pass's slot), statistics
+VkImageView vkb_tsr_obj_target(const p_set_rt *rt, int *slot);
+const uint8_t *vkb_tsr_prev_block(int bank, uint64_t addr, const uint8_t *cur, uint32_t n);
+VkShaderEXT vkb_tsr_obj_fs(int in_loc, int out_slot);
+void vkb_tsr_obj_count(int drawn, int found_prev);
+int vkb_pass_obj_slot(void);   // backend_vk.c: the object motion target's slot in the open pass (-1: none)                          // added to mipmapped samplers' LOD bias while FSR 3.1 is on
 
 // ---- vkb_mt.c: submissions recorded by several threads (2026-10-24)
 // The translation thread walks a submission once in order (vkb_mt_submit): render state, events and counters,

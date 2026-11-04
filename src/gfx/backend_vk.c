@@ -1743,6 +1743,8 @@ int vkb_in_pass(void) { return g_in_pass; }
 const p_set_rt *vkb_rt(void) { return &g_rt; }
 uint64_t vkb_frame(void) { return atomic_load(&g_ticket); }
 int vkb_rt_count(void) { return g_rt.n < 0 ? 0 : g_rt.n > 8 ? 8 : g_rt.n; }
+static __thread int t_obj_slot = -1;   // pass_begin: the object motion target's slot in the open pass
+int vkb_pass_obj_slot(void) { return g_in_pass ? t_obj_slot : -1; }
 VkExtent2D vkb_rt_extent(void) { return g_pass_extent; }
 int vkb_ready(void) { return g_ok == 1; }
 
@@ -1927,6 +1929,17 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         if (lw < w) w = lw;
         if (lh < h) h = lh;
         any = 1;
+    }
+    {   // the temporal upscaler's object motion target at a slot the scene's G-buffer pass leaves free (vkb_tsr.c)
+        int os;
+        VkImageView ov = any ? vkb_tsr_obj_target(&g_rt, &os) : VK_NULL_HANDLE;
+        t_obj_slot = ov ? os : -1;
+        if (ov) {
+            for (int i = ncolor; i < os; i++) color[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            color[os] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = ov,
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            if (os >= ncolor) ncolor = os + 1;
+        }
     }
     vkb_image *dim = g_rt.depth ? vkb_image_of(g_rt.depth) : NULL;
     if (dim && dim->refresh_from) vkb_tex_refresh(cb, dim);
@@ -2742,7 +2755,7 @@ struct mt_chunk {
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
     int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
-    uint64_t tsr[4];                      // the temporal upscaler's jitter state at its start (vkb_tsr.c)
+    uint64_t tsr[6];                      // the temporal upscaler's jitter state at its start (vkb_tsr.c)
 };
 static mt_chunk g_ch[MT_MAXCH];
 static int g_nch;

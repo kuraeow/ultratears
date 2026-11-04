@@ -301,6 +301,13 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                     Optimizer.RunPass(context);
                     TransformPasses.RunPass(context);
+
+                    // UltraTears: last frame's position beside this frame's (Transforms/PreviousPosition.cs)
+                    if (i == 0 && Definitions.Stage == ShaderStage.Vertex && GpuAccessor.QueryPreviousPosition())
+                    {
+                        int location = PreviousPosition.Run(cfg.Blocks, resourceManager, AttributeUsage, out int banks);
+                        GpuAccessor.ReportPreviousPosition(location, banks);
+                    }
                 }
 
                 funcs[i] = new Function(cfg.Blocks, $"fun{i}", false, inArgumentsCount, outArgumentsCount);

@@ -1238,6 +1238,7 @@ static VkImageView twin_view(VkCommandBuffer cb, vkb_image *im, VkImageViewType 
     return view;
 }
 
+static __thread const VkDescriptorBufferInfo *t_cb_override;   // obj_motion_draw: last frame's blocks for these slots
 static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, int stage) {
     uint32_t base = stage == 1 ? VKB_STAGE_BINDINGS : 0;
     VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment, sa = vkc.props.limits.minStorageBufferOffsetAlignment;
@@ -1246,7 +1247,8 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
     for (int slot = 0; slot < VKB_NCBUF; slot++) {
         if (!(sh->cbuf_mask & (1u << slot))) continue;
         VkDescriptorBufferInfo info;
-        if (slot == 1) {   // the shader's own constants: one copy per command buffer (they never change)
+        if (t_cb_override && t_cb_override[slot].buffer) info = t_cb_override[slot];
+        else if (slot == 1) {   // the shader's own constants: one copy per command buffer (they never change)
             uint32_t n = sh->c1_size ? (sh->c1_size + 15) & ~15u : 16;
             c1_t *c = &B->c1[((uintptr_t)sh * 0x9E3779B97F4A7C15ull) >> 54];
             if (c->sh != sh || c->rec != g_sub || no_cache()) {
@@ -1499,18 +1501,19 @@ static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed sinc
 static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, VkPrimitiveTopology topo) {
     // Nothing changed since the last draw of this command buffer: its ~45 values are recorded already. Not while the
     // depth audit or TOTK_VK_DEPTH_ALWAYS look at each draw.
-    static __thread struct { uint64_t rec; uint32_t gen; int ncolor; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
+    static __thread struct { uint64_t rec; uint32_t gen; int ncolor, oslot; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
+    int oslot = vkb_pass_obj_slot();   // the temporal upscaler's object motion target (vkb_tsr.c)
     static int per_draw = -1;
     if (per_draw < 0) per_draw = getenv("TOTK_VK_DEPTH_ALWAYS") != NULL || getenv("TOTK_VK_DYN_EVERY") != NULL;
     float jx = 0, jy = 0;   // the temporal upscaler's jitter of the scene's draws (vkb_tsr.c)
     vkb_tsr_jitter(vkb_rt(), &jx, &jy);
     if (!per_draw && !no_cache() && !vkb_depth_audit_on() && last.rec == g_rec && B->dc.rec == g_rec && last.gen == t_sgen &&
         last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo &&
-        last.jx == jx && last.jy == jy) {
+        last.jx == jx && last.jy == jy && last.oslot == oslot) {
         vkb_cnt_add(g_dyn_skips, 1);
         return;
     }
-    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo; last.jx = jx; last.jy = jy;
+    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo; last.jx = jx; last.jy = jy; last.oslot = oslot;
     // viewports (TOTK uses the upper-left window origin, as Vulkan) and the depth range
     VkViewport vps[16];
     int nvp = S.nvp ? S.nvp : 1;
@@ -1583,7 +1586,9 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
         DYN(D_SWM0 + f, uint32_t, S.stencil[f].write_mask, vk.vkCmdSetStencilWriteMask(cb, face, v_));
         DYN(D_SREF0 + f, uint32_t, S.stencil[f].ref, vk.vkCmdSetStencilReference(cb, face, v_));
     }
-    // colour: blend per target, write masks, logic op
+    // colour: blend per target, write masks, logic op; the temporal upscaler's object motion target (vkb_tsr.c), at a
+    // slot the game leaves free in the pass, is not written by the game's draws
+    if (oslot >= ncolor) ncolor = oslot + 1;
     if (ncolor > 0) {
         VkBool32 en[8];
         VkColorBlendEquationEXT eq[8];
@@ -1597,6 +1602,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
                                             blend_factor(b->src_a), blend_factor(b->dst_a), blend_op(b->eq_a)}
                 : (VkColorBlendEquationEXT){VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
             wm[i] = (S.chmask.mask >> (4 * i)) & 0xF;
+            if (i == oslot) en[i] = VK_FALSE, wm[i] = 0;
         }
         if (dyn(D_BLEN, en, sizeof en[0] * (size_t)ncolor)) vk.vkCmdSetColorBlendEnableEXT(cb, 0, (uint32_t)ncolor, en);
         if (dyn(D_BEQ, eq, sizeof eq[0] * (size_t)ncolor)) vk.vkCmdSetColorBlendEquationEXT(cb, 0, (uint32_t)ncolor, eq);
@@ -2071,7 +2077,7 @@ void vkb_draw_tsr_walk(void) {
         LOG("[vk] antialiasing: the scene's depth test %u (NVN 1-8: never less equal lequal greater notequal gequal always), "
             "depth range %s %g..%g", (unsigned)S.ds.df, S.has_dr ? "set" : "default", S.has_dr ? S.dr[0] : 0.0, S.has_dr ? S.dr[1] : 1.0);
     }
-    vkb_tsr_walk_draw(vkb_rt(), S.ubo[0][1].addr, S.ubo[0][1].size, fs);
+    vkb_tsr_walk_draw(vkb_rt(), S.ubo[0], fs);
 }
 
 // The game's FXAA under FSR 3.1 (vkb_tsr.c): its source, the tonemapped scene, copied into its target (the light target)
@@ -2090,6 +2096,104 @@ static int fxaa_copy(void) {
     vk.vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     vkb_image_written(dst);
     return 1;
+}
+
+// Per-object motion for FSR 3.1 (vkb_tsr.c): right after a solid draw of the scene's G-buffer pass, the same draw again
+// with its vertex shader's last-frame position variant (bound with last frame's blocks of the banks its position reads,
+// in the slots the variant has for them) and the object motion fragment shader, into the pass's object motion target
+// only, tested against the depth the draw just wrote and writing none. Only where a block other than the camera's
+// changed since last frame (the object moved); then the command buffer's caches start over (other shaders, sets and
+// state were bound).
+static void obj_motion_draw(VkCommandBuffer cb, const vkb_shader *vs, int indexed, const p_draw_idx *di, const p_draw *dr,
+                            uint32_t inst, uint32_t ints, uint32_t sint) {
+    int oslot = vkb_pass_obj_slot();
+    if (oslot < 0 || !S.has_ds || !S.ds.dt || !S.ds.dw) return;
+    const vkb_shader *pv = vkb_shader_prevpos(vs);
+    if (!pv || pv->unsupported || pv->prev_loc < 0) return;
+    // 1. did an object block change? (the parts of a model share theirs: the last answer per bank is kept)
+    static __thread uint8_t *cur;
+    static __thread struct { uint64_t addr, seq; uint32_t n; const uint8_t *prev; int moved; } memo[8];
+    if (!cur && !(cur = malloc(16384))) return;
+    const uint8_t *prev[VKB_NCBUF] = {0};
+    uint32_t len[VKB_NCBUF] = {0};
+    int moved = 0, found = 0;
+    uint64_t now = vkb_frame() + 1;   // a memo lasts within a frame
+    for (int k = 3; k < VKB_NCBUF; k++) {
+        int bank = pv->prev_of[k];
+        if (bank < 5 || bank > 7) continue;
+        const p_bind_buf *u = &S.ubo[0][bank - 3];
+        uint32_t n = u->size > 16384 ? 16384 : (uint32_t)u->size;
+        if (!u->addr || !n) continue;
+        if (memo[bank].addr == u->addr && memo[bank].n == n && memo[bank].seq == now) {
+            prev[k] = memo[bank].prev, moved |= memo[bank].moved;
+        } else {
+            vkb_ucap_read(u->addr, cur, n);
+            prev[k] = vkb_tsr_prev_block(bank, u->addr, cur, n);
+            int m = prev[k] && memcmp(prev[k], cur, n);
+            memo[bank].addr = u->addr, memo[bank].n = n, memo[bank].seq = now, memo[bank].prev = prev[k], memo[bank].moved = m;
+            moved |= m;
+        }
+        len[k] = n;
+        found |= prev[k] != NULL;
+    }
+    vkb_tsr_obj_count(moved, found);
+    if (!moved) return;
+    // 2. last frame's blocks into this submission's upload memory: the object's, and the camera's
+    VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment;
+    VkDescriptorBufferInfo ovr[VKB_NCBUF];
+    memset(ovr, 0, sizeof ovr);
+    for (int k = 3; k < VKB_NCBUF; k++) {
+        int bank = pv->prev_of[k];
+        if (!bank) continue;
+        const p_bind_buf *u = &S.ubo[0][bank - 3];
+        if (!u->addr || !u->size) continue;
+        if (bank == 4) {   // the camera: without last frame's, the camera pass's vector stays
+            len[k] = u->size > 16384 ? 16384 : (uint32_t)u->size;
+            vkb_ucap_read(u->addr, cur, len[k]);
+            if (!(prev[k] = vkb_tsr_prev_block(4, u->addr, cur, len[k]))) return;
+        }
+        if (!prev[k]) {   // other banks, and a block new this frame: this frame's
+            ovr[k] = guest_range(u->addr, u->size, ua, 1);
+            continue;
+        }
+        uint32_t n = len[k], m = (n + 15) & ~15u;
+        VkBuffer b;
+        VkDeviceSize off;
+        uint8_t *p = vkb_ring_alloc(m, ua, &b, &off);
+        memcpy(p, prev[k], n);
+        if (m > n) memset(p + n, 0, m - n);
+        ovr[k] = (VkDescriptorBufferInfo){b, off, m};
+    }
+    VkShaderEXT fobj = vkb_tsr_obj_fs(pv->prev_loc, oslot);
+    VkShaderEXT vobj = ints ? vkb_shader_variant(pv, ints, sint, NULL) : pv->obj;
+    if (!fobj || !vobj) return;
+    writes_t *W = &B->writes;
+    W->n = 0;
+    t_cb_override = ovr;
+    write_stage(W, VK_NULL_HANDLE, pv, 0);
+    t_cb_override = NULL;
+    if (vkb_split_sets()) bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_IMAGES), 0, resolve_set(W, VKB_LAYOUT_BUFFERS, VKB_PART_BUFFERS));
+    else bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_ALL), 0, VK_NULL_HANDLE);
+    VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                                       VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
+    VkShaderEXT objs[5] = {vobj, fobj, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
+    uint32_t nc = (uint32_t)vkb_rt_count();
+    if ((uint32_t)oslot >= nc) nc = (uint32_t)oslot + 1;
+    VkBool32 en[8] = {0};
+    VkColorComponentFlags wm[8] = {0};
+    wm[oslot] = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    vk.vkCmdSetColorBlendEnableEXT(cb, 0, nc, en);
+    vk.vkCmdSetColorWriteMaskEXT(cb, 0, nc, wm);
+    vk.vkCmdSetLogicOpEnableEXT(cb, VK_FALSE);
+    vk.vkCmdSetAlphaToCoverageEnableEXT(cb, VK_FALSE);
+    vk.vkCmdSetDepthTestEnable(cb, VK_TRUE);
+    vk.vkCmdSetDepthWriteEnable(cb, VK_FALSE);
+    vk.vkCmdSetDepthCompareOp(cb, VK_COMPARE_OP_LESS_OR_EQUAL);
+    vk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
+    if (indexed) vk.vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
+    else vk.vkCmdDraw(cb, (uint32_t)dr->count, inst, (uint32_t)dr->first, (uint32_t)dr->base_instance);
+    vkb_rec_begin();   // the next draw records its state, shaders and sets again (every cache of this command buffer)
 }
 
 void vkb_draw(const uint8_t *a, int indexed) {
@@ -2351,6 +2455,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
         vk.vkCmdDraw(cb, (uint32_t)dr->count, inst, (uint32_t)dr->first, (uint32_t)dr->base_instance);
         gprof_end(gq, fs ? fs : vs, 0, (uint32_t)dr->count, inst);
     }
+    obj_motion_draw(cb, vs, indexed, di, dr, inst, int_inputs, sint);   // a moving object's motion (FSR 3.1)
     if (vs->stores || (fs && fs->stores)) {
         g_stores_pending = 1;
         if (vs->stores) written_add(vs, 0);

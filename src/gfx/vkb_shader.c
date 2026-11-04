@@ -496,6 +496,22 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
             remap[b] = base + VKB_B_CBUF + (uint32_t)slot;
             s->cbuf_mask |= 1u << slot;
         }
+    // a last-frame position variant (the translator's PreviousPosition): bank n's last-frame block was asked for at slot
+    // n + 15; it goes into a slot of c3..c16 the shader does not use, and prev_of says which bank's block is bound there
+    s->prev_loc = (int)json_top_int(j, "prev_location", -1);
+    s->prev_banks = (uint32_t)json_top_int(j, "prev_banks", 0);
+    if (s->prev_loc >= 0 && (p = json_array(j, "cbufs")))
+        for (; (p = json_next(p, &e)); p = e) {
+            long b = json_int(p, e, "binding", -1), slot = json_int(p, e, "slot", -1);
+            if (b < 0 || b > 255 || slot < 18 || slot > 31) continue;
+            int free_slot = -1;
+            for (int k = 16; k >= 3 && free_slot < 0; k--)
+                if (!(s->cbuf_mask & (1u << k))) free_slot = k;
+            if (free_slot < 0) { s->unsupported = 1; continue; }   // no room: the variant is not used
+            remap[b] = base + VKB_B_CBUF + (uint32_t)free_slot;
+            s->cbuf_mask |= 1u << free_slot;
+            s->prev_of[free_slot] = (uint8_t)(slot - 15);
+        }
     // storage buffers: the address comes from the NVN driver bank c0, 16 bytes per slot: the stage's storage buffer
     // table (vertex 0x110, fragment 0x510, compute 0x310) or, for compute, its uniform buffer table (0x210): TOTK's
     // compute shaders also use uniform buffers as storage (MacNativeGames' "ubo_ptr")
@@ -1121,6 +1137,43 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     }
     pthread_mutex_unlock(&g_mu);
     return &e->sh;
+}
+
+// The last-frame position variant: the shader's key with each byte XOR 0x6d (the translator's PrevPosKey, Program.cs),
+// made like any shader (from its binary when compiled ahead) by a creator thread; until then, and for a shader without
+// one, NULL. Its entry is held for good (variants are few: the scene's vertex shaders).
+const vkb_shader *vkb_shader_prevpos(const vkb_shader *cvs) {
+    vkb_shader *vs = (vkb_shader *)cvs;
+    if (!vs || !vs->key || vs->stage != 0 || vs->prev_loc >= 0) return NULL;
+    int st = __atomic_load_n(&vs->prev_state, __ATOMIC_ACQUIRE);
+    if (st) return st > 0 ? vs->prev : NULL;
+    char key[65];
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        sscanf(vs->key + 2 * i, "%2x", &v);
+        snprintf(key + 2 * i, 3, "%02x", v ^ 0x6d);
+    }
+    pthread_mutex_lock(&g_mu);
+    shentry *e = entry(key, 0);
+    if (e->loaded < 0 || (e->sh.obj && (e->sh.unsupported || e->sh.prev_loc < 0))) {
+        __atomic_store_n(&vs->prev_state, -1, __ATOMIC_RELEASE);
+    } else if (e->sh.obj) {
+        if (!e->sh.c1) e->sh.c1 = vs->c1, e->sh.c1_size = vs->c1_size;   // the same code's constants
+        vs->prev = &e->sh;
+        __atomic_store_n(&vs->prev_state, 1, __ATOMIC_RELEASE);
+    } else if (!e->busy && !e->queued && g_cq_in - g_cq_out < CQ) {
+        if (!e->refs) e->refs = 1;   // held for good
+        e->queued = 1;
+        g_cq[g_cq_in++ % CQ] = e;
+        pthread_cond_signal(&g_cq_cv);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+VkShaderEXT vkb_shader_own_fragment(const uint32_t *spv, size_t bytes) {
+    VkShaderEXT obj = VK_NULL_HANDLE;
+    return make_object(NULL, NULL, VK_SHADER_STAGE_FRAGMENT_BIT, spv, bytes, &obj) == VK_SUCCESS ? obj : VK_NULL_HANDLE;
 }
 
 void vkb_shader_stats(uint64_t *loaded, uint64_t *missing) { *loaded = g_loaded; *missing = g_missing; }

@@ -42,6 +42,9 @@
 #include "vkb.h"
 #include "../../third_party/fsr3/fsr3_spv.h"
 #include "vkb_tsr_mv_spv.h"
+#include "vkb_shader.h"
+
+void vkb_tsr_obj_log(void);
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -99,7 +102,7 @@ typedef struct {
     float near_, far_, fov;  // the camera, for FSR's depth thresholds
     float dt_ms;
 } fsr_job;
-typedef struct { uint64_t seq; int kind; float jx, jy; const void *depth_mem; int job; } tsr_event;
+typedef struct { uint64_t seq; int kind; float jx, jy; const void *depth_mem; int job, jit; uint32_t frame, sw, sh; } tsr_event;
 enum { MAX_EV = 64, MAX_JOB = 4 };
 static struct {
     int phase;
@@ -136,7 +139,7 @@ static float halton(uint32_t i, uint32_t b) {
 static void ev_add(int kind, int job) {
     int n = atomic_load_explicit(&g_nev, memory_order_relaxed);
     if (n >= MAX_EV) return;
-    g_ev[n] = (tsr_event){vkb_seq(), kind, W.jx, W.jy, W.depth_mem, job};
+    g_ev[n] = (tsr_event){vkb_seq(), kind, W.jx, W.jy, W.depth_mem, job, W.jit, (uint32_t)W.frames, W.sw, W.sh};
     atomic_store_explicit(&g_nev, n + 1, memory_order_release);
 }
 
@@ -192,7 +195,7 @@ void vkb_tsr_walk_rt(const p_set_rt *rt) {
         // a later G-buffer pass of the same scene (TotK draws 8 targets with the scene depth again after the lighting and
         // some small passes): the scene goes on, jittered again
         if ((W.phase == PH_ARMED || W.phase == PH_ENDED) && z->mem == W.depth_mem && c->d.width == W.sw) {
-            if (W.phase == PH_ENDED && W.jit) ev_add(EV_JIT_ON, -1);
+            if (W.phase == PH_ENDED) ev_add(EV_JIT_ON, -1);
             W.phase = PH_SCENE;
             return;
         }
@@ -204,7 +207,7 @@ void vkb_tsr_walk_rt(const p_set_rt *rt) {
         }
         W.sw = c->d.width, W.sh = c->d.height, W.depth_mem = z->mem, W.depth = *z;
         frame_begin();
-        if (W.jit) ev_add(EV_JIT_ON, -1);
+        ev_add(EV_JIT_ON, -1);   // the scene's passes: jittered (when W.jit) and drawn with the object motion target
         return;
     }
     if (W.phase == PH_SCENE || W.phase == PH_ARMED) {
@@ -216,7 +219,7 @@ void vkb_tsr_walk_rt(const p_set_rt *rt) {
         // ended: the bloom chain, a pass at most a quarter as wide as the scene, after arming
         if (W.phase == PH_ARMED && c && c->d.width * 4 <= W.sw) {
             W.phase = PH_ENDED;
-            if (W.jit) ev_add(EV_JIT_OFF, -1);
+            ev_add(EV_JIT_OFF, -1);
         }
     }
 }
@@ -324,10 +327,14 @@ int vkb_tsr_fs_easu(const char *key) {
 }
 
 // A draw in the walk: the scene's camera, and the EASU draw where FSR goes.
-void vkb_tsr_walk_draw(const p_set_rt *rt, uint64_t c4_addr, uint64_t c4_size, const char *fs_key) {
+static void arena_keep(int bank, uint64_t addr, uint64_t size);
+void vkb_tsr_walk_draw(const p_set_rt *rt, const p_bind_buf *vubo, const char *fs_key) {
     if (!vkb_tsr_on() || W.phase == PH_IDLE || W.phase == PH_DONE) return;
     if (W.phase == PH_SCENE && rt->depth && rt->depth->mem == W.depth_mem) {
+        uint64_t c4_addr = vubo[1].addr, c4_size = vubo[1].size;
         if (c4_size == CAM_BYTES && c4_addr && !W.cam_addr) W.cam_addr = c4_addr;
+        for (int bank = 4; bank <= 7; bank++)   // this frame's blocks of the camera and the objects, for the next frame
+            if (vubo[bank - 3].addr && vubo[bank - 3].size) arena_keep(bank, vubo[bank - 3].addr, vubo[bank - 3].size);
         return;
     }
     // the game's FXAA into the light target, after the scene: a copy of its source instead (vkb_draw.c fxaa_copy)
@@ -353,16 +360,19 @@ void vkb_tsr_walk_draw(const p_set_rt *rt, uint64_t c4_addr, uint64_t c4_size, c
             W.logged_at = W.frames;
             VLOG("antialiasing: FSR 3.1 %ux%u -> %ux%u, %llu frames, %llu without FSR, %llu jitter holds", W.sw, W.sh, ow, oh,
                  (unsigned long long)W.frames, (unsigned long long)W.missed, (unsigned long long)W.holds);
+            vkb_tsr_obj_log();
         }
     }
 }
 
 // ---------------------------------------------------------------- recording: the jitter
-static __thread struct { int ev; float jx, jy; const void *mem; int on; } T;
-typedef struct { float jx, jy; const void *mem; int on; } tsr_chunk_state;
+// T.on: the scene's passes (jittered when T.jit, and drawn with the object motion target); T.frame: whose blocks
+static __thread struct { int ev; float jx, jy; const void *mem; int on, jit; uint32_t frame, sw, sh; } T;
+typedef struct { float jx, jy; const void *mem; int on, jit; uint32_t frame, sw, sh; } tsr_chunk_state;
+_Static_assert(sizeof(tsr_chunk_state) <= 48, "the chunk keeps 48 bytes of it (backend_vk.c mt_chunk.tsr)");
 size_t vkb_tsr_state_size(void) { return sizeof(tsr_chunk_state); }
 void vkb_tsr_state_save(void *dst) {   // the walk, at a chunk's start
-    tsr_chunk_state s = {W.jx, W.jy, W.depth_mem, W.jit && (W.phase == PH_SCENE || W.phase == PH_ARMED)};
+    tsr_chunk_state s = {W.jx, W.jy, W.depth_mem, W.phase == PH_SCENE || W.phase == PH_ARMED, W.jit, (uint32_t)W.frames, W.sw, W.sh};
     memcpy(dst, &s, sizeof s);
 }
 void vkb_tsr_sub_begin(void) {   // a new submission: its positions start again (the translation thread)
@@ -377,7 +387,7 @@ void vkb_tsr_rec_begin(const void *state) {   // a recording thread starts a chu
     if (state) {
         tsr_chunk_state s;
         memcpy(&s, state, sizeof s);
-        T.jx = s.jx, T.jy = s.jy, T.mem = s.mem, T.on = s.on;
+        T.jx = s.jx, T.jy = s.jy, T.mem = s.mem, T.on = s.on, T.jit = s.jit, T.frame = s.frame, T.sw = s.sw, T.sh = s.sh;
     }
 }
 static const tsr_event *ev_here(int kind) {   // an event of this kind at the current position
@@ -388,14 +398,20 @@ static const tsr_event *ev_here(int kind) {   // an event of this kind at the cu
         if (g_ev[i].kind == kind) return &g_ev[i];
     return NULL;
 }
+static void obj_clear(uint32_t w, uint32_t h);
+static void obj_prepare(uint32_t w, uint32_t h, int new_only);
+VkImageView vkb_tsr_obj_view(void);
 void vkb_tsr_rec_rt(void) {   // after a render target change
     if (!atomic_load_explicit(&g_nev, memory_order_relaxed)) return;
     const tsr_event *e = ev_here(EV_JIT_ON);
-    if (e) T.on = 1, T.jx = e->jx, T.jy = e->jy, T.mem = e->depth_mem;
+    if (e) {
+        T.on = 1, T.jit = e->jit, T.jx = e->jx, T.jy = e->jy, T.mem = e->depth_mem, T.sw = e->sw, T.sh = e->sh;
+        if (e->frame != T.frame) T.frame = e->frame, obj_clear(e->sw, e->sh);   // a new frame: no object moved yet
+    }
     if (ev_here(EV_JIT_OFF)) T.on = 0;
 }
 int vkb_tsr_jitter(const p_set_rt *rt, float *jx, float *jy) {   // the viewport offset of a draw into these targets
-    if (!T.on || !rt->depth || rt->depth->mem != T.mem) return 0;
+    if (!T.on || !T.jit || !rt->depth || rt->depth->mem != T.mem) return 0;
     *jx = T.jx, *jy = T.jy;
     return 1;
 }
@@ -498,7 +514,8 @@ static int pipelines(void) {
         } else {
             b[nb++] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
             b[nb++] = (VkDescriptorSetLayoutBinding){1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
-            ps[0].descriptorCount += VKB_SLOTS * NSETS, ps[1].descriptorCount += VKB_SLOTS * NSETS;
+            b[nb++] = (VkDescriptorSetLayoutBinding){2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+            ps[0].descriptorCount += 2 * VKB_SLOTS * NSETS, ps[1].descriptorCount += VKB_SLOTS * NSETS;
             code = tsr_mv_spv, size = sizeof tsr_mv_spv;
         }
         VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nb, .pBindings = b};
@@ -727,13 +744,18 @@ static int run(const fsr_job *j, vkb_image *target) {
     barrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     // the camera's motion vectors
     {
+        obj_prepare(rw, rh, 1);   // the object motion target, cleared when it is new (no objects drawn into it then)
         VkDescriptorImageInfo di = {VK_NULL_HANDLE, zv, VK_IMAGE_LAYOUT_GENERAL}, oi = {VK_NULL_HANDLE, F.r[R_MV].view, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet w[2] = {
+        VkDescriptorImageInfo bi2 = {VK_NULL_HANDLE, vkb_tsr_obj_view(), VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[3] = {
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[FSR3_NPASS], .dstBinding = 0, .descriptorCount = 1,
              .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &di},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[FSR3_NPASS], .dstBinding = 1, .descriptorCount = 1,
-             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi}};
-        vk.vkUpdateDescriptorSets(vkc.device, 2, w, 0, NULL);
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &oi},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[FSR3_NPASS], .dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &bi2}};
+        if (!bi2.imageView) { VLOG("antialiasing: no object motion target: FSR 3.1 off for this run"); goto out; }
+        vk.vkUpdateDescriptorSets(vkc.device, 3, w, 0, NULL);
         struct { float m[16], size[2], jit[2]; } pcs;
         if (j->have_m) memcpy(pcs.m, j->m, sizeof pcs.m);
         else for (int i = 0; i < 16; i++) pcs.m[i] = i % 5 == 0;   // no last frame: zero motion
@@ -848,4 +870,194 @@ int vkb_tsr_rec_draw(const p_set_rt *rt) {   // 1: FSR ran in place of this draw
     vkb_rec_begin();   // our shaders and sets were bound: the replay binds everything again
     if (!ok && !F.ok && F.tried) g_mode = 0;   // FSR 3.1 cannot run here: no more jitter either
     return ok;
+}
+
+// ---------------------------------------------------------------- per-object motion
+// The camera's motion is right for what holds still; an object that moves on its own (Link, creatures, what they carry,
+// moving props) gets its own: right after its draw in a G-buffer pass it is drawn again (vkb_draw.c obj_motion_draw)
+// with its vertex shader's last-frame position variant (made by the translator, Transforms/PreviousPosition.cs, bound
+// with last frame's blocks of the banks the position reads) and tsr_obj.frag, into the object motion target this file
+// adds to the scene's G-buffer passes at a target slot they leave free (backend_vk.c pass_begin). Only objects whose
+// blocks changed are drawn again.
+// Last frame's blocks: the walk keeps a copy of every block of banks c4..c7 the scene's draws bind, as of the submit
+// call, in an arena per frame (four in turn: the recording of a frame reads the one of the frame before while the
+// walk fills the next). A block of this frame is found last frame at the same address (an object the game did not
+// write again) or one step away: the game writes an object's blocks into two copies that take turns, the second right
+// after the first, a step of the block's size rounded up to 256 bytes apart (totk-pc-recomp measured it, vk_mvprev.c).
+// Both neighbours there (copies of adjacent objects interleave): the one more like this frame's.
+// TOTK_AA_OBJMV=0: the camera's motion only.
+enum { ARENAS = 4, BLOCK_MAX = 16384, ATAB = 1 << 14 };
+typedef struct { uint64_t addr; uint32_t off, size; uint8_t bank, used; } ablk;
+typedef struct { uint64_t frame; ablk tab[ATAB]; uint32_t n; uint8_t *data; size_t used, cap; } arena;
+static arena *g_arena[ARENAS];
+static _Atomic uint64_t g_obj_draws, g_obj_still, g_obj_noprev;
+static uint64_t g_kept_blocks, g_kept_bytes;
+
+static int objmv_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_AA_OBJMV"); v = !(e && *e == '0'); }
+    return v && vkb_tsr_on();
+}
+
+static uint32_t ahash(int bank, uint64_t addr) {
+    return (uint32_t)((((addr >> 4) ^ (uint64_t)bank * 0x9E3779B97F4A7C15ull) * 0x9E3779B97F4A7C15ull) >> 50);
+}
+
+static void arena_keep(int bank, uint64_t addr, uint64_t size) {   // the walk: a block this frame's scene binds
+    if (!objmv_on()) return;
+    arena **pa = &g_arena[W.frames % ARENAS];
+    if (!*pa && !(*pa = calloc(1, sizeof **pa))) return;
+    arena *a = *pa;
+    if (a->frame != W.frames) a->frame = W.frames, a->n = 0, a->used = 0, memset(a->tab, 0, sizeof a->tab);
+    if (a->n >= ATAB / 2) return;
+    uint32_t n = size > BLOCK_MAX ? BLOCK_MAX : (uint32_t)size;
+    for (uint32_t h = ahash(bank, addr);; h = (h + 1) & (ATAB - 1)) {
+        ablk *b = &a->tab[h];
+        if (b->used && b->addr == addr && b->bank == bank) return;   // kept already
+        if (b->used) continue;
+        if (a->used + n > a->cap) {
+            size_t cap = a->cap ? a->cap * 2 : (size_t)1 << 20;
+            while (cap < a->used + n) cap *= 2;
+            uint8_t *d = realloc(a->data, cap);
+            if (!d) return;
+            a->data = d, a->cap = cap;
+        }
+        vkb_ucap_read(addr, a->data + a->used, n);
+        *b = (ablk){addr, (uint32_t)a->used, n, (uint8_t)bank, 1};
+        a->used += n, a->n++;
+        g_kept_blocks++, g_kept_bytes += n;
+        return;
+    }
+}
+
+static const ablk *arena_find(const arena *a, int bank, uint64_t addr) {
+    for (uint32_t h = ahash(bank, addr);; h = (h + 1) & (ATAB - 1)) {
+        const ablk *b = &a->tab[h];
+        if (!b->used) return NULL;
+        if (b->addr == addr && b->bank == bank) return b;
+    }
+}
+
+// Last frame's copy of a block this draw binds (cur: its bytes now, n of them): NULL when there is none (a new object).
+const uint8_t *vkb_tsr_prev_block(int bank, uint64_t addr, const uint8_t *cur, uint32_t n) {
+    if (!T.frame) return NULL;
+    const arena *a = g_arena[(T.frame - 1) % ARENAS];
+    if (!a || a->frame != T.frame - 1) return NULL;
+    const ablk *self = arena_find(a, bank, addr);
+    if (self && self->size >= n) return a->data + self->off;
+    uint64_t step = ((uint64_t)n + 255) & ~255ull;
+    const ablk *lo = addr >= step ? arena_find(a, bank, addr - step) : NULL, *hi = arena_find(a, bank, addr + step);
+    if (lo && lo->size < n) lo = NULL;
+    if (hi && hi->size < n) hi = NULL;
+    if (lo && hi) {   // the one with more of its first 16 words equal to this frame's
+        int el = 0, eh = 0;
+        for (uint32_t w = 0; w < 16 && w * 4 + 4 <= n; w++) {
+            el += !memcmp(a->data + lo->off + w * 4, cur + w * 4, 4);
+            eh += !memcmp(a->data + hi->off + w * 4, cur + w * 4, 4);
+        }
+        return a->data + (eh > el ? hi : lo)->off;
+    }
+    return lo ? a->data + lo->off : hi ? a->data + hi->off : NULL;
+}
+
+void vkb_tsr_obj_count(int drawn, int found_prev) {   // statistics (the log line)
+    atomic_fetch_add_explicit(drawn ? &g_obj_draws : found_prev ? &g_obj_still : &g_obj_noprev, 1, memory_order_relaxed);
+}
+
+// The object motion target: RGBA32F at the scene size, GENERAL; cleared at each frame's first scene pass.
+static struct { VkImage img; VkDeviceMemory mem; VkImageView view; uint32_t w, h; pthread_mutex_t mu; VkShaderEXT fs[32][8]; } O = {
+    .mu = PTHREAD_MUTEX_INITIALIZER};
+static uint32_t memtype(uint32_t bits);
+static int obj_image(uint32_t w, uint32_t h) {   // O.mu held; 2: made now (UNDEFINED layout)
+    if (O.img && O.w == w && O.h == h) return 1;
+    if (O.img) vkb_destroy_later(O.view, O.img, O.mem), O.img = VK_NULL_HANDLE, O.view = VK_NULL_HANDLE, O.w = O.h = 0;
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                            .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vk.vkCreateImage(vkc.device, &ii, NULL, &O.img) != VK_SUCCESS) return O.img = VK_NULL_HANDLE, 0;
+    VkMemoryRequirements mr;
+    vk.vkGetImageMemoryRequirements(vkc.device, O.img, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = memtype(mr.memoryTypeBits)};
+    vkb_mtag = MT_IMAGE;
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = O.img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                .format = VK_FORMAT_R32G32B32A32_SFLOAT, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(vkc.device, &ai, NULL, &O.mem) != VK_SUCCESS ||
+        vk.vkBindImageMemory(vkc.device, O.img, O.mem, 0) != VK_SUCCESS || vk.vkCreateImageView(vkc.device, &vi, NULL, &O.view) != VK_SUCCESS) {
+        VLOG("antialiasing: the object motion target could not be made");
+        O.view = VK_NULL_HANDLE;
+        return 0;
+    }
+    O.w = w, O.h = h;
+    VLOG("antialiasing: object motion target made for %ux%u", w, h);
+    return 2;
+}
+static void obj_clear(uint32_t w, uint32_t h) { if (objmv_on()) obj_prepare(w, h, 0); }
+// The target cleared (recording, outside a pass): at a frame's first scene pass, and once when made for FSR's motion
+// pass (always: its texelFetch reads it, objects or not; new is 1 then: only a new image is cleared).
+static void obj_prepare(uint32_t w, uint32_t h, int new_only) {
+    if (!w || !h) return;
+    pthread_mutex_lock(&O.mu);
+    int made = obj_image(w, h);
+    pthread_mutex_unlock(&O.mu);
+    if (!made || (new_only && made != 2)) return;
+    vkb_pass_end_r(PE_OTHER);
+    VkCommandBuffer cb = vkb_cmd();
+    VkImageMemoryBarrier2 ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .oldLayout = made == 2 ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .image = O.img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+    vk.vkCmdPipelineBarrier2(cb, &di);
+    VkClearColorValue z = {{0, 0, 0, 0}};
+    VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk.vkCmdClearColorImage(cb, O.img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &r);
+    ib.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, ib.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vk.vkCmdPipelineBarrier2(cb, &di);
+}
+
+// A pass being begun: the target slot of the object motion target in it, and its view (VK_NULL_HANDLE: none). The
+// scene's G-buffer passes (three or more targets with the scene depth) of a frame whose target is cleared.
+VkImageView vkb_tsr_obj_target(const p_set_rt *rt, int *slot) {
+    *slot = -1;
+    if (!T.on || !objmv_on() || rt->n < 3 || !rt->depth || rt->depth->mem != T.mem || !rt->color[0] ||
+        rt->color[0]->d.width != T.sw || rt->color[0]->d.height != T.sh || O.w != T.sw || O.h != T.sh || !O.view)
+        return VK_NULL_HANDLE;
+    for (int i = 7; i >= 0 && *slot < 0; i--)
+        if (i >= rt->n || !rt->color[i]) *slot = i;
+    return *slot >= 0 ? O.view : VK_NULL_HANDLE;
+}
+
+// The fragment shader of an object motion draw: tsr_obj.frag with its input at the variant's output location and its
+// output at the pass's free slot (the template's Location decorations 31 and 7 patched).
+VkShaderEXT vkb_tsr_obj_fs(int in_loc, int out_slot) {
+    if (in_loc < 0 || in_loc >= 32 || out_slot < 0 || out_slot >= 8) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&O.mu);
+    VkShaderEXT s = O.fs[in_loc][out_slot];
+    if (!s) {
+        uint32_t code[sizeof tsr_obj_spv / 4];
+        memcpy(code, tsr_obj_spv, sizeof code);
+        for (size_t i = 5; i < sizeof code / 4;) {
+            uint32_t op = code[i] & 0xffff, wc = code[i] >> 16;
+            if (!wc) break;
+            if (op == 71 && wc == 4 && code[i + 2] == 30) code[i + 3] = code[i + 3] == 31 ? (uint32_t)in_loc : (uint32_t)out_slot;
+            i += wc;
+        }
+        s = O.fs[in_loc][out_slot] = vkb_shader_own_fragment(code, sizeof code);
+    }
+    pthread_mutex_unlock(&O.mu);
+    return s;
+}
+
+VkImageView vkb_tsr_obj_view(void) { return O.view; }
+
+void vkb_tsr_obj_log(void) {   // once in a while (vkb_tsr_walk_draw's line)
+    VLOG("antialiasing: object motion: %llu draws again, %llu held still, %llu without last frame's blocks; kept %llu blocks, %.1f MiB",
+         (unsigned long long)g_obj_draws, (unsigned long long)g_obj_still, (unsigned long long)g_obj_noprev,
+         (unsigned long long)g_kept_blocks, g_kept_bytes / 1048576.0);
 }
