@@ -1362,7 +1362,11 @@ static std::string res_for_aspect(int a, const std::string &res) {
 // none, and supersampling
 static const Opt SCALE_OPTS[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
                                  {"", "scale_game"}, {"100", "scale_native"}, {"150", "scale_150"}, {"200", "scale_200"}};
-// sharpness= (src/vk/fsr.c): the RCAS pass of the present's FSR 1, when the window is larger than the game's output
+// antialias= (src/gfx/vkb_tsr.c): how the scene reaches the output, the game's FSR 1 (with its FXAA) or FSR 3.1, which
+// also anti-aliases over frames; the scale above is then FSR 3.1's mode
+static const Opt AA_OPTS[] = {{"", "aa_game"}, {"fsr3", "FSR 3.1"}};
+// sharpness= (src/vk/fsr.c, src/gfx/vkb_tsr.c): the RCAS pass of the present's FSR 1 (when the window is larger than the
+// game's output), and of FSR 3.1
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
 
 template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
@@ -1650,9 +1654,18 @@ static void screen_play() {
         if ((k = dropdown("aspect", 748 - rw - 8, cy, aw, ASPECT_OPTS, a)) >= 0 && k != a)
             cfg_set("resolution", res_for_aspect(k, res));
         cy += ROW;
-        row_label(cy, "row_scale");
+        row_label(cy, "row_scale");   // the method, then its scale (as the shape, then the size, of the resolution)
         if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
             cfg_set("scale", SCALE_OPTS[k].value);
+        {
+            float sw = 126, mw = 0;
+            for (const Opt &o : SCALE_OPTS)
+                sw = SDL_max(sw, text_w(g_media.control, opt_label(o)) + 52);
+            for (const Opt &o : AA_OPTS)
+                mw = SDL_max(mw, text_w(g_media.control, opt_label(o)) + 50);
+            if ((k = dropdown("aa", 748 - sw - 8, cy, mw, AA_OPTS, opt_index(AA_OPTS, cfg_get("antialias")))) >= 0)
+                cfg_set("antialias", AA_OPTS[k].value);
+        }
         cy += ROW;
         row_label(cy, "row_sharp");
         if ((k = dropdown("sharp", 748, cy, 0, SHARP_OPTS, opt_index(SHARP_OPTS, cfg_get("sharpness"), "50"))) >= 0)

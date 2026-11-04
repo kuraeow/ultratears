@@ -125,7 +125,7 @@ static const char *default_exefs(void) {
                 // the player's settings (the launcher's Play screen writes them)
                 {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
                 {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
-                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"},
+                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}, {"antialias", "TOTK_AA"},
                 {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
                 {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;

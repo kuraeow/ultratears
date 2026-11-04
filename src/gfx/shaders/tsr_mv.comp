@@ -1,0 +1,31 @@
+#version 450
+// UltraTears: camera motion vectors for the temporal upscaler (src/gfx/vkb_tsr.c). SPDX-License-Identifier: GPL-3.0-or-later
+// Each pixel's depth is taken through one matrix, last frame's view-projection times the inverse of this frame's (made
+// in double precision on the CPU: in float, TotK's world coordinates in the thousands left distant surfaces shimmering),
+// from this frame's clip space to last frame's. The vector is last frame's window position minus this frame's, in render
+// pixels, without the jitter (FSR's convention). Clip space as the translated shaders write it: y up, depth -w..w; the
+// replay's viewports have negative heights, so window y grows downwards from ndc y = +1 and depth is ndc z * 0.5 + 0.5.
+// Objects that move on their own get only the camera's motion (the per-object motion comes later).
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform texture2D depth_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(push_constant) uniform P {
+    mat4 m;        // this frame's clip space to last frame's
+    vec2 size;     // render size in pixels
+    vec2 jitter;   // this frame's jitter in pixels, as the scene was drawn (window x right, y down)
+} pc;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    float d = texelFetch(depth_tex, p, 0).r;
+    vec2 win = vec2(p) + 0.5 - pc.jitter;   // where this pixel's surface sits without the jitter
+    vec4 ndc = vec4(win.x / pc.size.x * 2.0 - 1.0, 1.0 - win.y / pc.size.y * 2.0, d * 2.0 - 1.0, 1.0);
+    vec4 c = pc.m * ndc;
+    vec2 mv = vec2(0.0);
+    if (c.w > 1e-6) {
+        vec2 pn = c.xy / c.w;
+        mv = vec2((pn.x * 0.5 + 0.5) * pc.size.x, (0.5 - pn.y * 0.5) * pc.size.y) - win;
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+}

@@ -2595,6 +2595,8 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             if (!(g_in_pass && rt_keep() && !memcmp(&g_rt, a, sizeof g_rt))) {
                 pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt);
             }
+            if (mode == EX_ONE) vkb_tsr_walk_rt(&g_rt);   // one thread: the walk's look comes here (vkb_tsr.c)
+            vkb_tsr_rec_rt();
             trace_rt(); break;
         case OP_CLEAR_COLOR: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_ds((const p_clear_ds *)a); break;
@@ -2610,6 +2612,7 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             break;
         case OP_DRAW: case OP_DRAW_IDX:
             if (g_render_off) { vkb_cnt_add(g_cond_skipped, 1); rt_log(1); break; }
+            if (mode == EX_ONE) vkb_draw_tsr_walk();
             if (g_ok == 1) vkb_draw(a, h.op == OP_DRAW_IDX);
             break;
         case OP_DISPATCH: if (g_ok == 1) vkb_dispatch(a); break;
@@ -2739,6 +2742,7 @@ struct mt_chunk {
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
     int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
+    uint64_t tsr[4];                      // the temporal upscaler's jitter state at its start (vkb_tsr.c)
 };
 static mt_chunk g_ch[MT_MAXCH];
 static int g_nch;
@@ -2860,6 +2864,7 @@ static void mt_record(mt_chunk *c) {
     g_in_pass = 0;
     vkb_stores_take();
     t_seq = c->seq;
+    vkb_tsr_rec_begin(c->tsr);
     for (int i = c->h0; i < g_mt_n; i++) {
         const uint8_t *p = i == c->h0 ? c->p0 : (const uint8_t *)(uintptr_t)g_mt_h[i];
         if (chunk_end_at(c, i, p) || exec_ops(p, 0, EX_CHUNK, i, c)) break;
@@ -2912,6 +2917,7 @@ static void chunk_open(int hidx, const uint8_t *p) {   // a chunk starts at p, i
     c->render_off = g_render_off;
     c->stride = vkb_copy_stride_get();
     c->split = 0;
+    vkb_tsr_state_save(c->tsr);
     g_mt_draws = 0;
 }
 static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends before p: recording threads may take it
@@ -2947,14 +2953,14 @@ static void walk_command(uint32_t op, const uint8_t *a) {
     case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) vkb_ucap_update(d, n, a + 16); break; }
     case OP_COPY_T2B: { uint64_t ad, len; if (vkb_copy_t2b_range((const p_copy_b2t *)a, &ad, &len)) vkb_ucap_drop(ad, len); break; }
     case OP_COPY_STRIDE: vkb_copy_stride(((const p_copy_stride *)a)->stride); break;
-    case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); break;
+    case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); vkb_tsr_walk_rt(&g_rt); break;
     case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL:
     case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO:
     case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_IMG: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
         vkb_state(op, a);
         break;
     case OP_DRAW: case OP_DRAW_IDX:
-        if (!g_render_off) { g_mt_draws++; vkb_draw_prescan(a, op == OP_DRAW_IDX, 0); }
+        if (!g_render_off) { g_mt_draws++; vkb_draw_prescan(a, op == OP_DRAW_IDX, 0); vkb_draw_tsr_walk(); }
         break;
     case OP_DISPATCH: g_mt_draws++; vkb_draw_prescan(a, 0, 1); break;
     case OP_RENDER_ENABLE: g_render_off = !((const p_flag *)a)->value; break;

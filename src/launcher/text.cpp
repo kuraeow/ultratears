@@ -146,6 +146,7 @@ static const Text TEXTS[] = {
     {"scale_150", {"Supersampling 150%", "Суперсэмплинг 150%"}},
     {"scale_200", {"Supersampling 200%", "Суперсэмплинг 200%"}},
     {"res_display", {"As the screen", "Как у экрана"}},
+    {"aa_game", {"FSR 1 (the game's)", "FSR 1 (как в игре)"}},
     {"row_sharp", {"Sharpness", "Резкость"}},
     {"sharp_off", {"Off", "Выкл"}},
     {"sharp_default", {"50% (default)", "50% (по умолчанию)"}},

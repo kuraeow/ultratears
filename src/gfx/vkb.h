@@ -215,6 +215,20 @@ void vkb_state_load(const void *src);
 void vkb_rec_begin(void);                       // this thread starts a command buffer: its recording caches start empty
 void vkb_draw_mt_init(void);                    // objects made on first use, made before threads record (prologue)
 void vkb_draw_prescan(const uint8_t *payload, int indexed, int dispatch);   // the GPU writes a draw / dispatch makes (ucap)
+void vkb_draw_tsr_walk(void);                   // the walk's look at a draw for the temporal upscaler (vkb_tsr.c)
+
+// ---- vkb_tsr.c: temporal upscaling and anti-aliasing (FSR 3.1) in place of the game's FSR 1 (antialias=fsr3)
+int vkb_tsr_on(void);
+void vkb_tsr_sub_begin(void);                          // a submission starts (its command positions from 0)
+void vkb_tsr_walk_rt(const p_set_rt *rt);             // the walk, at a render target change
+void vkb_tsr_walk_draw(const p_set_rt *rt, uint64_t c4_addr, uint64_t c4_size, const char *fs_key);   // ...at a draw
+size_t vkb_tsr_state_size(void);                       // the jitter state a chunk starts with (saved by the walk)
+void vkb_tsr_state_save(void *dst);
+void vkb_tsr_rec_begin(const void *state);             // a recording thread starts a chunk (NULL: one thread)
+void vkb_tsr_rec_rt(void);                             // recording, after a render target change
+int vkb_tsr_jitter(const p_set_rt *rt, float *jx, float *jy);   // the viewport offset of a draw into these targets
+int vkb_tsr_rec_draw(const p_set_rt *rt);              // recording a draw: 1 when FSR ran in place of it (skip it)
+int vkb_tsr_fs_easu(const char *key);
 
 // ---- vkb_mt.c: submissions recorded by several threads (2026-10-24)
 // The translation thread walks a submission once in order (vkb_mt_submit): render state, events and counters,

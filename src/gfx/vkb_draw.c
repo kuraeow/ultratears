@@ -1498,15 +1498,18 @@ static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed sinc
 static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, VkPrimitiveTopology topo) {
     // Nothing changed since the last draw of this command buffer: its ~45 values are recorded already. Not while the
     // depth audit or TOTK_VK_DEPTH_ALWAYS look at each draw.
-    static __thread struct { uint64_t rec; uint32_t gen; int ncolor; VkExtent2D ext; VkPrimitiveTopology topo; } last;
+    static __thread struct { uint64_t rec; uint32_t gen; int ncolor; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
     static int per_draw = -1;
     if (per_draw < 0) per_draw = getenv("TOTK_VK_DEPTH_ALWAYS") != NULL || getenv("TOTK_VK_DYN_EVERY") != NULL;
+    float jx = 0, jy = 0;   // the temporal upscaler's jitter of the scene's draws (vkb_tsr.c)
+    vkb_tsr_jitter(vkb_rt(), &jx, &jy);
     if (!per_draw && !no_cache() && !vkb_depth_audit_on() && last.rec == g_rec && B->dc.rec == g_rec && last.gen == t_sgen &&
-        last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo) {
+        last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo &&
+        last.jx == jx && last.jy == jy) {
         vkb_cnt_add(g_dyn_skips, 1);
         return;
     }
-    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo;
+    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo; last.jx = jx; last.jy = jy;
     // viewports (TOTK uses the upper-left window origin, as Vulkan) and the depth range
     VkViewport vps[16];
     int nvp = S.nvp ? S.nvp : 1;
@@ -1516,6 +1519,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
         if (S.has_dr) { vps[i].minDepth = S.dr[0]; vps[i].maxDepth = S.dr[1]; }
         if (vps[i].width <= 0) vps[i].width = 1;
         if (vps[i].height == 0) vps[i].height = 1;
+        vps[i].x += jx, vps[i].y += jy;
         // The translator writes clip space with y up (GL / Metal, MacNativeGames' target); Vulkan's points down.
         // A negative-height viewport flips it back (core since Vulkan 1.1), so the shaders stay as translated.
         vps[i].y += vps[i].height;
@@ -2056,7 +2060,21 @@ void vkb_draw_mt_init(void) {
     sampler_of(-1, 0);
 }
 
+// The walk's look at a draw for the temporal upscaler (vkb_tsr.c): the scene camera (vertex c4) and the fragment shader.
+void vkb_draw_tsr_walk(void) {
+    if (!vkb_tsr_on()) return;
+    const char *fs = resolve_program() && S.sh[1] ? S.sh[1]->key : NULL;
+    static int said;   // once: the depth convention of the scene's draws (FSR 3.1 is built for one)
+    if (!said && vkb_rt()->n >= 3 && vkb_rt()->depth && S.has_ds && S.ds.dw && S.ubo[0][1].size == 0x940) {
+        said = 1;
+        LOG("[vk] antialiasing: the scene's depth test %u (NVN 1-8: never less equal lequal greater notequal gequal always), "
+            "depth range %s %g..%g", (unsigned)S.ds.df, S.has_dr ? "set" : "default", S.has_dr ? S.dr[0] : 0.0, S.has_dr ? S.dr[1] : 1.0);
+    }
+    vkb_tsr_walk_draw(vkb_rt(), S.ubo[0][1].addr, S.ubo[0][1].size, fs);
+}
+
 void vkb_draw(const uint8_t *a, int indexed) {
+    if (vkb_tsr_rec_draw(vkb_rt())) return;   // the game's EASU draw, replaced by FSR 3.1 (vkb_tsr.c)
     big_init();
     fixed_buffers();
     vkb_audit_draw_begin();

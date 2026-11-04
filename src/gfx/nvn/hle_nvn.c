@@ -2308,6 +2308,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu start t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
     mtl_sub_begin();
     { void vkb_seq_set(uint64_t seq); vkb_seq_set(0); }   // [Windows port] positions in this submission (captured uniforms)
+    { void vkb_tsr_sub_begin(void); vkb_tsr_sub_begin(); }   // [Windows port] the temporal upscaler's events (vkb_tsr.c)
     mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, ucap);   // TOTK: uniforms as of the submit call (ucap: bytes captured there)
     mtl_sub_index((const uint64_t *)h, n);
     {   // [Windows port] several recording threads (src/gfx/backend_vk.c vkb_mt_submit), else this one
