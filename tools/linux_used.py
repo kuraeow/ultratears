@@ -102,7 +102,7 @@ def measure(home):
             for p in re.split(r'\s+', out.stdout.replace('\\\n', ' ')):
                 classify(p, used)
         # what lld reads linking the game (its link line, the objects of build-linux), the encoder and the launcher
-        link = re.search(r'^rule link\n  command = clang (.*) -o \$out @\$out\.rsp (.*)$', text, re.M)
+        link = re.search(r'^rule link\n  command = (?:clang|\$cc) (.*) -o \$out @\$out\.rsp (.*)$', text, re.M)
         objs = re.search(r'^build linux/ultratears: link (.*)$', text, re.M).group(1).split()
         probe = tmp / 'probe.cpp'
         probe.write_text('int main() { return 0; }\n')

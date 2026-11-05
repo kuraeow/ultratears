@@ -181,29 +181,33 @@ def main():
     bd = 'build-linux' if linux else 'build'
     build = ROOT / bd
     build.mkdir(exist_ok=True)
-    link = (f'  command = clang {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
+    link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
             f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
-            f'  command = clang -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
+            f'  command = $cc -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
     lines = [
+        # the compilers by their full path, not through PATH: on Linux PATH is split at ':', and a game folder named
+        # "The Legend of Zelda: Tears of the Kingdom" put clang out of reach (issues #66, #69)
+        f'cc = {ninja_arg(str(CLANG64 / exe("clang")))}',
+        f'cxx = {ninja_arg(str(CLANG64 / exe("clang++")))}',
         f'builddir = {bd}',   # ninja's own state (.ninja_log, .ninja_deps) beside the objects, not beside the sources
         f'cflags = {cflags} -Wall -Wno-unused-function -I{bd}',   # build/version.h (the game's code: not, so a new version rebuilds nothing of it)
         f'gameflags = {game_cflags}',
         'rule cc',
-        '  command = clang -MD -MF $out.d $cflags -c $in -o $out',
+        '  command = $cc -MD -MF $out.d $cflags -c $in -o $out',
         '  depfile = $out.d',
         '  deps = gcc',
         f'gfxflags = {cflags} -w {GFX_INCLUDES}',
         'rule gfxcc',
-        '  command = clang -MD -MF $out.d $gfxflags -c $in -o $out',
+        '  command = $cc -MD -MF $out.d $gfxflags -c $in -o $out',
         '  depfile = $out.d',
         '  deps = gcc',
         'rule gfxcxx',   # C++ (the BC7 encoder): no exceptions or RTTI, static libc++ at the link
-        '  command = clang++ -MD -MF $out.d $gfxflags -std=c++17 -fno-exceptions -fno-rtti'
+        '  command = $cxx -MD -MF $out.d $gfxflags -std=c++17 -fno-exceptions -fno-rtti'
         + (' -stdlib=libstdc++' if linux else '') + ' -c $in -o $out',   # Linux: the sysroot's libstdc++, linked static
         '  depfile = $out.d',
         '  deps = gcc',
         'rule gamecc',
-        '  command = clang -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
+        '  command = $cc -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
         '  depfile = $out.d',
         '  deps = gcc',
         'rule rc',
