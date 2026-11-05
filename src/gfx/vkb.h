@@ -255,6 +255,9 @@ uint64_t vkb_seq(void);          // the position of the command being replayed w
 void vkb_seq_set(uint64_t seq);
 void vkb_pro_begin(void);        // records into the prologue from here (a no-op on one thread)
 void vkb_pro_end(void);
+int vkb_upload_split(void);      // TOTK_VK_UPLOAD_SPLIT: a prepared upload goes into its thread's own command buffer
+void vkb_upload_begin(void);     // records into it from here (backend_vk.c)
+void vkb_upload_end(void);
 void vkb_cmd_set(VkCommandBuffer cb);   // this thread's command buffer (VK_NULL_HANDLE: the submission's own)
 void vkb_mt_slot_reset(int slot);       // the slot's previous submission has completed (backend_vk.c mtl_sub_begin)
 void vkb_mt_submit(const uint64_t *h, int n);   // records the submission's command handles (after mtl_sub_begin)

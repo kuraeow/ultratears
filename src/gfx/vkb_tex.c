@@ -1382,6 +1382,11 @@ static int plan_prepare(vkb_image *im, uplan *P);
 static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P);
 // Several threads recording: into the submission's prologue, which runs before every chunk (the CPU wrote the bytes
 // before the submission, so earlier is as good; a GPU write to the image in a chunk still comes after it).
+// TOTK_VK_UPLOAD_SPLIT=1 (backend_vk.c vkb_upload_begin): a prepared upload into its thread's own command buffer, which
+// runs before every chunk too, under a lock of the image (a stripe of g_upimg_mu) instead of g_up_mu.
+static pthread_mutex_t g_upimg_mu[64];
+static pthread_once_t g_upimg_once = PTHREAD_ONCE_INIT;
+static void upimg_init(void) { for (int i = 0; i < 64; i++) pthread_mutex_init(&g_upimg_mu[i], NULL); }
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;   // one upload at a time: the ASTC batch is shared
 static void up_lock(void) {   // g_up_mu; a wait for another thread's upload counts (the long-submission line)
     if (!pthread_mutex_trylock(&g_up_mu)) return;
@@ -1411,6 +1416,23 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     if (vkb_mt_recording()) {
         uplan P;
         int planned = plan_prepare(im, &P);   // the bytes, outside the lock
+        pthread_mutex_t *m = NULL;   // TOTK_VK_UPLOAD_SPLIT: the image's lock (also around the usual upload below: the
+        if (vkb_upload_split()) {    // image may be made BC7 under it meanwhile)
+            pthread_once(&g_upimg_once, upimg_init);
+            m = &g_upimg_mu[((uintptr_t)im * 0x9E3779B97F4A7C15ull) >> 58];
+        }
+        if (planned && m) {   // its thread's command buffer, under the image's lock only
+            if (pthread_mutex_trylock(m)) { uint64_t tw = runtime_now_ns(); pthread_mutex_lock(m); vkb_step_add(PK_UPWAIT, tw); }
+            uint64_t tlk = runtime_now_ns();
+            vkb_upload_begin();
+            int rs = plan_record(vkb_cmd(), im, &P);
+            vkb_upload_end();
+            upx_add(UPX_LOCKED, tlk);
+            pthread_mutex_unlock(m);
+            if (rs) { free(P.s); vkb_step_add(PK_UPLOAD, t0); return rs == 1; }
+            planned = 0;   // not taken (BC7 not possible, remapped): the usual upload below
+        }
+        if (m) pthread_mutex_lock(m);   // (the image's lock first, then g_up_mu: never the other way round)
         up_lock();
         uint64_t tlk = runtime_now_ns();
         vkb_pro_begin();
@@ -1422,6 +1444,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         upx_add(UPX_LOCKED, tlk);
         if (inl && r) atomic_fetch_add_explicit(&g_upx[UPX_N_INLINE], 1, memory_order_relaxed);
         pthread_mutex_unlock(&g_up_mu);
+        if (m) pthread_mutex_unlock(m);
         free(P.s);
     } else r = tex_upload(cb, im);
     vkb_step_add(PK_UPLOAD, t0);
@@ -1805,7 +1828,7 @@ static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P) {
     if ((P->bc >= 0) != (im->bc7 != 0) || (P->bc >= 0 && (im->bc7 == 2) != (P->bc == VKB_BC_1)) || P->ns != (int)(im->levels * im->layers)) return 0;
     if (P->vgen && P->vgen != totk_vpool_generation()) return 0;   // remapped meanwhile
     im->stale = 0; im->cpu_written = 0;
-    im->upload_stamp = P->stamp;
+    __atomic_store_n(&im->upload_stamp, P->stamp, __ATOMIC_RELEASE);   // (after the BC7 image above: a thread that sees it draws with that)
     im->vpool_gen = P->vgen;
     im->content_hash = 0; im->hash_sub = 0;
     vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);

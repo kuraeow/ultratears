@@ -2822,7 +2822,7 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
 // Threads recording (vkb_mt_submit): the submission's command buffers after the slot's own, the last one for the work at
 // its end (copies back, the GPU end time).
 enum { MT_MAXCH = 96 };
-static VkCommandBuffer g_mt_list[2 * MT_MAXCH + 4];
+static VkCommandBuffer g_mt_list[2 * MT_MAXCH + 4 + 2 * VKB_MAXREC];   // (+ the uploads' command buffers, vkb_upload_begin)
 static int g_mt_nlist;
 uint64_t mtl_sub_commit(void) {
     uint64_t fence = ++g_fence;
@@ -2846,7 +2846,7 @@ uint64_t mtl_sub_commit(void) {
     s->fence = fence;
     if (!g_slot_sent) vk.vkEndCommandBuffer(s->cb);
     if (g_mt_nlist) vk.vkEndCommandBuffer(last);
-    VkCommandBufferSubmitInfo cbi[2 * MT_MAXCH + 5];
+    VkCommandBufferSubmitInfo cbi[2 * MT_MAXCH + 5 + 2 * VKB_MAXREC];
     int ncbi = 0;
     if (!g_slot_sent) cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
     g_slot_sent = 0;
@@ -3325,6 +3325,52 @@ static void part_flush(uint64_t t_start) {
     g_part_t = runtime_now_ns();
 }
 
+// ---- texture uploads in a command buffer per recording thread (TOTK_VK_UPLOAD_SPLIT=1, 2026-11-06) ----
+// Every upload of a submission went into the shared prologue under one lock (g_up_mu in vkb_tex.c, g_pro_mu here): the
+// BC7 image made, the layout change and the copies. On the Steam Deck the work under it and the waits for it were 50-90
+// ms of a long submission while the world streamed in (2026-11-06, the uploads-by-part line), the recording threads
+// taking turns. With the switch a prepared upload (vkb_tex.c plan_record) goes into a command buffer of its recording
+// thread's own, with its own layout tracking, under a lock of the image alone; these command buffers run after the
+// prologue and before every chunk, as the prologue's uploads did (the CPU wrote the bytes before the submission). An
+// image is uploaded once a submission (the image's lock and its upload stamp), so no two of them touch it. Uploads that
+// are not prepared (ASTC decoded on the CPU, untracked memory) go into the prologue as before. Off with partial
+// submission (whose parts close the prologue only).
+static VkCommandBuffer g_upcb[VKB_MAXREC];
+static vkb_trk g_uptrk[VKB_MAXREC];
+static __thread VkCommandBuffer t_up_cb_save;
+static __thread vkb_trk *t_up_trk_save;
+static int up_split_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_UPLOAD_SPLIT");
+        v = e && *e == '1';
+        if (v) VLOG("texture uploads: a command buffer per recording thread, a lock per image (TOTK_VK_UPLOAD_SPLIT)");
+    }
+    return v && !part_on();
+}
+int vkb_upload_split(void) { return t_recording && !t_pro_depth && up_split_on(); }
+void vkb_upload_begin(void) {   // (vkb_upload_split): records into this thread's uploads command buffer from here
+    int w = t_worker;
+    if (!g_upcb[w]) { g_upcb[w] = wp_get(g_cur, w); vkb_trk_reset(&g_uptrk[w]); }
+    t_up_cb_save = t_cb; t_up_trk_save = vkb_trk_get();
+    t_cb = g_upcb[w];
+    vkb_trk_set(&g_uptrk[w]);
+}
+void vkb_upload_end(void) { t_cb = t_up_cb_save; vkb_trk_set(t_up_trk_save); }
+static void uploads_close(VkCommandBuffer *list, int *n) {   // after the prologue: each thread's uploads, after its move
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        if (!g_upcb[w]) continue;
+        vk.vkEndCommandBuffer(g_upcb[w]);
+        VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+        glue(m, &g_uptrk[w], GLUE_FULL);
+        vk.vkEndCommandBuffer(m);
+        list[(*n)++] = m;
+        list[(*n)++] = g_upcb[w];
+        g_upcb[w] = VK_NULL_HANDLE;
+        g_part_full = 1;   // the chunk after them sees their writes
+    }
+}
+
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits
     uint64_t t0 = runtime_now_ns();
     static uint64_t walk_ns, wall_ns, subs, chunks, said_at, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
@@ -3353,6 +3399,7 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     vkb_trk_reset(&g_pro_trk);
     g_pro_any = 0;
     g_part_next = g_part_n = g_part_full = 0;
+    memset(g_upcb, 0, sizeof g_upcb);
     g_slot_sent = 0;
     int part = part_on();
     t_recording = 1;
@@ -3389,6 +3436,7 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     // (after parts: the prologue's work since the last part, then the chunks not sent)
     g_mt_nlist = 0;
     pro_close(g_mt_list, &g_mt_nlist, 0);
+    uploads_close(g_mt_list, &g_mt_nlist);
     chunks_glue(g_part_next, g_nch, g_mt_list, &g_mt_nlist);
     g_mt_list[g_mt_nlist++] = wp_get(g_cur, WP_MOVES);   // the end
     if (g_part_n) { g_part_subs++; g_part_parts += (uint64_t)g_part_n + 1; }
