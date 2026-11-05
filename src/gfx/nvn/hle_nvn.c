@@ -328,12 +328,14 @@ static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOT
    the heavy places of the player's route (2026-11-05, PC) the game's main thread and its workers (priority 44) waited
    49-61 ms a frame for a virtual core held by a worse-priority thread, the loader threads (50-56) held their cores twice
    as long as elsewhere, and asynchronous preemption was refused ~11,000 times because the owner was in a host call.
-   TOTK_STREAM_CORE_AWAY=1: these calls give the virtual core up, as a driver call on the Switch does not hold the
-   game's core (the part of 2d9bfec reverted with the rest of it; totk-pc-recomp sets up pools without its core).
+   These calls give the virtual core up, as a driver call on the Switch does not hold the game's core (the part of
+   2d9bfec reverted with the rest of it; totk-pc-recomp sets up pools without its core). Measured on the player's PC
+   (2026-11-06, same route): waits behind a worse-priority owner 14.2 -> 4.3 ms a frame, frames over 33 ms 72 -> 34,
+   over 50 ms 10 -> 1, loading as fast. On by default since then; TOTK_STREAM_CORE_AWAY=0 keeps the core (A/B).
    Their time is counted either way (the log line "streaming calls"). */
 static int stream_away_on(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_STREAM_CORE_AWAY"); v = e && *e == '1'; if (v) LOG("[nvn] streaming calls (pools, texels) give the virtual core up (TOTK_STREAM_CORE_AWAY)"); }
+    if (v < 0) { const char *e = getenv("TOTK_STREAM_CORE_AWAY"); v = !(e && *e == '0'); if (!v) LOG("[nvn] streaming calls (pools, texels) keep the virtual core (TOTK_STREAM_CORE_AWAY=0)"); }
     return v;
 }
 static _Atomic uint64_t g_stream_ns, g_stream_n, g_stream_max;
@@ -3218,7 +3220,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         LOG("[nvn] translation thread through frame %llu: %llu drain waits / %.1f ms over the last 300 frames, %llu queued items", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q);
         { uint64_t sn = atomic_exchange(&g_stream_n, 0), sns = atomic_exchange(&g_stream_ns, 0), smx = atomic_exchange(&g_stream_max, 0);
           LOG("[nvn] streaming calls (pools, texels) through frame %llu: %.1f a frame, %.2f ms a frame, the longest %.2f ms; virtual core %s",
-              (unsigned long long)g_frame, sn / 300.0, sns / 1e6 / 300, smx / 1e6, stream_away_on() ? "given up" : "kept (TOTK_STREAM_CORE_AWAY=1 gives it up)"); }
+              (unsigned long long)g_frame, sn / 300.0, sns / 1e6 / 300, smx / 1e6, stream_away_on() ? "given up" : "kept (TOTK_STREAM_CORE_AWAY=0)"); }
         static const char *const why[XD_N] = {"pool deleted", "read texels", "write texels", "program deleted", "queue finish", "suspend", "graphics layer", "pool memory reused", "read texels out of turn"};
         char line[512]; size_t o = 0;
         for (int k = 0; k < XD_N; k++) { uint64_t n = atomic_exchange(&g_x_why_n[k], 0), ns = atomic_exchange(&g_x_why_ns[k], 0);
