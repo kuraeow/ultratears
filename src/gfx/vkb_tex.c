@@ -1389,6 +1389,15 @@ static void up_lock(void) {   // g_up_mu; a wait for another thread's upload cou
     pthread_mutex_lock(&g_up_mu);
     vkb_step_add(PK_UPWAIT, t0);
 }
+// Where an upload's time goes (the long-submission line, backend_vk.c sub_long_check; 2026-11-06): the Steam Deck's long
+// submissions spent 400-500 ms in uploads over the recording threads, and which part - laying texels out of the Switch's
+// block-linear layout, gathering textures out of virtual pools, BC7 keys and cache reads, upload memory, the work under
+// the uploads lock - decides what to take on next. Running totals in ns (counts for the UPX_N_* and UPX_BYTES).
+enum { UPX_GATHER, UPX_LAYOUT, UPX_KEY, UPX_BC7READ, UPX_RING, UPX_LOCKED, UPX_INLINE, UPX_N_PLANNED, UPX_N_VPOOL, UPX_N_INLINE,
+       UPX_BYTES, UPX_N };
+static _Atomic uint64_t g_upx[UPX_N];
+static inline void upx_add(int k, uint64_t t0) { atomic_fetch_add_explicit(&g_upx[k], runtime_now_ns() - t0, memory_order_relaxed); }
+void vkb_tex_upload_parts(uint64_t v[11]) { for (int i = 0; i < UPX_N; i++) v[i] = atomic_load_explicit(&g_upx[i], memory_order_relaxed); }
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     uint64_t stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     if (vkb_mt_recording() && __atomic_load_n(&im->uploading, __ATOMIC_ACQUIRE)) {   // another thread is uploading it: its
@@ -1403,11 +1412,15 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         uplan P;
         int planned = plan_prepare(im, &P);   // the bytes, outside the lock
         up_lock();
+        uint64_t tlk = runtime_now_ns();
         vkb_pro_begin();
         r = planned ? plan_record(vkb_cmd(), im, &P) : 0;
+        int inl = 0;
         if (r == 2) r = 0;
-        else if (!r) r = tex_upload(vkb_cmd(), im);   // checks again: another thread may have uploaded it meanwhile
+        else if (!r) { uint64_t ti = runtime_now_ns(); r = tex_upload(vkb_cmd(), im); inl = 1; upx_add(UPX_INLINE, ti); }   // checks again: another thread may have uploaded it meanwhile
         vkb_pro_end();
+        upx_add(UPX_LOCKED, tlk);
+        if (inl && r) atomic_fetch_add_explicit(&g_upx[UPX_N_INLINE], 1, memory_order_relaxed);
         pthread_mutex_unlock(&g_up_mu);
         free(P.s);
     } else r = tex_upload(cb, im);
@@ -1620,7 +1633,9 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
     uint8_t *gathered = NULL;
     if (vpool) {
         if (!(gathered = malloc(L.size ? L.size : 1))) die("texture gather");
+        uint64_t tg = runtime_now_ns();
         totk_vpool_gather(at, L.size, gathered);
+        upx_add(UPX_GATHER, tg);
         src = gathered;
     }
     int srgb = d->format >= 0x87 && d->format <= 0x94, ok = 1, k = 0, fmt = -1;
@@ -1633,30 +1648,46 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
             psurf *s = &P->s[k];
             *s = (psurf){level, layer, lw, lh, ld, bx * (uint32_t)bw, by * (uint32_t)bh, VK_NULL_HANDLE, 0};
             if (!im->astc) {   // the texels, laid out straight into upload memory
+                uint64_t ta = runtime_now_ns();
                 uint8_t *rows = vkb_ring_alloc(bytes, 16, &s->buf, &s->off);
+                upx_add(UPX_RING, ta);
+                uint64_t tl = runtime_now_ns();
                 ok = !nvn_deswizzle(d, level, layer, src, rows, pitch);
+                upx_add(UPX_LAYOUT, tl);
+                atomic_fetch_add_explicit(&g_upx[UPX_BYTES], bytes, memory_order_relaxed);
                 continue;
             }
             // ASTC: the blocks in ordinary memory for the key (upload memory reads slowly), then the cached BC7 blocks
             static __thread uint8_t *blk;
             static __thread size_t blk_cap;
             if (bytes > blk_cap) { free(blk); blk_cap = (size_t)bytes; if (!(blk = malloc(blk_cap))) die("ASTC blocks"); }
+            uint64_t tl = runtime_now_ns();
             ok = !nvn_deswizzle(d, level, layer, src, blk, pitch);
+            upx_add(UPX_LAYOUT, tl);
             if (!ok) break;
+            uint64_t tk = runtime_now_ns();
             vkb_bc7_key key = vkb_bc7_key_of(blk, (size_t)bytes, lw, lh, ld, (uint32_t)bw, (uint32_t)bh, srgb);
             size_t len;
             int f;
             ok = vkb_bc7_lookup(key, &f, &len) && (fmt < 0 || f == fmt) && len == (f == VKB_BC_1 ? bc1_size(lw, lh, ld) : bc7_size(lw, lh, ld));
+            upx_add(UPX_KEY, tk);
             if (!ok) break;
             fmt = f;
+            uint64_t ta = runtime_now_ns();
             uint8_t *out = vkb_ring_alloc(len, 16, &s->buf, &s->off);
+            upx_add(UPX_RING, ta);
+            uint64_t tr = runtime_now_ns();
             ok = vkb_bc7_read(key, out, len);
+            upx_add(UPX_BC7READ, tr);
+            atomic_fetch_add_explicit(&g_upx[UPX_BYTES], len, memory_order_relaxed);
             s->row = (lw + 3) / 4 * 4; s->rows_h = (lh + 3) / 4 * 4;
         }
     }
     free(gathered);
     if (im->astc) P->bc = fmt;
     if (!ok) { free(P->s); P->s = NULL; return 0; }
+    atomic_fetch_add_explicit(&g_upx[UPX_N_PLANNED], 1, memory_order_relaxed);
+    if (vpool) atomic_fetch_add_explicit(&g_upx[UPX_N_VPOOL], 1, memory_order_relaxed);
     return 1;
 }
 // ---- the BC7 cache warmed ahead of uploads. An ASTC texture's first upload reads its BC7 blocks from the mapped
