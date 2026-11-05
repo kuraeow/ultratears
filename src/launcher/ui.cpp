@@ -48,6 +48,8 @@ static bool hovered_rect(ImVec2 a, ImVec2 b) {
 
 static bool g_drag_scrolled;   // the body was dragged with a finger: the touch that did it clicks nothing (ui_frame)
 static bool g_input_held;      // after a key / button was bound: nothing clicks until every key and button is up
+static bool g_scrolling;       // the right stick held or a drag going on: frames at the display's rate (main.cpp)
+bool ui_busy() { return g_scrolling; }
 
 // An invisible ImGui item over [x, y, w, h] (design pixels): focus, keyboard and gamepad come with it.
 static bool hit(const char *id, float x, float y, float w, float h, bool *hover, bool *down, bool enabled = true) {
@@ -55,7 +57,9 @@ static bool hit(const char *id, float x, float y, float w, float h, bool *hover,
     ImGui::PushID(id);
     if (!enabled)
         ImGui::BeginDisabled();
-    bool clicked = ImGui::InvisibleButton("##hit", ImVec2(w * S, h * S));
+    // EnableNav: ImGui 1.91 leaves an invisible button out of the keyboard and gamepad navigation unless asked (without
+    // it nothing on the launcher could be reached with the Steam Deck's controls)
+    bool clicked = ImGui::InvisibleButton("##hit", ImVec2(w * S, h * S), ImGuiButtonFlags_EnableNav);
     if (!enabled)
         ImGui::EndDisabled();
     ImGui::PopID();
@@ -2329,6 +2333,11 @@ void ui_frame(float scale) {
     background(ImGui::GetBackgroundDrawList(), io.DisplaySize);
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(io.DisplaySize);
+    static bool focused_once;   // the window focused from the start: without it the gamepad and the keys move nothing
+    if (!focused_once) {
+        ImGui::SetNextWindowFocus();
+        focused_once = true;
+    }
     ImGui::Begin("launcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                  ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DL = ImGui::GetWindowDrawList();
@@ -2337,7 +2346,9 @@ void ui_frame(float scale) {
 
     // the body scrolls when it does not fit (long texts, a small screen); the header and the buttons stay
     ImGui::SetCursorScreenPos(P(0, 72));
-    ImGui::BeginChild("body", ImVec2(800 * S, 328 * S), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+    // NavFlattened: the gamepad's and the keys' focus moves between the body's items and the tabs and buttons around it
+    // (without it the body was one item to the navigation, and nothing in it could be reached)
+    ImGui::BeginChild("body", ImVec2(800 * S, 328 * S), ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoBackground);
     DL = ImGui::GetWindowDrawList();
     DL->ChannelsSplit(2);   // 0: the cards, drawn after what is on them once their height is known
     DL->ChannelsSetCurrent(1);
@@ -2350,12 +2361,21 @@ void ui_frame(float scale) {
     case SCR_UPDATE: screen_update(); break;
     case SCR_BROKEN: screen_broken(); break;
     }
-    // a finger dragged over the body scrolls it (the Steam Deck's screen, touch screens); the wheel and the focus of the
-    // keyboard and the gamepad scroll it by themselves
-    if (io.MouseSource == ImGuiMouseSource_TouchScreen && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 8 * S) &&
-        ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows)) {
-        ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
-        g_drag_scrolled = true;
+    // A finger (or the mouse) dragged over the body scrolls it: the Steam Deck's screen in Gaming Mode reaches SDL as a
+    // mouse, not as touches, so any drag that began on the body counts (not on its scrollbar, and not with a list open);
+    // the drag's release clicks nothing (hit). The right stick scrolls it too; the wheel and the focus by themselves.
+    {
+        ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize(), c0 = io.MouseClickedPos[ImGuiMouseButton_Left];
+        bool from_body = c0.x >= wp.x && c0.x < wp.x + ws.x - 14 * S && c0.y >= wp.y && c0.y < wp.y + ws.y;
+        if (from_body && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 10 * S) &&
+            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+            ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+            g_drag_scrolled = true;
+        }
+        float rs = io.KeysData[ImGuiKey_GamepadRStickDown - ImGuiKey_NamedKey_BEGIN].AnalogValue - io.KeysData[ImGuiKey_GamepadRStickUp - ImGuiKey_NamedKey_BEGIN].AnalogValue;
+        g_scrolling = SDL_fabsf(rs) > 0.2f || ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (SDL_fabsf(rs) > 0.2f && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+            ImGui::SetScrollY(ImGui::GetScrollY() + rs * 700 * S * io.DeltaTime);
     }
     DL->ChannelsMerge();
     ImGui::EndChild();

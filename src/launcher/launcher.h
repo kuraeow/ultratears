@@ -118,3 +118,4 @@ bool ui_quit_wanted();                     // --play: the graphics prepared, the
 bool ui_play_finish();                     // --play, after closing: the game started
 void ui_quit();                            // closing: stop the build (it resumes next time)
 bool ui_event(const SDL_Event *e);         // every event first: true when the Controls tab took it (a key being bound)
+bool ui_busy();                            // scrolling by the stick or a drag: no idle wait between frames
