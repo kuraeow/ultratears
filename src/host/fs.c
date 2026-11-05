@@ -225,7 +225,7 @@ static void heapdef_overlay(void) {
     int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
     void totk_resolution_log(void);
     int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
-                      void **out, size_t *out_n);
+                      int prompts, void **out, size_t *out_n);
     int totk_aspect_output(unsigned *w, unsigned *h);
     int totk_fr_fps60(void);
     size_t n = 0, dn = 0, out_n = 0;
@@ -240,15 +240,19 @@ static void heapdef_overlay(void) {
     // output of another shape than 16:9 the layouts are laid out for it (host/ui_aspect.c)
     unsigned aw = 0, ah = 0;
     int capture = totk_fr_fps60(), aspect = totk_aspect_output(&aw, &ah);
-    if (!capture && !aspect) return;
+    // the button prompts for the Xbox / Steam Deck layout (host/ui_prompts.c; pad_layout=xbox, window_sdl.c binds_load)
+    const char *layout = getenv("TOTK_BIND_pad_layout"), *deck = getenv("SteamDeck");
+    int prompts = layout && !strcmp(layout, "xbox") ? (deck && !strcmp(deck, "1") ? 2 : 1) : 0;
+    if (!capture && !aspect && !prompts) return;
     in = rom_file(UI_COMMON, 64u << 20, &n);
     void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
     uint64_t t0 = runtime_now_ns();
-    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, &out, &out_n)) {
+    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, prompts, &out, &out_n)) {
         ovr_add(UI_COMMON, out, out_n);
-        fprintf(stderr, "[totk] RomFS: %s served%s%s (%.0f ms)\n", UI_COMMON,
+        fprintf(stderr, "[totk] RomFS: %s served%s%s%s (%.0f ms)\n", UI_COMMON,
                 capture ? ", the quick menus' background captured at once" : "",
-                aspect ? ", the layouts for the output's shape" : "", (runtime_now_ns() - t0) / 1e6);
+                aspect ? ", the layouts for the output's shape" : "", prompts ? ", the Xbox layout's prompts" : "",
+                (runtime_now_ns() - t0) / 1e6);
     } else if (!in || !dicts)
         fprintf(stderr, "[totk] RomFS: %s or %s missing: the game's own layouts\n", UI_COMMON, ZS_DICTS);
     free(in); free(dicts);
