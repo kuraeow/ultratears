@@ -2387,9 +2387,9 @@ void ui_frame(float scale) {
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseReleased(ImGuiMouseButton_Left))
         g_drag_scrolled = false;   // the drag is over (its release frame clicked nothing)
     if (g_input_held) {   // a key or button was just bound: clicks again once nothing is held
-        bool held = false;
-        for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END && !held; k++)
-            held = ImGui::IsKeyDown((ImGuiKey)k);
+        // from SDL, not ImGui: with its gamepad navigation off ImGui's gamepad keys stay as they were (the button that
+        // started the wait would read held for ever, and nothing would click again)
+        bool held = SDL_GetMouseState(nullptr, nullptr) != 0;
         int n = 0;
         const bool *keys = SDL_GetKeyboardState(&n);
         for (int i = 0; i < n && !held; i++)
