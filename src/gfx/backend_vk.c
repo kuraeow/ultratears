@@ -2915,12 +2915,13 @@ int vkb_mt_on(void) {
         int cpus = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (cpus < 1) cpus = 4;
 #endif
-        // 3/8 of the logical processors, at most 4: the game keeps 4-6 threads of its own busy, and recording threads
-        // beyond what is left took cores from it and from each other. With 8 processors (2026-11-03, a Depths forest,
-        // unlimited frames): 4 threads 13.4-13.7 ms a frame (p95 16.2-16.6) and 36.9 ms of recording, 3 threads 12.8-12.9
-        // (p95 14.7-15.4) and 25.8 ms, 2 threads 14.3-15.0 and 18.4 ms. Half of them, up to 8, before.
+        // The logical processors less two, at most 4: the game's threads wait for the recording most of a frame, so
+        // the processors they leave are free. Measured (frame p50): 6 processors (Linux, RX 570, ~7700 draws a frame,
+        // 2026-11-05) 1 thread 36.0 ms, 2 24.2, 3 22.0, 4 20.2; the Steam Deck (8) submits 2-3 ms sooner with 4 than
+        // with 3 at the same draw counts; 8 processors on Windows (2026-11-03, a Depths forest, unlimited frames) 3
+        // threads 12.8-12.9 ms and 4 13.4-13.7, within the noise. 3/8 of the processors before (6: 2, 8: 3).
         const char *e = getenv("TOTK_VK_RECORD_THREADS");
-        n = e && *e ? atoi(e) : cpus >= 4 ? (cpus * 3 / 8 < 4 ? cpus * 3 / 8 : 4) : 1;
+        n = e && *e ? atoi(e) : cpus - 2 < 4 ? cpus - 2 : 4;
         if (n > VKB_MAXREC) n = VKB_MAXREC;
         if (n < 1) n = 1;
         static const char *const diag[] = {"TOTK_VK_DRAWTRACE", "TOTK_VK_TRACE", "TOTK_SNAP", "TOTK_GPU_PROF", "TOTK_GPU_PASSPROF",

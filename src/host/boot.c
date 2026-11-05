@@ -95,10 +95,6 @@ static void deck_defaults(void) {
     setenv("TOTK_OUTPUT_RES", "1280x800", 0);
     setenv("TOTK_WINDOW", "fullscreen", 0);
     setenv("TOTK_FPS_LIMIT", "40", 0);
-    // Two recording threads (3 by the general rule): the same frame times on the Deck as three (2026-11-04, Lookout
-    // Landing, 120 s each: p50 26.5 / 25.8 ms, p95 35.3 / 35.2) with a quarter less CPU for recording, which shares the
-    // Deck's four cores with the game's three
-    setenv("TOTK_VK_RECORD_THREADS", "2", 0);
     // The recording threads below the game's (nice 5): the user's runs (2026-11-05, routes not the same) had p95 31.8
     // against 33.8 ms and fewer frames over 50 ms; a burst of uploads may take longer (one of 1.2 s in that run)
     setenv("TOTK_RECORD_NICE", "5", 0);
