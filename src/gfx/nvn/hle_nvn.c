@@ -325,7 +325,6 @@ static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
 static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CHAIN_LOG") != NULL; return on; }   // read once: EndRecording and Submit run hundreds of times a frame
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
@@ -345,7 +344,6 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return o->mem != NULL;
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     pool_t *o = (pool_t *)p;
     // TOTK translation thread: deleted in queue order (x_poolrel), after the submissions queued before - the game waited
     // for the GPU work that used the pool before finalizing it, so those do not touch it; before 2026-10-28 the game thread
@@ -360,7 +358,6 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, 
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p){return (NVNmemoryPoolFlags)((const pool_t *)p)->flags;}
 NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const void *)p;if(v->magic!=MAGIC('P','O','O','L'))return NULL;return (v->flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)?NULL:v->mem;}
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     return (NVNboolean)totk_vpool_map((pool_t *)p, n, (const totk_mapping_request *)(const void *)r);
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { const pool_t *o = (const pool_t *)p; return (NVNbufferAddress)(o->va ? o->va : (uint64_t)(uintptr_t)o->mem); }
@@ -568,11 +565,9 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     x_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
 }
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
 static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, ptrdiff_t row, ptrdiff_t img) {
@@ -587,11 +582,9 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (mtl_write_texels_mem(o, level, layer0, r, src, (size_t)row, (size_t)img)) x_texwrite(o, level, layer0, r, src, (size_t)row, (size_t)img, wb, hb);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
 }
 NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src, ptrdiff_t row, ptrdiff_t img) {
-    NVN_BLOCKING();   // pool setup / texel copies run while the world streams in: without the core (as on the Switch, a driver call), not holding up the game's other threads
     write_texels(CTX(t), (const view_t *)v, r, src, row, img);
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
