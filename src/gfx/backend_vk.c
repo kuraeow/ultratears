@@ -1308,7 +1308,8 @@ static int g_npost, g_capost;
 static uint64_t g_op_count[OP_COUNT_];
 static int g_op_said[OP_COUNT_];
 
-typedef struct job { uint64_t fence; post_op *ops; int n; int slot; uint64_t *wb; int nwb; struct job *next; struct wb_snap_s *snaps; int nsnaps; } job;
+typedef struct job { uint64_t fence; post_op *ops; int n; int slot; uint64_t *wb; int nwb; struct job *next; struct wb_snap_s *snaps; int nsnaps;
+                     uint64_t frame, t_sub; } job;   // frame, t_sub: the game frame it belongs to, when it went to the queue (gpu_frame)
 static job *g_jobs, **g_jobs_tail = &g_jobs;
 
 static void run_posts(const post_op *ops, int n) {
@@ -1494,6 +1495,36 @@ static void dead_reap(uint64_t done) {   // the GPU finished up to `done`
 }
 
 static void gpu_span(int slot, uint64_t fence);
+/* The GPU's work per game frame (hle_nvn.c's long-frame log, mtl_gpu_ms): the submissions made after mtl_set_frame(f)
+   count for frame f. For each: its GPU time (its two timestamps), when it ended (about when the retire thread saw its
+   fence: it waits on fences in order) and so began, and how long after it went to the queue the GPU began it (behind
+   earlier work). Filled by the retire thread; read 8 frames later. */
+#define GF_N 64
+static struct { uint64_t f, ns, beg, end; double lag_ms; unsigned subs; } g_gf[GF_N];
+static _Atomic uint64_t g_gf_frame;
+static int g_tsq_ready(void);
+static VkQueryPool g_tsq_pool(void);
+void mtl_set_frame(uint64_t f) { atomic_store(&g_gf_frame, f); }
+static void gpu_frame(const job *j) {
+    uint64_t t[2], end = runtime_now_ns();
+    if (!g_tsq_ready() || j->slot < 0) return;
+    if (vk.vkGetQueryPoolResults(vkc.device, g_tsq_pool(), (uint32_t)(2 * j->slot), 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] <= t[0]) return;
+    uint64_t dur = (uint64_t)((double)(t[1] - t[0]) * vkc.props.limits.timestampPeriod), beg = end > dur ? end - dur : 0;
+    __typeof__(g_gf[0]) *g = &g_gf[j->frame % GF_N];
+    if (g->f != j->frame) memset(g, 0, sizeof *g), g->f = j->frame, g->beg = beg;
+    g->ns += dur, g->subs++;
+    if (beg < g->beg) g->beg = beg;
+    if (end > g->end) g->end = end;
+    double lag = beg > j->t_sub ? (beg - j->t_sub) / 1e6 : 0;
+    if (lag > g->lag_ms) g->lag_ms = lag;
+}
+double mtl_gpu_ms(uint64_t f) { return g_gf[f % GF_N].f == f ? g_gf[f % GF_N].ns / 1e6 : -1; }
+int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
+    if (g_gf[f % GF_N].f != f || !g_gf[f % GF_N].subs) { *t0 = *t1 = 0; return 0; }
+    *t0 = g_gf[f % GF_N].beg, *t1 = g_gf[f % GF_N].end;
+    return 1;
+}
+double mtl_gpu_lag_ms(uint64_t f) { return g_gf[f % GF_N].f == f ? g_gf[f % GF_N].lag_ms : 0; }
 // Retires submissions in order: waits for the GPU, writes their events and counters, completes their fence.
 static void *retire_thread(void *unused) {
     (void)unused;
@@ -1511,6 +1542,7 @@ static void *retire_thread(void *unused) {
         VkResult r = vk.vkWaitSemaphores(vkc.device, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) { vk_check(r, "vkWaitSemaphores"); checkpoint_report(); die("GPU submission %llu lost", (unsigned long long)j->fence); }
         if (totk_tl_on()) gpu_span(j->slot, j->fence);   // TOTK_TIMELINE: when the GPU ran this command buffer
+        gpu_frame(j);
         pc_writeback(j->fence);   // pool copies: GPU writes into game memory, before the game is told
         if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps); free(j->wb); }   // GPU writes into game memory
         for (int k = 0; k < j->nsnaps; k++) if (((wb_snap_t *)j->snaps)[k].owned) free(((wb_snap_t *)j->snaps)[k].data);
@@ -1534,6 +1566,8 @@ void retire_start(void) {
 static VkQueryPool g_tsq;
 static int g_ts_used[SLOTS];
 static uint64_t g_gpu_ns, g_slot_wait_ns;
+static int g_tsq_ready(void) { return g_tsq != VK_NULL_HANDLE; }
+static VkQueryPool g_tsq_pool(void) { return g_tsq; }
 static void gpu_time_begin(int slot) {   // into the slot's own command buffer (the submission's first)
     if (!g_tsq) {
         VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * SLOTS};
@@ -2810,7 +2844,7 @@ uint64_t mtl_sub_commit(void) {
     if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2"); die("GPU submission failed"); }
     job *j = malloc(sizeof *j);
     if (!j) die("retire job");
-    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, (struct wb_snap_s *)g_wb_snaps, g_wb_nsnaps};   // g_wb_ranges: in the slot's copy back memory
+    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, (struct wb_snap_s *)g_wb_snaps, g_wb_nsnaps, atomic_load(&g_gf_frame), ts0};   // g_wb_ranges: in the slot's copy back memory
     g_wb_ranges = NULL; g_wb_snaps = NULL; g_wb_nsnaps = 0;
     totk_tl(TL_COMMIT, fence, 1);
     pthread_mutex_lock(&g_mu);

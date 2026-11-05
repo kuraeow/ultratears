@@ -3142,7 +3142,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
           if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[1024];
               snprintf(b, sizeof b, "frame %llu (%.2f s): total %.1f ms, submit+present %.1f ms, GPU %.1f ms; %u new pipelines + %u shader libraries in %.1f ms; texture uploads %u first + %u repeated, %.1f MB / %.1f ms",
-                       (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+                       (unsigned long long)r->f, r->t_s, r->fr, r->nv, g > 0 ? g : 0.0, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+              {   // the GPU's side of this frame (backend_vk.c gpu_frame): its work, the span it took, and how late the GPU
+                  // began a submission after it went to the queue (behind earlier work)
+                  double mtl_gpu_lag_ms(uint64_t f); uint64_t g0, g1;
+                  if (mtl_gpu_span(r->f, &g0, &g1)) { char sb[128]; snprintf(sb, sizeof sb, "; GPU span %.1f ms, began up to %.1f ms after the submit",
+                                                                       (g1 - g0) / 1e6, mtl_gpu_lag_ms(r->f)); strlcat(b, sb, sizeof b); } }
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
