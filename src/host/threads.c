@@ -123,6 +123,13 @@ typedef struct thr {
     uint64_t blk_t0, blk_cred, core_t0, core_cred; int blk_kind;   // a wait in progress: since when, counted up to when
     unsigned long os_tid;      // the host's id of this thread (os_times), set by the thread itself
     uint64_t st_inv_ns, st_inv_max;   // core waits while a worse-priority thread held a core this one may use: total, longest
+    // asynchronous preemption (below): this thread's host-call depth and Cpu (TLR), interruption state
+    volatile int *depth; Cpu *cpu; int ap_ok, ap_pending; uint64_t ap_rip, ap_last;
+#ifdef _WIN32
+    HANDLE ap_h; CONTEXT *ap_ctx;
+#else
+    pthread_t ap_pt; int ap_state; uint64_t ap_srip, ap_to;
+#endif
 } thr_t;
 
 /* The host thread's CPU time and, on Linux, its time runnable but not running (waiting for a processor: taken by other
@@ -227,11 +234,13 @@ static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1
    workers of middling priority. The owner is read from the mutex word, so it follows hand-offs; one level only (an
    owner blocked on another mutex passes nothing on). As totk-pc-recomp runtime/kernel.c eff_prio (MIT).
    TOTK_PRIO_INHERIT=0: raw priorities, as before. Holding G. */
+static int ap_on(void);
 static int pi_on(void) {
     static int on = -1;
     // [temporary] off by default (=1: on): on the PC, 2026-11-04 evening, the game itself stalled 65-420 ms ~8x as
     // often as the night before with it (and the spin below) on; to be told apart and measured before it comes back
-    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = e && *e == '1'; }
+    // with asynchronous preemption it is on (TOTK_PRIO_INHERIT=0 turns it off): see there
+    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = e && *e ? *e == '1' : ap_on(); }
     return on;
 }
 static int eff_prio(const thr_t *o) {
@@ -267,6 +276,338 @@ static void core_put(thr_t *t) {   // holding G
     t->st_hold_ns += now_ns() - t->core_since;
     core_grant(c);
 }
+static void core_take(thr_t *t);
+static int core_better_waiter(const thr_t *t, int c);
+// ---------- Asynchronous preemption (TOTK_ASYNC_PREEMPT, on unless 0) ----------
+// Horizon gives a core to a strictly better thread the moment that thread is ready. Here a better waiter flags the
+// owner (core_kick), which gives the core up at its next SVC or indirect call (runtime_core_checkpoint); game code with
+// neither keeps it for milliseconds, and while the world streams in the game's loaders (low priority) compute long
+// stretches like that while its frame's workers wait. So a waiter that has waited AP_FIRST_NS interrupts the owner, then
+// every AP_GAP_NS while it still waits: if the owner's host instruction pointer is in the lifted game code and it is in
+// no host call (rt_host_depth 0: no host lock below it), it is sent to runtime_ap_stub, which keeps every register the
+// game code may have live, gives the core up as at a checkpoint (runtime_ap_yield) and goes on where it was stopped.
+// An owner inside an SDK spin lock (TLR+0x100 disable_count) is not preempted: TLR+0x102 (interrupt_flag) is set and
+// the SDK calls SVC 0x36 once it leaves the lock (runtime_ap_sync). Priority inheritance (pi_on) comes with it: without
+// it a better thread takes the core of a low-priority mutex owner it then waits for.
+// The design is MacNativeGames' (games/totk/runtime/threads.c, 8bf0893, MIT, Copyright (c) 2026 MacNativeGames
+// contributors) as totk-pc-recomp runtime/kernel.c and platform/*.c carry it (MIT); the code here is ours.
+// TOTK_ASYNC_PREEMPT=0: the checkpoints only, as before (and no inheritance unless TOTK_PRIO_INHERIT=1).
+#define AP_FIRST_NS 250000ull   // a waiter spins this long before the first interruption (most core waits end sooner)
+#define AP_GAP_NS 1000000ull    // and interrupts the same owner at most once a millisecond
+static int g_ap = -1;
+static uintptr_t g_gen_lo, g_gen_hi;   // the lifted modules' host code: first and last function
+static uint64_t g_ap_sent, g_ap_taken, g_ap_deferred, g_ap_host, g_ap_out, g_ap_fail, g_ap_sync;
+extern __thread int rt_host_depth;     // runtime/dispatch.c
+int rt_lifted_range(uintptr_t *lo, uintptr_t *hi);
+void runtime_ap_stub(void);
+void runtime_core_checkpoint(void);
+void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
+
+static int ap_on(void) {
+    if (g_ap >= 0) return g_ap;
+    const char *e = getenv("TOTK_ASYNC_PREEMPT");
+    int on = !(e && !strcmp(e, "0")) && cores_enabled() && !getenv("TOTK_NO_PREEMPT");
+    uintptr_t lo = 0, hi = 0;
+    const char *why = on ? NULL : "off";
+    if (on && !rt_lifted_range(&lo, &hi)) on = 0, why = "no lifted code range";
+    const uintptr_t host[] = {(uintptr_t)runtime_ap_stub, (uintptr_t)runtime_core_checkpoint, (uintptr_t)rt_svc,
+                              (uintptr_t)rt_dispatch, (uintptr_t)guest_call};
+    for (unsigned i = 0; on && i < sizeof host / sizeof *host; i++)
+        if (host[i] >= lo && host[i] <= hi) on = 0, why = "host code inside the lifted code range";
+    g_gen_lo = lo, g_gen_hi = hi, g_ap = on;
+    fprintf(stderr, "[totk] virtual cores: asynchronous preemption %s%s%s\n", on ? "on" : "off", why ? ": " : "", why ? why : "");
+    return on;
+}
+static int ap_disabled(const thr_t *t) {   // inside an SDK spin lock (TLR+0x100 disable_count)
+    return t->cpu && t->cpu->tpidrro && *(volatile uint16_t *)(uintptr_t)(t->cpu->tpidrro + 0x100);
+}
+
+#ifdef _WIN32
+// Windows: the owner is suspended, its context read and, to move it, written back with another instruction pointer.
+static void ap_open(thr_t *t) {
+    HANDLE h = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, 0)) return;
+    CONTEXT *ctx = _aligned_malloc(sizeof *ctx, 16);
+    if (!ctx) { CloseHandle(h); return; }
+    t->ap_h = h, t->ap_ctx = ctx, t->ap_ok = 1;
+}
+static int ap_stop(thr_t *o, uint64_t *rip) {
+    if (SuspendThread(o->ap_h) == (DWORD)-1) return 0;
+    memset(o->ap_ctx, 0, sizeof *o->ap_ctx);
+    o->ap_ctx->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (!GetThreadContext(o->ap_h, o->ap_ctx)) { ResumeThread(o->ap_h); return 0; }
+    *rip = o->ap_ctx->Rip;
+    return 1;
+}
+static int ap_resume(thr_t *o, uint64_t to) {
+    int ok = 1;
+    if (to) o->ap_ctx->Rip = to, ok = SetThreadContext(o->ap_h, o->ap_ctx) != 0;
+    ResumeThread(o->ap_h);
+    return ok;
+}
+#else
+// Linux: a real-time signal stops the owner in its handler, which reports the interrupted instruction pointer and
+// waits until the waiter says where to go on (a state word: idle, asked, stopped, go).
+#include <signal.h>
+#include <ucontext.h>
+enum { AP_IDLE, AP_REQ, AP_STOPPED, AP_GO };
+static int g_ap_sig;
+static void ap_handler(int sig, siginfo_t *si, void *ucv) {
+    (void)sig, (void)si;
+    thr_t *t = t_self;
+    ucontext_t *u = ucv;
+    if (!t) return;
+    int req = AP_REQ;
+    t->ap_srip = (uint64_t)u->uc_mcontext.gregs[REG_RIP];
+    if (!__atomic_compare_exchange_n(&t->ap_state, &req, AP_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    while (__atomic_load_n(&t->ap_state, __ATOMIC_ACQUIRE) != AP_GO) __builtin_ia32_pause();
+    if (t->ap_to) u->uc_mcontext.gregs[REG_RIP] = (greg_t)t->ap_to;
+    __atomic_store_n(&t->ap_state, AP_IDLE, __ATOMIC_RELEASE);
+}
+static void ap_open(thr_t *t) {
+    static pthread_mutex_t once = PTHREAD_MUTEX_INITIALIZER;
+    if (!__atomic_load_n(&g_ap_sig, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&once);
+        if (!g_ap_sig) {
+            int sig = SIGRTMIN + 4;   // past the ones glibc keeps for itself
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = ap_handler;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            if (!sigaction(sig, &sa, NULL)) __atomic_store_n(&g_ap_sig, sig, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&once);
+    }
+    if (!g_ap_sig) return;
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, g_ap_sig);
+    pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+    t->ap_pt = pthread_self(), t->ap_ok = 1;
+}
+static int ap_stop(thr_t *o, uint64_t *rip) {
+    int idle = AP_IDLE;
+    if (!__atomic_compare_exchange_n(&o->ap_state, &idle, AP_REQ, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    if (pthread_kill(o->ap_pt, g_ap_sig)) { __atomic_store_n(&o->ap_state, AP_IDLE, __ATOMIC_RELEASE); return 0; }
+    uint64_t end = now_ns() + 2000000;   // a thread the host does not run now answers late: then not this time
+    while (__atomic_load_n(&o->ap_state, __ATOMIC_ACQUIRE) != AP_STOPPED) {
+        if (now_ns() < end) { __builtin_ia32_pause(); continue; }
+        int req = AP_REQ;
+        if (__atomic_compare_exchange_n(&o->ap_state, &req, AP_IDLE, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    }
+    *rip = o->ap_srip;
+    return 1;
+}
+static int ap_resume(thr_t *o, uint64_t to) {
+    o->ap_to = to;
+    __atomic_store_n(&o->ap_state, AP_GO, __ATOMIC_RELEASE);
+    return 1;
+}
+#endif
+
+// The calling guest thread, as it starts: interruptible if asynchronous preemption is on.
+static void ap_thread_start(thr_t *t) {
+    t->depth = &rt_host_depth;
+    t->cpu = guest_cpu();
+    if (ap_on()) ap_open(t);
+}
+
+// runtime_ap_stub (on the interrupted owner, game code at depth 0): where to go on, then the core given up to the
+// better waiter as at a checkpoint (the request may be stale by now; then the thread just goes on).
+uint64_t runtime_ap_rip(void) { return t_self->ap_rip; }
+void runtime_ap_yield(void) {
+    thr_t *t = t_self;
+    g_lock();
+    t->ap_pending = 0;
+    if (t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
+        g_ap_taken++;
+        core_put(t);
+        core_take(t);
+    }
+    g_unlock();
+}
+// SVC 0x36 SynchronizePreemptionState: the SDK leaves a spin lock with interrupt_flag set; a preemption it deferred
+// happens here (svc.c).
+void runtime_ap_sync(void) {
+    thr_t *t = t_self;
+    if (!t) return;
+    if (t->cpu && t->cpu->tpidrro) *(volatile uint16_t *)(uintptr_t)(t->cpu->tpidrro + 0x102) = 0;
+    g_lock();
+    g_ap_sync++;
+    if (t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) core_put(t), core_take(t);
+    g_unlock();
+}
+
+// The register save around runtime_ap_yield. Entered in place of the interrupted instruction: it saves the flags, the
+// volatile general registers, YMM0-15 (XMM0-15 in a build without AVX, whose CPUs have no VEX encoding) and MXCSR,
+// calls runtime_ap_rip and stores the result in a slot it reserved at entry, calls runtime_ap_yield, restores
+// everything and jumps through the slot. System V: below the 128-byte red zone the interrupted code may use; rsi and
+// rdi are volatile there. Windows: no red zone, rsi and rdi kept by the C calls, 32 bytes of shadow space.
+#ifdef __AVX__
+#define AP_VMOV "vmovdqa"
+#define AP_VR "%ymm"
+#define AP_VZU "    vzeroupper\n"
+#else
+#define AP_VMOV "movdqa"
+#define AP_VR "%xmm"
+#define AP_VZU ""
+#endif
+#define AP_SAVE(n, off) "    " AP_VMOV " " AP_VR #n ", " #off "(%rsp)\n"
+#define AP_LOAD(n, off) "    " AP_VMOV " " #off "(%rsp), " AP_VR #n "\n"
+#define AP_VSAVE AP_SAVE(0, 64) AP_SAVE(1, 96) AP_SAVE(2, 128) AP_SAVE(3, 160) AP_SAVE(4, 192) AP_SAVE(5, 224) \
+    AP_SAVE(6, 256) AP_SAVE(7, 288) AP_SAVE(8, 320) AP_SAVE(9, 352) AP_SAVE(10, 384) AP_SAVE(11, 416)            \
+    AP_SAVE(12, 448) AP_SAVE(13, 480) AP_SAVE(14, 512) AP_SAVE(15, 544)
+#define AP_VLOAD AP_LOAD(0, 64) AP_LOAD(1, 96) AP_LOAD(2, 128) AP_LOAD(3, 160) AP_LOAD(4, 192) AP_LOAD(5, 224) \
+    AP_LOAD(6, 256) AP_LOAD(7, 288) AP_LOAD(8, 320) AP_LOAD(9, 352) AP_LOAD(10, 384) AP_LOAD(11, 416)            \
+    AP_LOAD(12, 448) AP_LOAD(13, 480) AP_LOAD(14, 512) AP_LOAD(15, 544)
+#ifdef _WIN32
+__asm__(".text\n"
+        ".globl runtime_ap_stub\n"
+        ".def runtime_ap_stub; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "runtime_ap_stub:\n"
+        ".seh_proc runtime_ap_stub\n"
+        "    leaq -8(%rsp), %rsp\n"   // the slot; lea leaves the flags as the interrupted code had them
+        ".seh_stackalloc 8\n"
+        "    pushfq\n"
+        ".seh_stackalloc 8\n"
+        "    pushq %rax\n" ".seh_pushreg %rax\n"
+        "    pushq %rcx\n" ".seh_pushreg %rcx\n"
+        "    pushq %rdx\n" ".seh_pushreg %rdx\n"
+        "    pushq %r8\n" ".seh_pushreg %r8\n"
+        "    pushq %r9\n" ".seh_pushreg %r9\n"
+        "    pushq %r10\n" ".seh_pushreg %r10\n"
+        "    pushq %r11\n" ".seh_pushreg %r11\n"
+        "    pushq %rbp\n" ".seh_pushreg %rbp\n"
+        "    movq %rsp, %rbp\n"
+        ".seh_setframe %rbp, 0\n"
+        ".seh_endprologue\n"
+        "    andq $-32, %rsp\n"
+        "    subq $576, %rsp\n"   // 0 shadow space, 32 MXCSR, 36 the default MXCSR, 64 the vector registers
+        AP_VSAVE
+        "    stmxcsr 32(%rsp)\n"
+        "    movl $0x1f80, 36(%rsp)\n"
+        "    ldmxcsr 36(%rsp)\n"
+        "    cld\n"
+        AP_VZU
+        "    call runtime_ap_rip\n"
+        "    movq %rax, 72(%rbp)\n"   // the slot: 8 pushes and the flags above rbp
+        "    call runtime_ap_yield\n"
+        "    ldmxcsr 32(%rsp)\n"
+        AP_VLOAD
+        "    movq %rbp, %rsp\n"
+        "    popq %rbp\n"
+        "    popq %r11\n"
+        "    popq %r10\n"
+        "    popq %r9\n"
+        "    popq %r8\n"
+        "    popq %rdx\n"
+        "    popq %rcx\n"
+        "    popq %rax\n"
+        "    popfq\n"
+        "    leaq 8(%rsp), %rsp\n"
+        "    jmpq *-8(%rsp)\n"
+        ".seh_endproc\n");
+#else
+__asm__(".text\n"
+        ".globl runtime_ap_stub\n"
+        ".type runtime_ap_stub, @function\n"
+        ".p2align 4\n"
+        "runtime_ap_stub:\n"
+        "    .cfi_startproc\n"
+        "    leaq -136(%rsp), %rsp\n"   // past the red zone, and the slot at the new rsp
+        "    pushfq\n"
+        "    pushq %rax\n"
+        "    pushq %rcx\n"
+        "    pushq %rdx\n"
+        "    pushq %rsi\n"
+        "    pushq %rdi\n"
+        "    pushq %r8\n"
+        "    pushq %r9\n"
+        "    pushq %r10\n"
+        "    pushq %r11\n"
+        "    pushq %rbp\n"
+        "    movq %rsp, %rbp\n"
+        "    andq $-32, %rsp\n"
+        "    subq $576, %rsp\n"   // 32 MXCSR, 36 the default MXCSR, 64 the vector registers
+        AP_VSAVE
+        "    stmxcsr 32(%rsp)\n"
+        "    movl $0x1f80, 36(%rsp)\n"
+        "    ldmxcsr 36(%rsp)\n"
+        "    cld\n"
+        AP_VZU
+        "    call runtime_ap_rip\n"
+        "    movq %rax, 88(%rbp)\n"   // the slot: 10 pushes and the flags above rbp
+        "    call runtime_ap_yield\n"
+        "    ldmxcsr 32(%rsp)\n"
+        AP_VLOAD
+        "    movq %rbp, %rsp\n"
+        "    popq %rbp\n"
+        "    popq %r11\n"
+        "    popq %r10\n"
+        "    popq %r9\n"
+        "    popq %r8\n"
+        "    popq %rdi\n"
+        "    popq %rsi\n"
+        "    popq %rdx\n"
+        "    popq %rcx\n"
+        "    popq %rax\n"
+        "    popfq\n"
+        "    leaq 136(%rsp), %rsp\n"
+        "    jmpq *-136(%rsp)\n"
+        "    .cfi_endproc\n"
+        ".size runtime_ap_stub, .-runtime_ap_stub\n");
+#endif
+
+enum { AP_NONE, AP_RETRY, AP_SENT };
+// The owner a waiter t would interrupt: the worst one, flagged to give its core up, among those of cores t may use
+// that count worse than t (holding G).
+static thr_t *ap_target(const thr_t *t) {
+    int tp = eff_prio(t), wp = tp;
+    thr_t *o = NULL;
+    for (int i = 0; i < NCORE; i++) {
+        thr_t *h = g_core_owner[i];
+        if (!core_allowed(t, i) || !h || !h->preempt) continue;
+        int p = eff_prio(h);
+        if (p > wp) wp = p, o = h;
+    }
+    return o;
+}
+// Interrupt o if it runs top-level game code (holding G; o is stopped only between ap_stop and ap_resume, during
+// which nothing here takes a lock, and it holds no host lock where it is moved).
+static int ap_try(thr_t *o) {
+    if (!o || o->cur_core < 0 || !o->preempt) return AP_NONE;
+    if (!o->ap_ok || o->ap_pending) return AP_RETRY;
+    if (o->depth && __atomic_load_n(o->depth, __ATOMIC_RELAXED) > 0) { g_ap_host++; return AP_RETRY; }
+    if (ap_disabled(o)) {   // in an SDK spin lock: SVC 0x36 switches when it leaves
+        *(volatile uint16_t *)(uintptr_t)(o->cpu->tpidrro + 0x102) = 1;
+        g_ap_deferred++;
+        return AP_RETRY;
+    }
+    uint64_t now = now_ns(), rip = 0, to = 0;
+    if (o->ap_last && now - o->ap_last < AP_GAP_NS) return AP_RETRY;
+    o->ap_last = now;
+    if (!ap_stop(o, &rip)) { g_ap_fail++; return AP_RETRY; }
+    if (rip < g_gen_lo || rip > g_gen_hi) g_ap_out++;
+    else if (o->depth && __atomic_load_n(o->depth, __ATOMIC_RELAXED) > 0) g_ap_host++;
+    else if (ap_disabled(o)) *(volatile uint16_t *)(uintptr_t)(o->cpu->tpidrro + 0x102) = 1, g_ap_deferred++;
+    else o->ap_rip = rip, o->ap_pending = 1, to = (uint64_t)(uintptr_t)runtime_ap_stub;
+    if (!ap_resume(o, to)) { o->ap_pending = 0; g_ap_fail++; return AP_RETRY; }
+    if (to) g_ap_sent++;
+    return to ? AP_SENT : AP_RETRY;
+}
+// The counters, for the thread report (TOTK_STATS)
+static void ap_report(void) {
+    if (g_ap > 0)
+        fprintf(stderr, "[totk] virtual cores: asynchronous preemption since start: %llu interruptions sent, %llu cores "
+                "handed over, deferred in a spin lock %llu (SVC 0x36 %llu), not now: in a host call %llu, outside game code %llu, failed %llu\n",
+                (unsigned long long)g_ap_sent, (unsigned long long)g_ap_taken, (unsigned long long)g_ap_deferred,
+                (unsigned long long)g_ap_sync, (unsigned long long)g_ap_host, (unsigned long long)g_ap_out,
+                (unsigned long long)g_ap_fail);
+}
+
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
@@ -292,7 +633,22 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
         while (__atomic_load_n(&t->cur_core, __ATOMIC_ACQUIRE) < 0 && now_ns() - s0 < (uint64_t)spin_ns) __builtin_ia32_pause();
         g_lock();
     }
-    while (t->cur_core < 0) gc_wait(&t->cv);
+    if (g_ap > 0 && t->cur_core < 0 && ap_target(t)) {   // most waits end within microseconds: spin before interrupting
+        g_unlock();
+        uint64_t s0 = now_ns();
+        while (__atomic_load_n(&t->cur_core, __ATOMIC_ACQUIRE) < 0 && now_ns() - s0 < AP_FIRST_NS) __builtin_ia32_pause();
+        g_lock();
+    }
+    while (t->cur_core < 0) {
+        if (g_ap > 0 && ap_try(ap_target(t)) != AP_NONE) {   // the owner keeps its core for now: again in a millisecond
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_nsec += 1000000;
+            if (dl.tv_nsec >= 1000000000) dl.tv_sec++, dl.tv_nsec -= 1000000000;
+            gc_timedwait(&t->cv, &dl);
+        } else
+            gc_wait(&t->cv);
+    }
     if (inv) { uint64_t d = now_ns() - w0; t->st_inv_ns += d; if (d > t->st_inv_max) t->st_inv_max = d; }
     t->st_core_ns += now_ns() - t->core_cred, t->st_core_waits++;
     t->core_t0 = 0;
@@ -440,6 +796,7 @@ void runtime_threads_report(unsigned frames) {
                 "away %.1f ms, wake latency %.0f us; CPU %.1f ms, waiting for a processor %.1f ms\n", r[i].h, r[i].prio, r[i].hold, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
                 away > 0 ? away : 0.0, r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0, r[i].cpu > 0 ? r[i].cpu : 0.0, r[i].dly > 0 ? r[i].dly : 0.0);
     }
+    ap_report();
 }
 
 /* UltraTears (the long-frame log, gfx/nvn/hle_nvn.c): running totals in ns - [0] all guest threads waiting for a virtual
@@ -544,6 +901,7 @@ static void *thread_main(void *p) {
     plat_thread_start();
     Cpu *c = guest_cpu_new(t->stack_top, guest_tls_alloc());
     guest_cpu_set(c);
+    ap_thread_start(t);
     g_lock(); while (!t->started) gc_wait(&t->cv); core_take(t); g_unlock();
     c->x[0] = t->arg;
     guest_call(c, t->entry);   // does not return: the guest leaves through ExitThread (svc 0x0A)
@@ -579,6 +937,8 @@ uint32_t svc_thread_main_init(void) {
     gc_init(&t->cv);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self();
     t->cur_core = -1; t->os_tid = os_tid_self();
+    t_self = t;
+    ap_thread_start(t);
     g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; g_main_thr = t; core_take(t); g_unlock();
     t_self = t;
     preempt_point_set(t);

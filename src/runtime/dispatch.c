@@ -56,13 +56,27 @@ static __thread const HleSlot *t_native;
 __attribute__((weak)) int runtime_core_away(void) { return 0; }
 __attribute__((weak)) void runtime_core_back(int *away) { (void)away; }
 
+/* Host calls in progress on this thread: HLE functions, overrides of game functions and SVCs. Game code a host call
+   runs (a callback) runs inside it. Asynchronous preemption (host/threads.c) moves a thread off its virtual core only
+   at 0: deeper, the host frames below may hold a host lock. */
+__thread int rt_host_depth;
+static __thread GuestFn t_hostfn;
+static void hle_fn_thunk(Cpu *c) {   // an HLE_FUNC or an override, counted in rt_host_depth
+    GuestFn f = t_hostfn;
+    rt_host_depth++;
+    f(c);
+    rt_host_depth--;
+}
+
 void hle_native_thunk(Cpu *c) {
     const HleSlot *s = t_native;
     uint64_t (*f)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = s->native;
     char kind = s->ret;
     int away = 0;
+    rt_host_depth++;
     if (kind >= 'A' && kind <= 'Z') kind += 32, away = runtime_core_away();   // HLE_NATIVE_BLOCKING
     uint64_t r = f(c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5], c->x[6], c->x[7]);
+    rt_host_depth--;
     if (away) runtime_core_back(&away);
     switch (kind) {
     case 'v': break;
@@ -118,6 +132,21 @@ void *hle_alloc(uint64_t size) {
     return (void *)a;
 }
 
+/* The host code of the lifted modules: the first and the last function's address (host/threads.c, asynchronous
+   preemption: an interrupted thread is moved only when it runs there). 0 before dispatch_init. */
+int rt_lifted_range(uintptr_t *lo, uintptr_t *hi) {
+    uintptr_t l = UINTPTR_MAX, h = 0;
+    for (int t = 0; t < MAX_MODULES; t++)
+        for (uint64_t k = 0; k < tables[t].count; k++) {
+            uintptr_t f = (uintptr_t)tables[t].fns[k];
+            if (f < l) l = f;
+            if (f > h) h = f;
+        }
+    if (!h || l >= h) return 0;
+    *lo = l, *hi = h;
+    return 1;
+}
+
 void dispatch_init(void) {
     const uint64_t *addrs[] = {main_fn_addrs, subsdk0_fn_addrs, sdk_fn_addrs};
     const GuestFn *fns[] = {main_fn_ptrs, subsdk0_fn_ptrs, sdk_fn_ptrs};
@@ -151,13 +180,13 @@ static GuestFn dispatch_slow(Cpu *c) {
         int i = (int)((pc - HLE_BASE) / 16);
         if (i < hle_count) {
             if (hle_slots[i].native) { t_native = &hle_slots[i]; return hle_native_thunk; }
-            if (hle_slots[i].fn) return hle_slots[i].fn;
+            if (hle_slots[i].fn) { t_hostfn = hle_slots[i].fn; return hle_fn_thunk; }
             unimpl_pc = pc;
             return hle_unimplemented;
         }
     }
     for (int i = 0; i < override_count; i++)
-        if (overrides[i].addr == pc) return overrides[i].fn;
+        if (overrides[i].addr == pc) { t_hostfn = overrides[i].fn; return hle_fn_thunk; }
     GuestFn f = dispatch_lookup(pc);
     if (!f) {
         uint64_t off = 0;
