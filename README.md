@@ -62,6 +62,25 @@ Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, F11 or
 planned.
 </details>
 
+<details>
+<summary>Chinese and Korean text</summary>
+
+For Simplified Chinese, Traditional Chinese and Korean the game uses the Switch's own system fonts. They are part of
+the console's system software, not of the game, so the port can't make them from the dump. Without them the game stops
+when it starts in one of these languages; all other languages don't need them.
+
+Put the console's shared font files, taken from your own Switch, into `sysdata\fonts\` next to `exefs` and `romfs` in
+your dump folder before **Prepare the game** (or later straight into `data\fonts\` in the game folder):
+
+```text
+dump\
+└── sysdata\fonts\   0-standard.bfttf, 1-chinese-simplified.bfttf, 2-chinese-simplified-extension.bfttf,
+                     3-chinese-traditional.bfttf, 4-korean.bfttf, 5-nintendo-extension.bfttf
+```
+
+Put in all six; the game reads only the ones it asks for.
+</details>
+
 ## Building from source
 
 Install Git and Python 3, then:
