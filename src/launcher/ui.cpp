@@ -2,6 +2,7 @@
 // failure, and Play once the game is built. Layout in design pixels (800x480), multiplied by the window's scale.
 // Every clickable thing has a hover and a pressed look and the hand cursor; Tab / the gamepad move between them.
 #include "launcher.h"
+#include "imgui_internal.h"   // NavMoveRequestSubmit: the left stick moves the focus as the d-pad does
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -2336,6 +2337,32 @@ void ui_frame(float scale) {
         if (!held)
             g_input_held = false;
     }
+    // The left stick moves the focus as the d-pad does (ImGui itself only scrolls with it): a push one step, held it
+    // repeats after 0.35 s every 0.12 s. Not while a key is awaited or a list is open (its own items take the d-pad).
+    g_scrolling = false;   // (set again below while the sticks are held or a drag goes on)
+    {
+        static ImGuiDir held = ImGuiDir_None;
+        static double next_at;
+        auto mag = [&](ImGuiKey k) { return io.KeysData[k - ImGuiKey_NamedKey_BEGIN].AnalogValue; };
+        float lx = mag(ImGuiKey_GamepadLStickRight) - mag(ImGuiKey_GamepadLStickLeft);
+        float ly = mag(ImGuiKey_GamepadLStickDown) - mag(ImGuiKey_GamepadLStickUp);
+        ImGuiDir dir = ImGuiDir_None;
+        if (SDL_fabsf(lx) > SDL_fabsf(ly))
+            dir = lx > 0.5f ? ImGuiDir_Right : lx < -0.5f ? ImGuiDir_Left : ImGuiDir_None;
+        else
+            dir = ly > 0.5f ? ImGuiDir_Down : ly < -0.5f ? ImGuiDir_Up : ImGuiDir_None;
+        double now = ImGui::GetTime();
+        bool go = dir != ImGuiDir_None && !g_cap.on && !g_input_held && ImGui::GetCurrentContext()->NavWindow &&
+                  (dir != held || now >= next_at);
+        if (go) {
+            ImGui::NavMoveRequestSubmit(dir, dir, ImGuiNavMoveFlags_None, ImGuiScrollFlags_KeepVisibleEdgeX | ImGuiScrollFlags_KeepVisibleEdgeY);
+            ImGui::SetNavCursorVisible(true);
+            next_at = now + (dir != held ? 0.35 : 0.12);
+        }
+        held = dir;
+        if (dir != ImGuiDir_None)
+            g_scrolling = true;   // frames while it is held, for the repeat
+    }
     // while a key or button is awaited (and until it is let go) the keyboard and the gamepad do not move the focus
     const ImGuiConfigFlags nav = ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     if (g_cap.on || g_input_held)
@@ -2385,7 +2412,7 @@ void ui_frame(float scale) {
             g_drag_scrolled = true;
         }
         float rs = io.KeysData[ImGuiKey_GamepadRStickDown - ImGuiKey_NamedKey_BEGIN].AnalogValue - io.KeysData[ImGuiKey_GamepadRStickUp - ImGuiKey_NamedKey_BEGIN].AnalogValue;
-        g_scrolling = SDL_fabsf(rs) > 0.2f || ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        g_scrolling = g_scrolling || SDL_fabsf(rs) > 0.2f || ImGui::IsMouseDragging(ImGuiMouseButton_Left);
         if (SDL_fabsf(rs) > 0.2f && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             ImGui::SetScrollY(ImGui::GetScrollY() + rs * 700 * S * io.DeltaTime);
     }
