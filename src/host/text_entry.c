@@ -240,14 +240,14 @@ int text_entry_event(const SDL_Event *e) {
         }
         return 1;
     case SDL_EVENT_KEY_UP: return 1;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        switch (e->gbutton.button) {
-        case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_START: finish(1); break;   /* A, + */
-        case SDL_GAMEPAD_BUTTON_SOUTH: backspace(1); break;                               /* B */
-        case SDL_GAMEPAD_BUTTON_WEST: screen_keyboard(0); screen_keyboard(1); break;     /* Y: the keyboard again */
-        default: break;
-        }
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {   /* by the Switch button it is (window_sdl.c: the layout and bindings) */
+        uint64_t window_pad_bits(int button);
+        uint64_t bits = window_pad_bits(e->gbutton.button);
+        if (bits & (1 | 1024)) finish(1);                                  /* A, + */
+        else if (bits & 2) backspace(1);                                   /* B */
+        else if (bits & 8) { screen_keyboard(0); screen_keyboard(1); }    /* Y: the keyboard again */
         return 0;   /* (window_sdl.c still updates the controller: the game gets it held) */
+    }
     default: return 0;
     }
 }

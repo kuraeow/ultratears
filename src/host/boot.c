@@ -143,6 +143,10 @@ static const char *default_exefs(void) {
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
             }
             else if (!strncmp(line, "TOTK_", 5)) setenv(line, eq + 1, 0);
+            else if (!strncmp(line, "pad_", 4) || !strncmp(line, "key_", 4)) {   // the launcher's Controls tab (window_sdl.c binds_load)
+                char var[96];
+                if (snprintf(var, sizeof var, "TOTK_BIND_%s", line) < (int)sizeof var) setenv(var, eq + 1, 0);
+            }
             else
                 for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++)
                     if (!strcmp(line, keys[i][0])) setenv(keys[i][1], eq + 1, 0);

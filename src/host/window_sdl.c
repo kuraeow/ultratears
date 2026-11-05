@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "host.h"
 #include "../vk/present.h"
@@ -43,6 +44,93 @@ static int mac_key(SDL_Scancode s) {
     default: return -1;
     }
 }
+
+/* ---- bindings (the launcher's Controls tab writes them into ultratears.cfg; boot.c passes pad_* / key_* lines on as
+   TOTK_BIND_pad_* / TOTK_BIND_key_*). Unset: the layouts below, as before.
+   - pad_layout=xbox: the face buttons as an Xbox pad (and the Steam Deck) labels them, A the bottom one; default
+     (nintendo): by position as on a Switch controller, A the right one.
+   - pad_<action>=<SDL gamepad names, comma separated>: a, b, x, y (SDL's names by position: a = the bottom button),
+     leftshoulder, rightshoulder, lefttrigger, righttrigger, back, start, leftstick, rightstick, dpup ..., paddle1..4;
+     none: unbound. Actions: a b x y l r zl zr plus minus lstick rstick up down left right.
+   - key_<action>=<SDL scancode names, comma separated> (SDL_GetScancodeName: "W", "Space", "Left Shift"); none:
+     unbound. The same actions and move_up / move_down / move_left / move_right, cam_up / cam_down / cam_left /
+     cam_right (the sticks the keys drive). A key bound here no longer does what it did by default. */
+typedef struct { const char *id; uint64_t bit; int mac, mac_alt; } bind_action;
+static const bind_action ACTIONS[] = {
+    {"a", 1, 38, -1}, {"b", 2, 40, 49}, {"x", 4, 34, -1}, {"y", 8, 32, -1}, {"lstick", 16, 6, -1}, {"rstick", 32, 8, -1},
+    {"l", 64, 12, -1}, {"r", 128, 14, -1}, {"zl", 256, 58, -1}, {"zr", 512, 56, -1}, {"plus", 1024, 36, -1},
+    {"minus", 2048, 48, 53}, {"left", 4096, 3, -1}, {"up", 8192, 17, -1}, {"right", 16384, 4, -1}, {"down", 32768, 5, -1},
+    {"move_up", 0, 13, -1}, {"move_down", 0, 1, -1}, {"move_left", 0, 0, -1}, {"move_right", 0, 2, -1},
+    {"cam_up", 0, 126, -1}, {"cam_down", 0, 125, -1}, {"cam_left", 0, 123, -1}, {"cam_right", 0, 124, -1}};
+static int8_t g_keymap[SDL_SCANCODE_COUNT];        // scancode -> the Mac key code overrides_input.c reads, -1 none
+static uint64_t g_padbits[SDL_GAMEPAD_BUTTON_COUNT];   // SDL button -> Switch buttons
+static uint64_t g_trigbits[2];                     // the left / right trigger -> Switch buttons
+static int g_xbox_layout;
+
+static const char *bind_value(const char *kind, const char *id) {
+    char var[64];
+    snprintf(var, sizeof var, "TOTK_BIND_%s_%s", kind, id);
+    const char *v = getenv(var);
+    return v && *v ? v : NULL;
+}
+static void binds_load(void) {
+    for (int s = 0; s < SDL_SCANCODE_COUNT; s++) g_keymap[s] = (int8_t)mac_key((SDL_Scancode)s);
+    const char *layout = getenv("TOTK_BIND_pad_layout");
+    g_xbox_layout = layout && !SDL_strcasecmp(layout, "xbox");
+    static const struct { SDL_GamepadButton b; uint64_t bit; } common[] = {
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK, 16}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 32}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 64},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 128}, {SDL_GAMEPAD_BUTTON_START, 1024}, {SDL_GAMEPAD_BUTTON_BACK, 2048},
+        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 4096}, {SDL_GAMEPAD_BUTTON_DPAD_UP, 8192}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 16384},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 32768}};
+    memset(g_padbits, 0, sizeof g_padbits);
+    for (unsigned i = 0; i < sizeof common / sizeof *common; i++) g_padbits[common[i].b] = common[i].bit;
+    if (g_xbox_layout) {   // as labelled: A bottom, B right, X left, Y top
+        g_padbits[SDL_GAMEPAD_BUTTON_SOUTH] = 1, g_padbits[SDL_GAMEPAD_BUTTON_EAST] = 2;
+        g_padbits[SDL_GAMEPAD_BUTTON_WEST] = 4, g_padbits[SDL_GAMEPAD_BUTTON_NORTH] = 8;
+    } else {               // by position, as a Switch controller: A right, B bottom, X top, Y left
+        g_padbits[SDL_GAMEPAD_BUTTON_EAST] = 1, g_padbits[SDL_GAMEPAD_BUTTON_SOUTH] = 2;
+        g_padbits[SDL_GAMEPAD_BUTTON_NORTH] = 4, g_padbits[SDL_GAMEPAD_BUTTON_WEST] = 8;
+    }
+    g_trigbits[0] = 256, g_trigbits[1] = 512;
+    int changed = 0;
+    for (unsigned a = 0; a < sizeof ACTIONS / sizeof *ACTIONS; a++) {
+        const bind_action *A = &ACTIONS[a];
+        const char *v;
+        if (A->bit && (v = bind_value("pad", A->id))) {   // its buttons: these and no others
+            for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) g_padbits[b] &= ~A->bit;
+            g_trigbits[0] &= ~A->bit, g_trigbits[1] &= ~A->bit;
+            char list[256];
+            snprintf(list, sizeof list, "%s", v);
+            for (char *t = strtok(list, ","); t; t = strtok(NULL, ",")) {
+                while (*t == ' ') t++;
+                SDL_GamepadButton b = SDL_GetGamepadButtonFromString(t);
+                SDL_GamepadAxis ax = SDL_GetGamepadAxisFromString(t);
+                if (b != SDL_GAMEPAD_BUTTON_INVALID) g_padbits[b] |= A->bit;
+                else if (ax == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) g_trigbits[0] |= A->bit;
+                else if (ax == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) g_trigbits[1] |= A->bit;
+                else if (SDL_strcasecmp(t, "none")) fprintf(stderr, "[totk] pad_%s: no button \"%s\"\n", A->id, t);
+            }
+            changed++;
+        }
+        if ((v = bind_value("key", A->id))) {   // its keys: these and no others
+            for (int s = 0; s < SDL_SCANCODE_COUNT; s++)
+                if (g_keymap[s] == A->mac || (A->mac_alt >= 0 && g_keymap[s] == A->mac_alt)) g_keymap[s] = -1;
+            char list[256];
+            snprintf(list, sizeof list, "%s", v);
+            for (char *t = strtok(list, ","); t; t = strtok(NULL, ",")) {
+                while (*t == ' ') t++;
+                SDL_Scancode s = SDL_GetScancodeFromName(t);
+                if (s != SDL_SCANCODE_UNKNOWN) g_keymap[s] = (int8_t)A->mac;
+                else if (SDL_strcasecmp(t, "none")) fprintf(stderr, "[totk] key_%s: no key \"%s\"\n", A->id, t);
+            }
+            changed++;
+        }
+    }
+    fprintf(stderr, "[totk] controls: %s layout%s, %d action(s) bound in ultratears.cfg\n", g_xbox_layout ? "Xbox" : "Nintendo",
+            g_xbox_layout ? " (A the bottom button)" : " (A the right button)", changed);
+}
+// The Switch buttons an SDL button stands for (text_entry.c: OK is whatever is A)
+uint64_t window_pad_bits(int button) { return button >= 0 && button < SDL_GAMEPAD_BUTTON_COUNT ? g_padbits[button] : 0; }
 
 // Switch npad button bits (libnx HidNpadButton): A B X Y StickL StickR L R ZL ZR Plus Minus Left Up Right Down
 static int32_t stick(Sint16 v, int invert) {
@@ -77,17 +165,10 @@ static void pad_update(void) {
     RuntimeGamepadState s = {0};
     if (pad && text_entry_blocks_input()) s.connected = 1;   // held: connected, nothing pressed
     else if (pad) {
-        static const struct { SDL_GamepadButton b; uint64_t bit; } map[] = {
-            {SDL_GAMEPAD_BUTTON_EAST, 1}, {SDL_GAMEPAD_BUTTON_SOUTH, 2}, {SDL_GAMEPAD_BUTTON_NORTH, 4},
-            {SDL_GAMEPAD_BUTTON_WEST, 8}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, 16}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 32},
-            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 64}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 128},
-            {SDL_GAMEPAD_BUTTON_START, 1024}, {SDL_GAMEPAD_BUTTON_BACK, 2048}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, 4096},
-            {SDL_GAMEPAD_BUTTON_DPAD_UP, 8192}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 16384},
-            {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 32768}};
-        for (unsigned i = 0; i < sizeof map / sizeof *map; i++)
-            if (SDL_GetGamepadButton(pad, map[i].b)) s.buttons |= map[i].bit;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) s.buttons |= 256;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) s.buttons |= 512;
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)   // through the bindings (binds_load)
+            if (g_padbits[b] && SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) s.buttons |= g_padbits[b];
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) s.buttons |= g_trigbits[0];
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) s.buttons |= g_trigbits[1];
         s.lx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), 0);
         s.ly = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), 1);
         s.rx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), 0);
@@ -124,6 +205,7 @@ int window_init(void) {
         return 0;
     }
     pad_lock = SDL_CreateMutex();
+    binds_load();
     window = SDL_CreateWindow("UltraTears", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) { fprintf(stderr, "[totk] window: %s\n", SDL_GetError()); return 0; }
 #ifndef _WIN32
@@ -286,7 +368,7 @@ _Noreturn void window_loop(void) {
                         vkb_dump_request();
                         break;
                     }
-                    int k = mac_key(e.key.scancode);
+                    int k = e.key.scancode < SDL_SCANCODE_COUNT ? g_keymap[e.key.scancode] : -1;   // (binds_load)
                     if (k >= 0 && !e.key.repeat) runtime_input_key((unsigned)k, e.type == SDL_EVENT_KEY_DOWN);
                     break;
                 }
