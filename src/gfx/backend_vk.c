@@ -2616,6 +2616,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                      (double)(rn - prn) / 1e6 / f, (double)(pq - ppq) / f, (double)(tc - ptc) / f, (double)(pd - ppd) / f);
                 prn = rn; ptc = tc; ppq = pq; ppd = pd;
                 (void)psf;
+                { void vkb_tex_ahead_log(double frames); vkb_tex_ahead_log(f); }   // TOTK_TEX_AHEAD
             }
             static uint64_t pm, psh, ptb;
             uint64_t im_made, im_shared, im_back;
