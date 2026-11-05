@@ -117,3 +117,4 @@ bool ui_window_wanted();                   // false while --play has nothing to 
 bool ui_quit_wanted();                     // --play: the graphics prepared, the game to start
 bool ui_play_finish();                     // --play, after closing: the game started
 void ui_quit();                            // closing: stop the build (it resumes next time)
+bool ui_event(const SDL_Event *e);         // every event first: true when the Controls tab took it (a key being bound)

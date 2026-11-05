@@ -46,6 +46,9 @@ static bool hovered_rect(ImVec2 a, ImVec2 b) {
     return ImGui::IsMouseHoveringRect(a, b) && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 }
 
+static bool g_drag_scrolled;   // the body was dragged with a finger: the touch that did it clicks nothing (ui_frame)
+static bool g_input_held;      // after a key / button was bound: nothing clicks until every key and button is up
+
 // An invisible ImGui item over [x, y, w, h] (design pixels): focus, keyboard and gamepad come with it.
 static bool hit(const char *id, float x, float y, float w, float h, bool *hover, bool *down, bool enabled = true) {
     ImGui::SetCursorScreenPos(P(x, y));
@@ -60,9 +63,9 @@ static bool hit(const char *id, float x, float y, float w, float h, bool *hover,
     *down = enabled && ImGui::IsItemActive();
     if (*hover)
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-    if (enabled && ImGui::IsItemFocused() && ImGui::GetIO().NavVisible)   // keyboard / gamepad focus
-        DL->AddRect(P(x - 3, y - 3), P(x + w + 3, y + h + 3), IM_COL32(61, 214, 140, 160), 9 * S, 0, 2 * S);
-    return clicked;
+    if (enabled && ImGui::IsItemFocused() && ImGui::GetIO().NavVisible)   // keyboard / gamepad focus (the design, 7.1 / 7.2)
+        DL->AddRect(P(x - 4, y - 4), P(x + w + 4, y + h + 4), IM_COL32(118, 196, 170, 255), 10 * S, 0, 2 * S);
+    return clicked && !g_drag_scrolled && !g_input_held;
 }
 
 static ImVec2 text_size(ImFont *f, const char *t) { return f->CalcTextSizeA(f->FontSize, FLT_MAX, 0, t); }
@@ -1060,11 +1063,11 @@ static void screen_dump_footer() {
         start_build();
 }
 
-static void step_rows(float y) {
+static void step_rows(float y, float sp) {   // sp: from one row to the next (26, less when they would not fit)
     double est = est_total_secs();
     for (int i = 0; i < n_rows(); i++) {
         Row &r = U.rows[i];
-        float ry = y + 26 * i, cx = 44, cy = ry + 8;
+        float ry = y + sp * i, cx = 44, cy = ry + 8;
         ImU32 name_col = C_TEXT;
         switch (r.st) {
         case R_DONE: icon(g_media.check, 36, ry); break;
@@ -1133,9 +1136,13 @@ static void screen_build() {
     if (f > 0)
         DL->AddRectFilled(P(36, y), P(36 + 728 * (float)f, y + 8), U.failed ? C_BAR_FAIL : C_BAR_FILL, 4 * S);
     y += 34;
-    step_rows(y);
+    // every step above the footer (y 408): the rows close up when there are more of them than room (a build for the
+    // Steam Deck has one more), the failure's words below them included
+    float room = 398 - y - (U.failed && !U.fail_text.empty() ? 22 : 0);
+    float sp = SDL_max(20.0f, SDL_min(26.0f, room / n_rows()));
+    step_rows(y, sp);
     if (U.failed && !U.fail_text.empty())
-        rich(g_media.small, 36, y + 26 * n_rows() + 4, 728, {{U.fail_text.c_str(), C_ERR}});
+        rich(g_media.small, 36, y + sp * n_rows() + 4, 728, {{U.fail_text.c_str(), C_ERR}});
 }
 
 static void screen_build_footer() {
@@ -1540,14 +1547,54 @@ static bool toggle(const char *id, float x_right, float cy, bool on) {   // the 
     return clicked;
 }
 
-static int g_tab = 0;   // 0 general, 1 the game's language, 2 debug
+static int g_tab = 0;   // 0 general, 1 the game's language, 2 controls, 3 debug
+enum { TAB_COUNT = 4, TAB_CONTROLS = 2, TAB_DEBUG = 3 };
 static bool g_full_q = false;   // "Rebuild completely" pressed: asking whether to
 static std::string g_full_platform = "windows";   // for which platform (its list)
 
+// The shoulder buttons' names on the controller in use, for the tab badges (the design 7.1: L1 and R1 on the Steam Deck)
+static void shoulder_names(const char **l, const char **r) {
+    *l = "L1", *r = "R1";
+    const char *deck = SDL_getenv("SteamDeck");
+    if (deck && !SDL_strcmp(deck, "1"))
+        return;
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    SDL_GamepadType t = ids && n ? SDL_GetGamepadTypeForID(ids[0]) : SDL_GAMEPAD_TYPE_UNKNOWN;
+    SDL_free(ids);
+    if (t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE)
+        *l = "LB", *r = "RB";
+    else if (t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR)
+        *l = "L", *r = "R";
+}
+
+static void tab_badge(float x, const char *name) {   // the design: a light rounded square with the button's name
+    float w = SDL_max(22.0f, text_w(g_media.small, name) + 10);
+    DL->AddRectFilled(P(x, 25), P(x + w, 47), C_LIGHT, 5 * S);
+    text(g_media.small, x + (w - text_w(g_media.small, name)) / 2, 36 - g_media.small->FontSize / S / 2, IM_COL32(17, 17, 17, 255), name);
+}
+static float badge_w(const char *name) { return SDL_max(22.0f, text_w(g_media.small, name) + 10); }
+
+static bool capturing();   // the Controls tab waits for a key or button (below)
+
 static void play_tabs() {   // instead of the header on the Play screen (the design)
-    static const char *const TABS[] = {"tab_main", "tab_lang", "tab_debug"};
+    static const char *const TABS[] = {"tab_main", "tab_lang", "tab_controls", "tab_debug"};
+    // with a controller: L1 / R1 (LB / RB) go through the tabs, their badges at both ends (the design 7.1)
+    bool pad = SDL_HasGamepad();
+    if (pad && !capturing() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false))
+            g_tab = (g_tab + TAB_COUNT - 1) % TAB_COUNT;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false))
+            g_tab = (g_tab + 1) % TAB_COUNT;
+    }
+    const char *ln, *rn;
+    shoulder_names(&ln, &rn);
     float x = 36;
-    for (int i = 0; i < 3; i++) {
+    if (pad) {
+        tab_badge(x, ln);
+        x += badge_w(ln) + 10;
+    }
+    for (int i = 0; i < TAB_COUNT; i++) {
         const char *l = T(TABS[i]);
         float w = text_w(g_media.control, l) + 24;
         bool hov, down;
@@ -1558,6 +1605,8 @@ static void play_tabs() {   // instead of the header on the Play screen (the des
         text(g_media.control, x + 12, 36 - g_media.control->FontSize / S / 2, C_TEXT, l);
         x += w + 2;
     }
+    if (pad)
+        tab_badge(x + 8, rn);
     DL->AddLine(P(0, 60), P(800, 60), IM_COL32(40, 40, 40, 255), S);
 }
 
@@ -1640,9 +1689,15 @@ static void screen_debug() {
     DL->ChannelsSetCurrent(1);
 }
 
+static void screen_controls();
+
 static void screen_play() {
-    if (g_tab == 2) {
+    if (g_tab == TAB_DEBUG) {
         screen_debug();
+        return;
+    }
+    if (g_tab == TAB_CONTROLS) {
+        screen_controls();
         return;
     }
     float top = 80, y = top + 20;
@@ -1724,6 +1779,263 @@ static void screen_play() {
     DL->ChannelsSetCurrent(0);
     DL->AddRectFilled(P(36, top), P(764, cy + 28), C_CARD, 10 * S);
     DL->ChannelsSetCurrent(1);
+}
+
+// ---------------------------------------------------------------- Controls (the game reads them: src/host/window_sdl.c
+// binds_load). pad_layout= nintendo (unset: A the right button) or xbox (A the bottom one); pad_<action>= SDL gamepad
+// names (a = the bottom button, as SDL names them by position), key_<action>= SDL scancode names, comma separated, none:
+// unbound; unset: the default below, which is the game's. A key or button bound to one action leaves the others.
+struct Ctl { const char *id, *label, *pad_nin, *pad_xbox, *keys; };
+static const Ctl CTL_BUTTONS[] = {
+    {"a", "act_a", "b", "a", "J"}, {"b", "act_b", "a", "b", "K,Space"}, {"x", "act_x", "y", "x", "I"},
+    {"y", "act_y", "x", "y", "U"}, {"l", "act_l", "leftshoulder", "leftshoulder", "Q"},
+    {"r", "act_r", "rightshoulder", "rightshoulder", "E"}, {"zl", "act_zl", "lefttrigger", "lefttrigger", "Left Alt"},
+    {"zr", "act_zr", "righttrigger", "righttrigger", "Left Shift"}, {"plus", "act_plus", "start", "start", "Return"},
+    {"minus", "act_minus", "back", "back", "Tab,Escape"}, {"lstick", "act_lstick", "leftstick", "leftstick", "Z"},
+    {"rstick", "act_rstick", "rightstick", "rightstick", "C"}, {"up", "act_up", "dpup", "dpup", "T"},
+    {"down", "act_down", "dpdown", "dpdown", "G"}, {"left", "act_left", "dpleft", "dpleft", "F"},
+    {"right", "act_right", "dpright", "dpright", "H"}};
+static const Ctl CTL_MOVE[] = {
+    {"move_up", "act_move_up", nullptr, nullptr, "W"}, {"move_down", "act_move_down", nullptr, nullptr, "S"},
+    {"move_left", "act_move_left", nullptr, nullptr, "A"}, {"move_right", "act_move_right", nullptr, nullptr, "D"},
+    {"cam_up", "act_cam_up", nullptr, nullptr, "Up"}, {"cam_down", "act_cam_down", nullptr, nullptr, "Down"},
+    {"cam_left", "act_cam_left", nullptr, nullptr, "Left"}, {"cam_right", "act_cam_right", nullptr, nullptr, "Right"}};
+static const Opt LAYOUT_OPTS[] = {{"", "layout_nintendo"}, {"xbox", "layout_xbox"}};
+
+static int g_ctl_tab = 0;   // 0 the gamepad, 1 the keyboard
+static struct { bool on = false, pad = false; std::string id; Uint64 t0 = 0; } g_cap;   // waiting for a key or button
+static bool capturing() { return g_cap.on; }
+
+static bool on_deck() {
+    const char *d = SDL_getenv("SteamDeck");
+    return d && !SDL_strcmp(d, "1");
+}
+static std::string ctl_cfg(bool pad, const char *id) { return std::string(pad ? "pad_" : "key_") + id; }
+static std::vector<std::string> split_list(const std::string &v) {
+    std::vector<std::string> out;
+    size_t p = 0;
+    while (p <= v.size()) {
+        size_t e = v.find(',', p);
+        if (e == std::string::npos)
+            e = v.size();
+        std::string t = v.substr(p, e - p);
+        while (!t.empty() && t.front() == ' ')
+            t.erase(t.begin());
+        while (!t.empty() && t.back() == ' ')
+            t.pop_back();
+        if (!t.empty())
+            out.push_back(t);
+        p = e + 1;
+    }
+    return out;
+}
+static std::vector<std::string> ctl_current(bool pad, const Ctl &c) {
+    std::string v = cfg_get(ctl_cfg(pad, c.id).c_str());
+    if (v.empty())
+        v = pad ? (cfg_get("pad_layout") == "xbox" ? c.pad_xbox : c.pad_nin) : c.keys;
+    if (v == "none")
+        return {};
+    return split_list(v);
+}
+// A gamepad input as the chosen layout names it: the Xbox (and Steam Deck) letters with A at the bottom, the Switch's
+// with A on the right; the shoulders as the controller in use says (L1 on the Deck, LB on an Xbox pad, L on a Switch's)
+static std::string pad_label(const std::string &n) {
+    bool x = cfg_get("pad_layout") == "xbox", deck = on_deck();
+    if (n == "a") return x ? "A" : "B";
+    if (n == "b") return x ? "B" : "A";
+    if (n == "x") return x ? "X" : "Y";
+    if (n == "y") return x ? "Y" : "X";
+    if (n == "leftshoulder") return deck ? "L1" : x ? "LB" : "L";
+    if (n == "rightshoulder") return deck ? "R1" : x ? "RB" : "R";
+    if (n == "lefttrigger") return deck ? "L2" : x ? "LT" : "ZL";
+    if (n == "righttrigger") return deck ? "R2" : x ? "RT" : "ZR";
+    if (n == "back") return x || deck ? "View" : "−";
+    if (n == "start") return x || deck ? "Menu" : "+";
+    if (n == "leftstick") return "LS";
+    if (n == "rightstick") return "RS";
+    if (n == "dpup") return "↑";
+    if (n == "dpdown") return "↓";
+    if (n == "dpleft") return "←";
+    if (n == "dpright") return "→";
+    if (n.rfind("paddle", 0) == 0) return "P" + n.substr(6);
+    if (n == "misc1") return "Share";
+    return n;
+}
+// The input goes to this action and leaves any other that had it
+static void ctl_assign(bool pad, const std::string &id, const std::string &input) {
+    auto clear_from = [&](const Ctl *list, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            if (id == list[i].id || (pad && !list[i].pad_nin))
+                continue;
+            std::vector<std::string> cur = ctl_current(pad, list[i]);
+            auto it = std::find_if(cur.begin(), cur.end(), [&](const std::string &s) { return !SDL_strcasecmp(s.c_str(), input.c_str()); });
+            if (it == cur.end())
+                continue;
+            cur.erase(it);
+            std::string v;
+            for (const std::string &s : cur)
+                v += (v.empty() ? "" : ",") + s;
+            cfg_set(ctl_cfg(pad, list[i].id).c_str(), v.empty() ? "none" : v);
+        }
+    };
+    clear_from(CTL_BUTTONS, sizeof CTL_BUTTONS / sizeof *CTL_BUTTONS);
+    if (!pad)
+        clear_from(CTL_MOVE, sizeof CTL_MOVE / sizeof *CTL_MOVE);
+    cfg_set(ctl_cfg(pad, id.c_str()).c_str(), input);
+}
+static void cap_done() {
+    g_cap.on = false;
+    g_input_held = true;   // the key or button just pressed clicks nothing until it is up
+}
+
+// Every SDL event first (main.cpp): while a key or button is awaited it is taken here, not by ImGui.
+bool ui_event(const SDL_Event *e) {
+    if (!g_cap.on)
+        return false;
+    switch (e->type) {
+    case SDL_EVENT_KEY_DOWN: {
+        SDL_Scancode sc = e->key.scancode;
+        if (sc == SDL_SCANCODE_ESCAPE) {
+            cap_done();
+            return true;
+        }
+        // the game's own keys (window_sdl.c: F9 snapshots, F10 the frame counter, F11 full screen, Ctrl the mouse)
+        bool reserved = sc == SDL_SCANCODE_F9 || sc == SDL_SCANCODE_F10 || sc == SDL_SCANCODE_F11 ||
+                        sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL;
+        const char *name = SDL_GetScancodeName(sc);
+        if (!g_cap.pad && !reserved && name && *name && !e->key.repeat) {
+            ctl_assign(false, g_cap.id, name);
+            cap_done();
+        }
+        return true;
+    }
+    case SDL_EVENT_KEY_UP: case SDL_EVENT_TEXT_INPUT: return true;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (g_cap.pad) {
+            const char *name = SDL_GetGamepadStringForButton((SDL_GamepadButton)e->gbutton.button);
+            if (name && *name) {
+                ctl_assign(true, g_cap.id, name);
+                cap_done();
+            }
+        }
+        return true;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (g_cap.pad && e->gaxis.value > 20000 &&
+            (e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
+            ctl_assign(true, g_cap.id, SDL_GetGamepadStringForAxis((SDL_GamepadAxis)e->gaxis.axis));
+            cap_done();
+        }
+        return true;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:   // a click elsewhere: no longer waiting (the click itself goes on)
+        g_cap.on = false;
+        return false;
+    default: return false;
+    }
+}
+
+// The back-to-default button: a circular arrow, 28 x 28 at (x, cy - 14)
+static bool reset_button(const char *id, float x, float cy) {
+    bool hov, down;
+    bool clicked = hit(id, x, cy - 14, 28, 28, &hov, &down);
+    if (hov || down)
+        DL->AddRectFilled(P(x, cy - 14), P(x + 28, cy + 14), down ? C_DARK_DOWN : C_FIELD_HOVER, 6 * S);
+    ImVec2 c = P(x + 14, cy);
+    float r = 6.5f * S;
+    ImU32 col = hov ? C_TEXT : C_SUB;
+    // a circle open at the top right, its arrowhead at the top pointing back (anticlockwise): "undo"
+    float a0 = -SDL_PI_F * 0.5f + 0.55f;
+    DL->PathArcTo(c, r, a0, a0 + SDL_PI_F * 1.6f, 24);
+    DL->PathStroke(col, 0, 1.5f * S);
+    ImVec2 p(c.x + r * cosf(a0), c.y + r * sinf(a0)), t(sinf(a0), -cosf(a0)), nrm(cosf(a0), sinf(a0));
+    float hs = 4.2f * S;
+    DL->AddTriangleFilled(ImVec2(p.x + t.x * hs, p.y + t.y * hs), ImVec2(p.x + nrm.x * hs * 0.9f, p.y + nrm.y * hs * 0.9f),
+                          ImVec2(p.x - nrm.x * hs * 0.9f, p.y - nrm.y * hs * 0.9f), col);
+    if (hov)
+        ImGui::SetTooltip("%s", T("ctl_reset"));
+    return clicked;
+}
+
+static void ctl_row(float cy, bool pad, const Ctl &c) {
+    row_label(cy, c.label);
+    std::vector<std::string> cur = ctl_current(pad, c);
+    std::string shown;
+    for (const std::string &s : cur)
+        shown += (shown.empty() ? "" : ", ") + (pad ? pad_label(s) : s);
+    bool waiting = g_cap.on && g_cap.pad == pad && g_cap.id == c.id;
+    if (waiting)
+        shown = T(pad ? "press_button" : "press_key");
+    else if (shown.empty())
+        shown = T("ctl_unbound");
+    float w = SDL_max(132.0f, text_w(g_media.control, shown.c_str()) + 28), x = 748 - w;
+    bool hov, down;
+    std::string hid = std::string(pad ? "bp_" : "bk_") + c.id;
+    if (hit(hid.c_str(), x, cy - 16, w, 32, &hov, &down) && !waiting)
+        g_cap.on = true, g_cap.pad = pad, g_cap.id = c.id, g_cap.t0 = SDL_GetTicks();
+    DL->AddRectFilled(P(x, cy - 16), P(748, cy + 16), waiting ? C_DARK : hov ? C_FIELD_HOVER : C_FIELD, 6 * S);
+    if (waiting)
+        DL->AddRect(P(x, cy - 16), P(748, cy + 16), C_OK, 6 * S, 0, 1.5f * S);
+    text(g_media.control, x + (w - text_w(g_media.control, shown.c_str())) / 2, cy - g_media.control->FontSize / S / 2,
+         waiting ? C_OK : cur.empty() ? C_DIM : C_TEXT, shown.c_str());
+    std::string key = ctl_cfg(pad, c.id);
+    if (!cfg_get(key.c_str()).empty() && reset_button(("rs_" + hid).c_str(), x - 8 - 28, cy))
+        cfg_set(key.c_str(), "");   // the default again
+}
+
+static void card(float top, float bottom) {   // drawn under what is on it (the body's channel 0)
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(764, bottom), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
+}
+
+static void screen_controls() {
+    if (g_cap.on && SDL_GetTicks() - g_cap.t0 > 8000)   // nothing pressed for a while: no longer waiting
+        g_cap.on = false;
+    static const Opt DEV_OPTS[] = {{"pad", "ctl_gamepad"}, {"key", "ctl_keyboard"}};
+    float sw = 4;
+    for (const Opt &o : DEV_OPTS)
+        sw += text_w(g_media.control, opt_label(o)) + 24;
+    int k = segmented("ctl_dev", 36 + sw, 98, DEV_OPTS, g_ctl_tab);   // the gamepad or the keyboard, left under the tabs
+    if (k >= 0)
+        g_ctl_tab = k, g_cap.on = false;
+    bool pad = g_ctl_tab == 0;
+    const float ROW = 38;
+    float top = 124, cy;
+    if (pad) {   // the layout: which face button is A
+        text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T("sec_layout"));
+        cy = top + 52;
+        row_label(cy, "row_layout");
+        if ((k = segmented("pad_layout", 748, cy, LAYOUT_OPTS, opt_index(LAYOUT_OPTS, cfg_get("pad_layout")))) >= 0)
+            cfg_set("pad_layout", LAYOUT_OPTS[k].value);
+        float h = rich(g_media.small, 52, cy + 24, 696, {{T("layout_note"), C_SUB}}, 17);
+        float bottom = cy + 24 + h + 12;
+        card(top, bottom);
+        top = bottom + 8;
+    }
+    auto section = [&](const char *title, const Ctl *list, size_t n) {
+        text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T(title));
+        cy = top + 52;
+        for (size_t i = 0; i < n; i++, cy += ROW)
+            ctl_row(cy, pad, list[i]);
+        float bottom = cy - ROW + 28;
+        card(top, bottom);
+        top = bottom + 8;
+    };
+    section("sec_buttons", CTL_BUTTONS, sizeof CTL_BUTTONS / sizeof *CTL_BUTTONS);
+    if (!pad)
+        section("sec_move", CTL_MOVE, sizeof CTL_MOVE / sizeof *CTL_MOVE);
+    // when they apply, and everything of this device back to the defaults (the layout stays)
+    float bw = text_w(g_media.medium, T("ctl_reset_all")) + 34;
+    rich(g_media.small, 52, top + 12, 748 - bw - 16 - 52, {{T("ctl_applies"), C_SUB}}, 17);
+    if (button("ctl_reset_all", T("ctl_reset_all"), 748 - bw, top + 6, bw, 38, DARK)) {
+        for (const Ctl &c : CTL_BUTTONS)
+            cfg_set(ctl_cfg(pad, c.id).c_str(), "");
+        if (!pad)
+            for (const Ctl &c : CTL_MOVE)
+                cfg_set(ctl_cfg(pad, c.id).c_str(), "");
+        g_cap.on = false;
+    }
+    ImGui::SetCursorScreenPos(P(0, top + 56));   // the body scrolls down to here
+    ImGui::Dummy(ImVec2(1, 1));
 }
 
 static void screen_update() {
@@ -1985,6 +2297,35 @@ void ui_frame(float scale) {
     poll();
     gfx_poll();
     ImGuiIO &io = ImGui::GetIO();
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        g_drag_scrolled = false;   // the drag is over (its release frame clicked nothing)
+    if (g_input_held) {   // a key or button was just bound: clicks again once nothing is held
+        bool held = false;
+        for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END && !held; k++)
+            held = ImGui::IsKeyDown((ImGuiKey)k);
+        int n = 0;
+        const bool *keys = SDL_GetKeyboardState(&n);
+        for (int i = 0; i < n && !held; i++)
+            held = keys[i];
+        // the controllers themselves (ImGui's gamepad keys may not follow while its gamepad navigation is off)
+        SDL_JoystickID *ids = SDL_GetGamepads(&n);
+        for (int i = 0; ids && i < n && !held; i++) {
+            SDL_Gamepad *g = SDL_GetGamepadFromID(ids[i]);
+            for (int b = 0; g && b < SDL_GAMEPAD_BUTTON_COUNT && !held; b++)
+                held = SDL_GetGamepadButton(g, (SDL_GamepadButton)b);
+            if (g && !held)
+                held = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000 || SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
+        }
+        SDL_free(ids);
+        if (!held)
+            g_input_held = false;
+    }
+    // while a key or button is awaited (and until it is let go) the keyboard and the gamepad do not move the focus
+    const ImGuiConfigFlags nav = ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    if (g_cap.on || g_input_held)
+        io.ConfigFlags &= ~nav;
+    else
+        io.ConfigFlags |= nav;
     background(ImGui::GetBackgroundDrawList(), io.DisplaySize);
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(io.DisplaySize);
@@ -2008,6 +2349,13 @@ void ui_frame(float scale) {
     case SCR_PLAY: screen_play(); break;
     case SCR_UPDATE: screen_update(); break;
     case SCR_BROKEN: screen_broken(); break;
+    }
+    // a finger dragged over the body scrolls it (the Steam Deck's screen, touch screens); the wheel and the focus of the
+    // keyboard and the gamepad scroll it by themselves
+    if (io.MouseSource == ImGuiMouseSource_TouchScreen && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 8 * S) &&
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows)) {
+        ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+        g_drag_scrolled = true;
     }
     DL->ChannelsMerge();
     ImGui::EndChild();
@@ -2064,6 +2412,8 @@ void ui_demo(const char *name) {
     } else if (n == "dump_ok") {
         U.dump_st = D_OK;
     } else if (n == "build" || n == "hw" || n == "failed" || n == "done") {
+        if (const char *dp = SDL_getenv("ULTRS_LAUNCHER_DEMO_PLATFORM"))   // windows, linux or both (the Deck's row)
+            U.platform = dp;
         start_build_state();
         U.screen = SCR_BUILD;
         events({R"({"ev":"step","id":"tools","state":"done","secs":3})",
@@ -2084,9 +2434,14 @@ void ui_demo(const char *name) {
     } else if (n == "run") {   // a real build at once, as if Prepare was pressed
         U.dump_st = D_OK;
         start_build();
-    } else if (n == "play" || n == "play_upd" || n == "play_lang" || n == "play_debug" || n == "play_full") {
+    } else if (n == "play" || n == "play_upd" || n == "play_lang" || n == "play_debug" || n == "play_full" ||
+               n == "play_pad" || n == "play_keys") {
         U.screen = SCR_PLAY;
-        g_tab = n == "play_lang" ? 1 : n == "play_debug" || n == "play_full" ? 2 : 0;
+        g_tab = n == "play_lang" ? 1 : n == "play_pad" || n == "play_keys" ? TAB_CONTROLS
+              : n == "play_debug" || n == "play_full" ? TAB_DEBUG : 0;
+        g_ctl_tab = n == "play_keys";
+        if (const char *w = SDL_getenv("ULTRS_LAUNCHER_DEMO_WAIT"))   // an action waiting for its key or button
+            g_cap.on = true, g_cap.pad = !g_ctl_tab, g_cap.id = w, g_cap.t0 = SDL_GetTicks();
         g_full_q = n == "play_full";
         if (n == "play_lang") g_demo_open = SDL_getenv("ULTRS_LAUNCHER_DEMO_OPEN");
         if (n == "play_upd" || n == "play_lang") {

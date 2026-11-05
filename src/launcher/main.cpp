@@ -69,7 +69,8 @@ int main(int argc, char **argv) {
     if (!(dev_shot && *dev_shot) && !single_instance(TITLE))
         return 0;
     SDL_SetHint(SDL_HINT_APP_NAME, "UltraTears Launcher");
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    // the gamepad too: ImGui's SDL backend opens controllers only with it (the Steam Deck's own controls, any pad)
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         return start_failed(log, "SDL_Init");
     SDL_Log("video driver %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
     float scale = window_scale(nullptr);
@@ -116,6 +117,10 @@ int main(int argc, char **argv) {
         SDL_Event e;
         bool got = SDL_WaitEventTimeout(&e, 50);   // idle: a few frames a second (the build's progress), no busy loop
         while (got) {
+            if (ui_event(&e)) {   // a key or button being bound (the Controls tab): not for ImGui
+                got = SDL_PollEvent(&e);
+                continue;
+            }
             ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(win))) {
                 if (ui_close_request())
