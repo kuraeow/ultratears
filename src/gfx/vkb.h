@@ -249,7 +249,7 @@ int vkb_pass_obj_slot(void);   // backend_vk.c: the object motion target's slot 
 // into command buffers of their own. Work that must come before every chunk (texture uploads, pool copies) goes into the
 // submission's prologue (vkb_pro_begin / vkb_pro_end, under a lock). Each chunk tracks the layouts its images need first
 // and leave last (vkb_trk); between chunks a small command buffer moves them (and waits for all earlier work).
-int vkb_mt_on(void);             // TOTK_VK_RECORD_THREADS (default: by the number of processors; 1: single thread)
+int vkb_mt_on(void);             // TOTK_VK_RECORD_THREADS (default: 3, fewer on a machine with fewer processors; 1: single thread)
 int vkb_mt_recording(void);      // this thread is recording a chunk or the prologue
 uint64_t vkb_seq(void);          // the position of the command being replayed within its submission
 void vkb_seq_set(uint64_t seq);
