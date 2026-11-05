@@ -137,16 +137,28 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(addr, size, stack_maps[i].src, stack_maps[i].size)) { pthread_mutex_unlock(&memory_lock); return 0xdc01; }
+        // mapped again later: zero-filled like a fresh page. Each run of mapped pages in one call (a page a call, as
+        // before, was 8192 calls for 32 MiB, each a TLB flush across the CPUs, with memory_lock held)
         uint64_t released = 0;
-        for (unsigned i = 0; i < count; i++)
-            if (alias_pages[first + i]) {
-                alias_pages[first + i] = 0;
-                released += 4096;
-                decommit(addr + (uint64_t)i * 4096, 4096);   // mapped again later: zero-filled like a fresh page
-            }
+        for (unsigned i = 0; i < count;) {
+            if (!alias_pages[first + i]) { i++; continue; }
+            unsigned j = i;
+            while (j < count && alias_pages[first + j]) alias_pages[first + j++] = 0;
+            released += (uint64_t)(j - i) * 4096;
+            decommit(addr + (uint64_t)i * 4096, (uint64_t)(j - i) * 4096);
+            i = j;
+        }
         alias_bytes -= released;
     } else {
-        for (unsigned i = 0; i < count; i++) alias_pages[first + i] = 1;
+        // the new pages committed now, a run in one call: else each 64 KiB of them is committed by an exception on its
+        // first touch (runtime/platform/windows.c lazy_commit), thousands of times as the world streams in
+        for (unsigned i = 0; i < count;) {
+            if (alias_pages[first + i]) { i++; continue; }
+            unsigned j = i;
+            while (j < count && !alias_pages[first + j]) alias_pages[first + j++] = 1;
+            plat_commit(addr + (uint64_t)i * 4096, (uint64_t)(j - i) * 4096);
+            i = j;
+        }
         alias_bytes += fresh;
     }
     pthread_mutex_unlock(&memory_lock);
@@ -330,6 +342,7 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, uint64_t pc) {
         uint64_t size = r[1];
         if (size > HEAP_CAP || size % 0x200000 || size + runtime_image_bytes() > APP_POOL) { r[0] = 0xd401; return r[0]; }
         if (size < heap_size) decommit(HEAP_START + size, heap_size - size);
+        else if (size > heap_size) plat_commit(HEAP_START + heap_size, size - heap_size);   // now, not by an exception per 64 KiB on first touch
         heap_size = size;
         r[0] = 0; r[1] = HEAP_START;
         return 0;

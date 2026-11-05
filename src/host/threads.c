@@ -125,6 +125,7 @@ typedef struct thr {
     uint64_t st_inv_ns, st_inv_max;   // core waits while a worse-priority thread held a core this one may use: total, longest
     // asynchronous preemption (below): this thread's host-call depth and Cpu (TLR), interruption state
     volatile int *depth; Cpu *cpu; int ap_ok, ap_pending; uint64_t ap_rip, ap_last;
+    struct thr *target;        // waiting for a core: the owner core_kick matched to it (one owner per waiter)
 #ifdef _WIN32
     HANDLE ap_h; CONTEXT *ap_ctx;
 #else
@@ -263,12 +264,36 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     if (!b) return;
     *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; gc_signal(&b->cv);
 }
-// t waits for a core: the owners of the cores it may run on that count worse give theirs up at their next checkpoint
-// (holding G)
-static void core_kick(const thr_t *t) {
-    int tp = eff_prio(t);
-    for (int i = 0; i < NCORE; i++)
-        if (core_allowed(t, i) && g_core_owner[i] && eff_prio(g_core_owner[i]) > tp) g_core_owner[i]->preempt = 1;
+// Owners asked to give their cores up, one per waiter (holding G): the waiters best first, each claims the worst owner
+// worse than itself on a core it may run on that no better waiter claimed (a request already pending is reused), and
+// that owner gives its core up at its next checkpoint or when interrupted (asynchronous preemption, ap_try). Asking
+// every worse owner for every waiter (as before) made the waiters all interrupt the same owner while the others ran
+// on, and the cores several owners gave up for one waiter went to worse waiters, which asked again. As
+// totk-pc-recomp runtime/kernel.c core_kick (MIT). The argument is unused: every waiter is matched anew.
+static void core_kick(const thr_t *unused) {
+    (void)unused;
+    enum { NW = 64 };
+    thr_t *w[NW];
+    int wp[NW], op[NCORE], n = 0, claimed = 0;
+    for (int i = 0; i < NCORE; i++) op[i] = g_core_owner[i] ? eff_prio(g_core_owner[i]) : 0;
+    for (thr_t *p = g_core_wait; p && n < NW; p = p->cnext) {   // insertion sort: priority, then who came first
+        int i = n++, pp = eff_prio(p);
+        for (; i > 0 && (wp[i - 1] > pp || (wp[i - 1] == pp && w[i - 1]->cseq > p->cseq)); i--) w[i] = w[i - 1], wp[i] = wp[i - 1];
+        w[i] = p, wp[i] = pp;
+        p->target = NULL;
+    }
+    for (int k = 0; k < n && claimed != (1 << NCORE) - 1; k++) {
+        int v = -1;
+        for (int i = 0; i < NCORE; i++) {
+            thr_t *o = g_core_owner[i];
+            if ((claimed >> i & 1) || !core_allowed(w[k], i) || !o || op[i] <= wp[k]) continue;
+            if (v < 0 || op[i] > op[v] || (op[i] == op[v] && o->preempt && !g_core_owner[v]->preempt)) v = i;
+        }
+        if (v < 0) continue;
+        claimed |= 1 << v;
+        w[k]->target = g_core_owner[v];
+        g_core_owner[v]->preempt = 1;
+    }
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
@@ -562,18 +587,14 @@ __asm__(".text\n"
 #endif
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
-// The owner a waiter t would interrupt: the worst one, flagged to give its core up, among those of cores t may use
-// that count worse than t (holding G).
-static thr_t *ap_target(const thr_t *t) {
-    int tp = eff_prio(t), wp = tp;
-    thr_t *o = NULL;
-    for (int i = 0; i < NCORE; i++) {
-        thr_t *h = g_core_owner[i];
-        if (!core_allowed(t, i) || !h || !h->preempt) continue;
-        int p = eff_prio(h);
-        if (p > wp) wp = p, o = h;
+// The owner a waiter t would interrupt: the one core_kick matched to it (holding G).
+static thr_t *ap_target(thr_t *t) {
+    thr_t *o = t->target;
+    if (!o || o->cur_core < 0 || !core_allowed(t, o->cur_core)) {   // stale (that owner moved on): match the waiters again
+        core_kick(t);
+        o = t->target;
     }
-    return o;
+    return o && o->cur_core >= 0 && o->preempt ? o : NULL;
 }
 // Interrupt o if it runs top-level game code (holding G; o is stopped only between ap_stop and ap_resume, during
 // which nothing here takes a lock, and it holds no host lock where it is moved).
@@ -687,9 +708,13 @@ void runtime_core_back(int *away) {
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
     Cpu *c = guest_cpu();
-    if (c && c->tpidrro && pi_on() && *(volatile uint16_t *)(uintptr_t)(c->tpidrro + 0x100)) return;
+    int off = c && c->tpidrro && pi_on() && *(volatile uint16_t *)(uintptr_t)(c->tpidrro + 0x100);
     g_lock();
-    if (t->cur_core >= 0 && core_better_waiter(t, t->cur_core)) { core_put(t); core_take(t); }   // core_put clears the request
+    int better = t->cur_core >= 0 && core_better_waiter(t, t->cur_core);
+    // in an SDK spin lock: interrupt_flag (TLR+0x102) makes the SDK call SVC 0x36 as it leaves, which hands the core over
+    // (runtime_ap_sync); before, the request waited for a later checkpoint
+    if (better && off) *(volatile uint16_t *)(uintptr_t)(c->tpidrro + 0x102) = 1, t->preempt = 0, g_ap_deferred++;
+    else if (better) { core_put(t); core_take(t); }   // core_put clears the request
     else t->preempt = 0;
     g_unlock();
 }
