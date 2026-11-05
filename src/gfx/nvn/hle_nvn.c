@@ -2224,9 +2224,11 @@ static void x_texwrite(const tex_t *o, unsigned level, unsigned layer0, const NV
    queued for the image nor the translation thread's current job matter to it. Before (and with 0), the read drained the
    whole translation queue when texel writes were queued, else waited for the current job: ~15-19 ms each, 24-56 times in
    5 s while moving through the world on a 6-CPU Linux PC (2026-11-06), the windows with all the hitches. TotK reads
-   such textures (format 0x49, from game memory) while the world streams in. A GPU-written one goes the old way. */
+   such textures (format 0x49, from game memory) while the world streams in. A GPU-written one goes the old way.
+   On by default since 2026-11-06 (TOTK_READ_TEXELS_DIRECT=0: the old way): on that machine, same route, no read-texels
+   waits left, frames over 25 ms 399 -> 201; the player's PC unchanged in speed, picture and grass as before. */
 static _Atomic uint64_t g_xread_direct;
-static int read_direct(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_READ_TEXELS_DIRECT"); v = e && *e == '1'; } return v; }
+static int read_direct(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_READ_TEXELS_DIRECT"); v = !(e && *e == '0'); } return v; }
 static void x_read_texels(const tex_t *o, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     int mtl_read_texels_gpu(const tex_t *t);
     void mtl_read_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
