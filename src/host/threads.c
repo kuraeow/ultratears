@@ -233,14 +233,16 @@ static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1
    the game's main thread waits for (the Steam Deck's log: 4.4 ms a frame blocked on locks) queued for a core behind
    workers of middling priority. The owner is read from the mutex word, so it follows hand-offs; one level only (an
    owner blocked on another mutex passes nothing on). As totk-pc-recomp runtime/kernel.c eff_prio (MIT).
-   TOTK_PRIO_INHERIT=0: raw priorities, as before. Holding G. */
+   TOTK_PRIO_INHERIT=1 turns it on (off by default: raw priorities, see pi_on). Holding G. */
 static int ap_on(void);
 static int pi_on(void) {
     static int on = -1;
-    // [temporary] off by default (=1: on): on the PC, 2026-11-04 evening, the game itself stalled 65-420 ms ~8x as
-    // often as the night before with it (and the spin below) on; to be told apart and measured before it comes back
-    // with asynchronous preemption it is on (TOTK_PRIO_INHERIT=0 turns it off): see there
-    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = e && *e ? *e == '1' : ap_on(); }
+    // Off by default (=1: on). On the PC, 2026-11-04 evening, the game itself stalled 65-420 ms ~8x as often with it
+    // (and the spin below) on. It came back on with asynchronous preemption (2996fbb) without a measurement; the Steam
+    // Deck, same route with and without (2026-11-06, both with direct texel reads): without it frames over 33 ms
+    // 113 -> 80, over 50 ms 24 -> 20, waits behind a worse-priority core owner in long frames 21.2 -> 15.2 ms a frame,
+    // nothing worse. (The preemption-disable check of runtime_core_checkpoint follows this switch too.)
+    if (on < 0) { const char *e = getenv("TOTK_PRIO_INHERIT"); on = e && *e == '1'; (void)ap_on; }
     return on;
 }
 static int eff_prio(const thr_t *o) {
