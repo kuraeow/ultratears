@@ -122,6 +122,7 @@ typedef struct thr {
     uint64_t st_block_ns[5], st_blocks, st_core_ns, st_core_waits, st_wake_ns, st_wakes, woke_ns, st_hold_ns;
     uint64_t blk_t0, blk_cred, core_t0, core_cred; int blk_kind;   // a wait in progress: since when, counted up to when
     unsigned long os_tid;      // the host's id of this thread (os_times), set by the thread itself
+    uint64_t st_inv_ns, st_inv_max;   // core waits while a worse-priority thread held a core this one may use: total, longest
 } thr_t;
 
 /* The host thread's CPU time and, on Linux, its time runnable but not running (waiting for a processor: taken by other
@@ -275,6 +276,11 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     core_kick(t);
     t->core_t0 = t->core_cred = now_ns();
+    // a wait behind a worse-priority owner: Horizon would have given this thread the core at once; here the owner
+    // gives it up only at its next SVC or indirect call (runtime_threads_totals, the long-frame log)
+    int inv = 0, tp = eff_prio(t);
+    for (int i = 0; i < NCORE && !inv; i++) inv = core_allowed(t, i) && g_core_owner[i] && eff_prio(g_core_owner[i]) > tp;
+    uint64_t w0 = t->core_t0;
     // A short spin before sleeping (TOTK_CORE_SPIN_US, 20 by default; 0: none): a core often comes free within
     // microseconds (a worker's job ends, an SVC hands it over), and a sleep costs the host's wake latency on top
     // (15-20 us on the Steam Deck, 2026-11-04). core_grant sets cur_core under G; reading it here without G is a hint.
@@ -287,6 +293,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
         g_lock();
     }
     while (t->cur_core < 0) gc_wait(&t->cv);
+    if (inv) { uint64_t d = now_ns() - w0; t->st_inv_ns += d; if (d > t->st_inv_max) t->st_inv_max = d; }
     t->st_core_ns += now_ns() - t->core_cred, t->st_core_waits++;
     t->core_t0 = 0;
 }
@@ -437,15 +444,18 @@ void runtime_threads_report(unsigned frames) {
 
 /* UltraTears (the long-frame log, gfx/nvn/hle_nvn.c): running totals in ns - [0] all guest threads waiting for a virtual
    core, [1] the main thread holding one, [2] its core waits, [3..6] its blocked time by kind (lock, condition, address,
-   sync). Waits in progress are counted up to now. Read once a frame; the caller takes differences. */
-void runtime_threads_totals(uint64_t v[7]) {
-    memset(v, 0, 7 * sizeof *v);
+   sync), [7] all threads' core waits behind a worse-priority owner; [8] the longest such wait since the last call (not
+   a running total). Waits in progress are counted up to now. Read once a frame; the caller takes differences. */
+void runtime_threads_totals(uint64_t v[9]) {
+    memset(v, 0, 9 * sizeof *v);
     uint64_t now = now_ns();
     g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
         if (t->exited || !t->started) continue;
         if (t->core_t0) t->st_core_ns += now - t->core_cred, t->core_cred = now;
-        v[0] += t->st_core_ns;
+        v[0] += t->st_core_ns, v[7] += t->st_inv_ns;
+        if (t->st_inv_max > v[8]) v[8] = t->st_inv_max;
+        t->st_inv_max = 0;
     }
     thr_t *m = g_main_thr;
     if (m && !m->exited) {

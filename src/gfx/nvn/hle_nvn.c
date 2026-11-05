@@ -2674,7 +2674,7 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, log_ms, fs_ms, fs_mb, zstd_ms, gw_ms, thr[7]; unsigned pso, lib, up, rup, log_n; int ls; } lf_rec;
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, log_ms, fs_ms, fs_mb, zstd_ms, gw_ms, thr[9]; unsigned pso, lib, up, rup, log_n; int ls; } lf_rec;
 // The game's own waits in a frame, for the long-frame line (host/fs.c: file reads; host/zstd_host.c: decompression);
 // zeros where the host has none (graphics unit tests)
 __attribute__((weak)) void runtime_io_cost(uint64_t *fs_ns, uint64_t *fs_bytes, uint64_t *zstd_ns) { *fs_ns = *fs_bytes = *zstd_ns = 0; }   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
@@ -3122,9 +3122,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             static uint64_t pfs, pfb, pzs, pgw; uint64_t fs, fb, zs, gw = atomic_load(&g_gpu_wait_ns); runtime_io_cost(&fs, &fb, &zs);
             r->fs_ms = (fs - pfs) / 1e6; r->fs_mb = (fb - pfb) / 1048576.0; r->zstd_ms = (zs - pzs) / 1e6; r->gw_ms = (gw - pgw) / 1e6;
             pfs = fs; pfb = fb; pzs = zs; pgw = gw;
-            void runtime_threads_totals(uint64_t v[7]);   // host/threads.c: the game's threads (core waits, the main thread)
-            static uint64_t pth[7]; uint64_t th[7]; runtime_threads_totals(th);
-            for (int k = 0; k < 7; k++) r->thr[k] = th[k] >= pth[k] ? (th[k] - pth[k]) / 1e6 : 0, pth[k] = th[k];
+            void runtime_threads_totals(uint64_t v[9]);   // host/threads.c: the game's threads (core waits, the main thread)
+            static uint64_t pth[9]; uint64_t th[9]; runtime_threads_totals(th);
+            for (int k = 0; k < 8; k++) r->thr[k] = th[k] >= pth[k] ? (th[k] - pth[k]) / 1e6 : 0, pth[k] = th[k];
+            r->thr[8] = th[8] / 1e6;   // (the longest wait itself, not a total)
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -3139,7 +3140,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[768];
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[1024];
               snprintf(b, sizeof b, "frame %llu (%.2f s): total %.1f ms, submit+present %.1f ms, GPU %.1f ms; %u new pipelines + %u shader libraries in %.1f ms; texture uploads %u first + %u repeated, %.1f MB / %.1f ms",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
@@ -3150,8 +3151,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
                                          r->fs_ms, r->fs_mb, r->zstd_ms, r->gw_ms); strlcat(b, gb, sizeof b); }
               {   // the game's own threads this frame: the main thread on its virtual core / waiting for one / blocked (by kind),
                   // and all threads' waits for a virtual core (three for the game, as on the Switch)
-                  char tb[192]; snprintf(tb, sizeof tb, "; game threads: main on a core %.1f ms, core wait %.1f, blocked lock %.1f / cond %.1f / address %.1f / sync %.1f; all core waits %.1f ms",
-                                         r->thr[1], r->thr[2], r->thr[3], r->thr[4], r->thr[5], r->thr[6], r->thr[0]); strlcat(b, tb, sizeof b); }
+                  char tb[256]; snprintf(tb, sizeof tb, "; game threads: main on a core %.1f ms, core wait %.1f, blocked lock %.1f / cond %.1f / address %.1f / sync %.1f; all core waits %.1f ms, of them behind a worse-priority thread %.1f (longest %.1f)",
+                                         r->thr[1], r->thr[2], r->thr[3], r->thr[4], r->thr[5], r->thr[6], r->thr[0], r->thr[7], r->thr[8]); strlcat(b, tb, sizeof b); }
               if (r->log_ms >= 0.1) {   // the log's own writes this frame (unbuffered: each one a write to the file)
                   char lb[64]; snprintf(lb, sizeof lb, "; log %u writes / %.1f ms", r->log_n, r->log_ms); strlcat(b, lb, sizeof b); }
               if (hidden) strlcat(b, "; next to a loading screen, not visible", sizeof b);

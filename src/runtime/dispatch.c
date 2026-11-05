@@ -52,11 +52,19 @@ HostFn hle_lookup_impl(const char *name) {
 // HLE_NATIVE: the slot being called (set by dispatch_slow, which every host call passes through: host stubs are not
 // cached in the dispatch cache).
 static __thread const HleSlot *t_native;
+// The virtual cores (host/threads.c); these defaults where there are none (unit tests, probes)
+__attribute__((weak)) int runtime_core_away(void) { return 0; }
+__attribute__((weak)) void runtime_core_back(int *away) { (void)away; }
+
 void hle_native_thunk(Cpu *c) {
     const HleSlot *s = t_native;
     uint64_t (*f)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = s->native;
+    char kind = s->ret;
+    int away = 0;
+    if (kind >= 'A' && kind <= 'Z') kind += 32, away = runtime_core_away();   // HLE_NATIVE_BLOCKING
     uint64_t r = f(c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5], c->x[6], c->x[7]);
-    switch (s->ret) {
+    if (away) runtime_core_back(&away);
+    switch (kind) {
     case 'v': break;
     case 'b': c->x[0] = (uint8_t)r; break;
     case 'w': c->x[0] = (uint32_t)r; break;
