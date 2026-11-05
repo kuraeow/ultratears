@@ -67,9 +67,16 @@ static void dead_zone(int32_t *x, int32_t *y) {
     *x = (int32_t)(*x * k);
     *y = (int32_t)(*y * k);
 }
+int text_entry_blocks_input(void);   // text_entry.c: the software keyboard's field holds the game's input
+static int pad_down(void) {   // any button or trigger of the controller pressed
+    if (!pad) return 0;
+    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) return 1;
+    return SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384 || SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384;
+}
 static void pad_update(void) {
     RuntimeGamepadState s = {0};
-    if (pad) {
+    if (pad && text_entry_blocks_input()) s.connected = 1;   // held: connected, nothing pressed
+    else if (pad) {
         static const struct { SDL_GamepadButton b; uint64_t bit; } map[] = {
             {SDL_GAMEPAD_BUTTON_EAST, 1}, {SDL_GAMEPAD_BUTTON_SOUTH, 2}, {SDL_GAMEPAD_BUTTON_NORTH, 4},
             {SDL_GAMEPAD_BUTTON_WEST, 8}, {SDL_GAMEPAD_BUTTON_LEFT_STICK, 16}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, 32},
@@ -136,6 +143,8 @@ int window_init(void) {
         fprintf(stderr, "[totk] window: %s\n", mode);
     }
     SDL_SetWindowRelativeMouseMode(window, true);   // the mouse is the game window's from the start (mouse_capture)
+    void text_entry_init(SDL_Window *w);   // text_entry.c: the software keyboard's field
+    text_entry_init(window);
     if (!vkp_init(window))
         runtime_fail("Vulkan initialization failed (Vulkan 1.3 with VK_EXT_shader_object is required)");
     return 1;
@@ -246,6 +255,10 @@ _Noreturn void window_loop(void) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 100)) {
             do {
+                int text_entry_event(const SDL_Event *e);   // text_entry.c: the software keyboard's field first
+                if (text_entry_event(&e)) continue;
+                if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && text_entry_blocks_input() &&
+                    e.key.scancode != SDL_SCANCODE_F11 && e.key.scancode != SDL_SCANCODE_F10) continue;
                 switch (e.type) {
                 case SDL_EVENT_QUIT:
                     fprintf(stderr, "[totk] window closed\n");
@@ -291,6 +304,14 @@ _Noreturn void window_loop(void) {
                 default: break;
                 }
             } while (SDL_PollEvent(&e));
+        }
+        {   // the game's input back once every key and button pressed for the field is up
+            void text_entry_tick(int pad_down);
+            int held = text_entry_blocks_input();
+            SDL_LockMutex(pad_lock);
+            text_entry_tick(pad_down());
+            SDL_UnlockMutex(pad_lock);
+            if (held && !text_entry_blocks_input()) pad_update();
         }
         title_update();
     }

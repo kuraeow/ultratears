@@ -132,3 +132,53 @@ void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat
                            .imageOffset = {(int32_t)x0, (int32_t)y0, 0}, .imageExtent = {w, h, 1}};
     vk.vkCmdCopyBufferToImage(cb, g_buf[slot], dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
 }
+
+// ---- the text field of the game's software keyboard (host/text_entry.c), the same way: drawn on the CPU into a
+// host-visible buffer of the frame in flight and copied over the picture. Its buffers are made the first time it opens.
+enum { PANEL_BYTES = 2048 * 512 * 4 };
+static VkBuffer g_pbuf[SLOTS];
+static VkDeviceMemory g_pmem[SLOTS];
+static uint8_t *g_pmap[SLOTS];
+static int panel_buffers(void) {
+    if (g_pbuf[0]) return 1;
+    for (int i = 0; i < SLOTS; i++) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PANEL_BYTES,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkMemoryRequirements req;
+        if (vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_pbuf[i]) != VK_SUCCESS) { g_pbuf[0] = VK_NULL_HANDLE; return 0; }
+        vk.vkGetBufferMemoryRequirements(vkc.device, g_pbuf[i], &req);
+        uint32_t type = UINT32_MAX;
+        VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t t = 0; t < vkc.memory.memoryTypeCount; t++)
+            if ((req.memoryTypeBits & (1u << t)) && (vkc.memory.memoryTypes[t].propertyFlags & want) == want) { type = t; break; }
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_pmem[i]) != VK_SUCCESS ||
+            vk.vkBindBufferMemory(vkc.device, g_pbuf[i], g_pmem[i], 0) != VK_SUCCESS ||
+            vk.vkMapMemory(vkc.device, g_pmem[i], 0, VK_WHOLE_SIZE, 0, (void **)&g_pmap[i]) != VK_SUCCESS) {
+            g_pbuf[0] = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    return 1;
+}
+void vk_text_panel_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot) {
+    int text_entry_visible(void);
+    int text_entry_panel(uint8_t *px, size_t cap, uint32_t sw, uint32_t sh, int bgr, uint32_t *x0, uint32_t *y0,
+                         uint32_t *w, uint32_t *h);
+    if (!text_entry_visible() || slot >= SLOTS || (fmt != VK_FORMAT_B8G8R8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_UNORM) ||
+        !panel_buffers())
+        return;
+    uint32_t x0, y0, w, h;
+    if (!text_entry_panel(g_pmap[slot], PANEL_BYTES, ext.width, ext.height, fmt == VK_FORMAT_B8G8R8A8_UNORM, &x0, &y0, &w, &h))
+        return;
+    if (x0 + w > ext.width || y0 + h > ext.height) return;
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vk.vkCmdPipelineBarrier2(cb, &dep);
+    VkBufferImageCopy r = {.bufferRowLength = w, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                           .imageOffset = {(int32_t)x0, (int32_t)y0, 0}, .imageExtent = {w, h, 1}};
+    vk.vkCmdCopyBufferToImage(cb, g_pbuf[slot], dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+}

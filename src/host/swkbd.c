@@ -5,9 +5,10 @@
  * Without this the SDK went on to nn::applet::StartLibraryAppletImmediately, which has no host side, and the game
  * crashed there (GitHub #58, Woodland Stable).
  *
- * [temporary] There is no text field yet: the answer is the game's initial text if it gives one, else TOTK_SWKBD_TEXT,
- * else a default name in the game's language, confirmed at once. An in-game text field (overlay, with the Steam Deck's
- * on-screen keyboard) is the next step (dev-local/docs/plan.md).
+ * The player types into a field over the picture (text_entry.c: the physical keyboard on a PC, Steam's on-screen
+ * keyboard on the Steam Deck), which starts with the game's initial text, else a default name in the game's language.
+ * TOTK_SWKBD_TEXT=<text> answers without the field (scripted runs); without a window (TOTK_HEADLESS) the starting
+ * text is the answer.
  *
  * The ShowKeyboardArg layout (KeyboardConfig, then the work buffer {pointer, size}) follows the SDK's own setters, as
  * MacNativeGames' swkbd_host.c (MIT) and totk-pc-recomp's swkbd.c (MIT) read them; the code is ours. SDK 20.5 (TotK
@@ -27,6 +28,8 @@ enum {
 };
 
 uint64_t runtime_game_language(void);   /* overrides_oe.c: the Switch language code, packed into 8 bytes */
+int text_entry_run(const uint16_t *init, size_t ninit, int max_units, int min_units, uint32_t disabled, int numeric,
+                   uint16_t *out, size_t cap, size_t *nout);   /* text_entry.c */
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
@@ -138,13 +141,23 @@ static uint32_t show_keyboard(uint64_t *str, const uint8_t *arg) {
         const uint16_t *t = (const uint16_t *)(uintptr_t)(work + (uint64_t)init_off);
         while (n < (size_t)init_len && n < KB_LIMIT && t[n]) { u[n] = t[n]; n++; }
     }
-    if (!n) {
-        const char *e = getenv("TOTK_SWKBD_TEXT");
-        from = e && *e ? "TOTK_SWKBD_TEXT" : "the default name";
-        n = utf8_to_utf16(e && *e ? e : default_name(), u, KB_LIMIT);
-    }
+    const char *e = getenv("TOTK_SWKBD_TEXT");   /* an answer without the field (scripted runs) */
+    int forced = e && *e;
+    if (forced) { from = "TOTK_SWKBD_TEXT"; n = utf8_to_utf16(e, u, KB_LIMIT); }
+    else if (!n) { from = "the default name"; n = utf8_to_utf16(default_name(), u, KB_LIMIT); }
     n = clean(u, n, (size_t)max_len, disabled, numeric);
     int confirmed = n > 0 && (int)n >= min_len;
+    if (!forced) {   /* the field over the picture (text_entry.c), starting with that text; none without a window */
+        uint16_t typed[KB_LIMIT + 1];
+        size_t got = 0;
+        int r = text_entry_run(u, n, max_len, min_len, disabled, numeric, typed, KB_LIMIT, &got);
+        if (r >= 0) {
+            from = "the text field";
+            memcpy(u, typed, got * 2);
+            n = clean(u, got, (size_t)max_len, disabled, numeric);
+            confirmed = r == 1 && n > 0 && (int)n >= min_len;
+        }
+    }
     if (!confirmed) n = 0;
 
     uint64_t buf = str[0], size = str[1];

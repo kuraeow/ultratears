@@ -37,6 +37,15 @@ static uint64_t bfttf_size(const uint8_t *p, uint64_t len, uint32_t (*rd)(const 
     return (uint64_t)size + 8 == len && (first == 0x00010000u || first == 0x4f54544fu) ? size : 0;
 }
 
+static int file_exists(int type) {
+    const char *dir = getenv("TOTK_SHARED_FONTS");
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%s.bfttf", dir ? dir : "data/fonts", names[type]);
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
 static uint8_t *load(int type) {   /* lock held */
     if (font[type]) return font[type];
     const char *dir = getenv("TOTK_SHARED_FONTS");
@@ -77,6 +86,33 @@ static const void *address(int type) {
 static size_t size(int type) {
     pthread_mutex_lock(&lock); load(valid(type)); size_t n = (size_t)font_bytes[type]; pthread_mutex_unlock(&lock);
     return n;
+}
+
+/* The font itself (sfnt, decoded) for our own text (text_entry.c: CJK glyphs Inter lacks), NULL when the player has no
+   such file: never fatal. Decoded once into a copy of its own; the game's form stays as it is. */
+const uint8_t *runtime_shared_font_sfnt(int type, size_t *n) {
+    static uint8_t *plain[SHARED_FONT_COUNT];
+    static int tried[SHARED_FONT_COUNT];
+    if (type < 0 || type >= SHARED_FONT_COUNT) return NULL;
+    pthread_mutex_lock(&lock);
+    if (!tried[type]) {
+        tried[type] = 1;
+        uint8_t *p = font[type] ? font[type] : file_exists(type) ? load(type) : NULL;
+        uint8_t *d = p ? malloc((size_t)font_bytes[type] + 4) : NULL;
+        if (d) {
+            uint32_t key = be32(p) ^ BFTTF_MAGIC;
+            memset(d, 0, (size_t)font_bytes[type] + 4);
+            for (uint64_t i = 0; i + 4 <= font_bytes[type]; i += 4) {   /* (an sfnt's tables are 4-byte aligned) */
+                uint32_t w = be32(p + 8 + i) ^ key;
+                d[i] = (uint8_t)(w >> 24), d[i + 1] = (uint8_t)(w >> 16), d[i + 2] = (uint8_t)(w >> 8), d[i + 3] = (uint8_t)w;
+            }
+            plain[type] = d;
+        }
+    }
+    const uint8_t *r = plain[type];
+    if (r && n) *n = (size_t)font_bytes[type];
+    pthread_mutex_unlock(&lock);
+    return r;
 }
 
 HLE_NATIVE("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", load_state, 'w')

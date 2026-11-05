@@ -78,6 +78,9 @@ static void deck_defaults(void) {
 #ifndef _WIN32
     const char *env = getenv("SteamDeck");
     int deck = env && !strcmp(env, "1");
+    // started by Steam on the Deck: SDL's text input opens Steam's on-screen keyboard (host/text_entry.c, the game's
+    // software keyboard); only then, as without Steam the steam:// link would start Steam itself
+    if (deck) setenv("SDL_ENABLE_STEAM_SCREEN_KEYBOARD", "1", 0);
     if (!deck) {
         char vendor[64] = "", product[64] = "";
         FILE *v = fopen("/sys/class/dmi/id/board_vendor", "r"), *p = fopen("/sys/class/dmi/id/product_name", "r");
