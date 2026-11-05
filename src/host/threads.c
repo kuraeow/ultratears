@@ -121,8 +121,42 @@ typedef struct thr {
     // waiting for a virtual core, and from a wake to running again (the host's scheduling latency)
     uint64_t st_block_ns[5], st_blocks, st_core_ns, st_core_waits, st_wake_ns, st_wakes, woke_ns, st_hold_ns;
     uint64_t blk_t0, blk_cred, core_t0, core_cred; int blk_kind;   // a wait in progress: since when, counted up to when
+    unsigned long os_tid;      // the host's id of this thread (os_times), set by the thread itself
 } thr_t;
+
+/* The host thread's CPU time and, on Linux, its time runnable but not running (waiting for a processor: taken by other
+   threads), in ns since it started (runtime_threads_report). Linux: /proc/self/task/<tid>/schedstat ("run delay
+   slices"); Windows: GetThreadTimes, no delay. 0 when not readable. */
+#ifdef _WIN32
+static unsigned long os_tid_self(void) { return GetCurrentThreadId(); }
+static int os_times(unsigned long tid, uint64_t *run, uint64_t *delay) {
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)tid);
+    FILETIME c, e, k, u;
+    int ok = h && GetThreadTimes(h, &c, &e, &k, &u);
+    if (h) CloseHandle(h);
+    if (!ok) return 0;
+    *run = ((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) * 100 + ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime) * 100;
+    *delay = 0;
+    return 1;
+}
+#else
+#include <sys/syscall.h>
+#include <unistd.h>
+static unsigned long os_tid_self(void) { return (unsigned long)syscall(SYS_gettid); }
+static int os_times(unsigned long tid, uint64_t *run, uint64_t *delay) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%lu/schedstat", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long r = 0, d = 0;
+    int ok = fscanf(f, "%llu %llu", &r, &d) == 2;
+    fclose(f);
+    *run = r, *delay = d;
+    return ok;
+}
+#endif
 static thr_t *g_all;
+static thr_t *g_main_thr;   // the guest main thread (svc_thread_main_init): its share of a long frame
 
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
@@ -340,8 +374,8 @@ void runtime_threads_report(unsigned frames) {
     enum { N = 256 };
     // matched by thread id: a handle comes back for a new thread once the old one is gone, and its smaller totals went
     // negative (61489146967 ms in the Deck's log of 2026-11-04)
-    static struct { uint64_t id; uint64_t b[5], core, cw, wake, wakes, blocks, hold; } last[N];
-    typedef struct { uint32_t h; int prio; double b[5], all, core, cw, wake, wakes, blocks, hold; } row;
+    static struct { uint64_t id; uint64_t b[5], core, cw, wake, wakes, blocks, hold, run, delay; } last[N];
+    typedef struct { uint32_t h; int prio, k; unsigned long tid; double b[5], all, core, cw, wake, wakes, blocks, hold, cpu, dly; } row;
     row r[N];
     int n = 0;
     static uint64_t last_ns;   // the window's wall time per frame: what a thread did not wait, it ran (or waited on the host)
@@ -363,7 +397,7 @@ void runtime_threads_report(unsigned frames) {
         if (!last[k].id) memset(&last[k], 0, sizeof last[k]), last[k].id = t->id;
         row *x = &r[n++];
         x->hold = (double)(t->st_hold_ns - last[k].hold) / 1e6 / frames, last[k].hold = t->st_hold_ns;
-        x->h = t->handle, x->prio = t->prio, x->all = 0;
+        x->h = t->handle, x->prio = t->prio, x->all = 0, x->k = k, x->tid = t->os_tid, x->cpu = x->dly = -1;
         for (int i = 0; i < 5; i++) x->b[i] = (double)(t->st_block_ns[i] - last[k].b[i]) / 1e6 / frames, x->all += x->b[i], last[k].b[i] = t->st_block_ns[i];
         x->core = (double)(t->st_core_ns - last[k].core) / 1e6 / frames, last[k].core = t->st_core_ns;
         x->cw = (double)(t->st_core_waits - last[k].cw) / frames, last[k].cw = t->st_core_waits;
@@ -372,6 +406,17 @@ void runtime_threads_report(unsigned frames) {
         x->blocks = (double)(t->st_blocks - last[k].blocks) / frames, last[k].blocks = t->st_blocks;
     }
     g_unlock();
+    // the host's view (outside G: a file read per thread on Linux): CPU time the thread got, and time it was runnable
+    // but the host ran other threads (Linux only) - a virtual core held while its thread waits for a processor
+    double cpu_all = 0, dly_all = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t run, delay;
+        if (!r[i].tid || !os_times(r[i].tid, &run, &delay)) continue;
+        if (last[r[i].k].run && run >= last[r[i].k].run)
+            r[i].cpu = (double)(run - last[r[i].k].run) / 1e6 / frames, r[i].dly = (double)(delay - last[r[i].k].delay) / 1e6 / frames;
+        last[r[i].k].run = run, last[r[i].k].delay = delay;
+        if (r[i].cpu >= 0) cpu_all += r[i].cpu, dly_all += r[i].dly;
+    }
     double core_all = 0, wake_all = 0, wakes_all = 0, hold_all = 0;
     for (int i = 0; i < n; i++) core_all += r[i].core, wake_all += r[i].wake, wakes_all += r[i].wakes, hold_all += r[i].hold;
     for (int i = 0; i < n; i++)   // the rows: the threads that held the virtual cores longest first
@@ -380,14 +425,36 @@ void runtime_threads_report(unsigned frames) {
     // "on a core": the time holding a virtual core (the three cores give at most 3x the frame); "away": neither on a
     // core nor in a guest wait - a host service that gave its core up (GPU, audio, files), or the host not running it
     fprintf(stderr, "[totk] guest threads per frame: virtual cores held %.2f of %.2f ms, waiting for a virtual core %.2f ms in all, "
-            "wake latency %.0f us average (%.0f wakes a frame)\n", hold_all, 3 * frame_ms, core_all,
-            wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames);
+            "wake latency %.0f us average (%.0f wakes a frame); host: CPU %.2f ms, waiting for a processor %.2f ms\n", hold_all, 3 * frame_ms, core_all,
+            wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames, cpu_all, dly_all);
     for (int i = 0; i < n && i < 10; i++) {
         double away = frame_ms > 0 ? frame_ms - r[i].all - r[i].core - r[i].hold : 0.0;
         fprintf(stderr, "[totk]   thread %#x prio %d: on a core %.1f ms, core wait %.2f ms (%.1f), blocked %.1f ms (lock %.1f, cond %.1f, address %.1f, sync %.1f; %.1f waits), "
-                "away %.1f ms, wake latency %.0f us\n", r[i].h, r[i].prio, r[i].hold, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
-                away > 0 ? away : 0.0, r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0);
+                "away %.1f ms, wake latency %.0f us; CPU %.1f ms, waiting for a processor %.1f ms\n", r[i].h, r[i].prio, r[i].hold, r[i].core, r[i].cw, r[i].all, r[i].b[1], r[i].b[2], r[i].b[3], r[i].b[4], r[i].blocks,
+                away > 0 ? away : 0.0, r[i].wakes ? r[i].wake / r[i].wakes / 1e3 : 0.0, r[i].cpu > 0 ? r[i].cpu : 0.0, r[i].dly > 0 ? r[i].dly : 0.0);
     }
+}
+
+/* UltraTears (the long-frame log, gfx/nvn/hle_nvn.c): running totals in ns - [0] all guest threads waiting for a virtual
+   core, [1] the main thread holding one, [2] its core waits, [3..6] its blocked time by kind (lock, condition, address,
+   sync). Waits in progress are counted up to now. Read once a frame; the caller takes differences. */
+void runtime_threads_totals(uint64_t v[7]) {
+    memset(v, 0, 7 * sizeof *v);
+    uint64_t now = now_ns();
+    g_lock();
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->exited || !t->started) continue;
+        if (t->core_t0) t->st_core_ns += now - t->core_cred, t->core_cred = now;
+        v[0] += t->st_core_ns;
+    }
+    thr_t *m = g_main_thr;
+    if (m && !m->exited) {
+        if (m->blk_t0) m->st_block_ns[m->blk_kind] += now - m->blk_cred, m->blk_cred = now;
+        if (m->cur_core >= 0 && now > m->core_since) m->st_hold_ns += now - m->core_since, m->core_since = now;
+        v[1] = m->st_hold_ns, v[2] = m->st_core_ns;
+        for (int k = 1; k <= 4; k++) v[2 + k] = m->st_block_ns[k];
+    }
+    g_unlock();
 }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
@@ -462,6 +529,7 @@ uint32_t (*dm_thread_tick_fn)(void);   // the current game tick, when diagnostic
 static void *thread_main(void *p) {
     thr_t *t = p;
     t_self = t;
+    t->os_tid = os_tid_self();
     preempt_point_set(t);
     plat_thread_start();
     Cpu *c = guest_cpu_new(t->stack_top, guest_tls_alloc());
@@ -500,8 +568,8 @@ uint32_t svc_thread_main_init(void) {
     thr_t *t = calloc(1, sizeof *t);
     gc_init(&t->cv);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self();
-    t->cur_core = -1;
-    g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); g_unlock();
+    t->cur_core = -1; t->os_tid = os_tid_self();
+    g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; g_main_thr = t; core_take(t); g_unlock();
     t_self = t;
     preempt_point_set(t);
     return t->handle;
