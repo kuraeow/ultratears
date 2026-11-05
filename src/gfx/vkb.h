@@ -45,7 +45,6 @@ void vkb_ring_stats(uint64_t *chunks, uint64_t *bytes, uint64_t *pairs);   // up
 void vkb_ring_counts(uint64_t *peak, uint64_t *made, uint64_t *freed);   // its peak bytes; chunks made and given back so far
 uint64_t vkb_ring_reclaim(void);   // out of memory: idle slots' upload memory back (bytes freed)
 void vkb_ring_reserve(uint64_t bytes);   // upload memory made ahead for uploads coming (vkb_draw.c)
-int vkb_staging_new(VkDeviceSize size, VkBuffer *buf, VkDeviceMemory *mem, uint8_t **map);   // staging of its own (vkb_draw.c)
 int vkb_slot_idle(int slot);   // the GPU has finished the slot's submission and it does not record now (backend_vk.c)
 // What the next vkAllocateMemory of this thread is for (the memory log counts by it; reset by the allocation).
 enum { MT_OTHER, MT_IMAGE, MT_RING, MT_DESC, MT_POOL_COPY, MT_MIRROR, MT_UCAP, MT_WRITEBACK, MT_COPY_BACK, MT_N };
@@ -89,7 +88,6 @@ typedef struct vkb_image {
     int wb_pending;                // in the write-back queue (vkb_tex.c vkb_tex_writeback_frame)
     uint64_t wb_seq;               // write_seq of the contents last written back (or being)
     struct vkb_image *refresh_from;   // newer contents at the same memory in another size: scaled in before use (vkb_tex.c)
-    void *ahead;                   // its bytes prepared ahead in staging memory (vkb_tex.c, TOTK_TEX_AHEAD; g_up_mu)
 } vkb_image;
 void vkb_image_written(vkb_image *im);   // the GPU writes it (render target, clear, copy, storage)
 // TOTK_DEPTH_AUDIT=1 (development, vkb_tex.c): depth is D32F here, D16/D24 in the game. Logs colour textures sampled

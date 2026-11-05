@@ -197,9 +197,7 @@ static void side_free(entry *t) {    // an image kept beside an entry (twin, blo
     vkb_destroy_image_later(t->im.img, t->im.mem, t->im.imem);
     free(t);
 }
-static void ah_plan_free_v(void *P);
 static void entry_drop(entry *e) {   // g_mu held: out of the indexes, destroyed when the GPU is done with it
-    if (e->im.ahead) { ah_plan_free_v(e->im.ahead); e->im.ahead = NULL; }   // (g_up_mu not needed: no thread uses e now)
     if (e->im.wb_pending) { pthread_mutex_lock(&g_wbq_mu); wbq_remove(e); pthread_mutex_unlock(&g_wbq_mu); }
     for (int i = 0; i < g_nwbj; i++) if (g_wbj[i].e == e) g_wbj[i].e = NULL;
     if (e->shaped) {
@@ -609,10 +607,7 @@ static int image_memory(vkb_image *im) {
 }
 
 static int create(vkb_image *im, const tex_t *t);
-static void ah_plan_free_v(void *P);   // its bytes prepared ahead, unused (below)
-static entry *ahead_take(uint64_t serial);   // an image made ahead for this texture, with its bytes (below)
 static void entry_discard(entry *e) {   // made by create() and never used: destroyed at once
-    if (e->im.ahead) { ah_plan_free_v(e->im.ahead); e->im.ahead = NULL; }
     vk.vkDestroyImage(vkc.device, e->im.img, NULL);
     if (e->im.imem) vkb_imem_free(e->im.imem);
     else vk.vkFreeMemory(vkc.device, e->im.mem, NULL);
@@ -892,7 +887,6 @@ retry:
     } else if (e) g_images_shared++;
     if (!e && !pre && !locked) {
         pthread_mutex_unlock(&g_mu);
-        if ((pre = ahead_take(t->serial))) goto retry;   // made ahead on the prefetch thread, its bytes with it (TOTK_TEX_AHEAD)
         if (!(pre = calloc(1, sizeof *pre))) die("image entry");
         uint64_t t0 = runtime_now_ns();
         int ok = create(&pre->im, t);
@@ -930,7 +924,6 @@ retry:
     g_n++;
     pthread_mutex_unlock(&g_mu);
     if (pre) entry_discard(pre);   // an image over the same memory was found meanwhile
-    { void vkb_tex_ahead_drop(uint64_t serial); vkb_tex_ahead_drop(t->serial); }   // drawn through a shared image: not needed
     if (c) *c = (icache_t){t->serial, sub, &e->im};
     return &e->im;
 }
@@ -1164,10 +1157,8 @@ VkImageView vkb_view(vkb_image *im, const view_t *v, int attachment, int view_ty
     return view;
 }
 
-void vkb_tex_ahead_drop(uint64_t serial);
 void vkb_tex_release(const tex_t *t) {
     if (!t || !t->serial || !vkb_ready()) return;
-    vkb_tex_ahead_drop(t->serial);   // prepared ahead and never drawn (TOTK_TEX_AHEAD)
     vkb_lock(&g_mu, LK_IMAGES);
     tslot *s = g_cap ? slot(t->serial) : NULL;
     if (s && s->serial == t->serial && s->e) {
@@ -1386,12 +1377,9 @@ static void astc_run(void) {   // the gathered items, decoded; then the batch is
 
 static int tex_upload(VkCommandBuffer cb, vkb_image *im);
 typedef struct { uint32_t level, layer, lw, lh, ld, row, rows_h; VkBuffer buf; VkDeviceSize off; } psurf;
-// bc: VKB_BC_* of cached blocks, -1: texels; ahead: in staging of its own (ch: each surface's chunk, 0xff: none yet)
-typedef struct { psurf *s; int ns, bc; uint64_t stamp, vgen; int ahead; uint8_t *ch; } uplan;
+typedef struct { psurf *s; int ns, bc; uint64_t stamp, vgen; } uplan;   // bc: VKB_BC_* of cached blocks, -1: texels
 static int plan_prepare(vkb_image *im, uplan *P);
 static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P);
-static int ah_consume(vkb_image *im);       // textures prepared ahead (below)
-static void ah_drop_plan(vkb_image *im);
 // Several threads recording: into the submission's prologue, which runs before every chunk (the CPU wrote the bytes
 // before the submission, so earlier is as good; a GPU write to the image in a chunk still comes after it).
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;   // one upload at a time: the ASTC batch is shared
@@ -1408,17 +1396,10 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         pthread_mutex_unlock(&g_up_mu);
         stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     }
-    if (!im->storage || im->gpu_written || (stamp && !vkb_tex_stale(im))) {   // the common case: nothing to do
-        if (__atomic_load_n(&im->ahead, __ATOMIC_RELAXED)) ah_drop_plan(im);   // prepared for nothing (drawn into first)
-        return 0;
-    }
+    if (!im->storage || im->gpu_written || (stamp && !vkb_tex_stale(im))) return 0;   // the common case: nothing to do
     uint64_t t0 = runtime_now_ns();
     int r;
     if (vkb_mt_recording()) {
-        if (__atomic_load_n(&im->ahead, __ATOMIC_ACQUIRE)) {   // prepared ahead: only the copies, if nothing wrote it since
-            int ra = ah_consume(im);
-            if (ra) { vkb_step_add(PK_UPLOAD, t0); return ra == 1; }
-        }
         uplan P;
         int planned = plan_prepare(im, &P);   // the bytes, outside the lock
         up_lock();
@@ -1429,10 +1410,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         vkb_pro_end();
         pthread_mutex_unlock(&g_up_mu);
         free(P.s);
-    } else {
-        if (__atomic_load_n(&im->ahead, __ATOMIC_RELAXED)) ah_drop_plan(im);   // one recording thread: the usual upload
-        r = tex_upload(cb, im);
-    }
+    } else r = tex_upload(cb, im);
     vkb_step_add(PK_UPLOAD, t0);
     return r;
 }
@@ -1619,18 +1597,8 @@ static int plan_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_VK_UPLOAD_LOCKED"); v = !(e && *e == '1'); }
     return v;
 }
-static uint8_t *ah_alloc(VkDeviceSize n, VkBuffer *buf, VkDeviceSize *off, uint8_t *ch);
-static void ah_unref(const uplan *P, int used);
-// Upload memory for surface k: the slot's ring, or staging of its own when prepared ahead (NULL: none left)
-static uint8_t *pl_alloc(uplan *P, int k, VkDeviceSize n, VkBuffer *buf, VkDeviceSize *off) {
-    if (!P->ahead) return vkb_ring_alloc(n, 16, buf, off);
-    return ah_alloc(n, buf, off, &P->ch[k]);
-}
-static int plan_prepare_x(vkb_image *im, uplan *P, int ahead);
-static int plan_prepare(vkb_image *im, uplan *P) { return plan_prepare_x(im, P, 0); }
-static int plan_prepare_x(vkb_image *im, uplan *P, int ahead) {   // 1: the bytes are in upload memory, P says where
+static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in upload memory, P says where
     memset(P, 0, sizeof *P);
-    P->ahead = ahead;
     const nvn_texdesc *d = &im->d;
     if (!plan_on() || !im->storage || im->gpu_written || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
     if (im->upload_stamp && !vkb_tex_stale(im)) return 0;
@@ -1644,8 +1612,6 @@ static int plan_prepare_x(vkb_image *im, uplan *P, int ahead) {   // 1: the byte
     if (!vpool && (at < 0x0800000000ull || at + L.size > 0x8000000000ull || !nvn_dirty_tracked(im->storage, L.size))) return 0;
     int ns = (int)(im->levels * im->layers);
     if (!ns || !(P->s = calloc((size_t)ns, sizeof *P->s))) return 0;
-    if (ahead && !(P->ch = malloc((size_t)ns))) { free(P->s); P->s = NULL; return 0; }
-    if (ahead) memset(P->ch, 0xff, (size_t)ns);
     P->ns = ns; P->bc = -1;
     if (!vpool) nvn_dirty_protect(im->storage, L.size);
     P->stamp = nvn_dirty_now();   // before reading: a write meanwhile shows as dirty
@@ -1667,8 +1633,8 @@ static int plan_prepare_x(vkb_image *im, uplan *P, int ahead) {   // 1: the byte
             psurf *s = &P->s[k];
             *s = (psurf){level, layer, lw, lh, ld, bx * (uint32_t)bw, by * (uint32_t)bh, VK_NULL_HANDLE, 0};
             if (!im->astc) {   // the texels, laid out straight into upload memory
-                uint8_t *rows = pl_alloc(P, k, bytes, &s->buf, &s->off);
-                ok = rows && !nvn_deswizzle(d, level, layer, src, rows, pitch);
+                uint8_t *rows = vkb_ring_alloc(bytes, 16, &s->buf, &s->off);
+                ok = !nvn_deswizzle(d, level, layer, src, rows, pitch);
                 continue;
             }
             // ASTC: the blocks in ordinary memory for the key (upload memory reads slowly), then the cached BC7 blocks
@@ -1683,18 +1649,14 @@ static int plan_prepare_x(vkb_image *im, uplan *P, int ahead) {   // 1: the byte
             ok = vkb_bc7_lookup(key, &f, &len) && (fmt < 0 || f == fmt) && len == (f == VKB_BC_1 ? bc1_size(lw, lh, ld) : bc7_size(lw, lh, ld));
             if (!ok) break;
             fmt = f;
-            uint8_t *out = pl_alloc(P, k, len, &s->buf, &s->off);
-            ok = out && vkb_bc7_read(key, out, len);
+            uint8_t *out = vkb_ring_alloc(len, 16, &s->buf, &s->off);
+            ok = vkb_bc7_read(key, out, len);
             s->row = (lw + 3) / 4 * 4; s->rows_h = (lh + 3) / 4 * 4;
         }
     }
     free(gathered);
     if (im->astc) P->bc = fmt;
-    if (!ok) {
-        if (ahead) { ah_unref(P, 0); free(P->ch); P->ch = NULL; }
-        free(P->s); P->s = NULL;
-        return 0;
-    }
+    if (!ok) { free(P->s); P->s = NULL; return 0; }
     return 1;
 }
 // ---- the BC7 cache warmed ahead of uploads. An ASTC texture's first upload reads its BC7 blocks from the mapped
@@ -1705,14 +1667,9 @@ static int plan_prepare_x(vkb_image *im, uplan *P, int ahead) {   // 1: the byte
 // computes its surfaces' cache keys and reads their pages; the upload then finds them in memory. It changes nothing
 // the upload does: not warmed in time (or the game had not written the texture yet) it reads the disk as before.
 // TOTK_TEX_PREFETCH=0: off.
-// With TOTK_TEX_AHEAD=1 every texture with CPU-visible memory is queued too, and the thread prepares it (below).
 enum { PF_QUEUE = 512, PF_SEEN = 4096 };
 static tex_t g_pfq[PF_QUEUE];
-static uint8_t g_pfw[PF_QUEUE];   // its BC7 pages to be warmed (else only prepared ahead)
 static int g_pf_head, g_pf_n;
-static int ahead_on(void);
-static void ahead_one(const tex_t *t);
-static void ahead_expire(void);
 static uint64_t g_pf_seen[PF_SEEN];   // recently queued textures (storage and shape): queued once
 static pthread_mutex_t g_pf_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pf_cv = PTHREAD_COND_INITIALIZER;
@@ -1759,21 +1716,13 @@ static void *prefetch_thread(void *unused) {
         }
         while (!g_pf_n) pthread_cond_wait(&g_pf_cv, &g_pf_mu);
         tex_t t = g_pfq[g_pf_head];
-        int warm = g_pfw[g_pf_head];
         g_pf_head = (g_pf_head + 1) % PF_QUEUE;
         g_pf_n--;
-        int last = !g_pf_n;
         pthread_mutex_unlock(&g_pf_mu);
-        if (warm) {
-            prefetch_one(&t);
-            nvn_texlayout L;
-            nvn_tex_layout(&t.d, &L);
-            coming += (uint64_t)(t.d.width ? t.d.width : 1) * (t.d.height ? t.d.height : 1) * (L.layers ? L.layers : 1) * 4 / 3;
-        }
-        if (ahead_on()) {
-            ahead_one(&t);
-            if (last) ahead_expire();
-        }
+        prefetch_one(&t);
+        nvn_texlayout L;
+        nvn_tex_layout(&t.d, &L);
+        coming += (uint64_t)(t.d.width ? t.d.width : 1) * (t.d.height ? t.d.height : 1) * (L.layers ? L.layers : 1) * 4 / 3;
     }
     return NULL;
 }
@@ -1785,23 +1734,17 @@ static void prefetch_start(void) {
 void vkb_tex_prefetch(const tex_t *t) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_TEX_PREFETCH"); on = !(e && *e == '0') && vkb_bc7_on(); }
-    int ah = ahead_on();
-    if ((!on && !ah) || !t || !t->mem) return;
+    if (!on || !t || !t->mem) return;
     const nvn_texdesc *d = &t->d;
     VkImageAspectFlags aspect;
-    int astc = 0, bw = 1, bh = 1, warm = on;
-    // warmed: ASTC 2D / 2D array / cube textures in game memory (the kinds an upload takes from the cache), not in a
-    // virtual pool; prepared ahead: any but a buffer texture (plan_prepare decides)
+    int astc = 0, bw = 1, bh = 1;
+    // ASTC 2D / 2D array / cube textures in game memory (the kinds an upload takes from the cache), not in a virtual pool
     if (d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY || d->target == NVN_TEXTURE_TARGET_3D ||
-        d->target == NVN_TEXTURE_TARGET_BUFFER || nvn_fmt_bpb(d->format, &bw, &bh) != 16) warm = 0;
+        d->target == NVN_TEXTURE_TARGET_BUFFER || nvn_fmt_bpb(d->format, &bw, &bh) != 16) return;
+    vkb_format(d->format, &aspect, &astc);
     uintptr_t at = (uintptr_t)t->mem;
-    if (warm) {
-        vkb_format(d->format, &aspect, &astc);
-        if (!astc || at < 0x0800000000ull || at + t->L.size > 0x8000000000ull || totk_vpool_gather(at, 0, NULL)) warm = 0;
-    }
-    if (!warm && !(ah && d->target != NVN_TEXTURE_TARGET_BUFFER)) return;
+    if (!astc || at < 0x0800000000ull || at + t->L.size > 0x8000000000ull || totk_vpool_gather(at, 0, NULL)) return;
     uint64_t key = (uint64_t)at * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
-    if (ah) key ^= t->serial * 0xC2B2AE3D27D4EB4Full;   // prepared per texture object: the same memory again is another
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_mutex_lock(&g_pf_mu);
     uint64_t *seen = &g_pf_seen[(key >> 20) % PF_SEEN];
@@ -1809,7 +1752,6 @@ void vkb_tex_prefetch(const tex_t *t) {
     if (fresh && g_pf_n < PF_QUEUE) {
         *seen = key;
         g_pfq[(g_pf_head + g_pf_n) % PF_QUEUE] = *t;
-        g_pfw[(g_pf_head + g_pf_n) % PF_QUEUE] = (uint8_t)warm;
         g_pf_n++;
         pthread_cond_signal(&g_pf_cv);
         atomic_fetch_add(&g_pf_queued, 1);
@@ -1819,201 +1761,6 @@ void vkb_tex_prefetch(const tex_t *t) {
 }
 void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfaces) {
     *queued = atomic_load(&g_pf_queued); *dropped = atomic_load(&g_pf_dropped); *surfaces = atomic_load(&g_pf_surfaces);
-}
-
-// ---- textures prepared ahead (TOTK_TEX_AHEAD=1, 2026-11-06) ----
-// The Steam Deck's worst hitches (100-280 ms, 2026-11-06) were submissions recorded in 103-994 ms while a place streamed
-// in: new images (22-259 ms), their bytes laid out from game memory into upload memory (72-1359 ms over the recording
-// threads) and upload memory made (up to 267 ms), all at a texture's first use, while the game waited for that
-// submission (totk-pc-recomp uploads the same way, in its replay). The game initializes a texture some frames before it
-// draws with it (the BC7 warming above uses that), so with the switch the prefetch thread also makes its image and lays
-// its bytes out into staging memory of its own (plan_prepare, as a recording thread would), noting the write-watch
-// generation before it reads them. They are kept by texture serial, apart from the image index (a texture the game
-// finalizes or never draws is not in it; dropped after AH_KEEP presents). At the texture's first use vkb_image_of takes
-// the image, and the upload only records the copies from staging, if nothing wrote the texture's memory since; else, and
-// when it was not prepared in time, the upload is the usual one. A staging chunk is filled again once no plan uses it
-// and the submissions that copied from it are done.
-enum { AH_CHUNK = 32u << 20, AH_CHUNKS = 8, AH_N = 768, AH_KEEP = 600 };
-typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *map; VkDeviceSize used; int made; _Atomic int live; _Atomic uint64_t fence; } ah_chunk;
-static ah_chunk g_ahc[AH_CHUNKS];
-static int g_ahc_cur = -1;   // the chunk being filled (the prefetch thread only)
-typedef struct { uint64_t serial, frame; entry *pre; uplan *P; } ah_ent;
-static ah_ent g_ahe[AH_N];
-static int g_nahe;
-static pthread_mutex_t g_ahe_mu = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic uint64_t g_ah_made, g_ah_used, g_ah_written, g_ah_unused, g_ah_failed, g_ah_ns, g_ah_chunks;
-uint64_t mtl_done(void);
-static int ahead_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        // (not vkb_mt_on here: it settles the recording threads once, and this may run before the device is up; a
-        // single recording thread does not take the plans, ah_drop_plan lets them go)
-        const char *e = getenv("TOTK_TEX_AHEAD");
-        v = e && *e == '1';
-        if (v) VLOG("textures prepared ahead: their images and bytes made on the prefetch thread before first use (TOTK_TEX_AHEAD)");
-    }
-    return v;
-}
-static uint8_t *ah_alloc(VkDeviceSize n, VkBuffer *buf, VkDeviceSize *off, uint8_t *ch) {   // the prefetch thread
-    if (n > AH_CHUNK) return NULL;
-    for (int tries = 0; tries <= AH_CHUNKS; tries++) {
-        if (g_ahc_cur >= 0) {
-            ah_chunk *c = &g_ahc[g_ahc_cur];
-            VkDeviceSize at = (c->used + 15) & ~(VkDeviceSize)15;
-            if (at + n <= AH_CHUNK) {
-                c->used = at + n;
-                atomic_fetch_add(&c->live, 1);
-                *buf = c->buf; *off = at; *ch = (uint8_t)g_ahc_cur;
-                return c->map + at;
-            }
-        }
-        // the next chunk: one no plan uses and whose copies are done, else a new one
-        int pick = -1;
-        uint64_t done = mtl_done();
-        for (int i = 0; i < AH_CHUNKS && pick < 0; i++)
-            if (i != g_ahc_cur && g_ahc[i].made && !atomic_load(&g_ahc[i].live) && atomic_load(&g_ahc[i].fence) <= done) pick = i;
-        for (int i = 0; i < AH_CHUNKS && pick < 0; i++)
-            if (!g_ahc[i].made && vkb_staging_new(AH_CHUNK, &g_ahc[i].buf, &g_ahc[i].mem, &g_ahc[i].map)) {
-                g_ahc[i].made = 1;
-                atomic_fetch_add(&g_ah_chunks, 1);
-                pick = i;
-            }
-        if (pick < 0) return NULL;   // all in use: the upload will be the usual one
-        g_ahc[pick].used = 0;
-        atomic_store(&g_ahc[pick].fence, 0);
-        g_ahc_cur = pick;
-    }
-    return NULL;
-}
-static void ah_unref(const uplan *P, int used) {   // its surfaces' chunks: one plan less; used: copied in this submission
-    if (!P->ch) return;
-    uint64_t f = mtl_last_fence() + 1;
-    for (int i = 0; i < P->ns; i++) {
-        if (P->ch[i] == 0xff) continue;
-        ah_chunk *c = &g_ahc[P->ch[i]];
-        if (used) { uint64_t o = atomic_load(&c->fence); while (f > o && !atomic_compare_exchange_weak(&c->fence, &o, f)) {} }
-        atomic_fetch_sub(&c->live, 1);
-    }
-}
-static void ah_plan_free(uplan *P, int used) {
-    if (!P) return;
-    ah_unref(P, used);
-    free(P->s); free(P->ch); free(P);
-}
-static void ah_ent_free(ah_ent *a) {   // not taken: its image and staging go
-    entry_discard(a->pre);
-    ah_plan_free(a->P, 0);
-    atomic_fetch_add(&g_ah_unused, 1);
-}
-// The texture is drawn: its image, with the plan on it, for vkb_image_of (NULL: none prepared)
-static entry *ahead_take(uint64_t serial) {
-    if (!__atomic_load_n(&g_nahe, __ATOMIC_RELAXED)) return NULL;
-    entry *pre = NULL;
-    pthread_mutex_lock(&g_ahe_mu);
-    for (int i = 0; i < g_nahe; i++)
-        if (g_ahe[i].serial == serial) {
-            pre = g_ahe[i].pre;
-            pre->im.ahead = g_ahe[i].P;
-            g_ahe[i] = g_ahe[--g_nahe];
-            break;
-        }
-    pthread_mutex_unlock(&g_ahe_mu);
-    return pre;
-}
-// The texture is finalized, or drawn through another image (shared): what was prepared for it goes
-void vkb_tex_ahead_drop(uint64_t serial) {
-    if (!__atomic_load_n(&g_nahe, __ATOMIC_RELAXED)) return;
-    ah_ent a = {0};
-    pthread_mutex_lock(&g_ahe_mu);
-    for (int i = 0; i < g_nahe; i++)
-        if (g_ahe[i].serial == serial) { a = g_ahe[i]; g_ahe[i] = g_ahe[--g_nahe]; break; }
-    pthread_mutex_unlock(&g_ahe_mu);
-    if (a.pre) ah_ent_free(&a);
-}
-static void ahead_expire(void) {   // the prefetch thread: what was not drawn in AH_KEEP presents
-    uint64_t now = vkb_frame();
-    for (;;) {
-        ah_ent a = {0};
-        pthread_mutex_lock(&g_ahe_mu);
-        for (int i = 0; i < g_nahe; i++)
-            if (g_ahe[i].frame + AH_KEEP < now) { a = g_ahe[i]; g_ahe[i] = g_ahe[--g_nahe]; break; }
-        pthread_mutex_unlock(&g_ahe_mu);
-        if (!a.pre) return;
-        ah_ent_free(&a);
-    }
-}
-static void ahead_one(const tex_t *t) {   // the prefetch thread
-    if (!t->mem || !vkb_ready() || t->d.target == NVN_TEXTURE_TARGET_BUFFER || atomic_load(&g_vram_tight)) return;
-    pthread_mutex_lock(&g_ahe_mu);
-    int have = 0, full = g_nahe == AH_N;
-    for (int i = 0; i < g_nahe && !have; i++) have = g_ahe[i].serial == t->serial;
-    pthread_mutex_unlock(&g_ahe_mu);
-    if (have) return;
-    if (full) { atomic_fetch_add(&g_ah_failed, 1); return; }
-    uint64_t t0 = runtime_now_ns();
-    entry *pre = calloc(1, sizeof *pre);
-    uplan *P = calloc(1, sizeof *P);
-    if (!pre || !P) { free(pre); free(P); return; }
-    if (!create(&pre->im, t)) { free(pre); free(P); return; }
-    int ok = plan_prepare_x(&pre->im, P, 1);
-    if (ok && P->bc >= 0 && !pre->im.bc7) {   // ASTC with every surface in the BC7 cache: its image as BC7 now
-        int srgb = pre->im.d.format >= 0x87 && pre->im.d.format <= 0x94;
-        ok = to_bc7(&pre->im, srgb, P->bc);
-        if (!ok) ah_unref(P, 0);
-    }
-    if (!ok) {
-        free(P->s); free(P->ch); free(P);
-        entry_discard(pre);
-        atomic_fetch_add(&g_ah_failed, 1);
-        return;
-    }
-    atomic_fetch_add(&g_ah_ns, runtime_now_ns() - t0);
-    pthread_mutex_lock(&g_ahe_mu);
-    int put = g_nahe < AH_N;
-    if (put) g_ahe[g_nahe++] = (ah_ent){t->serial, vkb_frame(), pre, P};
-    pthread_mutex_unlock(&g_ahe_mu);
-    if (!put) { ah_ent a = {t->serial, 0, pre, P}; ah_ent_free(&a); return; }
-    atomic_fetch_add(&g_ah_made, 1);
-}
-// Recording thread, at the image's first upload: the copies from staging (1), another thread uploaded it meanwhile (2),
-// or not usable (0: the usual upload follows)
-static int ah_consume(vkb_image *im) {
-    up_lock();
-    uplan *P = im->ahead;
-    im->ahead = NULL;
-    int r = 0;
-    if (P) {
-        nvn_texlayout L;
-        nvn_tex_layout(&im->d, &L);
-        int clean = P->vgen ? totk_vpool_dirty_since((uintptr_t)im->storage, L.size, P->stamp) == 0
-                            : !nvn_dirty_since(im->storage, L.size, P->stamp);
-        if (clean) { vkb_pro_begin(); r = plan_record(vkb_cmd(), im, P); vkb_pro_end(); }
-        atomic_fetch_add(r == 1 ? &g_ah_used : &g_ah_written, 1);
-    }
-    pthread_mutex_unlock(&g_up_mu);
-    ah_plan_free(P, r == 1);
-    return r;
-}
-static void ah_plan_free_v(void *P) { if (P) { ah_plan_free(P, 0); atomic_fetch_add(&g_ah_unused, 1); } }
-static void ah_drop_plan(vkb_image *im) {
-    up_lock();
-    uplan *P = im->ahead;
-    im->ahead = NULL;
-    pthread_mutex_unlock(&g_up_mu);
-    if (P) { ah_plan_free(P, 0); atomic_fetch_add(&g_ah_unused, 1); }
-}
-// The per-frame log line (backend_vk.c), over `frames` presents
-void vkb_tex_ahead_log(double frames) {
-    if (!ahead_on() || frames <= 0) return;
-    static uint64_t p[6];
-    uint64_t v[6] = {atomic_load(&g_ah_made), atomic_load(&g_ah_used), atomic_load(&g_ah_written), atomic_load(&g_ah_unused),
-                     atomic_load(&g_ah_failed), atomic_load(&g_ah_ns)};
-    double made = (double)(v[0] - p[0]);
-    VLOG("per frame: textures prepared ahead %.2f (%.2f ms each on the prefetch thread), used %.2f, written since %.2f, "
-         "dropped unused %.2f, not prepared %.2f; waiting %d, staging %llu MiB", made / frames, made ? (double)(v[5] - p[5]) / 1e6 / made : 0.0,
-         (double)(v[1] - p[1]) / frames, (double)(v[2] - p[2]) / frames, (double)(v[3] - p[3]) / frames, (double)(v[4] - p[4]) / frames,
-         g_nahe, (unsigned long long)(atomic_load(&g_ah_chunks) * (AH_CHUNK >> 20)));
-    memcpy(p, v, sizeof p);
 }
 
 // Under g_up_mu, into the prologue: 1 when recorded, 0 to upload as before, 2 when another thread uploaded it meanwhile.

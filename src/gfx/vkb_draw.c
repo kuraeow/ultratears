@@ -242,17 +242,6 @@ void vkb_ring_stats(uint64_t *chunks, uint64_t *bytes, uint64_t *pairs) {   // m
         }
 }
 
-// Staging memory of its own for textures prepared ahead (vkb_tex.c, TOTK_TEX_AHEAD): upload memory as the rings' (same
-// type, made off the recording threads), not tied to a command slot.
-int vkb_staging_new(VkDeviceSize size, VkBuffer *buf, VkDeviceMemory *mem, uint8_t **map) {
-    chunk_t c;
-    t_reserving = 1;
-    int ok = chunk_new(&c, size);
-    t_reserving = 0;
-    if (!ok) return 0;
-    *buf = c.buf; *mem = c.mem; *map = c.map;
-    return 1;
-}
 void *vkb_ring_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
     slot_res *r = &g_res[vkb_slot()][vkb_worker()];
     for (;;) {
