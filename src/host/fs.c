@@ -192,7 +192,7 @@ static uint64_t file_index(const char *p) {
 #define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
 #define UI_COMMON "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"
 #define ZS_DICTS "Pack/ZsDic.pack.zs"
-enum { NOVR = 4 };
+enum { NOVR = 8 };
 static struct { uint64_t index; uint8_t *data; uint64_t size; } ovr[NOVR];
 static int novr;
 static int ovr_find(uint64_t i) { for (int k = 0; k < novr; k++) if (ovr[k].index == i) return k; return -1; }
@@ -289,6 +289,29 @@ static int romfs_owns(const char *path) {
     return n && path && !strncmp(path, mount_name, n) && path[n] == ':';
 }
 static int romfs_handle(uint64_t h) { return h > ROM_BASE && h < ROM_BASE + NROM; }
+/* The language's message archive (Mals/<lang>.Product.<n>.sarc.zs), the first time the game opens it: the letters of
+   the action prompt's diamond that host/ui_prompts.c moved to another place say that place's letter (a button bound
+   away from its place). Built once per file, served from memory like the layouts. */
+static void mals_overlay(const char *p, uint64_t i) {
+    int totk_ui_prompts_mals(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t tried[32];
+    static int ntried;
+    pthread_mutex_lock(&lock);
+    int seen = 0;
+    for (int k = 0; k < ntried; k++) seen |= tried[k] == i;
+    if (!seen && ntried < 32 && novr < NOVR) {
+        tried[ntried++] = i;
+        size_t n = 0, dn = 0, out_n = 0;
+        void *in = rom_file(p, 64u << 20, &n), *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL, *out = NULL;
+        if (in && dicts && totk_ui_prompts_mals(in, n, dicts, dn, &out, &out_n)) {
+            ovr_add(p, out, out_n);
+            fprintf(stderr, "[totk] RomFS: %s served with the diamond's letters after the controls\n", p);
+        }
+        free(in); free(dicts);
+    }
+    pthread_mutex_unlock(&lock);
+}
 static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     runtime_fs_log("rom", path ? path : "(null)");
     if (!out || mode != OPEN_READ) return R_ROM_UNSUPPORTED;
@@ -296,6 +319,7 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!p) return R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
+    if (!strncmp(p, "Mals/", 5)) mals_overlay(p, i);
     int fd = -1;
     if (rom_folder) {
         char full[8192];

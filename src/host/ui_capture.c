@@ -101,27 +101,25 @@ int totk_ui_prompts_apply(uint8_t *blarc, size_t n);                           /
 // (host/ui_prompts.c) the member of a SARC named name: [*lo, *hi)
 int totk_sarc_member(const uint8_t *d, size_t n, const char *name, size_t *lo, size_t *hi) { return sarc_member(d, n, name, lo, hi); }
 
-/* in: the RomFS file (zstd with a dictionary of dicts, the decompressed Pack/ZsDic.pack.zs); out: the fixed file,
-   compressed with the same dictionary (malloc). capture: the quick menus' background at once (above 30 fps); w x h: an
-   output of another shape than 16:9, the layouts for it (host/ui_aspect.c; 0 x 0 none); prompts: the button prompts
-   after the player's controls (host/ui_prompts.c; 0 none). Each part that does not find
-   the archive as expected is left out and says so. 1 when anything was done; 0 leaves the game's file as it is. */
-int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
-                  int prompts, void **out, size_t *out_n) {
+/* A RomFS file (zstd with a dictionary of the game's, from dicts_z: Pack/ZsDic.pack.zs as in RomFS) decompressed, given
+   to edit (the decompressed bytes, their size, ctx: 1 when it changed anything), and compressed again with the same
+   dictionary into *out (malloc). 1 when edited; 0 leaves the game's file as it is. */
+int totk_zs_edit(const void *in, size_t n, const void *dicts_z, size_t dn, int (*edit)(uint8_t *raw, size_t n, void *ctx),
+                 void *ctx, void **out, size_t *out_n) {
     *out = NULL;
     unsigned id = ZSTD_getDictID_fromFrame(in, n);
     unsigned long long raw = ZSTD_getFrameContentSize(in, n), praw = ZSTD_getFrameContentSize(dicts_z, dn);
     if (!id || raw == ZSTD_CONTENTSIZE_UNKNOWN || raw == ZSTD_CONTENTSIZE_ERROR || raw > (256u << 20) ||
         praw == ZSTD_CONTENTSIZE_UNKNOWN || praw == ZSTD_CONTENTSIZE_ERROR || praw > (64u << 20))
         return 0;
-    uint8_t *pack = malloc((size_t)praw), *blarc = malloc((size_t)raw);
+    uint8_t *pack = malloc((size_t)praw), *data = malloc((size_t)raw);
     void *z = NULL;
     int ok = 0;
     ZSTD_DCtx *dc = ZSTD_createDCtx();
     ZSTD_CCtx *cc = ZSTD_createCCtx();
     const uint8_t *dict = NULL;
     size_t dict_n = 0;
-    if (!pack || !blarc || !dc || !cc || ZSTD_decompress(pack, (size_t)praw, dicts_z, dn) != praw) goto done;
+    if (!pack || !data || !dc || !cc || ZSTD_decompress(pack, (size_t)praw, dicts_z, dn) != praw) goto done;
     // the pack is a SARC of dictionaries: the one with the frame's id
     {
         uint16_t header, count;
@@ -136,37 +134,53 @@ int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int 
                     dict = pack + start + a, dict_n = b - a;
             }
     }
-    if (!dict || ZSTD_decompress_usingDict(dc, blarc, (size_t)raw, in, n, dict, dict_n) != raw) goto done;
+    if (!dict || ZSTD_decompress_usingDict(dc, data, (size_t)raw, in, n, dict, dict_n) != raw) goto done;
+    if (!edit(data, (size_t)raw, ctx)) goto done;
+    size_t cap = ZSTD_compressBound((size_t)raw);
+    z = malloc(cap);
+    size_t zn = z ? ZSTD_compress_usingDict(cc, z, cap, data, (size_t)raw, dict, dict_n, 3) : 0;
+    if (!z || ZSTD_isError(zn)) goto done;
+    *out = z, *out_n = zn, z = NULL, ok = 1;
+done:
+    free(z); free(pack); free(data);
+    ZSTD_freeDCtx(dc); ZSTD_freeCCtx(cc);
+    return ok;
+}
+
+typedef struct { int capture, prompts; unsigned w, h; } ui_parts;
+static int ui_edit(uint8_t *blarc, size_t raw, void *ctx) {
+    const ui_parts *u = ctx;
     static const char *const shortcut[] = {"C_CaptureBG_00", "C_CaptureClearBG_00", "P_CaptureClearBG_00"};
     static const char *const builder[] = {"C_CaptureBG_00"};
     int done_any = 0;
-    if (capture) {
+    if (u->capture) {
         size_t lo, hi, lo2, hi2;
-        uint8_t *copy = malloc((size_t)raw);   // both animations checked before either is changed
-        if (copy && sarc_member(blarc, (size_t)raw, "anim/ShortCutBG_00_In.bflan", &lo, &hi) &&
-            sarc_member(blarc, (size_t)raw, "anim/AutoBuilder_00_In.bflan", &lo2, &hi2)) {
-            memcpy(copy, blarc, (size_t)raw);
+        uint8_t *copy = malloc(raw);   // both animations checked before either is changed
+        if (copy && sarc_member(blarc, raw, "anim/ShortCutBG_00_In.bflan", &lo, &hi) &&
+            sarc_member(blarc, raw, "anim/AutoBuilder_00_In.bflan", &lo2, &hi2)) {
+            memcpy(copy, blarc, raw);
             if (move_keys(copy, lo, hi, shortcut, 3) == 3 && move_keys(copy, lo2, hi2, builder, 1) == 1) {
-                free(blarc);
-                blarc = copy, copy = NULL, done_any = 1;
+                memcpy(blarc, copy, raw);
+                done_any = 1;
             }
         }
         free(copy);
         if (!done_any)
             fprintf(stderr, "[totk] quick menu background: the layout archive is not as expected; the game keeps its own\n");
     }
-    if (w && h && totk_ui_aspect_apply(blarc, (size_t)raw, w, h))
+    if (u->w && u->h && totk_ui_aspect_apply(blarc, raw, u->w, u->h))
         done_any = 1;
-    if (prompts && totk_ui_prompts_apply(blarc, (size_t)raw))
+    if (u->prompts && totk_ui_prompts_apply(blarc, raw))
         done_any = 1;
-    if (!done_any) goto done;
-    size_t cap = ZSTD_compressBound((size_t)raw);
-    z = malloc(cap);
-    size_t zn = z ? ZSTD_compress_usingDict(cc, z, cap, blarc, (size_t)raw, dict, dict_n, 3) : 0;
-    if (!z || ZSTD_isError(zn)) goto done;
-    *out = z, *out_n = zn, z = NULL, ok = 1;
-done:
-    free(z); free(pack); free(blarc);
-    ZSTD_freeDCtx(dc); ZSTD_freeCCtx(cc);
-    return ok;
+    return done_any;
+}
+
+/* in: the layout archive (UI/LayoutArchive/Common...blarc.zs); out: the fixed file. capture: the quick menus' background
+   at once (above 30 fps); w x h: an output of another shape than 16:9, the layouts for it (host/ui_aspect.c; 0 x 0
+   none); prompts: the button prompts after the player's controls (host/ui_prompts.c; 0 none). Each part that does not
+   find the archive as expected is left out and says so. 1 when anything was done; 0 leaves the game's file as it is. */
+int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
+                  int prompts, void **out, size_t *out_n) {
+    ui_parts u = {capture, prompts, w, h};
+    return totk_zs_edit(in, n, dicts_z, dn, ui_edit, &u, out, out_n);
 }

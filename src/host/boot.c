@@ -102,8 +102,12 @@ static void deck_defaults(void) {
     // The recording threads below the game's (nice 5): the user's runs (2026-11-05, routes not the same) had p95 31.8
     // against 33.8 ms and fewer frames over 50 ms; a burst of uploads may take longer (one of 1.2 s in that run)
     setenv("TOTK_RECORD_NICE", "5", 0);
-    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps (the Deck's defaults where ultratears.cfg sets none)\n",
-            getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"));
+    // The Deck's buttons as labelled on it (A the bottom one: the Xbox layout, window_sdl.c binds_load), with the
+    // prompts for it (ui_prompts.c); pad_layout=nintendo in ultratears.cfg (the launcher's Controls tab) keeps the Switch's
+    setenv("TOTK_BIND_pad_layout", "xbox", 0);
+    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps, %s button layout (the Deck's defaults where "
+            "ultratears.cfg sets none)\n", getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"),
+            getenv("TOTK_BIND_pad_layout"));
 #endif
 }
 

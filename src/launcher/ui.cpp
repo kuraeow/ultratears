@@ -1806,15 +1806,41 @@ static const Ctl CTL_MOVE[] = {
     {"move_left", "act_move_left", nullptr, nullptr, "A"}, {"move_right", "act_move_right", nullptr, nullptr, "D"},
     {"cam_up", "act_cam_up", nullptr, nullptr, "Up"}, {"cam_down", "act_cam_down", nullptr, nullptr, "Down"},
     {"cam_left", "act_cam_left", nullptr, nullptr, "Left"}, {"cam_right", "act_cam_right", nullptr, nullptr, "Right"}};
-static const Opt LAYOUT_OPTS[] = {{"", "layout_nintendo"}, {"xbox", "layout_xbox"}};
+static const Opt LAYOUT_OPTS[] = {{"nintendo", "layout_nintendo"}, {"xbox", "layout_xbox"}};
 
 static int g_ctl_tab = 0;   // 0 the gamepad, 1 the keyboard
 static struct { bool on = false, pad = false; std::string id; Uint64 t0 = 0; } g_cap;   // waiting for a key or button
 static bool capturing() { return g_cap.on; }
 
+// The Steam Deck: SteamDeck=1 (Steam sets it) or Valve's board, product Jupiter (LCD) or Galileo (OLED), as the game
+// tells it (src/host/boot.c deck_defaults)
 static bool on_deck() {
     const char *d = SDL_getenv("SteamDeck");
-    return d && !SDL_strcmp(d, "1");
+    if (d && !SDL_strcmp(d, "1"))
+        return true;
+#ifndef _WIN32
+    static int dmi = -1;
+    if (dmi < 0) {
+        auto first_line = [](const char *path) {
+            size_t n = 0;
+            char *t = (char *)SDL_LoadFile(path, &n);
+            std::string s = t ? std::string(t, n) : "";
+            SDL_free(t);
+            return s.substr(0, s.find_first_of("\r\n"));
+        };
+        std::string vendor = first_line("/sys/class/dmi/id/board_vendor"), product = first_line("/sys/class/dmi/id/product_name");
+        dmi = vendor == "Valve" && (product == "Jupiter" || product == "Galileo");
+    }
+    return dmi == 1;
+#else
+    return false;
+#endif
+}
+// The Xbox layout (A the bottom button): chosen, or unset on the Steam Deck, whose buttons are labelled so (the game's
+// default there too, src/host/boot.c); pad_layout=nintendo keeps the Switch's on the Deck
+static bool layout_xbox() {
+    std::string v = cfg_get("pad_layout");
+    return v == "xbox" || (v.empty() && on_deck());
 }
 static std::string ctl_cfg(bool pad, const char *id) { return std::string(pad ? "pad_" : "key_") + id; }
 static std::vector<std::string> split_list(const std::string &v) {
@@ -1838,7 +1864,7 @@ static std::vector<std::string> split_list(const std::string &v) {
 static std::vector<std::string> ctl_current(bool pad, const Ctl &c) {
     std::string v = cfg_get(ctl_cfg(pad, c.id).c_str());
     if (v.empty())
-        v = pad ? (cfg_get("pad_layout") == "xbox" ? c.pad_xbox : c.pad_nin) : c.keys;
+        v = pad ? (layout_xbox() ? c.pad_xbox : c.pad_nin) : c.keys;
     if (v == "none")
         return {};
     return split_list(v);
@@ -1846,7 +1872,7 @@ static std::vector<std::string> ctl_current(bool pad, const Ctl &c) {
 // A gamepad input as the chosen layout names it: the Xbox (and Steam Deck) letters with A at the bottom, the Switch's
 // with A on the right; the shoulders as the controller in use says (L1 on the Deck, LB on an Xbox pad, L on a Switch's)
 static std::string pad_label(const std::string &n) {
-    bool x = cfg_get("pad_layout") == "xbox", deck = on_deck();
+    bool x = layout_xbox(), deck = on_deck();
     if (n == "a") return x ? "A" : "B";
     if (n == "b") return x ? "B" : "A";
     if (n == "x") return x ? "X" : "Y";
@@ -2010,8 +2036,9 @@ static void screen_controls() {
         text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T("sec_layout"));
         cy = top + 52;
         row_label(cy, "row_layout");
-        if ((k = segmented("pad_layout", 748, cy, LAYOUT_OPTS, opt_index(LAYOUT_OPTS, cfg_get("pad_layout")))) >= 0)
-            cfg_set("pad_layout", LAYOUT_OPTS[k].value);
+        // stored only when it differs from the platform's default (the Xbox one on the Steam Deck)
+        if ((k = segmented("pad_layout", 748, cy, LAYOUT_OPTS, layout_xbox() ? 1 : 0)) >= 0)
+            cfg_set("pad_layout", !SDL_strcmp(LAYOUT_OPTS[k].value, on_deck() ? "xbox" : "nintendo") ? "" : LAYOUT_OPTS[k].value);
         float h = rich(g_media.small, 52, cy + 24, 696, {{T("layout_note"), C_SUB}}, 17);
         float bottom = cy + 24 + h + 12;
         card(top, bottom);

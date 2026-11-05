@@ -159,6 +159,12 @@ static int nope(const char *what, const char *name) {   /* why the diamond is le
     return 0;
 }
 
+/* letter panes that say another letter (a button bound away from its place): their messages, changed when the game
+   reads its language's message archive (totk_ui_prompts_mals) */
+enum { MAXMSG = 16 };
+static struct { char label[25]; char letter; } msg[MAXMSG];
+static int nmsg;
+
 /* how a pane sits: translate, rotate, scale (0x24 bytes from +0x2C), origin and, for a text, its position */
 typedef struct { uint8_t srt[0x24], origin, textpos; } sit;
 static sit sit_of(const uint8_t *d, const pane *p) {
@@ -176,6 +182,7 @@ static void sit_set(uint8_t *d, const pane *p, const sit *s) {
 
 static int diamond(uint8_t *blarc, size_t n) {
     size_t lo, hi;
+    nmsg = 0;
     if (!totk_sarc_member(blarc, n, "blyt/DoCommand_00.bflyt", &lo, &hi) || !panes(blarc, lo, hi)) return nope("no layout", NULL);
     uint8_t *d = blarc;
     /* the action's box and words: X's open to the right, Y's to the left (the templates); per group the panes that turn
@@ -269,10 +276,23 @@ static int diamond(uint8_t *blarc, size_t n) {
         if (!strcmp(p->kind, "pan1") && (k = named(p->name, "N_Loop")) >= 0) group = k;
         else if (!strcmp(p->kind, "pan1") && (k = named(p->name, "N_Stop")) >= 0) group = k;
         if (strcmp(p->kind, "txt1") || (k = named(p->name, "T_")) < 0 || group < 0) continue;
-        int to = -1;
-        for (int q = 0; q < 4; q++) if (letter_at(q) == k) to = q;
-        if (to == place[group]) d[p->at + 8] &= (uint8_t)~1;   /* under the marked button: hidden */
-        else set_t(d, p, LETTER[to][0], LETTER[to][1]);
+        int to = -1, own = -1;
+        for (int q = 0; q < 4; q++) {
+            if (letter_at(q) == k) to = q;
+            if (letter_at(q) == group) own = q;   /* where the group's own letter is on the pad */
+        }
+        if (to == place[group]) {
+            /* under the marked button: this pane goes where the group's own letter is on the pad (a button bound away
+               from its place leaves that place empty otherwise) and says that letter (host/fs.c: the game's messages,
+               totk_ui_prompts_message) */
+            if (own >= 0 && own != place[group] && nmsg < MAXMSG) {
+                set_t(d, p, LETTER[own][0], LETTER[own][1]);
+                snprintf(msg[nmsg].label, sizeof msg[nmsg].label, "%s", p->name);
+                msg[nmsg++].letter = LET[group];
+            } else
+                d[p->at + 8] &= (uint8_t)~1;   /* hidden */
+        } else
+            set_t(d, p, LETTER[to][0], LETTER[to][1]);
     }
     set_t(d, hold, RUSH[place[0]][0] - 29, RUSH[place[0]][1] - 6);   /* A's hold effect, (29, 6) in it */
     /* the action's box opens to the left on the left place, else to the right */
@@ -396,4 +416,68 @@ static int guide_keys(uint8_t *blarc, size_t n) {
 int totk_ui_prompts_apply(uint8_t *blarc, size_t n) {
     int a = diamond(blarc, n), b = guide_keys(blarc, n);
     return a || b;
+}
+
+/* ---- the letters' messages: LayoutMsg/DoCommand_00.msbt in the language's Mals/<lang>.Product.<n>.sarc (MSBT:
+   a 0x20-byte header, then sections of a 16-byte header and their data, each padded to 16; LBL1 hashes the labels to
+   their message index, TXT2 holds UTF-16 texts). Each label of msg[] gets its letter in place of its one letter: the
+   same size, so the archive keeps its size. */
+static int msbt_letters(uint8_t *m, size_t n) {
+    if (n < 0x20 || memcmp(m, "MsgStdBn", 8)) return 0;
+    size_t lbl = 0, txt = 0, pos = 0x20;
+    uint32_t lsize = 0, tsize = 0;
+    while (pos + 16 <= n) {
+        uint32_t size;
+        memcpy(&size, m + pos + 4, 4);
+        if (pos + 16 + size > n) return 0;
+        if (!memcmp(m + pos, "LBL1", 4)) lbl = pos + 16, lsize = size;
+        if (!memcmp(m + pos, "TXT2", 4)) txt = pos + 16, tsize = size;
+        pos += 16 + ((size + 15) & ~15u);
+    }
+    if (!lbl || !txt || lsize < 4 || tsize < 4) return 0;
+    uint32_t slots, count;
+    memcpy(&slots, m + lbl, 4);
+    memcpy(&count, m + txt, 4);
+    int done = 0;
+    for (uint32_t s = 0; s < slots && 4 + 8 * (size_t)s + 8 <= lsize; s++) {
+        uint32_t nl, off;
+        memcpy(&nl, m + lbl + 4 + 8 * s, 4);
+        memcpy(&off, m + lbl + 4 + 8 * s + 4, 4);
+        size_t o = lbl + off;
+        for (uint32_t j = 0; j < nl; j++) {
+            if (o + 1 > lbl + lsize) return done;
+            unsigned len = m[o];
+            if (o + 1 + len + 4 > lbl + lsize) return done;
+            uint32_t index;
+            memcpy(&index, m + o + 1 + len, 4);
+            for (int k = 0; k < nmsg; k++) {
+                if (strlen(msg[k].label) != len || memcmp(m + o + 1, msg[k].label, len) || index >= count) continue;
+                uint32_t at;
+                memcpy(&at, m + txt + 4 + 4 * index, 4);
+                uint8_t *t = m + txt + at;
+                /* exactly one capital letter, then the end: else (another language's own wording) left as it is */
+                if (txt + at + 4 > txt + tsize || t[1] || t[0] < 'A' || t[0] > 'Z' || t[2] || t[3]) continue;
+                t[0] = (uint8_t)msg[k].letter;
+                done++;
+            }
+            o += 1 + len + 4;
+        }
+    }
+    return done;
+}
+static int mals_edit(uint8_t *sarc, size_t n, void *ctx) {
+    (void)ctx;
+    size_t lo, hi;
+    if (!totk_sarc_member(sarc, n, "LayoutMsg/DoCommand_00.msbt", &lo, &hi)) return 0;
+    int done = msbt_letters(sarc + lo, hi - lo);
+    fprintf(stderr, "[totk] button prompts: %d of %d diamond letters say the pad's letter\n", done, nmsg);
+    return done > 0;
+}
+int totk_zs_edit(const void *in, size_t n, const void *dicts_z, size_t dn, int (*edit)(uint8_t *raw, size_t n, void *ctx),
+                 void *ctx, void **out, size_t *out_n);   /* host/ui_capture.c */
+/* host/fs.c, when the game opens Mals/<lang>...sarc.zs: the archive with the letters changed, 0 when there is nothing
+   to change (the layout's prompts are the game's, or no letter moved). */
+int totk_ui_prompts_mals(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n) {
+    *out = NULL;
+    return nmsg ? totk_zs_edit(in, n, dicts_z, dn, mals_edit, NULL, out, out_n) : 0;
 }
