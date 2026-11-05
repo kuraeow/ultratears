@@ -97,14 +97,14 @@ static int move_keys(uint8_t *d, size_t lo, size_t hi, const char *const *panes,
 }
 
 int totk_ui_aspect_apply(uint8_t *blarc, size_t n, unsigned w, unsigned h);   // host/ui_aspect.c
-int totk_ui_prompts_apply(uint8_t *blarc, size_t n, int deck);                 // host/ui_prompts.c
+int totk_ui_prompts_apply(uint8_t *blarc, size_t n);                           // host/ui_prompts.c
 // (host/ui_prompts.c) the member of a SARC named name: [*lo, *hi)
 int totk_sarc_member(const uint8_t *d, size_t n, const char *name, size_t *lo, size_t *hi) { return sarc_member(d, n, name, lo, hi); }
 
 /* in: the RomFS file (zstd with a dictionary of dicts, the decompressed Pack/ZsDic.pack.zs); out: the fixed file,
    compressed with the same dictionary (malloc). capture: the quick menus' background at once (above 30 fps); w x h: an
-   output of another shape than 16:9, the layouts for it (host/ui_aspect.c; 0 x 0 none); prompts: the button prompts for
-   the Xbox layout (host/ui_prompts.c; 1, 2 with the Steam Deck's names, 0 none). Each part that does not find
+   output of another shape than 16:9, the layouts for it (host/ui_aspect.c; 0 x 0 none); prompts: the button prompts
+   after the player's controls (host/ui_prompts.c; 0 none). Each part that does not find
    the archive as expected is left out and says so. 1 when anything was done; 0 leaves the game's file as it is. */
 int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
                   int prompts, void **out, size_t *out_n) {
@@ -157,7 +157,7 @@ int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int 
     }
     if (w && h && totk_ui_aspect_apply(blarc, (size_t)raw, w, h))
         done_any = 1;
-    if (prompts && totk_ui_prompts_apply(blarc, (size_t)raw, prompts == 2))
+    if (prompts && totk_ui_prompts_apply(blarc, (size_t)raw))
         done_any = 1;
     if (!done_any) goto done;
     size_t cap = ZSTD_compressBound((size_t)raw);

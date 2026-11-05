@@ -240,9 +240,9 @@ static void heapdef_overlay(void) {
     // output of another shape than 16:9 the layouts are laid out for it (host/ui_aspect.c)
     unsigned aw = 0, ah = 0;
     int capture = totk_fr_fps60(), aspect = totk_aspect_output(&aw, &ah);
-    // the button prompts for the Xbox / Steam Deck layout (host/ui_prompts.c; pad_layout=xbox, window_sdl.c binds_load)
-    const char *layout = getenv("TOTK_BIND_pad_layout"), *deck = getenv("SteamDeck");
-    int prompts = layout && !strcmp(layout, "xbox") ? (deck && !strcmp(deck, "1") ? 2 : 1) : 0;
+    // the button prompts after the player's controls: the Xbox layout, buttons bound elsewhere (host/ui_prompts.c)
+    int totk_ui_prompts_wanted(void);
+    int prompts = totk_ui_prompts_wanted();
     if (!capture && !aspect && !prompts) return;
     in = rom_file(UI_COMMON, 64u << 20, &n);
     void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
@@ -251,7 +251,7 @@ static void heapdef_overlay(void) {
         ovr_add(UI_COMMON, out, out_n);
         fprintf(stderr, "[totk] RomFS: %s served%s%s%s (%.0f ms)\n", UI_COMMON,
                 capture ? ", the quick menus' background captured at once" : "",
-                aspect ? ", the layouts for the output's shape" : "", prompts ? ", the Xbox layout's prompts" : "",
+                aspect ? ", the layouts for the output's shape" : "", prompts ? ", the button prompts after the controls" : "",
                 (runtime_now_ns() - t0) / 1e6);
     } else if (!in || !dicts)
         fprintf(stderr, "[totk] RomFS: %s or %s missing: the game's own layouts\n", UI_COMMON, ZS_DICTS);

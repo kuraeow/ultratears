@@ -1,18 +1,22 @@
-/* The game's button prompts for an Xbox / Steam Deck layout (pad_layout=xbox, window_sdl.c binds_load: Switch A is the
- * bottom face button, B the right one, X the left one, Y the top one). Applied to the decompressed
- * UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc at start (host/ui_capture.c totk_ui_build, host/fs.c serves the
- * result), on the player's machine; nothing changes size, so the game's resource size table holds.
+/* The game's button prompts after the player's controls (window_sdl.c binds_load: pad_layout=xbox puts Switch A on the
+ * bottom face button, B on the right, X on the left, Y on top; pad_<action> binds any action to other inputs). Applied
+ * to the decompressed UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc at start (host/ui_capture.c totk_ui_build,
+ * host/fs.c serves the result), on the player's machine; nothing changes size, so the game's resource size table holds.
  *
  *  - The action prompt (blyt/DoCommand_00.bflyt) is a diamond of the four face buttons with the one to press marked and
- *    its action written beside it. Each button has its group (N_A_00 ... N_Y_00, shown by DoCommand_00_ButtonPattern):
- *    the diamond's base (P_Base?_0n), the other three letters (T_?_0n) and the marked button (N_Btn?_0n: its key, the
- *    action's box and words). On the Switch A is on the right, B at the bottom, X on top, Y on the left. Here each
- *    button goes where it is on an Xbox pad: A and B, X and Y trade places, the base takes the other's look (texture,
- *    turn, mirror), and the action's box and words of X and Y trade sides (Y's open to the left: on an Xbox pad X is
- *    the left one). Every pane is checked against the Switch layout first; anything else leaves the archive as it is.
+ *    its action written beside it. Each Switch button has its group (N_A_00 ... N_Y_00, shown by
+ *    DoCommand_00_ButtonPattern): the diamond's base (P_Base?_0n), the other three letters (T_?_0n) and the marked
+ *    button (N_Btn?_0n: its key P_Key*, the action's box and words). On the Switch A is on the right, B at the bottom,
+ *    X on top, Y on the left. Here each group marks the place of the face button its Switch button is bound to, with
+ *    that button's letter in the layout (Xbox: A bottom, B right, X left, Y top); the base takes the look that marks
+ *    that place (the game's own two textures, turned), the action's box opens to the left on the left place, and the
+ *    other letters go to their places in the layout. A letter whose place is the marked one is hidden; a place whose
+ *    letter is the marked button's own (a button bound away from its place) stays without one: the panes' letters come
+ *    from the game's messages, one per pane. A Switch button bound to no face button keeps the layout's place.
+ *    Every pane is checked against the Switch layout first; anything else leaves the archive as it is.
  *  - The button guide in play (bottom right) draws L and ZL from timg/__Combined.bntx (Nt_KeyTexL_00, Nt_KeyTexZL_00:
- *    R8, 108 x 108, one level, block linear): the key's shape stays, its letters become LB / LT (L1 / L2 on the Steam
- *    Deck), drawn with Inter (compiled in, host/text_entry.c).
+ *    R8, 108 x 108, one level, block linear): the key's shape stays, its letters become the bound input's name (LB / LT,
+ *    L1 / L2 on the Steam Deck), drawn with Inter (compiled in, host/text_entry.c).
  * The prompts drawn in the game's button font (L, R, ZL, ZR, +, - in texts) are not changed here.
  * The idea of redrawing the guide's key images is MacNativeGames' / totk-pc-recomp's (MIT, tools/button_icons.py);
  * the diamond and the code are ours. */
@@ -29,6 +33,71 @@
 extern const unsigned char te_inter_ttf[];   /* host/text_entry.c */
 
 int totk_sarc_member(const uint8_t *d, size_t n, const char *name, size_t *lo, size_t *hi);   /* host/ui_capture.c */
+
+/* ---- the controls (as window_sdl.c binds_load reads them) */
+static int xbox_layout(void) { const char *v = getenv("TOTK_BIND_pad_layout"); return v && !strcmp(v, "xbox"); }
+static int on_deck(void) { const char *v = getenv("SteamDeck"); return v && !strcmp(v, "1"); }
+/* the first SDL gamepad name bound to the Switch action (pad_<id>), else the layout's default */
+static void bound(const char *id, const char *dflt, char *out, size_t cap) {
+    char var[48];
+    snprintf(var, sizeof var, "TOTK_BIND_pad_%s", id);
+    const char *v = getenv(var);
+    if (!v || !*v) v = dflt;
+    while (*v == ' ') v++;
+    size_t n = strcspn(v, ", ");
+    if (n >= cap) n = cap - 1;
+    memcpy(out, v, n), out[n] = 0;
+}
+/* places, as the Switch's buttons are: 0 right (A), 1 bottom (B), 2 top (X), 3 left (Y) */
+static int place_of(const char *sdl) {   /* SDL names face buttons by place: a bottom, b right, x left, y top */
+    return !strcmp(sdl, "b") ? 0 : !strcmp(sdl, "a") ? 1 : !strcmp(sdl, "y") ? 2 : !strcmp(sdl, "x") ? 3 : -1;
+}
+/* the letter (0 A, 1 B, 2 X, 3 Y) on each place in the layout */
+static int letter_at(int place) {
+    static const int xbox[4] = {1, 0, 3, 2};   /* right B, bottom A, top Y, left X */
+    return xbox_layout() ? xbox[place] : place;
+}
+static const char *const FACE_ID[4] = {"a", "b", "x", "y"};
+static int face_place(int k) {   /* where Switch button k is: its binding's place, else the layout's */
+    static const char *const nin[4] = {"b", "a", "y", "x"}, *const xb[4] = {"a", "b", "x", "y"};
+    char s[32];
+    bound(FACE_ID[k], xbox_layout() ? xb[k] : nin[k], s, sizeof s);
+    int p = place_of(s);
+    if (p < 0) {
+        fprintf(stderr, "[totk] button prompts: %c is bound to %s, not a face button: the diamond marks the layout's place\n", "ABXY"[k], s);
+        p = place_of(xbox_layout() ? xb[k] : nin[k]);
+    }
+    return p;
+}
+/* an input's name in the layout (the guide's keys) */
+static const char *input_label(const char *n) {
+    int x = xbox_layout(), deck = on_deck(), p = place_of(n);
+    static const char *const L[4] = {"A", "B", "X", "Y"};
+    if (p >= 0) return L[letter_at(p)];
+    if (!strcmp(n, "leftshoulder")) return deck ? "L1" : x ? "LB" : "L";
+    if (!strcmp(n, "rightshoulder")) return deck ? "R1" : x ? "RB" : "R";
+    if (!strcmp(n, "lefttrigger")) return deck ? "L2" : x ? "LT" : "ZL";
+    if (!strcmp(n, "righttrigger")) return deck ? "R2" : x ? "RT" : "ZR";
+    if (!strcmp(n, "back")) return x || deck ? "View" : "-";
+    if (!strcmp(n, "start")) return x || deck ? "Menu" : "+";
+    if (!strcmp(n, "leftstick")) return "LS";
+    if (!strcmp(n, "rightstick")) return "RS";
+    if (!strncmp(n, "paddle", 6)) return n[6] == '1' ? "P1" : n[6] == '2' ? "P2" : n[6] == '3' ? "P3" : "P4";
+    return NULL;   /* (the d-pad and the rest: the game's key stays) */
+}
+
+/* Whether the prompts differ from the game's: the Xbox layout, or a face button, L or ZL bound elsewhere. */
+int totk_ui_prompts_wanted(void) {
+    if (xbox_layout()) return 1;
+    static const char *const ids[] = {"a", "b", "x", "y", "l", "zl"};
+    for (unsigned i = 0; i < sizeof ids / sizeof *ids; i++) {
+        char var[48];
+        snprintf(var, sizeof var, "TOTK_BIND_pad_%s", ids[i]);
+        const char *v = getenv(var);
+        if (v && *v) return 1;
+    }
+    return 0;
+}
 
 /* ---- the layout's panes */
 enum { MAXP = 1024 };
@@ -64,20 +133,20 @@ static pane *find(const char *name) {
     for (int i = 0; i < NP; i++) if (!strcmp(P[i].name, name)) return &P[i];
     return NULL;
 }
-/* pane fields: origin +0x09, translate +0x2C, rotate +0x38, scale +0x44; picture material +0x64; text position +0x5C */
+/* pane fields: flags +0x08 (bit 0 shown), origin +0x09, translate +0x2C, rotate +0x38, scale +0x44; picture material
+   +0x64; text position +0x5C */
 static void get_t(const uint8_t *d, const pane *p, float t[2]) { memcpy(t, d + p->at + 0x2C, 8); }
 static void set_t(uint8_t *d, const pane *p, float x, float y) { float t[2] = {x, y}; memcpy(d + p->at + 0x2C, t, 8); }
 static int near(const float t[2], float x, float y) { return fabsf(t[0] - x) < 0.5f && fabsf(t[1] - y) < 0.5f; }
 
-/* where each face button and its letter are on the Switch (A right, B bottom, X top, Y left) */
-static const char LET[4] = {'A', 'B', 'X', 'Y'};
+/* by place (0 right, 1 bottom, 2 top, 3 left): the marked button, the other letters, the press effects */
 static const float BTN[4][2] = {{39, 0}, {0, -39}, {0, 39}, {-39, 0}};
 static const float LETTER[4][2] = {{39, 1}, {2, -39}, {1, 39}, {-38, 0}};
 static const float RUSH[4][2] = {{129, 6}, {90, -38}, {90, 38}, {-129, 0}};
-static int partner(int k) { return k ^ 1; }   /* A <-> B, X <-> Y */
+static const char LET[4] = {'A', 'B', 'X', 'Y'};
 static int letter_index(char c) { for (int k = 0; k < 4; k++) if (LET[k] == c) return k; return -1; }
 
-/* the pane's name is <prefix><letter><suffix> with suffix "_0<digit>": the letter's index, else -1 */
+/* the pane's name is <prefix><letter>_0<digit>: the letter's index, else -1 */
 static int named(const char *name, const char *prefix) {
     size_t n = strlen(prefix);
     if (strncmp(name, prefix, n)) return -1;
@@ -85,40 +154,60 @@ static int named(const char *name, const char *prefix) {
     if (k < 0 || name[n + 1] != '_' || name[n + 2] != '0' || name[n + 3] < '0' || name[n + 3] > '9' || name[n + 4]) return -1;
     return k;
 }
-/* two panes trade where they are and how they face: translate, rotate, scale, origin (and a text's position) */
-static void trade(uint8_t *d, const pane *a, const pane *b) {
-    uint8_t t[0x24], o;
-    memcpy(t, d + a->at + 0x2C, 0x24); memcpy(d + a->at + 0x2C, d + b->at + 0x2C, 0x24); memcpy(d + b->at + 0x2C, t, 0x24);
-    o = d[a->at + 9]; d[a->at + 9] = d[b->at + 9]; d[b->at + 9] = o;
-    if (!strcmp(a->kind, "txt1") && !strcmp(b->kind, "txt1")) { o = d[a->at + 0x5C]; d[a->at + 0x5C] = d[b->at + 0x5C]; d[b->at + 0x5C] = o; }
-}
-
 static int nope(const char *what, const char *name) {   /* why the diamond is left as it is, into the log */
     fprintf(stderr, "[totk] button prompts: DoCommand_00 is not as the Switch layout (%s%s%s)\n", what, name ? " " : "", name ? name : "");
     return 0;
+}
+
+/* how a pane sits: translate, rotate, scale (0x24 bytes from +0x2C), origin and, for a text, its position */
+typedef struct { uint8_t srt[0x24], origin, textpos; } sit;
+static sit sit_of(const uint8_t *d, const pane *p) {
+    sit s;
+    memcpy(s.srt, d + p->at + 0x2C, 0x24);
+    s.origin = d[p->at + 9];
+    s.textpos = !strcmp(p->kind, "txt1") ? d[p->at + 0x5C] : 0;
+    return s;
+}
+static void sit_set(uint8_t *d, const pane *p, const sit *s) {
+    memcpy(d + p->at + 0x2C, s->srt, 0x24);
+    d[p->at + 9] = s->origin;
+    if (!strcmp(p->kind, "txt1")) d[p->at + 0x5C] = s->textpos;
 }
 
 static int diamond(uint8_t *blarc, size_t n) {
     size_t lo, hi;
     if (!totk_sarc_member(blarc, n, "blyt/DoCommand_00.bflyt", &lo, &hi) || !panes(blarc, lo, hi)) return nope("no layout", NULL);
     uint8_t *d = blarc;
-    /* the X / Y pairs whose sides trade (each a box and words that open to the right for X, to the left for Y) */
-    static const char *const sides[][2] = {
+    /* the action's box and words: X's open to the right, Y's to the left (the templates); per group the panes that turn
+       when its button goes to the other side (A's second button and its stop state included) */
+    static const char *const side[][2] = {
         {"P_CaptureX_00", "P_CaptureY_00"}, {"W_BaseX_00", "W_BaseY_00"}, {"T_GuideX_00", "T_GuideY_00"},
         {"T_GuideX_TW", "T_GuideY_TW"}, {"N_CaptureX_00", "N_CaptureY_00"}, {"T_CaptureGuideX_00", "T_CaptureGuideY_00"},
         {"T_CaptureGuideX_TW", "T_CaptureGuideY_TW"}, {"P_CaptureKeyX_00", "P_CaptureKeyY_00"}};
+    enum { NSIDE = sizeof side / sizeof *side };
+    static const char *const group_side[4][NSIDE + 4] = {
+        {"P_CaptureA_00", "W_BaseA_00", "T_GuideA_00", "T_GuideA_TW", "N_CaptureA_00", "T_CaptureGuideA_00",
+         "T_CaptureGuideA_TW", "P_CaptureKeyA_00", "P_CaptureA_04", "W_BaseA_01", "T_GuideA_01", "T_GuideA_TW_00"},
+        {"P_CaptureB_00", "W_BaseB_00", "T_GuideB_00", "T_GuideB_TW", "N_CaptureB_00", "T_CaptureGuideB_00",
+         "T_CaptureGuideB_TW", "P_CaptureKeyB_00"},
+        {"P_CaptureX_00", "W_BaseX_00", "T_GuideX_00", "T_GuideX_TW", "N_CaptureX_00", "T_CaptureGuideX_00",
+         "T_CaptureGuideX_TW", "P_CaptureKeyX_00"},
+        {"P_CaptureY_00", "W_BaseY_00", "T_GuideY_00", "T_GuideY_TW", "N_CaptureY_00", "T_CaptureGuideY_00",
+         "T_CaptureGuideY_TW", "P_CaptureKeyY_00"}};
+    /* the A group's extra ones map to these templates: P_CaptureA_04 like P_Capture?_00, W_BaseA_01 like W_Base?_00, ... */
+    static const int extra_tpl[4] = {0, 1, 2, 3};
     /* 1. every pane as the Switch layout has it, before anything changes */
     struct { pane *p; int k; int what; } todo[256];
     int nt = 0, bases = 0;
-    pane *base[4] = {0};
-    uint8_t look[4][0x24];   /* rotate, scale (from +0x38) are kept with the material below */
-    uint16_t mat[4];
+    uint8_t look[4][0x14];   /* rotate, scale (from +0x38) */
+    uint16_t mat[4], keymat[4];
+    int keys = 0;
     for (int i = 0; i < NP && nt < 256; i++) {
         pane *p = &P[i];
         float t[2];
         get_t(d, p, t);
         int k;
-        if (!strcmp(p->kind, "txt1") && !strncmp(p->name, "T_", 2) && (k = named(p->name, "T_")) >= 0) {
+        if (!strcmp(p->kind, "txt1") && (k = named(p->name, "T_")) >= 0) {
             if (!near(t, LETTER[k][0], LETTER[k][1])) return nope("a letter elsewhere:", p->name);
             todo[nt].p = p, todo[nt].k = k, todo[nt++].what = 0;
         } else if (!strcmp(p->kind, "pan1") && ((k = named(p->name, "N_Btn")) >= 0 || (k = named(p->name, "N_CompanionBtn")) >= 0)) {
@@ -126,7 +215,6 @@ static int diamond(uint8_t *blarc, size_t n) {
             todo[nt].p = p, todo[nt].k = k, todo[nt++].what = 1;
         } else if (!strcmp(p->kind, "pic1") && (k = named(p->name, "P_Base")) >= 0) {
             if (!strcmp(p->name + 7, "_00")) {
-                base[k] = p;
                 memcpy(look[k], d + p->at + 0x38, 0x14);
                 memcpy(&mat[k], d + p->at + 0x64, 2);
                 bases++;
@@ -134,32 +222,73 @@ static int diamond(uint8_t *blarc, size_t n) {
             todo[nt].p = p, todo[nt].k = k, todo[nt++].what = 2;
         } else if (!strcmp(p->kind, "pic1") && !strncmp(p->name, "P_Capture", 9) && (k = letter_index(p->name[9])) >= 0 &&
                    p->name[10] == '_' && p->name[11] == '0' && p->name[12] >= '1' && p->name[12] <= '3' && !p->name[13]) {
-            if (!near(t, RUSH[k][0], RUSH[k][1]) && !(k == 0 && near(t, 29, 6))) return nope("an effect elsewhere:", p->name);   /* (A's hold: below) */
+            if (!near(t, RUSH[k][0], RUSH[k][1]) && !(k == 0 && near(t, 29, 6))) return nope("an effect elsewhere:", p->name);
             if (near(t, RUSH[k][0], RUSH[k][1])) todo[nt].p = p, todo[nt].k = k, todo[nt++].what = 3;
+        } else if (!strcmp(p->kind, "pic1") && !strncmp(p->name, "P_Key", 5) && p->name[6] == '_' && p->name[7] == '0' && !p->name[9]) {
+            /* the marked key's picture: P_KeyA_0n (A), P_KeyB_00, P_KeyX_00, P_Key0_00 (Y's) */
+            int kk = p->name[5] == '0' ? 3 : letter_index(p->name[5]);
+            if (kk < 0) continue;
+            if (!strcmp(p->name + 6, "_00")) memcpy(&keymat[kk], d + p->at + 0x64, 2), keys |= 1 << kk;
+            todo[nt].p = p, todo[nt].k = kk, todo[nt++].what = 4;
         }
     }
     pane *hold = find("N_LoopA_03");
     float ht[2] = {0, 0};
     if (hold) get_t(d, hold, ht);
     if (bases != 4) return nope("not four diamond bases", NULL);
+    if (keys != 15) return nope("not four keys", NULL);
     if (nt < 20) return nope("too few panes", NULL);
     if (!hold || !near(ht, 100, 0)) return nope("the hold effect elsewhere", NULL);
-    for (unsigned s = 0; s < sizeof sides / sizeof *sides; s++)
-        if (!find(sides[s][0]) || !find(sides[s][1])) return nope("missing", find(sides[s][0]) ? sides[s][1] : sides[s][0]);
-    /* 2. where they go on an Xbox pad */
+    sit tpl[2][NSIDE];   /* [0] opens to the right (X's), [1] to the left (Y's) */
+    for (int s = 0; s < NSIDE; s++) {
+        pane *a = find(side[s][0]), *b = find(side[s][1]);
+        if (!a || !b) return nope("missing", a ? side[s][1] : side[s][0]);
+        tpl[0][s] = sit_of(d, a), tpl[1][s] = sit_of(d, b);
+    }
+    /* 2. where each group's button is now */
+    int place[4], changed = 0;
+    for (int k = 0; k < 4; k++) changed |= (place[k] = face_place(k)) != k || letter_at(place[k]) != k;
+    if (!changed) return 0;   /* the game's own */
     for (int i = 0; i < nt; i++) {
         pane *p = todo[i].p;
-        int q = partner(todo[i].k);
-        switch (todo[i].what) {
-        case 0: set_t(d, p, LETTER[q][0], LETTER[q][1]); break;
-        case 1: set_t(d, p, BTN[q][0], BTN[q][1]); break;
-        case 2: memcpy(d + p->at + 0x38, look[q], 0x14); memcpy(d + p->at + 0x64, &mat[q], 2); break;
-        case 3: set_t(d, p, RUSH[q][0], RUSH[q][1]); break;
+        int k = todo[i].k;
+        switch (todo[i].what) {   /* (the letters, what 0: below, by the group they are in) */
+        case 1: set_t(d, p, BTN[place[k]][0], BTN[place[k]][1]); break;
+        case 2: memcpy(d + p->at + 0x38, look[place[k]], 0x14); memcpy(d + p->at + 0x64, &mat[place[k]], 2); break;
+        case 3: set_t(d, p, RUSH[place[k]][0], RUSH[place[k]][1]); break;
+        case 4: memcpy(d + p->at + 0x64, &keymat[letter_at(place[k])], 2); break;   /* the letter on that place */
+        default: break;
         }
     }
-    set_t(d, hold, RUSH[1][0] - 29, RUSH[1][1] - 6);   /* A's hold effect, (29, 6) in it: where B's rush is */
-    for (unsigned s = 0; s < sizeof sides / sizeof *sides; s++) trade(d, find(sides[s][0]), find(sides[s][1]));
-    return nt;
+    /* the other letters: each to its place in the layout; hidden where its place is the group's marked one. A letter
+       pane belongs to the group whose pane block it is in: the T_<L>_<n> panes of group G follow G's N_Loop?_00 */
+    int group = -1;
+    for (int i = 0; i < NP; i++) {
+        pane *p = &P[i];
+        int k;
+        if (!strcmp(p->kind, "pan1") && (k = named(p->name, "N_Loop")) >= 0) group = k;
+        else if (!strcmp(p->kind, "pan1") && (k = named(p->name, "N_Stop")) >= 0) group = k;
+        if (strcmp(p->kind, "txt1") || (k = named(p->name, "T_")) < 0 || group < 0) continue;
+        int to = -1;
+        for (int q = 0; q < 4; q++) if (letter_at(q) == k) to = q;
+        if (to == place[group]) d[p->at + 8] &= (uint8_t)~1;   /* under the marked button: hidden */
+        else set_t(d, p, LETTER[to][0], LETTER[to][1]);
+    }
+    set_t(d, hold, RUSH[place[0]][0] - 29, RUSH[place[0]][1] - 6);   /* A's hold effect, (29, 6) in it */
+    /* the action's box opens to the left on the left place, else to the right */
+    for (int k = 0; k < 4; k++) {
+        int left = place[k] == 3;
+        if (left == (k == 3)) continue;   /* as on the Switch */
+        for (int s = 0; s < NSIDE + 4 && group_side[k][s]; s++) {
+            pane *p = find(group_side[k][s]);
+            if (p) sit_set(d, p, &tpl[left][s < NSIDE ? s : extra_tpl[s - NSIDE]]);
+        }
+    }
+    static const char *const where[4] = {"right", "bottom", "top", "left"};
+    fprintf(stderr, "[totk] button prompts: A %s (%c), B %s (%c), X %s (%c), Y %s (%c)\n", where[place[0]], LET[letter_at(place[0])],
+            where[place[1]], LET[letter_at(place[1])], where[place[2]], LET[letter_at(place[2])], where[place[3]],
+            LET[letter_at(place[3])]);
+    return 1;
 }
 
 /* ---- the button guide's L and ZL keys */
@@ -194,7 +323,8 @@ static int texture(const uint8_t *b, size_t n, const char *name, size_t *data, u
 }
 
 /* The key's letters replaced: inside the key everything white again (row by row between its edges), then the new
-   label cut out in black, centred on the key, as tall as the game's letters (about 38 % of the image), bold. */
+   label cut out in black, centred on the key, as tall as the game's letters (about 38 % of the image; smaller for a
+   long name), bold. */
 static void relabel(uint8_t *b, size_t data, unsigned w, unsigned h, unsigned bh, const char *label) {
     uint8_t *px = malloc((size_t)w * h);
     if (!px) return;
@@ -215,6 +345,8 @@ static void relabel(uint8_t *b, size_t data, unsigned w, unsigned h, unsigned bh
         float cap = h * 0.38f, scale = stbtt_ScaleForPixelHeight(&f, cap / 0.73f);   /* Inter's capitals: 0.73 em */
         int adv_total = 0, lsb;
         for (const char *c = label; *c; c++) { int adv; stbtt_GetCodepointHMetrics(&f, *c, &adv, &lsb); adv_total += adv; }
+        float room = (x1 - x0) * 0.8f;   /* a long name ("Menu") smaller, within the key */
+        if (adv_total * scale > room) cap *= room / (adv_total * scale), scale = room / adv_total;
         float tw = adv_total * scale, pen = (x0 + x1 + 1) / 2.0f - tw / 2.0f, base = (y0 + y1 + 1) / 2.0f + cap / 2.0f;
         static uint8_t g[128 * 128];
         for (const char *c = label; *c; c++) {
@@ -240,24 +372,28 @@ static void relabel(uint8_t *b, size_t data, unsigned w, unsigned h, unsigned bh
     free(px);
 }
 
-static int guide_keys(uint8_t *blarc, size_t n, int deck) {
+static int guide_keys(uint8_t *blarc, size_t n) {
+    char l[32], zl[32];
+    bound("l", "leftshoulder", l, sizeof l);
+    bound("zl", "lefttrigger", zl, sizeof zl);
+    const char *ll = input_label(l), *zll = input_label(zl);
+    int do_l = ll && strcmp(ll, "L"), do_zl = zll && strcmp(zll, "ZL");   /* (the game's own: nothing to draw) */
+    if (!do_l && !do_zl) return 0;
     size_t lo, hi, dl, dz;
     unsigned w, h, bh, w2, h2, bh2;
     if (!totk_sarc_member(blarc, n, "timg/__Combined.bntx", &lo, &hi) || memcmp(blarc + lo, "BNTX", 4)) return 0;
     uint8_t *b = blarc + lo;
     size_t bn = hi - lo;
     if (!texture(b, bn, "Nt_KeyTexL_00", &dl, &w, &h, &bh) || !texture(b, bn, "Nt_KeyTexZL_00", &dz, &w2, &h2, &bh2)) return 0;
-    relabel(b, dl, w, h, bh, deck ? "L1" : "LB");
-    relabel(b, dz, w2, h2, bh2, deck ? "L2" : "LT");
+    if (do_l) relabel(b, dl, w, h, bh, ll);
+    if (do_zl) relabel(b, dz, w2, h2, bh2, zll);
+    fprintf(stderr, "[totk] button prompts: the guide's keys %s / %s\n", do_l ? ll : "L", do_zl ? zll : "ZL");
     return 1;
 }
 
-/* The prompts for the Xbox / Steam Deck layout into the decompressed layout archive. deck: the guide's keys named as the
-   Steam Deck's (L1, L2). 1 when anything changed; each part that does not find the archive as the Switch's leaves it. */
-int totk_ui_prompts_apply(uint8_t *blarc, size_t n, int deck) {
-    int a = diamond(blarc, n), b = guide_keys(blarc, n, deck);
-    fprintf(stderr, "[totk] button prompts for the Xbox layout: the action diamond %s, the guide's keys %s\n",
-            a ? "rearranged (A bottom, B right, X left, Y top)" : "not as expected: left as it is",
-            b ? (deck ? "L1 / L2" : "LB / LT") : "not as expected: left as they are");
+/* The prompts after the player's controls into the decompressed layout archive. 1 when anything changed; each part
+   that does not find the archive as the Switch's leaves it. */
+int totk_ui_prompts_apply(uint8_t *blarc, size_t n) {
+    int a = diamond(blarc, n), b = guide_keys(blarc, n);
     return a || b;
 }
