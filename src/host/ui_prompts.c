@@ -17,7 +17,8 @@
  *  - The button guide in play (bottom right) draws L and ZL from timg/__Combined.bntx (Nt_KeyTexL_00, Nt_KeyTexZL_00:
  *    R8, 108 x 108, one level, block linear): the key's shape stays, its letters become the bound input's name (LB / LT,
  *    L1 / L2 on the Steam Deck), drawn with Inter (compiled in, host/text_entry.c).
- * The prompts drawn in the game's button font (L, R, ZL, ZR, +, - in texts) are not changed here.
+ *  - The symbols in the game's texts (its button font, in the Font archives): each action's symbol becomes that of the button
+ *    it is bound to (below, totk_ui_prompts_font).
  * The idea of redrawing the guide's key images is MacNativeGames' / totk-pc-recomp's (MIT, tools/button_icons.py);
  * the diamond and the code are ours. */
 #include <math.h>
@@ -480,4 +481,230 @@ int totk_zs_edit(const void *in, size_t n, const void *dicts_z, size_t dn, int (
 int totk_ui_prompts_mals(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n) {
     *out = NULL;
     return nmsg ? totk_zs_edit(in, n, dicts_z, dn, mals_edit, NULL, out, out_n) : 0;
+}
+
+/* ---- the button font: the symbols the game writes in its texts ("press [A]") come from scft/External.bfotf in each
+   Font/Font*.Nin_NX_NVN.bfarc (SARC). A .bfotf is an OpenType (CFF) font behind an 8-byte header, every big-endian
+   32-bit word XORed with one key (bytes 4..8 are the font's size XORed with it). Each button's symbol is a glyph at a
+   private-use code (U+E040 A ...); an action bound to another button gets that button's glyph in its place. The glyphs
+   only change places (their charstrings in the CFF CharStrings INDEX and their hmtx metrics), so the font, the archive
+   and the game's resource size table keep their sizes. The symbols stay the Switch's: the layout's letters (the Xbox
+   layout's A is the Switch's A symbol), L / R / ZL / ZR for the shoulders, + / - for Menu / View. */
+static const struct { const char *id; unsigned cp; const char *nin, *xbox; } SYM[] = {
+    {"a", 0xE040, "b", "a"}, {"b", 0xE041, "a", "b"}, {"x", 0xE042, "y", "x"}, {"y", 0xE043, "x", "y"},
+    {"l", 0xE044, "leftshoulder", "leftshoulder"}, {"r", 0xE045, "rightshoulder", "rightshoulder"},
+    {"zl", 0xE046, "lefttrigger", "lefttrigger"}, {"zr", 0xE047, "righttrigger", "righttrigger"},
+    {"plus", 0xE04B, "start", "start"}, {"minus", 0xE04C, "back", "back"},
+    {"lstick", 0xE056, "leftstick", "leftstick"}, {"rstick", 0xE057, "rightstick", "rightstick"},
+    {"up", 0xE060, "dpup", "dpup"}, {"down", 0xE061, "dpdown", "dpdown"}, {"left", 0xE062, "dpleft", "dpleft"},
+    {"right", 0xE063, "dpright", "dpright"}};
+enum { NSYM = sizeof SYM / sizeof *SYM };
+static int sym_from[NSYM];   /* the glyph each action's place shows: SYM index */
+static int sym_state;        /* 0 not worked out, 1 the game's own, 2 changed */
+
+/* Each action shows the symbol of the button it is bound to (its first input); the result is always a permutation:
+   an action bound to nothing with a symbol, or to a button another action has too, keeps a symbol no one else shows. */
+static int sym_plan(void) {
+    if (sym_state) return sym_state == 2;
+    int used[NSYM] = {0}, x = xbox_layout(), odd = 0;
+    for (int k = 0; k < NSYM; k++) {
+        char s[32];
+        bound(SYM[k].id, x ? SYM[k].xbox : SYM[k].nin, s, sizeof s);
+        sym_from[k] = -1;
+        for (int j = 0; j < NSYM; j++)
+            if (!strcmp(s, x ? SYM[j].xbox : SYM[j].nin) && !used[j]) sym_from[k] = j, used[j] = 1;
+        if (sym_from[k] < 0) odd = 1;
+    }
+    for (int k = 0; k < NSYM; k++) {
+        if (sym_from[k] >= 0) continue;
+        int j = used[k] ? -1 : k;
+        for (int q = 0; j < 0 && q < NSYM; q++) if (!used[q]) j = q;
+        sym_from[k] = j, used[j] = 1;
+    }
+    int changed = 0;
+    for (int k = 0; k < NSYM; k++) changed |= sym_from[k] != k;
+    if (odd)
+        fprintf(stderr, "[totk] button font: an action is bound to no button with a symbol, or to one another action has "
+                        "too; it keeps a symbol no other action shows\n");
+    sym_state = changed ? 2 : 1;
+    return changed;
+}
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static void wbe32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24), p[1] = (uint8_t)(v >> 16), p[2] = (uint8_t)(v >> 8), p[3] = (uint8_t)v; }
+
+/* the glyph of cp from a format 4 subtable of the cmap at [c, c + cn); 0 none */
+static unsigned cmap_glyph(const uint8_t *f, size_t c, size_t cn, unsigned cp) {
+    if (cn < 4) return 0;
+    unsigned nt = be16(f + c + 2);
+    for (unsigned t = 0; t < nt && 4 + 8 * (size_t)t + 8 <= cn; t++) {
+        size_t s = c + be32(f + c + 4 + 8 * t + 4);
+        if (s + 14 > c + cn || be16(f + s) != 4) continue;
+        size_t len = be16(f + s + 2), segs = be16(f + s + 6) / 2;
+        if (s + len > c + cn || 16 + 8 * segs > len) continue;
+        size_t ends = s + 14, starts = ends + 2 * segs + 2, deltas = starts + 2 * segs, ranges = deltas + 2 * segs;
+        for (size_t i = 0; i < segs; i++) {
+            unsigned end = be16(f + ends + 2 * i), start = be16(f + starts + 2 * i);
+            if (cp > end || cp < start) continue;
+            unsigned delta = be16(f + deltas + 2 * i), ro = be16(f + ranges + 2 * i);
+            if (!ro) return (cp + delta) & 0xFFFF;
+            size_t g = ranges + 2 * i + ro + 2 * (cp - start);
+            if (g + 2 > s + len) return 0;
+            unsigned v = be16(f + g);
+            return v ? (v + delta) & 0xFFFF : 0;
+        }
+    }
+    return 0;
+}
+
+/* a CFF INDEX at p: its count, offset size and where its data start (offsets are 1-based from there); 0 malformed */
+static int cff_index(const uint8_t *f, size_t lo, size_t hi, size_t p, unsigned *count, unsigned *osz, size_t *data, size_t *end) {
+    if (p + 2 > hi || p < lo) return 0;
+    *count = be16(f + p);
+    if (!*count) { *osz = 0, *data = *end = p + 2; return 1; }
+    if (p + 3 > hi) return 0;
+    *osz = f[p + 2];
+    if (*osz < 1 || *osz > 4 || p + 3 + (size_t)(*count + 1) * *osz > hi) return 0;
+    *data = p + 3 + (size_t)(*count + 1) * *osz - 1;
+    size_t last = 0;
+    for (unsigned b = 0; b < *osz; b++) last = last << 8 | f[p + 3 + (size_t)*count * *osz + b];
+    *end = *data + last;
+    return *end <= hi;
+}
+static size_t cff_off(const uint8_t *f, size_t p, unsigned osz, unsigned i) {   /* offset i of the INDEX at p */
+    size_t v = 0;
+    for (unsigned b = 0; b < osz; b++) v = v << 8 | f[p + 3 + (size_t)i * osz + b];
+    return v;
+}
+/* the Top DICT at [a, b): its CharStrings offset (operator 17); 0 if absent or the font is CID-keyed (ROS, 12 30:
+   glyphs with their own private dicts, not swapped here) */
+static size_t cff_charstrings(const uint8_t *f, size_t a, size_t b) {
+    long st[48];
+    int ns = 0;
+    size_t cs = 0;
+    for (size_t p = a; p < b;) {
+        unsigned v = f[p];
+        if (v <= 21) {
+            unsigned op = v;
+            p++;
+            if (v == 12) { if (p >= b) return 0; op = 1200 + f[p++]; }
+            if (op == 1230) return 0;
+            if (op == 17 && ns == 1) cs = (size_t)st[0];
+            ns = 0;
+            continue;
+        }
+        long x;
+        if (v == 28) { if (p + 3 > b) return 0; x = (int16_t)be16(f + p + 1), p += 3; }
+        else if (v == 29) { if (p + 5 > b) return 0; x = (int32_t)be32(f + p + 1), p += 5; }
+        else if (v == 30) {   /* a real: its nibbles up to the end one */
+            for (p++; p < b && (f[p] & 15) != 15 && (f[p] >> 4) != 15; p++) {}
+            p++, x = 0;
+        } else if (v >= 32 && v <= 246) x = (long)v - 139, p++;
+        else if (v >= 247 && v <= 250) { if (p + 2 > b) return 0; x = (long)(v - 247) * 256 + f[p + 1] + 108, p += 2; }
+        else if (v >= 251 && v <= 254) { if (p + 2 > b) return 0; x = -(long)(v - 251) * 256 - f[p + 1] - 108, p += 2; }
+        else return 0;
+        if (ns < 48) st[ns++] = x;
+    }
+    return cs;
+}
+static uint32_t table_sum(const uint8_t *f, size_t at, size_t len) {
+    uint32_t s = 0;
+    for (size_t i = 0; i < len; i += 4) {
+        uint8_t w[4] = {0};
+        memcpy(w, f + at + i, len - i < 4 ? len - i : 4);
+        s += be32(w);
+    }
+    return s;
+}
+
+/* The OpenType font f (n bytes): the symbols' glyphs to their actions' places. 1 when done. */
+static int otf_swap(uint8_t *f, size_t n) {
+    if (n < 12 || memcmp(f, "OTTO", 4)) return 0;
+    unsigned nt = be16(f + 4);
+    size_t cff = 0, cffn = 0, cmap = 0, cmapn = 0, hmtx = 0, hmtxn = 0, hhea = 0, maxp = 0, head = 0, dir[4] = {0};
+    if (12 + 16 * (size_t)nt > n) return 0;
+    for (unsigned t = 0; t < nt; t++) {
+        const uint8_t *e = f + 12 + 16 * t;
+        size_t at = be32(e + 8), len = be32(e + 12);
+        if (at + len > n) return 0;
+        if (!memcmp(e, "CFF ", 4)) cff = at, cffn = len, dir[0] = 12 + 16 * t;
+        else if (!memcmp(e, "cmap", 4)) cmap = at, cmapn = len;
+        else if (!memcmp(e, "hmtx", 4)) hmtx = at, hmtxn = len, dir[1] = 12 + 16 * t;
+        else if (!memcmp(e, "hhea", 4) && len >= 36) hhea = at;
+        else if (!memcmp(e, "maxp", 4) && len >= 6) maxp = at;
+        else if (!memcmp(e, "head", 4) && len >= 12) head = at;
+    }
+    if (!cff || !cmap || !hmtx || !hhea || !maxp || !head) return 0;
+    unsigned glyphs = be16(f + maxp + 4), nh = be16(f + hhea + 34), gid[NSYM];
+    if (nh > glyphs || (size_t)nh * 4 > hmtxn) return 0;
+    for (int k = 0; k < NSYM; k++) {   /* every symbol a glyph with its own advance (not one of the shared-width tail) */
+        gid[k] = cmap_glyph(f, cmap, cmapn, SYM[k].cp);
+        if (!gid[k] || gid[k] >= nh) return 0;
+    }
+    /* the CFF: header, Name INDEX, Top DICT INDEX (its first dict) -> the CharStrings INDEX */
+    size_t lo = cff, hi = cff + cffn, d0, e0, d1, e1, d2, e2;
+    unsigned c0, o0, c1, o1, c2, o2;
+    if (cffn < 4 || !cff_index(f, lo, hi, lo + f[lo + 2], &c0, &o0, &d0, &e0) || !cff_index(f, lo, hi, e0, &c1, &o1, &d1, &e1) || c1 < 1)
+        return 0;
+    size_t cs = cff_charstrings(f, d1 + cff_off(f, e0, o1, 0), d1 + cff_off(f, e0, o1, 1));
+    if (!cs || !cff_index(f, lo, hi, lo + cs, &c2, &o2, &d2, &e2) || c2 != glyphs) return 0;
+    size_t csp = lo + cs, body = d2 + 1, total = e2 - body;
+    /* the charstrings and metrics as they are, then each symbol's place gets its source's */
+    uint8_t *old = malloc(total), met[NSYM][4];
+    size_t *off = malloc(sizeof *off * (glyphs + 1));
+    if (!old || !off) { free(old); free(off); return 0; }
+    memcpy(old, f + body, total);
+    for (unsigned g = 0; g <= glyphs; g++) off[g] = cff_off(f, csp, o2, g) - 1;
+    for (int k = 0; k < NSYM; k++) memcpy(met[k], f + hmtx + 4 * gid[k], 4);
+    size_t pos = 0;
+    for (unsigned g = 0; g < glyphs; g++) {
+        unsigned from = g;
+        for (int k = 0; k < NSYM; k++) if (gid[k] == g) from = gid[sym_from[k]];
+        size_t len = off[from + 1] - off[from];
+        if (off[from + 1] < off[from] || off[from + 1] > total || pos + len > total) { free(old); free(off); return 0; }
+        memcpy(f + body + pos, old + off[from], len);
+        pos += len;
+        size_t v = pos + 1;
+        for (int b = (int)o2 - 1; b >= 0; b--, v >>= 8) f[csp + 3 + (size_t)(g + 1) * o2 + b] = (uint8_t)v;
+    }
+    for (int k = 0; k < NSYM; k++) memcpy(f + hmtx + 4 * gid[k], met[sym_from[k]], 4);
+    free(old); free(off);
+    /* the two tables' checksums and the font's (head.checkSumAdjustment) */
+    wbe32(f + dir[0] + 4, table_sum(f, cff, cffn));
+    wbe32(f + dir[1] + 4, table_sum(f, hmtx, hmtxn));
+    wbe32(f + head + 8, 0);
+    wbe32(f + head + 8, 0xB1B0AFBAu - table_sum(f, 0, n));
+    return 1;
+}
+
+/* The archive's scft/External.bfotf decoded, its glyphs swapped, encoded again. */
+static int font_edit(uint8_t *sarc, size_t n, void *ctx) {
+    (void)ctx;
+    size_t lo, hi;
+    if (!totk_sarc_member(sarc, n, "scft/External.bfotf", &lo, &hi) || hi - lo < 16 || (hi - lo) % 4) return 0;
+    uint8_t *b = sarc + lo;
+    size_t fn = hi - lo - 8;
+    uint32_t key = be32(b + 4) ^ (uint32_t)fn;
+    if ((be32(b) ^ key) != 0x7f9a0218u) return 0;   /* (the magic, as host/shared_font.c reads system fonts) */
+    for (size_t i = 8; i < hi - lo; i += 4) wbe32(b + i, be32(b + i) ^ key);
+    int ok = otf_swap(b + 8, fn);
+    for (size_t i = 8; i < hi - lo; i += 4) wbe32(b + i, be32(b + i) ^ key);
+    if (!ok) fprintf(stderr, "[totk] button font: External.bfotf is not as expected; the game's symbols stay\n");
+    return ok;
+}
+/* host/fs.c, when the game opens Font/Font*.bfarc.zs: the archive with the button symbols after the controls, 0 when
+   they are the game's own (nothing rebound) or the font is not as expected. */
+int totk_ui_prompts_font(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n) {
+    *out = NULL;
+    if (!sym_plan()) return 0;
+    int ok = totk_zs_edit(in, n, dicts_z, dn, font_edit, NULL, out, out_n);
+    if (ok) {
+        char line[512];
+        int at = 0;
+        for (int k = 0; k < NSYM && at < (int)sizeof line - 32; k++)
+            if (sym_from[k] != k) at += snprintf(line + at, sizeof line - at, " %s=%s", SYM[k].id, SYM[sym_from[k]].id);
+        fprintf(stderr, "[totk] button font: symbols after the controls:%s\n", line);
+    }
+    return ok;
 }

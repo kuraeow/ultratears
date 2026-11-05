@@ -289,11 +289,12 @@ static int romfs_owns(const char *path) {
     return n && path && !strncmp(path, mount_name, n) && path[n] == ':';
 }
 static int romfs_handle(uint64_t h) { return h > ROM_BASE && h < ROM_BASE + NROM; }
-/* The language's message archive (Mals/<lang>.Product.<n>.sarc.zs), the first time the game opens it: the letters of
-   the action prompt's diamond that host/ui_prompts.c moved to another place say that place's letter (a button bound
-   away from its place). Built once per file, served from memory like the layouts. */
-static void mals_overlay(const char *p, uint64_t i) {
-    int totk_ui_prompts_mals(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+/* Built the first time the game opens them, served from memory like the layouts (host/ui_prompts.c):
+   - the language's message archive (Mals/<lang>.Product.<n>.sarc.zs): the letters of the action prompt's diamond that
+     moved to another place say that place's letter (a button bound away from its place);
+   - the font archives (Font/Font*.Nin_NX_NVN.bfarc.zs): the button symbols in the game's texts after the controls. */
+typedef int (*zs_builder)(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+static void lazy_overlay(const char *p, uint64_t i, zs_builder build, const char *what) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static uint64_t tried[32];
     static int ntried;
@@ -303,10 +304,11 @@ static void mals_overlay(const char *p, uint64_t i) {
     if (!seen && ntried < 32 && novr < NOVR) {
         tried[ntried++] = i;
         size_t n = 0, dn = 0, out_n = 0;
+        uint64_t t0 = runtime_now_ns();
         void *in = rom_file(p, 64u << 20, &n), *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL, *out = NULL;
-        if (in && dicts && totk_ui_prompts_mals(in, n, dicts, dn, &out, &out_n)) {
+        if (in && dicts && build(in, n, dicts, dn, &out, &out_n)) {
             ovr_add(p, out, out_n);
-            fprintf(stderr, "[totk] RomFS: %s served with the diamond's letters after the controls\n", p);
+            fprintf(stderr, "[totk] RomFS: %s served with %s (%.0f ms)\n", p, what, (runtime_now_ns() - t0) / 1e6);
         }
         free(in); free(dicts);
     }
@@ -319,7 +321,10 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!p) return R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
-    if (!strncmp(p, "Mals/", 5)) mals_overlay(p, i);
+    int totk_ui_prompts_mals(const void *, size_t, const void *, size_t, void **, size_t *);
+    int totk_ui_prompts_font(const void *, size_t, const void *, size_t, void **, size_t *);
+    if (!strncmp(p, "Mals/", 5)) lazy_overlay(p, i, totk_ui_prompts_mals, "the diamond's letters after the controls");
+    else if (!strncmp(p, "Font/Font", 9) && strstr(p, ".bfarc.zs")) lazy_overlay(p, i, totk_ui_prompts_font, "the button symbols after the controls");
     int fd = -1;
     if (rom_folder) {
         char full[8192];
