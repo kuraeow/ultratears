@@ -1893,27 +1893,70 @@ static std::string pad_label(const std::string &n) {
     if (n == "misc1") return "Share";
     return n;
 }
-// The input goes to this action and leaves any other that had it
-static void ctl_assign(bool pad, const std::string &id, const std::string &input) {
-    auto clear_from = [&](const Ctl *list, size_t n) {
+static std::string ctl_default(bool pad, const Ctl &c) { return pad ? (layout_xbox() ? c.pad_xbox : c.pad_nin) : c.keys; }
+static bool same_input(const std::string &a, const std::string &b) { return !SDL_strcasecmp(a.c_str(), b.c_str()); }
+static bool has_input(const std::vector<std::string> &l, const std::string &s) {
+    return std::any_of(l.begin(), l.end(), [&](const std::string &t) { return same_input(t, s); });
+}
+// Stored as the default (empty) when it is the default, "none" when nothing
+static void ctl_store(bool pad, const Ctl &c, const std::vector<std::string> &l) {
+    std::string v;
+    for (const std::string &s : l)
+        v += (v.empty() ? "" : ",") + s;
+    if (v.empty())
+        v = "none";
+    std::vector<std::string> def = split_list(ctl_default(pad, c));
+    bool is_def = def.size() == l.size();
+    for (size_t i = 0; is_def && i < l.size(); i++)
+        is_def = same_input(def[i], l[i]);
+    cfg_set(ctl_cfg(pad, c.id).c_str(), is_def ? "" : v);
+}
+// The inputs go to this action; an action that had one of them gets this action's old input in its place (a swap:
+// A to B's button gives B A's), so no action is left without one and no input does two
+static void ctl_set(bool pad, const Ctl &c, const std::vector<std::string> &inputs) {
+    std::vector<std::string> freed;
+    for (const std::string &s : ctl_current(pad, c))
+        if (!has_input(inputs, s))
+            freed.push_back(s);
+    size_t next = 0;
+    auto swap_in = [&](const Ctl *list, size_t n) {
         for (size_t i = 0; i < n; i++) {
-            if (id == list[i].id || (pad && !list[i].pad_nin))
+            if (!SDL_strcmp(c.id, list[i].id) || (pad && !list[i].pad_nin))
                 continue;
-            std::vector<std::string> cur = ctl_current(pad, list[i]);
-            auto it = std::find_if(cur.begin(), cur.end(), [&](const std::string &s) { return !SDL_strcasecmp(s.c_str(), input.c_str()); });
-            if (it == cur.end())
-                continue;
-            cur.erase(it);
-            std::string v;
-            for (const std::string &s : cur)
-                v += (v.empty() ? "" : ",") + s;
-            cfg_set(ctl_cfg(pad, list[i].id).c_str(), v.empty() ? "none" : v);
+            std::vector<std::string> cur = ctl_current(pad, list[i]), out;
+            bool changed = false;
+            for (const std::string &s : cur) {
+                if (!has_input(inputs, s)) {
+                    out.push_back(s);
+                    continue;
+                }
+                changed = true;
+                while (next < freed.size() && (has_input(out, freed[next]) || has_input(cur, freed[next])))
+                    next++;   // already this action's: given to the next one instead
+                if (next < freed.size())
+                    out.push_back(freed[next++]);
+            }
+            if (changed)
+                ctl_store(pad, list[i], out);
         }
     };
-    clear_from(CTL_BUTTONS, sizeof CTL_BUTTONS / sizeof *CTL_BUTTONS);
+    swap_in(CTL_BUTTONS, sizeof CTL_BUTTONS / sizeof *CTL_BUTTONS);
     if (!pad)
-        clear_from(CTL_MOVE, sizeof CTL_MOVE / sizeof *CTL_MOVE);
-    cfg_set(ctl_cfg(pad, id.c_str()).c_str(), input);
+        swap_in(CTL_MOVE, sizeof CTL_MOVE / sizeof *CTL_MOVE);
+    ctl_store(pad, c, inputs);
+}
+static const Ctl *ctl_find(const std::string &id) {
+    for (const Ctl &c : CTL_BUTTONS)
+        if (id == c.id)
+            return &c;
+    for (const Ctl &c : CTL_MOVE)
+        if (id == c.id)
+            return &c;
+    return nullptr;
+}
+static void ctl_assign(bool pad, const std::string &id, const std::string &input) {
+    if (const Ctl *c = ctl_find(id))
+        ctl_set(pad, *c, {input});
 }
 static void cap_done() {
     g_cap.on = false;
@@ -2010,7 +2053,7 @@ static void ctl_row(float cy, bool pad, const Ctl &c) {
          waiting ? C_OK : cur.empty() ? C_DIM : C_TEXT, shown.c_str());
     std::string key = ctl_cfg(pad, c.id);
     if (!cfg_get(key.c_str()).empty() && reset_button(("rs_" + hid).c_str(), x - 8 - 28, cy))
-        cfg_set(key.c_str(), "");   // the default again
+        ctl_set(pad, c, split_list(ctl_default(pad, c)));   // the default again, swapped as an assignment is
 }
 
 static void card(float top, float bottom) {   // drawn under what is on it (the body's channel 0)
