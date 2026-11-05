@@ -77,6 +77,8 @@ static uint64_t desired_language(void) {
     return result;
 }
 
+uint64_t runtime_game_language(void) { return desired_language(); }   /* (swkbd.c: a default name in it) */
+
 static int focus_policy;
 // What the game asked to be told; kept for when the port sends these (the mode never changes yet). Unused till then.
 __attribute__((unused)) static unsigned resume_notification, operation_notification, performance_notification;
