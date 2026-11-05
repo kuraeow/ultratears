@@ -49,6 +49,7 @@ static bool hovered_rect(ImVec2 a, ImVec2 b) {
 static bool g_drag_scrolled;   // the body was dragged with a finger: the touch that did it clicks nothing (ui_frame)
 static bool g_input_held;      // after a key / button was bound: nothing clicks until every key and button is up
 static bool g_scrolling;       // the right stick held or a drag going on: frames at the display's rate (main.cpp)
+static bool g_focus_play;      // the Play screen was just shown: its Play button takes the focus once it is there
 bool ui_busy() { return g_scrolling; }
 
 // An invisible ImGui item over [x, y, w, h] (design pixels): focus, keyboard and gamepad come with it.
@@ -2189,6 +2190,11 @@ static void screen_play_footer() {
         return;
     }
     // Play; with a newer release found also Update, and what is new (the design: Play grey beside a green Update)
+    if (g_focus_play) {   // the Play screen shown: Play has the focus (A starts the game), its frame with a controller
+        ImGui::SetKeyboardFocusHere();
+        ImGui::SetNavCursorVisible(SDL_HasGamepad());
+        g_focus_play = false;
+    }
     if (button("play", T("play"), 36, 408, 116, 48, U.has_upd ? DARK : PRIMARY)) {
         g_play_failed = false;
         G.tries = 0;
@@ -2300,6 +2306,12 @@ void ui_frame(float scale) {
     S = scale;
     poll();
     gfx_poll();
+    {   // entering the Play screen (at start, after a build, back from an update): Play takes the focus
+        static int last_screen = -1;
+        if (U.screen == SCR_PLAY && last_screen != SCR_PLAY)
+            g_focus_play = true;
+        last_screen = U.screen;
+    }
     ImGuiIO &io = ImGui::GetIO();
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseReleased(ImGuiMouseButton_Left))
         g_drag_scrolled = false;   // the drag is over (its release frame clicked nothing)
