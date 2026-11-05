@@ -809,6 +809,22 @@ int vkb_tex_refresh(VkCommandBuffer cb, vkb_image *im) {
 // image is freed while a submission is recorded: releases run on the translation thread between submissions).
 typedef struct { uint64_t serial, sub; vkb_image *im; } icache_t;
 static __thread icache_t *t_icache;
+/* Whether ReadTexels of t has to read the GPU's image (mtl_read_texels' first branch): a GPU-written colour image of an
+   uncompressed format. Only looks: makes no image (vkb_image_of would), so the game's thread may ask while the
+   translation thread records. An image shared by another texture object over the same memory counts. */
+int mtl_read_texels_gpu(const tex_t *t) {
+    if (!t || !t->serial || !vkb_ready()) return 0;
+    int bw = 1, bh = 1;
+    if (!nvn_fmt_bpb(t->d.format, &bw, &bh) || (t->d.format >= 0x19 && t->d.format <= 0x24)) return 0;
+    int gpu = 0;
+    pthread_mutex_lock(&g_mu);
+    entry *e = NULL;
+    if (g_cap) { tslot *s = slot(t->serial); if (s->serial == t->serial) e = s->e; }
+    if (!e && t->mem) for (e = g_shape[shape_of(t->mem, &t->d)]; e && !same_shape(e, t); e = e->shape_next) {}
+    if (e) gpu = e->im.gpu_written && !e->im.astc && e->im.aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    pthread_mutex_unlock(&g_mu);
+    return gpu;
+}
 vkb_image *vkb_image_of(const tex_t *t) {
     if (!t || !t->serial || !vkb_ready()) return NULL;
     icache_t *c = NULL;
@@ -1900,6 +1916,7 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
 // TOTK reads GPU results on the CPU this way; the null backend's zeros made the title screen several times too bright.
 // GPU-written images: the region is copied to upload memory and read after the GPU is done. Others: the game memory is
 // the truth, de-laid-out as for an upload. Tightly packed rows unless the caller gives strides (block rows for BC).
+void mtl_read_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     if (!t || !r || !dst || r->width <= 0 || r->height <= 0) return;
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -1934,7 +1951,19 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
             for (uint32_t y = 0; y < by; y++) memcpy(dst + z * img + y * row, px + ((size_t)z * by + y) * wb, wb);
         return;
     }
-    // from game memory: the whole level / layer, then the region
+    mtl_read_texels_mem(t, level, layer0, r, dst, row, img);
+}
+
+// ReadTexels from game memory (a texture the GPU has not written: the game memory is the truth, WriteTexels puts its
+// bytes there at once): the whole level / layer deswizzled, then the region. No GPU, no backend state: any thread.
+void mtl_read_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    if (!t || !r || !dst || r->width <= 0 || r->height <= 0) return;
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint32_t bx = (uint32_t)(r->width + bw - 1) / bw, by = (uint32_t)(r->height + bh - 1) / bh, nz = r->depth > 0 ? (uint32_t)r->depth : 1;
+    size_t wb = (size_t)bx * (size_t)bpb;
+    if (!row) row = wb;
+    if (!img) img = row * by;
+    int is3d = t->d.target == NVN_TEXTURE_TARGET_3D;
     uint32_t lw = t->d.width >> level ? t->d.width >> level : 1, lh = t->d.height >> level ? t->d.height >> level : 1;
     uint32_t ld = is3d ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     uint32_t lbx = (lw + bw - 1) / bw, lby = (lh + bh - 1) / bh, pitch = lbx * (uint32_t)bpb;

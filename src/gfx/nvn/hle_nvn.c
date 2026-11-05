@@ -2189,7 +2189,18 @@ static void x_texwrite(const tex_t *o, unsigned level, unsigned layer0, const NV
     pthread_mutex_lock(&g_xq_mu); g_xtexw++; pthread_mutex_unlock(&g_xq_mu);
     x_push(&j);
 }
+/* TOTK_READ_TEXELS_DIRECT=1: a texture the GPU has not written is read from game memory at once, on the game's thread.
+   Its game memory is the truth (WriteTexels writes it there at once, mtl_write_texels_mem), so neither the texel writes
+   queued for the image nor the translation thread's current job matter to it. Before (and with 0), the read drained the
+   whole translation queue when texel writes were queued, else waited for the current job: ~15-19 ms each, 24-56 times in
+   5 s while moving through the world on a 6-CPU Linux PC (2026-11-06), the windows with all the hitches. TotK reads
+   such textures (format 0x49, from game memory) while the world streams in. A GPU-written one goes the old way. */
+static _Atomic uint64_t g_xread_direct;
+static int read_direct(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_READ_TEXELS_DIRECT"); v = e && *e == '1'; } return v; }
 static void x_read_texels(const tex_t *o, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    int mtl_read_texels_gpu(const tex_t *t);
+    void mtl_read_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
+    if (read_direct() && !mtl_read_texels_gpu(o)) { atomic_fetch_add(&g_xread_direct, 1); mtl_read_texels_mem(o, level, layer0, r, dst, row, img); return; }
     if (!async_replay()) { mtl_read_texels(o, level, layer0, r, dst, row, img); return; }
     NVN_BLOCKING();
     pthread_mutex_lock(&g_xread_mu);
@@ -3181,7 +3192,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         char line[512]; size_t o = 0;
         for (int k = 0; k < XD_N; k++) { uint64_t n = atomic_exchange(&g_x_why_n[k], 0), ns = atomic_exchange(&g_x_why_ns[k], 0);
             if (n) o += (size_t)snprintf(line + o, sizeof line - o, " %s %llu / %.1f ms;", why[k], (unsigned long long)n, ns / 1e6); }
-        if (o) LOG("[nvn]   drain waits by reason:%s", line); }
+        if (o) LOG("[nvn]   drain waits by reason:%s", line);
+        { uint64_t dr = atomic_exchange(&g_xread_direct, 0); if (dr) LOG("[nvn]   texel reads from game memory at once (TOTK_READ_TEXELS_DIRECT): %llu", (unsigned long long)dr); } }
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
