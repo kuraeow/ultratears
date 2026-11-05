@@ -3335,6 +3335,10 @@ static void part_flush(uint64_t t_start) {
 // image is uploaded once a submission (the image's lock and its upload stamp), so no two of them touch it. Uploads that
 // are not prepared (ASTC decoded on the CPU, untracked memory) go into the prologue as before. Off with partial
 // submission (whose parts close the prologue only).
+// [experimental] On by default since 2026-11-06 (the player's decision; TOTK_VK_UPLOAD_SPLIT=0: one prologue, as before).
+// The Steam Deck, ~6 min with against ~2 min without: waits for one another's uploads 12-50 -> 0-11 ms in long
+// submissions, frames over 50 ms 13 -> 7 a minute. One black artifact over half the screen once, not yet told apart
+// from the old black holes on AMD (GitHub #38): if such reports come, test with =0 first.
 static VkCommandBuffer g_upcb[VKB_MAXREC];
 static vkb_trk g_uptrk[VKB_MAXREC];
 static __thread VkCommandBuffer t_up_cb_save;
@@ -3343,8 +3347,9 @@ static int up_split_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_VK_UPLOAD_SPLIT");
-        v = e && *e == '1';
-        if (v) VLOG("texture uploads: a command buffer per recording thread, a lock per image (TOTK_VK_UPLOAD_SPLIT)");
+        v = !(e && *e == '0');
+        VLOG("texture uploads: %s", v ? "a command buffer per recording thread, a lock per image [experimental] (TOTK_VK_UPLOAD_SPLIT=0: one prologue)"
+                                      : "one prologue, one lock (TOTK_VK_UPLOAD_SPLIT=0)");
     }
     return v && !part_on();
 }
