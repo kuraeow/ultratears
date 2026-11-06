@@ -1825,6 +1825,9 @@ void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfa
 // 215 ms. With the switch a thread below the game's threads keeps, after every submission begins, at least MR_FLOOR of
 // spare upload memory (one ring chunk: an upload of up to 64 MiB finds it) and image blocks with half a block free.
 // It costs that memory held (host memory, or device memory with resizable BAR; image blocks are device memory).
+// On by default since 2026-11-06 (the player's decision; TOTK_VK_MEM_READY=0: off): the Steam Deck, ~6.5 min with
+// against ~6 without, frames over 50 ms 11.3 -> 6.0 a minute, and the submissions that made 251-291 ms of upload memory
+// for the large uploads were gone (57 ms at most).
 enum { MR_FLOOR = 64u << 20 };
 static pthread_mutex_t g_mr_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_mr_cv = PTHREAD_COND_INITIALIZER;
@@ -1834,8 +1837,8 @@ static int mem_ready_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_VK_MEM_READY");
-        v = e && *e == '1';
-        if (v) VLOG("memory kept ready: %u MiB of spare upload memory and half an image block free, made off the recording threads (TOTK_VK_MEM_READY)", MR_FLOOR >> 20);
+        v = !(e && *e == '0');
+        if (v) VLOG("memory kept ready: %u MiB of spare upload memory and half an image block free, made off the recording threads (TOTK_VK_MEM_READY=0: off)", MR_FLOOR >> 20);
     }
     return v;
 }
