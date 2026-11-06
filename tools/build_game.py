@@ -93,6 +93,16 @@ def linux_libs():
             '-l:libopus.a -l:libvpx.a -l:libzstd.a -l:libstdc++.a -lm -lpthread -ldl')
 
 
+def profile_rt(clang):
+    """The link flags of the PGO training build: clang's profile runtime. The game folder's trimmed toolchain has none;
+    MSYS2's CLANG64 of the same clang has it (lib/clang/<n>/lib/windows)."""
+    for root in (clang.parent, pathlib.Path('C:/msys64/clang64')):
+        libs = sorted((root / 'lib/clang').glob('*/lib/windows/libclang_rt.profile-x86_64.a'))
+        if libs:
+            return ' -u__llvm_profile_runtime ' + ninja_arg(libs[-1].as_posix())
+    sys.exit('--pgo gen: no libclang_rt.profile-x86_64.a (the toolchain or C:/msys64/clang64)')
+
+
 def rel(p):
     return pathlib.Path(os.path.relpath(p, ROOT)).as_posix()
 
@@ -161,12 +171,18 @@ def main():
     ap.add_argument('--platform', default='windows' if os.name == 'nt' else 'linux', choices=['windows', 'linux'],
                     help='linux: cross-compile the game for Linux / Steam Deck (the Linux kit, LINUX_KIT)')
     ap.add_argument('--runtime-only', action='store_true', help='compile our runtime only, not the game code (porting)')
-    ap.add_argument('--pgo', choices=['gen'], help='gen: the PGO training build (Windows): the game code counts itself '
-                    '(-fprofile-generate, src/host/pgo.c), objects in ../pgo-build, the game as UltraTears-pgo.exe')
+    ap.add_argument('--pgo', choices=['gen', 'use'], help='gen: the PGO training build (Windows): the game code counts itself '
+                    '(-fprofile-generate, src/host/pgo.c), objects in ../pgo-build, the game as UltraTears-pgo.exe; '
+                    'use: the game code optimized by --profile (Windows: UltraTears-pgo.exe; Linux: ../pgo-linux/linux/ultratears)')
+    ap.add_argument('--profile', help='--pgo use: the merged profile (llvm-profdata merge of the training counts)')
     a = ap.parse_args()
     linux = a.platform == 'linux'
-    if a.pgo and (linux or a.target != 'ultratears'):
-        sys.exit('--pgo gen: the ultratears target for Windows only (the Linux kit has no profile runtime)')
+    if a.pgo and a.target != 'ultratears':
+        sys.exit('--pgo: the ultratears target only')
+    if a.pgo == 'gen' and linux:
+        sys.exit('--pgo gen: Windows only (the Linux kit has no profile runtime; the game code is the same C)')
+    if a.pgo == 'use' and not (a.profile and pathlib.Path(a.profile).is_file()):
+        sys.exit('--pgo use needs --profile <merged .profdata>')
     if linux and not (LINUX_KIT / 'sysroot').is_dir():
         sys.exit(f'the Linux kit is missing ({LINUX_KIT})')
     if not linux and os.name != 'nt':
@@ -181,16 +197,20 @@ def main():
     if a.pgo == 'gen':   # the counts of the game's code; our runtime is not counted (src/host/pgo.c writes them)
         cflags += ' -DULTRS_PGO_GEN'
         game_cflags += ' -fprofile-generate'
+    if a.pgo == 'use':   # functions the training did not reach are compiled as without (warnings: -w)
+        game_cflags += ' -fprofile-use=' + ninja_arg(pathlib.Path(a.profile).resolve().as_posix())
     if arch != 'x86-64-v3':
         print(f'code for {arch}: this CPU has no AVX2 / FMA / BMI2 (slower than x86-64-v3)', flush=True)
     a.j = a.j or min(a.cpus, jobs_for_ram())
     gen = ROOT / a.generated
-    bd = 'build-linux' if linux else '../pgo-build' if a.pgo else 'build'   # the training build: beside the game folder
+    # the PGO builds beside the game folder, not over its own (the training one, and the optimized one until it is checked)
+    bd = ('../pgo-build' + ('-linux' if linux else '') + ('-use' if a.pgo == 'use' else '')) if a.pgo else 'build-linux' if linux else 'build'
+    lin_dir = '../pgo-linux/linux' if a.pgo else 'linux'
     build = ROOT / bd
     build.mkdir(exist_ok=True)
     link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
             f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
-            f'  command = $cc -fuse-ld=lld -g{" -fprofile-generate" if a.pgo else ""} -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
+            f'  command = $cc -fuse-ld=lld -g{profile_rt(CLANG64) if a.pgo == "gen" else ""} -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
     lines = [
         # the compilers by their full path, not through PATH: on Linux PATH is split at ':', and a game folder named
         # "The Legend of Zelda: Tears of the Kingdom" put clang out of reach (issues #66, #69)
@@ -258,7 +278,7 @@ def main():
     if not game_objs:
         sys.exit(f'no generated C in {gen}: run tools/gen_game.py first')
     if linux:   # the game for Linux in linux/, beside the game folder's data
-        out = 'linux/ultratears' if a.target == 'ultratears' else f'{bd}/{a.target}'
+        out = f'{lin_dir}/ultratears' if a.target == 'ultratears' else f'{bd}/{a.target}'
     else:
         out = ('UltraTears-pgo.exe' if a.pgo else 'UltraTears.exe') if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
     lines.append(f'build {out}: link {" ".join(objs + game_objs)}')
@@ -268,7 +288,7 @@ def main():
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
     if linux:   # SDL3 beside the game (rpath $ORIGIN)
         import shutil
-        (ROOT / 'linux').mkdir(exist_ok=True)
+        (ROOT / lin_dir).mkdir(parents=True, exist_ok=True)
         # the Linux kit has libSDL3.so.0 itself (its links made copies, tools/make_linux_kit.py); a full sysroot has it
         # as a link to libSDL3.so.0.<version>, which Windows may have extracted as a copy or not at all
         lib = LINUX_KIT / 'sysroot/usr/lib/x86_64-linux-gnu'
@@ -276,7 +296,7 @@ def main():
                     if p.is_file() and p.stat().st_size > 1 << 20), None)
         if not sdl:
             sys.exit(f'libSDL3.so.0 is missing from the Linux kit ({lib}): the game for Linux needs it beside itself')
-        shutil.copy2(sdl, ROOT / 'linux/libSDL3.so.0')
+        shutil.copy2(sdl, ROOT / lin_dir / 'libSDL3.so.0')
     env = tool_env()
     # Another compiler (an update brought another LLVM): ninja sees the same command lines and would keep the objects
     # the old one made, so they go and everything is compiled by the new one.
