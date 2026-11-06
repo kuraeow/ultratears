@@ -251,7 +251,11 @@ def main():
     if profile:
         game_cflags += f' -fprofile-use={bd}/pgo.profdata' + PGO_FLAGS   # relative: a moved game folder rebuilds nothing
         print(f'PGO: the game code is optimized by {rel(PGO_PROFILE)}', flush=True)
-    link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
+    # --no-call-graph-profile-sort: objects built with the profile carry their call graph, and ld.lld orders the
+    # functions of the whole program by it, our runtime in among the game's hot code (rt_dispatch between two lifted
+    # functions): the same cut through the lifted code's range as the hot/cold sections (PGO_FLAGS), which turns the
+    # virtual cores' asynchronous preemption off. The input order keeps the runtime before the game code.
+    link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g -Wl,--no-call-graph-profile-sort '
             f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
             f'  command = $cc -fuse-ld=lld -g{profile_rt(CLANG64) if a.pgo == "gen" else ""} -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
     lines = [
