@@ -34,7 +34,7 @@ TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
                     'src/host/window_sdl.c', 'src/vk/vk.c', 'src/vk/present.c', 'src/vk/fsr.c', 'src/vk/overlay.c', 'src/host/motion_fusion.c',
                     'src/host/deck_imu.c',
                     'src/host/profiler.c', 'src/host/watch.c', 'src/host/frame_rate.c', 'src/host/render_res.c', 'src/host/ui_capture.c',
-                    'src/host/ui_aspect.c', 'src/host/ui_prompts.c', 'src/host/zstd_host.c']}
+                    'src/host/ui_aspect.c', 'src/host/ui_prompts.c', 'src/host/zstd_host.c', 'src/host/pgo.c']}
 # The graphics front end (MacNativeGames' NVN layer) with its macOS stand-ins: own include paths, own rule
 GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_ext.c', 'src/gfx/nvn/nvn_registry.c',
        'src/gfx/nvn/nvn_thunks.gen.c', 'src/gfx/nvn/nvn_dirty_win.c', 'src/gfx/nvn/totk_timeline_win.c',
@@ -161,8 +161,12 @@ def main():
     ap.add_argument('--platform', default='windows' if os.name == 'nt' else 'linux', choices=['windows', 'linux'],
                     help='linux: cross-compile the game for Linux / Steam Deck (the Linux kit, LINUX_KIT)')
     ap.add_argument('--runtime-only', action='store_true', help='compile our runtime only, not the game code (porting)')
+    ap.add_argument('--pgo', choices=['gen'], help='gen: the PGO training build (Windows): the game code counts itself '
+                    '(-fprofile-generate, src/host/pgo.c), objects in ../pgo-build, the game as UltraTears-pgo.exe')
     a = ap.parse_args()
     linux = a.platform == 'linux'
+    if a.pgo and (linux or a.target != 'ultratears'):
+        sys.exit('--pgo gen: the ultratears target for Windows only (the Linux kit has no profile runtime)')
     if linux and not (LINUX_KIT / 'sysroot').is_dir():
         sys.exit(f'the Linux kit is missing ({LINUX_KIT})')
     if not linux and os.name != 'nt':
@@ -174,16 +178,19 @@ def main():
     if linux:
         cflags = cflags.replace(' -gcodeview', '') + ' ' + linux_flags()
         game_cflags = game_cflags.replace(' -gcodeview', '') + ' ' + linux_flags()
+    if a.pgo == 'gen':   # the counts of the game's code; our runtime is not counted (src/host/pgo.c writes them)
+        cflags += ' -DULTRS_PGO_GEN'
+        game_cflags += ' -fprofile-generate'
     if arch != 'x86-64-v3':
         print(f'code for {arch}: this CPU has no AVX2 / FMA / BMI2 (slower than x86-64-v3)', flush=True)
     a.j = a.j or min(a.cpus, jobs_for_ram())
     gen = ROOT / a.generated
-    bd = 'build-linux' if linux else 'build'
+    bd = 'build-linux' if linux else '../pgo-build' if a.pgo else 'build'   # the training build: beside the game folder
     build = ROOT / bd
     build.mkdir(exist_ok=True)
     link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
             f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
-            f'  command = $cc -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
+            f'  command = $cc -fuse-ld=lld -g{" -fprofile-generate" if a.pgo else ""} -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
     lines = [
         # the compilers by their full path, not through PATH: on Linux PATH is split at ':', and a game folder named
         # "The Legend of Zelda: Tears of the Kingdom" put clang out of reach (issues #66, #69)
@@ -227,8 +234,8 @@ def main():
         # the port's icon (assets/icon.ico, the author's own drawing: README.md, Legal) and version in the resources
         print(f'UltraTears {version_files(build)}', flush=True)
         if not linux:
-            lines.append('build build/obj/ultratears_res.o: rc build/ultratears.rc | assets/icon.ico')
-            objs.append('build/obj/ultratears_res.o')
+            lines.append(f'build {bd}/obj/ultratears_res.o: rc {bd}/ultratears.rc | assets/icon.ico')
+            objs.append(f'{bd}/obj/ultratears_res.o')
         for src in GFX:
             cxx = src.endswith('.cpp')
             obj = f'{bd}/obj/{src.rsplit(".", 1)[0].replace("/", "_")}.o'
@@ -253,10 +260,10 @@ def main():
     if linux:   # the game for Linux in linux/, beside the game folder's data
         out = 'linux/ultratears' if a.target == 'ultratears' else f'{bd}/{a.target}'
     else:
-        out = 'UltraTears.exe' if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
+        out = ('UltraTears-pgo.exe' if a.pgo else 'UltraTears.exe') if a.target == 'ultratears' else f'build/{a.target}.exe'   # the game: in the game folder
     lines.append(f'build {out}: link {" ".join(objs + game_objs)}')
     if not linux:
-        lines.append(f'  pdb = build/{pathlib.Path(out).stem}.pdb')
+        lines.append(f'  pdb = {bd}/{pathlib.Path(out).stem}.pdb')
     lines.append(f'default {" ".join(objs) if a.runtime_only else out}')
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
     if linux:   # SDL3 beside the game (rpath $ORIGIN)

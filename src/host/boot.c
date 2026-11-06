@@ -232,6 +232,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk] modules loaded and linked in %.0f ms\n", (runtime_now_ns() - t0) / 1e6);
 
     runtime_profiler_start();
+    { void pgo_start(void); pgo_start(); }   // the PGO training build only (src/host/pgo.c)
 
     // The window takes the main thread (SDL wants its events there); the game gets its own. TOTK_HEADLESS=1: no
     // window, no sound device, the game on the main thread (automated runs).

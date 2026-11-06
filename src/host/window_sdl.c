@@ -345,6 +345,7 @@ _Noreturn void window_loop(void) {
                 case SDL_EVENT_QUIT:
                     fprintf(stderr, "[totk] window closed\n");
                     runtime_profiler_stop();
+                    { void pgo_flush(void); pgo_flush(); }   // the PGO training build only (src/host/pgo.c)
                     _Exit(0);
                 case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
