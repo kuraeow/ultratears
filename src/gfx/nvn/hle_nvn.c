@@ -339,16 +339,20 @@ static int stream_away_on(void) {
     return v;
 }
 static _Atomic uint64_t g_stream_ns, g_stream_n, g_stream_max;
-typedef struct { int away; uint64_t t0; } stream_call;
+// the longest of each kind (the log line): which call it is that takes long (2026-11-07: up to 11-23 ms on Linux)
+enum { SC_INIT, SC_FINI, SC_MAPV, SC_READ, SC_WRITE, SC_N };
+static _Atomic uint64_t g_stream_kmax[SC_N];
+typedef struct { int away; uint64_t t0; int kind; } stream_call;
 static void stream_end(stream_call *s) {
     uint64_t d = plat_now_ns() - s->t0;
     atomic_fetch_add(&g_stream_ns, d); atomic_fetch_add(&g_stream_n, 1);
     for (uint64_t m = atomic_load(&g_stream_max); d > m && !atomic_compare_exchange_weak(&g_stream_max, &m, d);) {}
+    for (uint64_t m = atomic_load(&g_stream_kmax[s->kind]); d > m && !atomic_compare_exchange_weak(&g_stream_kmax[s->kind], &m, d);) {}
     runtime_core_back(&s->away);
 }
-#define NVN_STREAM_CALL() __attribute__((cleanup(stream_end))) stream_call totk_stream_ = {stream_away_on() ? runtime_core_away() : 0, plat_now_ns()}
+#define NVN_STREAM_CALL(k) __attribute__((cleanup(stream_end))) stream_call totk_stream_ = {stream_away_on() ? runtime_core_away() : 0, plat_now_ns(), (k)}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_INIT);
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
@@ -368,7 +372,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return o->mem != NULL;
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_FINI);
     pool_t *o = (pool_t *)p;
     // TOTK translation thread: deleted in queue order (x_poolrel), after the submissions queued before - the game waited
     // for the GPU work that used the pool before finalizing it, so those do not touch it; before 2026-10-28 the game thread
@@ -383,7 +387,7 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, 
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p){return (NVNmemoryPoolFlags)((const pool_t *)p)->flags;}
 NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p){const pool_t *v=(const void *)p;if(v->magic!=MAGIC('P','O','O','L'))return NULL;return (v->flags&NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)?NULL:v->mem;}
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_MAPV);
     return (NVNboolean)totk_vpool_map((pool_t *)p, n, (const totk_mapping_request *)(const void *)r);
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { const pool_t *o = (const pool_t *)p; return (NVNbufferAddress)(o->va ? o->va : (uint64_t)(uintptr_t)o->mem); }
@@ -591,11 +595,11 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     x_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_READ);
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
 }
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_READ);
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
 static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, ptrdiff_t row, ptrdiff_t img) {
@@ -610,11 +614,11 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (mtl_write_texels_mem(o, level, layer0, r, src, (size_t)row, (size_t)img)) x_texwrite(o, level, layer0, r, src, (size_t)row, (size_t)img, wb, hb);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_WRITE);
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
 }
 NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src, ptrdiff_t row, ptrdiff_t img) {
-    NVN_STREAM_CALL();
+    NVN_STREAM_CALL(SC_WRITE);
     write_texels(CTX(t), (const view_t *)v, r, src, row, img);
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
@@ -3234,8 +3238,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         pthread_mutex_lock(&g_xq_mu); uint64_t q = g_xq_in - g_xq_done; pthread_mutex_unlock(&g_xq_mu);
         LOG("[nvn] translation thread through frame %llu: %llu drain waits / %.1f ms over the last 300 frames, %llu queued items", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q);
         { uint64_t sn = atomic_exchange(&g_stream_n, 0), sns = atomic_exchange(&g_stream_ns, 0), smx = atomic_exchange(&g_stream_max, 0);
-          LOG("[nvn] streaming calls (pools, texels) through frame %llu: %.1f a frame, %.2f ms a frame, the longest %.2f ms; virtual core %s",
-              (unsigned long long)g_frame, sn / 300.0, sns / 1e6 / 300, smx / 1e6, stream_away_on() ? "given up" : "kept (TOTK_STREAM_CORE_AWAY=0)"); }
+          uint64_t km[SC_N]; for (int k = 0; k < SC_N; k++) km[k] = atomic_exchange(&g_stream_kmax[k], 0);
+          LOG("[nvn] streaming calls (pools, texels) through frame %llu: %.1f a frame, %.2f ms a frame, the longest %.2f ms (pool init %.2f, finalize %.2f, map virtual %.2f, read texels %.2f, write texels %.2f); virtual core %s",
+              (unsigned long long)g_frame, sn / 300.0, sns / 1e6 / 300, smx / 1e6, km[SC_INIT] / 1e6, km[SC_FINI] / 1e6, km[SC_MAPV] / 1e6,
+              km[SC_READ] / 1e6, km[SC_WRITE] / 1e6, stream_away_on() ? "given up" : "kept (TOTK_STREAM_CORE_AWAY=0)"); }
         static const char *const why[XD_N] = {"pool deleted", "read texels", "write texels", "program deleted", "queue finish", "suspend", "graphics layer", "pool memory reused", "read texels out of turn"};
         char line[512]; size_t o = 0;
         for (int k = 0; k < XD_N; k++) { uint64_t n = atomic_exchange(&g_x_why_n[k], 0), ns = atomic_exchange(&g_x_why_ns[k], 0);

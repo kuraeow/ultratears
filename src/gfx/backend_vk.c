@@ -81,17 +81,52 @@ void vkb_rw_write(vkb_rw *l, int kind) {
 void vkb_rw_write_end(vkb_rw *l) { ReleaseSRWLockExclusive((PSRWLOCK)l); }
 #else
 #include <pthread.h>
+/* Linux: writers first (TOTK_RWLOCK_WRITER=0: glibc's default, readers first). glibc's default lets readers in while a
+   writer waits, and the recording threads read the pool table for nearly every draw, so a writer waited until the
+   recording of the frame was done: the game's own streaming calls (a memory pool made: mtl_pool_add takes g_pool_mu
+   for writing) took up to 11-23 ms on the Steam Deck and the friend's PC, the game's loader waited in them, its main
+   thread for the loader - the 40-30-40 dips while the world streams in, Linux only (Windows' SRW locks let a waiting
+   writer go first), and totk-pc-recomp on the same PC has none. Waits are counted as on Windows (the per-frame "lock
+   waits" line showed 0.00 on Linux). No reader here takes the same lock again while holding it, which writer
+   preference would deadlock. */
+static pthread_mutex_t g_rw_init_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t *get_rw(vkb_rw *l) {
-    if (!l->opaque) {
-        pthread_rwlock_t *rw = (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
-        pthread_rwlock_init(rw, NULL);
-        l->opaque = rw;
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&l->opaque, __ATOMIC_ACQUIRE);
+    if (rw) return rw;
+    pthread_mutex_lock(&g_rw_init_mu);
+    if (!(rw = l->opaque)) {
+        static int writer = -1;
+        if (writer < 0) { const char *e = getenv("TOTK_RWLOCK_WRITER"); writer = !(e && *e == '0'); }
+        rw = (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
+        pthread_rwlockattr_t a;
+        pthread_rwlockattr_init(&a);
+        if (writer) pthread_rwlockattr_setkind_np(&a, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        pthread_rwlock_init(rw, &a);
+        pthread_rwlockattr_destroy(&a);
+        __atomic_store_n((pthread_rwlock_t **)&l->opaque, rw, __ATOMIC_RELEASE);
     }
-    return (pthread_rwlock_t *)l->opaque;
+    pthread_mutex_unlock(&g_rw_init_mu);
+    return rw;
 }
-void vkb_rw_read(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_rdlock(get_rw(l)); }
+static void rw_waited(int kind, uint64_t t0) {
+    atomic_fetch_add_explicit(&vkb_lock_wait_ns[kind], runtime_now_ns() - t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&vkb_lock_waits[kind], 1, memory_order_relaxed);
+}
+void vkb_rw_read(vkb_rw *l, int kind) {
+    pthread_rwlock_t *rw = get_rw(l);
+    if (!pthread_rwlock_tryrdlock(rw)) return;
+    uint64_t t0 = runtime_now_ns();
+    pthread_rwlock_rdlock(rw);
+    rw_waited(kind, t0);
+}
 void vkb_rw_read_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
-void vkb_rw_write(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_wrlock(get_rw(l)); }
+void vkb_rw_write(vkb_rw *l, int kind) {
+    pthread_rwlock_t *rw = get_rw(l);
+    if (!pthread_rwlock_trywrlock(rw)) return;
+    uint64_t t0 = runtime_now_ns();
+    pthread_rwlock_wrlock(rw);
+    rw_waited(kind, t0);
+}
 void vkb_rw_write_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
 #endif
 
