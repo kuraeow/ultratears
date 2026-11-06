@@ -3317,6 +3317,32 @@ static int part_drain_ok(void) {
     }
     return v;
 }
+// Fourth version (2026-11-06, night): a part held back for a full barrier goes all the same when the GPU has done
+// everything sent before it, for then the barrier waits for nothing. The third version held it whatever the GPU did:
+// right for the friend's RX 570, busy all the time (a drain there was a stall), wrong for the Steam Deck, whose GPU ran
+// through the first part and stood idle until the end of the recording - and parts were held exactly while the world
+// streamed in (texture uploads queued, prologue work), so the Deck dipped 40-30-40 in the same places, in the dense ones
+// frames over 33 ms 55 a minute against 34 with the second version (frame-compare.md 0). Each part signals g_part_sem;
+// idle: it and the submissions before reached their values. TOTK_VK_PART_IDLE=0: held whatever the GPU does (third).
+static VkSemaphore g_part_sem;   // (g_part_mu) parts' own timeline: part g_part_seq signals g_part_seq
+static uint64_t g_part_seq, g_part_idle_sent;   // (g_part_mu) parts sent; held-back parts sent for an idle GPU (the log line)
+static int part_idle_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_PART_IDLE");
+        v = !(e && *e == '0');
+        VLOG("partial submission: %s", v ? "a part held back for a full barrier goes when the GPU is idle (TOTK_VK_PART_IDLE=0: held)"
+                                         : "a part held back for a full barrier waits whatever the GPU does (TOTK_VK_PART_IDLE=0)");
+    }
+    return v;
+}
+static int gpu_idle(void) {   // (g_part_mu) the GPU has done every submission and part sent so far
+    if (!g_part_sem) return 0;
+    uint64_t main = 0, part = 0;
+    if (vk.vkGetSemaphoreCounterValue(vkc.device, g_timeline, &main) != VK_SUCCESS ||
+        vk.vkGetSemaphoreCounterValue(vkc.device, g_part_sem, &part) != VK_SUCCESS) return 0;
+    return main >= __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE) && part >= g_part_seq;
+}
 static int uploads_queued(void) {   // uploads not yet taken by a part
     pthread_once(&g_upq_once, upq_init);
     for (int w = 0; w < VKB_MAXREC; w++) {
@@ -3391,11 +3417,19 @@ static void part_flush(void) {
     int n = 0;
     int first = !g_slot_sent;
     pthread_mutex_lock(&g_pro_mu);   // no prologue work meanwhile; glue writes image layouts the prologue's work may change
-    if (!first && !part_drain_ok() && (g_pro_any || uploads_queued())) {   // it would drain the GPU: held back
-        pthread_mutex_unlock(&g_pro_mu);
-        g_part_held++;
-        pthread_mutex_unlock(&g_part_mu);
-        return;
+    if (!first && !part_drain_ok() && (g_pro_any || uploads_queued())) {   // it would drain the GPU: held back, unless idle
+        if (!(part_idle_on() && gpu_idle())) {
+            pthread_mutex_unlock(&g_pro_mu);
+            g_part_held++;
+            pthread_mutex_unlock(&g_part_mu);
+            return;
+        }
+        g_part_idle_sent++;
+    }
+    if (!g_part_sem) {   // the parts' timeline, made at the first part
+        VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo ci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
+        if (!vk_check(vk.vkCreateSemaphore(vkc.device, &ci, NULL, &g_part_sem), "parts' timeline semaphore")) g_part_sem = VK_NULL_HANDLE;
     }
     pro_close(list, &n, 1);
     uploads_take(list, &n);
@@ -3411,7 +3445,10 @@ static void part_flush(void) {
     }
     for (int i = 0; i < n; i++)
         cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = list[i]};
-    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)ncbi, .pCommandBufferInfos = cbi};
+    VkSemaphoreSubmitInfo psig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_part_sem, .value = g_part_seq + 1,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};   // gpu_idle
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)ncbi, .pCommandBufferInfos = cbi,
+                        .signalSemaphoreInfoCount = g_part_sem ? 1u : 0u, .pSignalSemaphoreInfos = &psig};
     uint64_t tps = runtime_now_ns();
     pc_sync(g_fence + 1);   // pool copies these chunks use (each pool once a submission)
     vkb_step_add(PK_SYNC, tps);
@@ -3422,6 +3459,7 @@ static void part_flush(void) {
     vkb_step_add(PK_SUBMIT, ts0);
     if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2 (part)"); die("GPU submission failed"); }
     if (first) g_part_first_ns += ts0 - g_part_t0;
+    if (g_part_sem) g_part_seq++;
     g_part_n++;
     g_part_t = runtime_now_ns();
     pthread_mutex_unlock(&g_part_mu);
@@ -3616,11 +3654,11 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
              "glue and submit %.1f", pro_ns / 1e6 / 600, walk_ns / 1e6 / 600, rec_ns / 1e6 / 600, tail_ns / 1e6 / 600);
         if (part)
             VLOG("partial submission: %.0f %% of submissions in parts, %.1f parts each, the first part sent %.1f ms after the start "
-                 "(the whole: %.1f ms); parts held back from a full barrier %.1f times a submission", 100.0 * g_part_subs / 600,
-                 g_part_subs ? (double)g_part_parts / g_part_subs : 0.0, g_part_subs ? g_part_first_ns / 1e6 / g_part_subs : 0.0,
-                 wall_ns / 1e6 / 600, g_part_held / 600.0);
+                 "(the whole: %.1f ms); parts held back from a full barrier %.1f times a submission, sent for an idle GPU %.1f",
+                 100.0 * g_part_subs / 600, g_part_subs ? (double)g_part_parts / g_part_subs : 0.0,
+                 g_part_subs ? g_part_first_ns / 1e6 / g_part_subs : 0.0, wall_ns / 1e6 / 600, g_part_held / 600.0, g_part_idle_sent / 600.0);
         prev_rec = rec; wall_ns = walk_ns = chunks = g_glue_images = longest_ns = longest_draws = pro_ns = rec_ns = tail_ns = 0;
-        g_part_subs = g_part_parts = g_part_first_ns = g_part_held = 0;
+        g_part_subs = g_part_parts = g_part_first_ns = g_part_held = g_part_idle_sent = 0;
     }
 }
 
