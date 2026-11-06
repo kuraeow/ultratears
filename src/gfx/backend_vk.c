@@ -3240,7 +3240,7 @@ static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
     if (t->n) atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
 }
 
-// ---- partial submission (TOTK_VK_PARTIAL_SUBMIT=1, 2026-11-05) ----
+// ---- partial submission (on by default since 2026-11-06; TOTK_VK_PARTIAL_SUBMIT=0: off) ----
 // The GPU stood idle while a submission was recorded, and the game then waited for that same submission: on the
 // player's PC (2026-11-05, TOTK_TIMELINE, frames 4200-4530) 4.3 of the 6.8 ms of recording before each wait of 5 ms
 // and more (frame-compare.md 3b). So the translation thread sends the chunks recorded so far, in order, while the
@@ -3300,8 +3300,9 @@ static int part_on(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_VK_PARTIAL_SUBMIT");
-        v = e && *e == '1';
-        if (v) VLOG("partial submission: recorded chunks go to the GPU in order while the rest are recorded (TOTK_VK_PARTIAL_SUBMIT)");
+        v = !(e && *e == '0');   // on by default since 2026-11-06 (the player's PC: frames over 25 ms 100 -> 23 a minute)
+        VLOG("partial submission: %s", v ? "recorded chunks go to the GPU in order while the rest are recorded (TOTK_VK_PARTIAL_SUBMIT=0: off)"
+                                         : "off, the submission in one call (TOTK_VK_PARTIAL_SUBMIT=0)");
     }
     return v;
 }
