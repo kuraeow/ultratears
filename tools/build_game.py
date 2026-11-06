@@ -103,6 +103,39 @@ def profile_rt(clang):
     sys.exit('--pgo gen: no libclang_rt.profile-x86_64.a (the toolchain or C:/msys64/clang64)')
 
 
+# Profile-guided optimization of the game's code (on by default since 2026-11-06): how often each lifted function ran
+# and which way its branches went, counted in a 20-minute training run of the game (--pgo gen, src/host/pgo.c) and
+# merged (llvm-profdata merge --sparse: functions that never ran left out). Only the lifted functions' names (their
+# addresses), their control-flow hashes and the counts: no bytes of the game. The game's code is the same for every
+# player (TOTK 1.4.3, tools/setup.py checks it), so one profile serves all. clang lays out and inlines by it; it
+# changes no result. On the Steam Deck the game's work a frame 23-24.6 -> 21-22.6 ms in the dense places
+# (dev-local/docs/frame-compare.md 0). Code the training never reached keeps the optimization it has without a
+# profile (-pgo-cold-func-opt=default), not the size-first one clang gives cold code. A function whose C changed since
+# (another lifter) does not match its hash and is compiled as without. TOTK_PGO=0: without the profile (A/B).
+PGO_PROFILE = ROOT / 'pgo/totk-1.4.3.profdata.zst'
+PGO_FLAGS = ' -mllvm -pgo-cold-func-opt=default'
+
+
+def pgo_profile(build):
+    """The profile unpacked into the build folder (its path), or None: switched off, missing, or no zstd in this
+    Python. Rewritten only when it changed: the game objects depend on it, so a new profile compiles them again."""
+    if os.environ.get('TOTK_PGO') == '0':
+        print('PGO: off (TOTK_PGO=0)', flush=True)
+        return None
+    if not PGO_PROFILE.is_file():
+        return None
+    try:
+        from compression import zstd
+    except ImportError:
+        print('PGO: this Python cannot unpack the profile (no compression.zstd): building without it', flush=True)
+        return None
+    data = zstd.decompress(PGO_PROFILE.read_bytes())
+    out = build / 'pgo.profdata'
+    if not out.is_file() or out.read_bytes() != data:
+        out.write_bytes(data)
+    return out
+
+
 def rel(p):
     return pathlib.Path(os.path.relpath(p, ROOT)).as_posix()
 
@@ -198,7 +231,7 @@ def main():
         cflags += ' -DULTRS_PGO_GEN'
         game_cflags += ' -fprofile-generate'
     if a.pgo == 'use':   # functions the training did not reach are compiled as without (warnings: -w)
-        game_cflags += ' -fprofile-use=' + ninja_arg(pathlib.Path(a.profile).resolve().as_posix())
+        game_cflags += ' -fprofile-use=' + ninja_arg(pathlib.Path(a.profile).resolve().as_posix()) + PGO_FLAGS
     if arch != 'x86-64-v3':
         print(f'code for {arch}: this CPU has no AVX2 / FMA / BMI2 (slower than x86-64-v3)', flush=True)
     a.j = a.j or min(a.cpus, jobs_for_ram())
@@ -208,6 +241,10 @@ def main():
     lin_dir = '../pgo-linux/linux' if a.pgo else 'linux'
     build = ROOT / bd
     build.mkdir(exist_ok=True)
+    profile = pgo_profile(build) if not a.pgo and a.target == 'ultratears' and not a.runtime_only else None
+    if profile:
+        game_cflags += f' -fprofile-use={bd}/pgo.profdata' + PGO_FLAGS   # relative: a moved game folder rebuilds nothing
+        print(f'PGO: the game code is optimized by {rel(PGO_PROFILE)}', flush=True)
     link = (f'  command = $cc {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
             f'-Wl,-rpath,{RPATH} -o $out @$out.rsp {linux_libs()}' if linux else
             f'  command = $cc -fuse-ld=lld -g{profile_rt(CLANG64) if a.pgo == "gen" else ""} -Wl,--pdb=$pdb -o $out @$out.rsp {LIBS}')
@@ -265,7 +302,7 @@ def main():
     for module in ('main', 'subsdk0', 'sdk'):
         for c in sorted((gen / module).glob('*.c')):
             obj = f'{bd}/game/{module}/{c.stem}.o'
-            lines.append(f'build {obj}: gamecc {rel(c)}')
+            lines.append(f'build {obj}: gamecc {rel(c)}' + (f' | {bd}/pgo.profdata' if profile else ''))
             text = c.read_text(errors='replace')
             # [temporary] a function with an unresolved computed branch is one switch over every
             # instruction; with thousands of labels clang -O1/-O2 takes from minutes to hours per file (main_376:
