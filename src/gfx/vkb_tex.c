@@ -1633,6 +1633,7 @@ static int plan_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_VK_UPLOAD_LOCKED"); v = !(e && *e == '1'); }
     return v;
 }
+static void pfs_upload_note(const vkb_image *im, uint64_t read_ns);   // slow BC7 reads by warming state (below)
 static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in upload memory, P says where
     memset(P, 0, sizeof *P);
     const nvn_texdesc *d = &im->d;
@@ -1662,6 +1663,7 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
         src = gathered;
     }
     int srgb = d->format >= 0x87 && d->format <= 0x94, ok = 1, k = 0, fmt = -1;
+    uint64_t rd_ns = 0;   // this texture's BC7 reads
     for (uint32_t level = 0; level < im->levels && ok; level++) {
         uint32_t lw = im->width >> level ? im->width >> level : 1, lh = im->height >> level ? im->height >> level : 1;
         uint32_t ld = im->depth >> level ? im->depth >> level : 1;
@@ -1701,6 +1703,7 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
             upx_add(UPX_RING, ta);
             uint64_t tr = runtime_now_ns();
             ok = vkb_bc7_read(key, out, len);
+            rd_ns += runtime_now_ns() - tr;
             upx_add(UPX_BC7READ, tr);
             atomic_fetch_add_explicit(&g_upx[UPX_BYTES], len, memory_order_relaxed);
             s->row = (lw + 3) / 4 * 4; s->rows_h = (lh + 3) / 4 * 4;
@@ -1708,6 +1711,7 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
     }
     free(gathered);
     if (im->astc) P->bc = fmt;
+    if (rd_ns > 1000000) pfs_upload_note(im, rd_ns);   // over 1 ms: the disk; what the warming had done with it
     if (!ok) { free(P->s); P->s = NULL; return 0; }
     atomic_fetch_add_explicit(&g_upx[UPX_N_PLANNED], 1, memory_order_relaxed);
     if (vpool) atomic_fetch_add_explicit(&g_upx[UPX_N_VPOOL], 1, memory_order_relaxed);
@@ -1721,6 +1725,44 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
 // computes its surfaces' cache keys and reads their pages; the upload then finds them in memory. It changes nothing
 // the upload does: not warmed in time (or the game had not written the texture yet) it reads the disk as before.
 // TOTK_TEX_PREFETCH=0: off.
+// Uploads whose BC7 reads went to the disk (over 1 ms a texture), by what the warming had done with the texture
+// (2026-11-06): arriving in a new place, the Steam Deck read 240-3000 ms of BC7 over the recording threads in one
+// submission though 2.5-3 textures a frame were warmed. A table by memory and shape (the warming's own key) keeps each
+// texture's state and the presents it was initialized and warmed in; the long-submission line sums them.
+enum { PFS_UNKNOWN, PFS_VPOOL, PFS_OUTSIDE, PFS_QUEUED, PFS_FULL, PFS_SEEN, PFS_WARMED, PFS_N };
+typedef struct { uint64_t key; uint32_t init_frame, warm_frame; uint8_t state; } pfstate;
+enum { PFS_TAB = 16384 };
+static pfstate g_pfs[PFS_TAB];
+static pthread_mutex_t g_pfs_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_pfs_n[PFS_N], g_pfs_ns[PFS_N], g_pfs_init_frames, g_pfs_warm_frames;
+static uint64_t pfs_key(const void *mem, const nvn_texdesc *d) {
+    return (uint64_t)(uintptr_t)mem * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
+}
+static void pfs_set(uint64_t key, int state) {
+    pfstate *e = &g_pfs[(key >> 18) % PFS_TAB];
+    uint32_t now = (uint32_t)vkb_frame();
+    pthread_mutex_lock(&g_pfs_mu);
+    if (state == PFS_WARMED) { if (e->key == key) { e->state = PFS_WARMED; e->warm_frame = now; } }
+    else *e = (pfstate){key, now, 0, (uint8_t)state};
+    pthread_mutex_unlock(&g_pfs_mu);
+}
+static void pfs_upload_note(const vkb_image *im, uint64_t read_ns) {
+    uint64_t key = pfs_key(im->storage, &im->d);
+    pfstate *e = &g_pfs[(key >> 18) % PFS_TAB];
+    uint32_t now = (uint32_t)vkb_frame();
+    pthread_mutex_lock(&g_pfs_mu);
+    pfstate c = *e;
+    pthread_mutex_unlock(&g_pfs_mu);
+    int st = c.key == key ? c.state : PFS_UNKNOWN;
+    atomic_fetch_add(&g_pfs_n[st], 1);
+    atomic_fetch_add(&g_pfs_ns[st], read_ns);
+    if (st != PFS_UNKNOWN) atomic_fetch_add(&g_pfs_init_frames, now - c.init_frame);
+    if (st == PFS_WARMED) atomic_fetch_add(&g_pfs_warm_frames, now - c.warm_frame);
+}
+void vkb_tex_slow_reads(uint64_t v[16]) {   // counts by state [0..6], ns by state [7..13], presents since init, since warmed
+    for (int i = 0; i < PFS_N; i++) v[i] = atomic_load(&g_pfs_n[i]), v[PFS_N + i] = atomic_load(&g_pfs_ns[i]);
+    v[14] = atomic_load(&g_pfs_init_frames); v[15] = atomic_load(&g_pfs_warm_frames);
+}
 enum { PF_QUEUE = 512, PF_SEEN = 4096 };
 static tex_t g_pfq[PF_QUEUE];
 static int g_pf_head, g_pf_n;
@@ -1774,6 +1816,7 @@ static void *prefetch_thread(void *unused) {
         g_pf_n--;
         pthread_mutex_unlock(&g_pf_mu);
         prefetch_one(&t);
+        pfs_set(pfs_key(t.mem, &t.d), PFS_WARMED);
         nvn_texlayout L;
         nvn_tex_layout(&t.d, &L);
         coming += (uint64_t)(t.d.width ? t.d.width : 1) * (t.d.height ? t.d.height : 1) * (L.layers ? L.layers : 1) * 4 / 3;
@@ -1797,12 +1840,15 @@ void vkb_tex_prefetch(const tex_t *t) {
         d->target == NVN_TEXTURE_TARGET_BUFFER || nvn_fmt_bpb(d->format, &bw, &bh) != 16) return;
     vkb_format(d->format, &aspect, &astc);
     uintptr_t at = (uintptr_t)t->mem;
-    if (!astc || at < 0x0800000000ull || at + t->L.size > 0x8000000000ull || totk_vpool_gather(at, 0, NULL)) return;
-    uint64_t key = (uint64_t)at * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
+    if (!astc) return;
+    uint64_t key = pfs_key(t->mem, d);
+    if (at < 0x0800000000ull || at + t->L.size > 0x8000000000ull) { pfs_set(key, PFS_OUTSIDE); return; }
+    if (totk_vpool_gather(at, 0, NULL)) { pfs_set(key, PFS_VPOOL); return; }
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_mutex_lock(&g_pf_mu);
     uint64_t *seen = &g_pf_seen[(key >> 20) % PF_SEEN];
     int fresh = *seen != key;
+    int st = !fresh ? PFS_SEEN : g_pf_n < PF_QUEUE ? PFS_QUEUED : PFS_FULL;
     if (fresh && g_pf_n < PF_QUEUE) {
         *seen = key;
         g_pfq[(g_pf_head + g_pf_n) % PF_QUEUE] = *t;
@@ -1811,6 +1857,7 @@ void vkb_tex_prefetch(const tex_t *t) {
         atomic_fetch_add(&g_pf_queued, 1);
     } else if (fresh) atomic_fetch_add(&g_pf_dropped, 1);
     pthread_mutex_unlock(&g_pf_mu);
+    pfs_set(key, st);
     if (fresh) pthread_once(&once, prefetch_start);
 }
 void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfaces) {

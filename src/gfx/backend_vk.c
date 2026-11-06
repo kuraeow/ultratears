@@ -1612,15 +1612,17 @@ static void gpu_time_end(int slot, VkCommandBuffer cb) {   // into the submissio
 // A submission whose recording took over 100 ms: where the time went (log line "long submission"). The game waits for
 // its recording at the present: these are the hitches when new parts of the world arrive.
 extern uint64_t vkb_astc_ns, vkb_shader_load_ns;
-enum { SUB_SNAP = 25 };   // [14..24]: vkb_tex.c's upload parts (vkb_tex_upload_parts)
+enum { SUB_SNAP = 41 };   // [14..24]: vkb_tex.c's upload parts (vkb_tex_upload_parts); [25..40]: its slow BC7 reads
 static uint64_t g_sub_t0, g_sub_snap[SUB_SNAP];
 void vkb_tex_upload_parts(uint64_t v[11]);
+void vkb_tex_slow_reads(uint64_t v[16]);
 static void sub_snap(uint64_t v[SUB_SNAP]) {
     v[0] = vkb_step_ns[PK_CREATE]; v[1] = vkb_step_ns[PK_UPLOAD]; v[2] = vkb_astc_ns; v[3] = vkb_shader_load_ns;
     v[4] = g_sh_scan_ns; v[5] = g_sh_in_bytes;
     v[6] = vkb_step_ns[PK_ALLOC]; v[7] = vkb_step_ns[PK_UCAP]; v[8] = vkb_step_ns[PK_SYNC]; v[9] = vkb_step_ns[PK_SUBMIT]; v[10] = g_slot_wait_ns;
     v[11] = vkb_step_ns[PK_UPWAIT]; v[12] = vkb_step_ns[PK_SLOWDRAW]; v[13] = vkb_step_n[PK_SLOWDRAW];
     vkb_tex_upload_parts(&v[14]);
+    vkb_tex_slow_reads(&v[25]);
 }
 static void sub_long_check(uint64_t fence) {
     uint64_t now = runtime_now_ns(), v[SUB_SNAP];
@@ -1645,6 +1647,17 @@ static void sub_long_check(uint64_t fence) {
              "uploads lock %.0f ms (of it inline uploads %.0f ms)", (unsigned long long)fence, (unsigned long long)(a[7] - b[7]),
              (unsigned long long)(a[8] - b[8]), (a[10] - b[10]) / 1048576.0, (unsigned long long)(a[9] - b[9]), (a[0] - b[0]) / 1e6,
              (a[1] - b[1]) / 1e6, (a[2] - b[2]) / 1e6, (a[3] - b[3]) / 1e6, (a[4] - b[4]) / 1e6, (a[5] - b[5]) / 1e6, (a[6] - b[6]) / 1e6);
+        // the textures whose BC7 reads went to the disk (over 1 ms each), by what the warming had done (vkb_tex.c PFS_*)
+        uint64_t *c = &v[25], *d = &g_sub_snap[25], n[7], all = 0, ns = 0;
+        for (int i = 0; i < 7; i++) n[i] = c[i] - d[i], all += n[i], ns += c[7 + i] - d[7 + i];
+        if (all)
+            VLOG("long submission %llu: slow BC7 reads: %llu textures (%.0f ms); warmed %llu (%.0f ms, warmed %.0f presents before), queued "
+                 "not warmed yet %llu (%.0f ms), queue full %llu, taken for seen %llu, in a virtual pool %llu (%.0f ms), outside game memory %llu, "
+                 "not known %llu (%.0f ms); initialized %.0f presents before on average", (unsigned long long)fence, (unsigned long long)all,
+                 ns / 1e6, (unsigned long long)n[6], (c[13] - d[13]) / 1e6, n[6] ? (double)(c[15] - d[15]) / (double)n[6] : 0.0,
+                 (unsigned long long)n[3], (c[10] - d[10]) / 1e6, (unsigned long long)n[4], (unsigned long long)n[5], (unsigned long long)n[1],
+                 (c[8] - d[8]) / 1e6, (unsigned long long)n[2], (unsigned long long)n[0], (c[7] - d[7]) / 1e6,
+                 all > n[0] ? (double)(c[14] - d[14]) / (double)(all - n[0]) : 0.0);
     }
 }
 
