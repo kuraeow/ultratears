@@ -1817,6 +1817,71 @@ void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfa
     *queued = atomic_load(&g_pf_queued); *dropped = atomic_load(&g_pf_dropped); *surfaces = atomic_load(&g_pf_surfaces);
 }
 
+// ---- memory kept ready (TOTK_VK_MEM_READY=1, 2026-11-06) ----
+// Upload memory made ahead (vkb_ring_reserve) and image memory blocks made ahead (vkb_image_blocks_reserve) were made
+// only by the prefetch thread after a batch of warmed ASTC textures. In the Steam Deck's run of 2026-11-06 it warmed
+// 0.1-0.5 textures a frame before the long submissions, and those submissions made the memory themselves: upload
+// memory 137-189 ms for 3-7 large uncompressed textures (50 MiB, not ASTC: never counted ahead), new images up to
+// 215 ms. With the switch a thread below the game's threads keeps, after every submission begins, at least MR_FLOOR of
+// spare upload memory (one ring chunk: an upload of up to 64 MiB finds it) and image blocks with half a block free.
+// It costs that memory held (host memory, or device memory with resizable BAR; image blocks are device memory).
+enum { MR_FLOOR = 64u << 20 };
+static pthread_mutex_t g_mr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mr_cv = PTHREAD_COND_INITIALIZER;
+static int g_mr_kick;
+static _Atomic uint64_t g_mr_runs, g_mr_ns;
+static int mem_ready_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_MEM_READY");
+        v = e && *e == '1';
+        if (v) VLOG("memory kept ready: %u MiB of spare upload memory and half an image block free, made off the recording threads (TOTK_VK_MEM_READY)", MR_FLOOR >> 20);
+    }
+    return v;
+}
+static void *mem_ready_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("totk-mem-ready");
+    { void plat_thread_background(void); plat_thread_background(); }
+    for (;;) {
+        pthread_mutex_lock(&g_mr_mu);
+        while (!g_mr_kick) pthread_cond_wait(&g_mr_cv, &g_mr_mu);
+        g_mr_kick = 0;
+        pthread_mutex_unlock(&g_mr_mu);
+        if (!vkb_ready()) continue;
+        uint64_t t0 = runtime_now_ns();
+        if (!atomic_load(&g_vram_tight)) vkb_ring_reserve(MR_FLOOR);   // returns at once when the spares hold that much
+        vkb_image_blocks_reserve();                                       // likewise when half a block is free
+        atomic_fetch_add(&g_mr_ns, runtime_now_ns() - t0);
+        atomic_fetch_add(&g_mr_runs, 1);
+    }
+    return NULL;
+}
+static void mem_ready_start(void) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, mem_ready_thread, NULL) == 0) pthread_detach(th);
+}
+void vkb_mem_ready_kick(void) {   // a submission begins (vkb_draw.c vkb_slot_reset)
+    if (!mem_ready_on()) return;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, mem_ready_start);
+    pthread_mutex_lock(&g_mr_mu);
+    g_mr_kick = 1;
+    pthread_cond_signal(&g_mr_cv);
+    pthread_mutex_unlock(&g_mr_mu);
+}
+// The per-frame log line (backend_vk.c), over `frames` presents
+void vkb_mem_ready_log(double frames) {
+    if (!mem_ready_on() || frames <= 0) return;
+    static uint64_t pr, pn, pb, pc;
+    uint64_t r = atomic_load(&g_mr_runs), n = atomic_load(&g_mr_ns), b = atomic_load(&g_imem_blocks_made);
+    uint64_t vkb_ring_reserved(void);
+    uint64_t c = vkb_ring_reserved();
+    VLOG("per frame: memory kept ready: %.2f ms on its thread; since the last line: %llu upload chunks made ahead, %llu image blocks made (ahead or not)",
+         r > pr ? (double)(n - pn) / 1e6 / frames : 0.0, (unsigned long long)(c - pc), (unsigned long long)(b - pb));
+    pr = r; pn = n; pb = b; pc = c;
+}
+
 // Under g_up_mu, into the prologue: 1 when recorded, 0 to upload as before, 2 when another thread uploaded it meanwhile.
 static int plan_record(VkCommandBuffer cb, vkb_image *im, const uplan *P) {
     if (im->upload_stamp && !vkb_tex_stale(im)) return 2;

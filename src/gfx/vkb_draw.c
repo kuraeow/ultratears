@@ -107,6 +107,7 @@ static int chunk_new(chunk_t *c, VkDeviceSize size) {
 enum { RESERVE_MAX = 256u << 20 };
 #define RESERVE_HOLD 5000000000ull
 static _Atomic uint64_t g_reserve_at, g_reserved;
+uint64_t vkb_ring_reserved(void) { return atomic_load(&g_reserved); }   // chunks made ahead (the log)
 void vkb_ring_reserve(uint64_t bytes) {
     if (bytes > RESERVE_MAX) bytes = RESERVE_MAX;
     atomic_store(&g_reserve_at, runtime_now_ns());
@@ -197,6 +198,7 @@ void vkb_slot_reset(int slot) {   // the slot's previous submission has complete
     for (int w = 0; w < VKB_MAXREC; w++) ring_trim(&g_res[slot][w]);
     pthread_mutex_unlock(&g_ring_mu);
     spare_expire();
+    { void vkb_mem_ready_kick(void); vkb_mem_ready_kick(); }   // TOTK_VK_MEM_READY: memory made ahead for this submission's kind
     for (int w = 0; w < VKB_MAXREC; w++) {
         slot_res *r = &g_res[slot][w];
         for (int i = 0; i < r->n; i++) r->c[i].used = 0;
