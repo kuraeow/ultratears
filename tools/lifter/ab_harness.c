@@ -21,6 +21,7 @@ extern const ab_fn ab_fns[];
 extern const int ab_nfns;
 
 volatile int g_fnprof;
+int g_simd_nanvec = 1;   // simd_fp.h vslow (runtime/dispatch.c)
 void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) { (void)a; (void)lr; (void)x0; }
 
 enum { BUF_SIZE = 0x40000 };

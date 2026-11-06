@@ -147,7 +147,13 @@ int rt_lifted_range(uintptr_t *lo, uintptr_t *hi) {
     return 1;
 }
 
+// [TOTK] simd_fp.h vslow: a vector FP result with a NaN lane fixed across the vector, not lane by lane through the
+// scalar path (on by default since 2026-11-06; TOTK_FP_NANVEC=0: lane by lane, as before)
+int g_simd_nanvec = 1;
+
 void dispatch_init(void) {
+    const char *nv = getenv("TOTK_FP_NANVEC");
+    g_simd_nanvec = !(nv && *nv == '0');
     const uint64_t *addrs[] = {main_fn_addrs, subsdk0_fn_addrs, sdk_fn_addrs};
     const GuestFn *fns[] = {main_fn_ptrs, subsdk0_fn_ptrs, sdk_fn_ptrs};
     uint64_t counts[] = {main_fn_count, subsdk0_fn_count, sdk_fn_count};
