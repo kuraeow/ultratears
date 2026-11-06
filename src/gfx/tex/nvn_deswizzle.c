@@ -95,6 +95,41 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     return 0;
 }
 
+// [port] A region written straight into the storage (WriteTexels): x0/w in bytes, y0/h in block rows, z0/n slices (3D:
+// depth slices; other targets: n must be 1). Only the region's bytes are touched, in runs of up to 16 (a GOB sector).
+// The whole level deswizzled, patched and swizzled back took 11-16 ms a call on the Steam Deck while the world
+// streamed in (2026-11-07, the streaming-call line: write texels), for regions much smaller than their textures.
+int nvn_swizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x0, uint32_t y0, uint32_t z0,
+                       uint32_t w, uint32_t h, uint32_t n, const void *src, size_t row, size_t img, void *storage) {
+    const uint8_t *s = src;
+    uint8_t *dst = storage;
+    if (nvn_tex_is_linear(d)) {
+        if (level || layer || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7) || z0 || n != 1) return -1;
+        int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+        if (!bpb) return -1;
+        uint32_t row_bytes = (uint32_t)((d->width + bw - 1) / bw) * (uint32_t)bpb, rows = d->target == 0 ? 1 : (d->height + bh - 1) / bh;
+        uint32_t stride = nvn_tex_linear_stride(d);
+        if (x0 + w > row_bytes || y0 + h > rows || stride < row_bytes) return -1;
+        for (uint32_t y = 0; y < h; y++) memcpy(dst + (size_t)(y0 + y) * stride + x0, s + y * row, w);
+        return 0;
+    }
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (x0 + w > row_bytes || y0 + h > rows || z0 + n > slices) return -1;
+    dst += base;
+    for (uint32_t z = 0; z < n; z++)
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *line = s + z * img + y * row;
+            for (uint32_t x = 0; x < w;) {
+                uint32_t bx = x0 + x, run = 16 - bx % 16;
+                if (run > w - x) run = w - x;
+                memcpy(dst + nvn_bl_offset(bx, y0 + y, z0 + z, row_bytes, rows, th, td), line + x, run);
+                x += run;
+            }
+        }
+    return 0;
+}
+
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1);
 }

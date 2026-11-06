@@ -2174,6 +2174,21 @@ int mtl_write_texels_mem(const tex_t *t, unsigned level, unsigned layer0, const 
     uint32_t lbx = (lw + bw - 1) / bw, lby = (lh + bh - 1) / bh, pitch = lbx * (uint32_t)bpb;
     uint32_t sx = (uint32_t)r->xoffset / bw, sy = (uint32_t)r->yoffset / bh;
     if (sx + bx > lbx || sy + by > lby) { VLOG("WriteTexels: region outside texture %llu", (unsigned long long)t->serial); return 0; }
+    {   // the region alone, straight into the storage (nvn_swizzle_region); TOTK_WRITE_TEXELS_REGION=0: the whole level
+        // deswizzled, patched and swizzled back as before (11-16 ms a call on the Steam Deck while the world streamed in)
+        static int region = -1;
+        if (region < 0) { const char *e = getenv("TOTK_WRITE_TEXELS_REGION"); region = !(e && *e == '0'); }
+        if (region) {
+            int ok = 1;
+            if (is3d) ok = (uint32_t)r->zoffset + nz <= ld &&
+                           !nvn_swizzle_region(&t->d, level, 0, sx * (uint32_t)bpb, sy, (uint32_t)r->zoffset, (uint32_t)wb, by, nz, src, row, img, t->mem);
+            else
+                for (uint32_t z = 0; z < nz && ok; z++)
+                    ok = !nvn_swizzle_region(&t->d, level, layer0 + (uint32_t)r->zoffset + z, sx * (uint32_t)bpb, sy, 0, (uint32_t)wb, by, 1,
+                                             src + z * img, row, img, t->mem);
+            if (ok) return 1;   // (a region refused part-way is written again whole below: same bytes)
+        }
+    }
     uint8_t *lin = malloc((size_t)pitch * lby * ld);
     if (!lin) die("WriteTexels");
     uint8_t *storage = (uint8_t *)t->mem;

@@ -21,6 +21,11 @@ int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void
 // Single-point address: within this level and layer, linear (x byte, y block row, z slice) → block-linear byte offset relative to the start of this level and layer (unit tests verify against hand calculation)
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD);
 
+// A region written straight into the storage of level / layer: x0, w in bytes; y0, h in block rows; z0, n depth slices
+// (3D; else z0 0, n 1); src rows `row` bytes apart, slices `img` apart. Only the region's bytes change. 0 done, -1 not
+// supported (the caller goes the whole-level way).
+int nvn_swizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t x0, uint32_t y0, uint32_t z0,
+                       uint32_t w, uint32_t h, uint32_t n, const void *src, size_t row, size_t img, void *storage);
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);
