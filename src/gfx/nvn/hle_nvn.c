@@ -3069,7 +3069,20 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         nvn_pacer pc = {o->pace};
         qslot = now + nvn_pace(&pc, now, period);
         o->pace = pc.target;
-        if (idx >= 0 && idx < 4) o->avail[idx] = period ? qslot + period : 0;
+        /* The image is free for the next acquire one period after its slot, when the next frame reaches the display: a
+           frame gets exactly one period from acquire to present, and one a little longer misses its slot even when the
+           frames around it had time to spare (the Steam Deck at 40: the game's main thread waited 18 ms a frame for the
+           slot in the dense places while frames of 26-37 ms still came, 2026-11-06). With the frame queue
+           (TOTK_FRAME_QUEUE=1, as totk-pc-recomp's frame_queue, nvn_api_obj.c) it is free at its slot: by then its
+           present is a copy queued on the translation thread (the acquire waits for that job and the GPU copy), so the
+           game draws the next frame while this one waits for its turn, and a frame up to one period longer still makes
+           its slot, for up to one frame more input delay. They measured frames over 17.5 ms at 60 fps 25-33 -> 1-8
+           per 30 s. */
+        static int fq = -1;
+        if (fq < 0) { const char *e = getenv("TOTK_FRAME_QUEUE"); fq = e && *e == '1';
+                      LOG("[nvn] frame queue: %s", fq ? "on, an image is free at its display slot (TOTK_FRAME_QUEUE=1)"
+                                                      : "off, an image is free one period after its slot (TOTK_FRAME_QUEUE=1: on)"); }
+        if (idx >= 0 && idx < 4) o->avail[idx] = period ? qslot + (fq ? 0 : period) : 0;
     }
     if (runtime_frame_step_update) runtime_frame_step_update(qslot ? qslot : now_ns());
     if (movie_host_tick) movie_host_tick();

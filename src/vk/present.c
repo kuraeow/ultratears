@@ -141,6 +141,15 @@ typedef struct {
 } out_t;
 static out_t g_out[OUTS];
 static uint64_t g_out_seq;       // under mu
+// The frame queue (TOTK_FRAME_QUEUE=1, gfx/nvn/hle_nvn.c nvnQueuePresentTexture): the game may draw a frame while the
+// one before waits for its slot, so a pending frame is one still to be shown in its turn, not one a newer frame makes
+// stale: frames are shown oldest first and none is dropped for a newer one (dropping it would be the very skipped
+// frame the queue is there to avoid). Without it, the newest pending frame wins as before.
+static int out_fifo(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_FRAME_QUEUE"); v = e && *e == '1'; }
+    return v;
+}
 
 static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < vkc.memory.memoryTypeCount; i++)
@@ -197,7 +206,7 @@ void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int cro
     out_t *o = &g_out[slot];
     o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1; o->not_before = not_before;
     if (crop) memcpy(o->crop, crop, sizeof o->crop); else memset(o->crop, 0, sizeof o->crop);
-    for (int i = 0; i < OUTS; i++)   // older pending frames are never shown
+    for (int i = 0; i < OUTS && !out_fifo(); i++)   // older pending frames are never shown (with the frame queue: they are)
         if (i != slot && g_out[i].state == 1 && g_out[i].seq < o->seq) g_out[i].state = 0;
     frames_in++;
     pthread_cond_signal(&cv);
@@ -304,7 +313,10 @@ static void *present_thread(void *unused) {
         if (again) pick = last;
         else {
             shown = frames_in;   // frames that came while the last one was shown are skipped: only the newest counts
-            for (int i = 0; i < OUTS; i++) if (g_out[i].state == 1 && (pick < 0 || g_out[i].seq > g_out[pick].seq)) pick = i;
+            for (int i = 0; i < OUTS; i++)   // the newest pending frame, or with the frame queue the oldest (in its turn)
+                if (g_out[i].state == 1 && (pick < 0 || (out_fifo() ? g_out[i].seq < g_out[pick].seq : g_out[i].seq > g_out[pick].seq))) pick = i;
+            for (int i = 0; i < OUTS && out_fifo(); i++)   // a newer one still pending: the loop goes on to it, not to sleep
+                if (i != pick && g_out[i].state == 1) shown = frames_in - 1;
         }
         if (pick >= 0) g_out[pick].state = 2, last = pick;
         pthread_mutex_unlock(&mu);
