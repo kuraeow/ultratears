@@ -2835,8 +2835,9 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
 
 // Threads recording (vkb_mt_submit): the submission's command buffers after the slot's own, the last one for the work at
 // its end (copies back, the GPU end time).
-enum { MT_MAXCH = 96 };
-static VkCommandBuffer g_mt_list[2 * MT_MAXCH + 4 + 2 * VKB_MAXREC];   // (+ the uploads' command buffers, vkb_upload_begin)
+// UPQ_MAX: uploads of a submission sent in parts each in a command buffer of its own (vkb_upload_begin), at most
+enum { MT_MAXCH = 96, UPQ_MAX = 1024, MT_LIST = 2 * MT_MAXCH + 4 + 2 * VKB_MAXREC + 2 * (UPQ_MAX + VKB_MAXREC) };
+static VkCommandBuffer g_mt_list[MT_LIST];   // (+ the uploads' command buffers, vkb_upload_begin)
 static int g_mt_nlist;
 uint64_t mtl_sub_commit(void) {
     uint64_t fence = ++g_fence;
@@ -2860,7 +2861,7 @@ uint64_t mtl_sub_commit(void) {
     s->fence = fence;
     if (!g_slot_sent) vk.vkEndCommandBuffer(s->cb);
     if (g_mt_nlist) vk.vkEndCommandBuffer(last);
-    VkCommandBufferSubmitInfo cbi[2 * MT_MAXCH + 5 + 2 * VKB_MAXREC];
+    static VkCommandBufferSubmitInfo cbi[MT_LIST + 1];   // (the translation thread only)
     int ncbi = 0;
     if (!g_slot_sent) cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
     g_slot_sent = 0;
@@ -2930,7 +2931,9 @@ uint64_t mtl_sub_commit(void) {
 // The chunk size follows the threads: a submission waits for its longest chunk, so about four chunks a thread of the
 // previous submission's draws (2026-10-31, the Depths run: chunks of ~490 draws, the longest 8.5 ms of a 10 ms
 // submission while three threads waited), between MT_MIN and MT_DRAWS; TOTK_VK_CHUNK_DRAWS=<n> sets it.
-enum { MT_DRAWS = 400, MT_MIN = 96 };
+enum { MT_DRAWS = 400, MT_MIN = 96, PART_FIRST = 64 };   // PART_FIRST: partial submission's first chunk (walk_op)
+static int part_on(void);
+static void part_flush(void);
 static int g_chunk_draws = MT_DRAWS;   // this submission's: a chunk ends at a render target change after it, inside a pass after 5/4 of it
 static uint64_t g_prev_draws;          // the draws of the previous submission
 struct mt_chunk {
@@ -3111,6 +3114,7 @@ static void *mt_thread(void *arg) {
         pthread_mutex_unlock(&g_mt_mu);
         mt_record(&g_ch[k]);
         mt_recorded(&g_ch[k]);
+        if (part_on()) part_flush();   // the recorded prefix to the GPU now, not when the translation thread looks next
     }
     return NULL;
 }
@@ -3141,8 +3145,10 @@ static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends b
 static int walk_op(const uint8_t *p, int hidx) {   // before a command at depth 0: a new chunk at a render target change
     op_hdr h;
     memcpy(&h, p, sizeof h);
-    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= (uint64_t)g_chunk_draws * 5 / 4 && g_rt.n > 0;   // inside a pass with colour targets
-    if (((h.op == OP_SET_RT && g_mt_draws >= (uint64_t)g_chunk_draws) || split) && g_nch < MT_MAXCH - 1) {
+    // partial submission: the first chunk short, so that the GPU has work soon after the walk (part_flush)
+    uint64_t lim = g_nch == 0 && part_on() && g_chunk_draws > PART_FIRST ? PART_FIRST : (uint64_t)g_chunk_draws;
+    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= lim * 5 / 4 && g_rt.n > 0;   // inside a pass with colour targets
+    if (((h.op == OP_SET_RT && g_mt_draws >= lim) || split) && g_nch < MT_MAXCH - 1) {
         chunk_close(hidx, p);
         chunk_open(hidx, p);
         g_ch[g_nch].split = split && h.op != OP_SET_RT;
@@ -3248,9 +3254,47 @@ static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
 // and it is recorded before this thread sees it done and takes g_pro_mu to close the part, so the work is in this
 // part's prologue or an earlier one. Pool copies (Linux) are synced once a submission, at the first part using them
 // (pc_sync). [temporary] The GPU time of a submission (its two timestamps) includes the waits between its parts.
-enum { PART_DRAWS = 64, PART_MAX = 8 };
+// Second version (2026-11-06): the first one sent its first part 7.4-9.4 ms into a recording of 6-18 ms (the friend's
+// RX 570, the Steam Deck; frame-compare.md 3и) - after the prologue, the walk and a chunk of the translation thread's
+// own - so the GPU still began when the frame was nearly recorded, and the game's thread waited for "record, then
+// draw" as before (12-21 ms in long frames against totk-pc-recomp's 0.00 on the same machine: their GPU begins 0.45 ms
+// after the submission). Now the first chunk is short (PART_FIRST draws), every thread that records a chunk sends the
+// recorded prefix (g_part_mu: one at a time), the first part as soon as the walk is done, and the texture uploads of
+// the recording threads go with the parts (each in a command buffer of its own, vkb_upload_begin) instead of all into
+// the prologue under one lock.
+enum { PART_DRAWS = 64, PART_MAX = 16 };
 static int g_part_next, g_part_n, g_part_full;   // the first chunk not sent; parts sent; the next chunk's glue waits for all
 static uint64_t g_part_t, g_glue_images;           // when the last part went; images moved between chunks (the log line)
+static pthread_mutex_t g_part_mu = PTHREAD_MUTEX_INITIALIZER;   // part_flush and the submission's end, one at a time
+static int g_walk_done, g_part_closing;            // (g_part_mu) parts may go; the submission is sending the rest
+static uint64_t g_part_t0;                         // when the submission's recording began
+// uploads with partial submission: each in its own command buffer, ended by its thread and queued until a part takes it
+typedef struct { VkCommandBuffer cb; vkb_trk trk; } upq_e;
+static upq_e *g_upq[VKB_MAXREC];
+static int g_upq_n[VKB_MAXREC], g_upq_cap[VKB_MAXREC], g_upq_taken[VKB_MAXREC];
+static pthread_mutex_t g_upq_mu[VKB_MAXREC];
+static pthread_once_t g_upq_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_upq_total;   // queued this submission (UPQ_MAX: then into the prologue, as without the split)
+static void upq_init(void) { for (int w = 0; w < VKB_MAXREC; w++) pthread_mutex_init(&g_upq_mu[w], NULL); }
+// The uploads queued so far into list, each after its move (the first with a full barrier); g_pro_mu held.
+static void uploads_take(VkCommandBuffer *list, int *n) {
+    pthread_once(&g_upq_once, upq_init);
+    int first = 1;
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        pthread_mutex_lock(&g_upq_mu[w]);   // an upload being recorded now is waited for (its image may be marked uploaded)
+        for (int i = g_upq_taken[w]; i < g_upq_n[w]; i++) {
+            VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+            glue(m, &g_upq[w][i].trk, first ? GLUE_FULL : 0);
+            first = 0;
+            vk.vkEndCommandBuffer(m);
+            list[(*n)++] = m;
+            list[(*n)++] = g_upq[w][i].cb;
+        }
+        g_upq_taken[w] = g_upq_n[w];
+        pthread_mutex_unlock(&g_upq_mu[w]);
+    }
+    if (!first) g_part_full = 1;   // the chunk after them sees their writes
+}
 static uint64_t g_part_subs, g_part_parts, g_part_first_ns;   // the log line: submissions sent in parts, parts, first part after the start
 static int part_on(void) {
     static int v = -1;
@@ -3295,28 +3339,33 @@ static void chunks_glue(int a, int b, VkCommandBuffer *list, int *n) {   // chun
         list[(*n)++] = g_ch[k].cb;
     }
 }
-// After the walk, on the translation thread only: the chunks recorded in order since the last part, if enough.
-static void part_flush(uint64_t t_start) {
-    if (g_part_n >= PART_MAX) return;
+// After the walk, on any thread that records chunks: the chunks recorded in order since the last part, if enough.
+static void part_flush(void) {
+    if (pthread_mutex_trylock(&g_part_mu)) return;   // another thread is sending: it sees what is recorded
+    if (!g_walk_done || g_part_closing || g_part_n >= PART_MAX) { pthread_mutex_unlock(&g_part_mu); return; }
     pthread_mutex_lock(&g_mt_mu);
     int e = g_part_next;
     uint64_t draws = 0;
     while (e < g_nch && g_ch[e].done) draws += g_ch[e++].draws;
     int all = g_nch;
     pthread_mutex_unlock(&g_mt_mu);
-    if (e == g_part_next || e == all || draws < PART_DRAWS) return;   // all recorded: the submission itself sends them
     uint64_t now = runtime_now_ns();
-    if (g_part_n && now - g_part_t < 1000000) return;
-    VkCommandBuffer list[2 * MT_MAXCH + 4];
+    // all recorded: the submission itself sends them; after the first part, at most one a millisecond
+    if (e == g_part_next || e == all || draws < (g_part_n ? PART_DRAWS : 1) || (g_part_n && now - g_part_t < 1000000)) {
+        pthread_mutex_unlock(&g_part_mu);
+        return;
+    }
+    static VkCommandBuffer list[MT_LIST];   // (g_part_mu)
     int n = 0;
     int first = !g_slot_sent;
     pthread_mutex_lock(&g_pro_mu);   // no prologue work meanwhile; glue writes image layouts the prologue's work may change
     pro_close(list, &n, 1);
+    uploads_take(list, &n);
     chunks_glue(g_part_next, e, list, &n);
     g_slot_sent = 1;   // under g_pro_mu: snap_take reads it there
     pthread_mutex_unlock(&g_pro_mu);
     g_part_next = e;
-    VkCommandBufferSubmitInfo cbi[2 * MT_MAXCH + 5];
+    static VkCommandBufferSubmitInfo cbi[MT_LIST + 1];
     int ncbi = 0;
     if (first) {
         vk.vkEndCommandBuffer(g_slots[g_cur].cb);
@@ -3334,9 +3383,10 @@ static void part_flush(uint64_t t_start) {
     vk_queue_unlock();
     vkb_step_add(PK_SUBMIT, ts0);
     if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2 (part)"); die("GPU submission failed"); }
-    if (first) g_part_first_ns += ts0 - t_start;
+    if (first) g_part_first_ns += ts0 - g_part_t0;
     g_part_n++;
     g_part_t = runtime_now_ns();
+    pthread_mutex_unlock(&g_part_mu);
 }
 
 // ---- texture uploads in a command buffer per recording thread (TOTK_VK_UPLOAD_SPLIT=1, 2026-11-06) ----
@@ -3347,8 +3397,8 @@ static void part_flush(uint64_t t_start) {
 // thread's own, with its own layout tracking, under a lock of the image alone; these command buffers run after the
 // prologue and before every chunk, as the prologue's uploads did (the CPU wrote the bytes before the submission). An
 // image is uploaded once a submission (the image's lock and its upload stamp), so no two of them touch it. Uploads that
-// are not prepared (ASTC decoded on the CPU, untracked memory) go into the prologue as before. Off with partial
-// submission (whose parts close the prologue only).
+// are not prepared (ASTC decoded on the CPU, untracked memory) go into the prologue as before. With partial submission
+// each upload is a command buffer of its own that the next part takes (uploads_take), at most UPQ_MAX a submission.
 // [experimental] On by default since 2026-11-06 (the player's decision; TOTK_VK_UPLOAD_SPLIT=0: one prologue, as before).
 // The Steam Deck, ~6 min with against ~2 min without: waits for one another's uploads 12-50 -> 0-11 ms in long
 // submissions, frames over 50 ms 13 -> 7 a minute. One black artifact over half the screen once, not yet told apart
@@ -3365,17 +3415,45 @@ static int up_split_on(void) {
         VLOG("texture uploads: %s", v ? "a command buffer per recording thread, a lock per image [experimental] (TOTK_VK_UPLOAD_SPLIT=0: one prologue)"
                                       : "one prologue, one lock (TOTK_VK_UPLOAD_SPLIT=0)");
     }
-    return v && !part_on();
+    return v;
 }
-int vkb_upload_split(void) { return t_recording && !t_pro_depth && up_split_on(); }
+int vkb_upload_split(void) {
+    return t_recording && !t_pro_depth && up_split_on() && (!part_on() || atomic_load(&g_upq_total) < UPQ_MAX);
+}
 void vkb_upload_begin(void) {   // (vkb_upload_split): records into this thread's uploads command buffer from here
     int w = t_worker;
-    if (!g_upcb[w]) { g_upcb[w] = wp_get(g_cur, w); vkb_trk_reset(&g_uptrk[w]); }
     t_up_cb_save = t_cb; t_up_trk_save = vkb_trk_get();
+    if (part_on()) {   // its own command buffer, queued for the next part when it ends (uploads_take)
+        pthread_once(&g_upq_once, upq_init);
+        pthread_mutex_lock(&g_upq_mu[w]);   // until vkb_upload_end
+        if (g_upq_n[w] == g_upq_cap[w]) {
+            int cap = g_upq_cap[w] ? g_upq_cap[w] * 2 : 64;
+            upq_e *q = realloc(g_upq[w], sizeof *q * (size_t)cap);
+            if (!q) die("upload queue");
+            memset(q + g_upq_cap[w], 0, sizeof *q * (size_t)(cap - g_upq_cap[w]));
+            g_upq[w] = q; g_upq_cap[w] = cap;
+        }
+        upq_e *e = &g_upq[w][g_upq_n[w]];
+        e->cb = wp_get(g_cur, w);
+        vkb_trk_reset(&e->trk);
+        atomic_fetch_add(&g_upq_total, 1);
+        t_cb = e->cb;
+        vkb_trk_set(&e->trk);
+        return;
+    }
+    if (!g_upcb[w]) { g_upcb[w] = wp_get(g_cur, w); vkb_trk_reset(&g_uptrk[w]); }
     t_cb = g_upcb[w];
     vkb_trk_set(&g_uptrk[w]);
 }
-void vkb_upload_end(void) { t_cb = t_up_cb_save; vkb_trk_set(t_up_trk_save); }
+void vkb_upload_end(void) {
+    if (part_on()) {
+        int w = t_worker;
+        vk.vkEndCommandBuffer(t_cb);
+        g_upq_n[w]++;
+        pthread_mutex_unlock(&g_upq_mu[w]);
+    }
+    t_cb = t_up_cb_save; vkb_trk_set(t_up_trk_save);
+}
 static void uploads_close(VkCommandBuffer *list, int *n) {   // after the prologue: each thread's uploads, after its move
     for (int w = 0; w < VKB_MAXREC; w++) {
         if (!g_upcb[w]) continue;
@@ -3417,10 +3495,17 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     g_pro_cb = wp_get(g_cur, WP_PRO);
     vkb_trk_reset(&g_pro_trk);
     g_pro_any = 0;
-    g_part_next = g_part_n = g_part_full = 0;
-    memset(g_upcb, 0, sizeof g_upcb);
-    g_slot_sent = 0;
     int part = part_on();
+    pthread_mutex_lock(&g_part_mu);   // (a recording thread may still be leaving part_flush of the last submission)
+    g_part_next = g_part_n = g_part_full = 0;
+    g_walk_done = g_part_closing = 0;
+    g_part_t0 = t0;
+    pthread_mutex_unlock(&g_part_mu);
+    memset(g_upcb, 0, sizeof g_upcb);
+    memset(g_upq_n, 0, sizeof g_upq_n);
+    memset(g_upq_taken, 0, sizeof g_upq_taken);
+    atomic_store(&g_upq_total, 0);
+    g_slot_sent = 0;
     t_recording = 1;
     vkb_pro_begin();
     vkb_draw_mt_init();
@@ -3441,21 +3526,32 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     uint64_t tr = runtime_now_ns();
     walk_ns += tr - tw;
     // this thread records chunks too, then waits for the others (partial submission: sending what is recorded in order)
-    if (part) part_flush(t0);
-    for (int k; (k = mt_take()) >= 0;) { mt_record(&g_ch[k]); mt_recorded(&g_ch[k]); if (part) part_flush(t0); }
+    if (part) {
+        pthread_mutex_lock(&g_part_mu);
+        g_walk_done = 1;
+        pthread_mutex_unlock(&g_part_mu);
+        part_flush();
+    }
+    for (int k; (k = mt_take()) >= 0;) { mt_record(&g_ch[k]); mt_recorded(&g_ch[k]); if (part) part_flush(); }
     pthread_mutex_lock(&g_mt_mu);
     while (g_mt_done < g_nch) {
         pthread_cond_wait(&g_mt_done_cv, &g_mt_mu);
-        if (part) { pthread_mutex_unlock(&g_mt_mu); part_flush(t0); pthread_mutex_lock(&g_mt_mu); }
+        if (part) { pthread_mutex_unlock(&g_mt_mu); part_flush(); pthread_mutex_lock(&g_mt_mu); }
     }
     pthread_mutex_unlock(&g_mt_mu);
+    if (part) {   // no part from here on: the rest goes with the submission
+        pthread_mutex_lock(&g_part_mu);
+        g_part_closing = 1;
+        pthread_mutex_unlock(&g_part_mu);
+    }
     uint64_t tt = runtime_now_ns();
     rec_ns += tt - tr;
     // in order: the slot's command buffer moves images into the prologue's layouts, then each chunk's move and the chunk
     // (after parts: the prologue's work since the last part, then the chunks not sent)
     g_mt_nlist = 0;
     pro_close(g_mt_list, &g_mt_nlist, 0);
-    uploads_close(g_mt_list, &g_mt_nlist);
+    if (part) uploads_take(g_mt_list, &g_mt_nlist);
+    else uploads_close(g_mt_list, &g_mt_nlist);
     chunks_glue(g_part_next, g_nch, g_mt_list, &g_mt_nlist);
     g_mt_list[g_mt_nlist++] = wp_get(g_cur, WP_MOVES);   // the end
     if (g_part_n) { g_part_subs++; g_part_parts += (uint64_t)g_part_n + 1; }
