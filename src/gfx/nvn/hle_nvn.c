@@ -2091,10 +2091,11 @@ static pthread_mutex_t g_xq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_xq_cv = PTHREAD_COND_INITIALIZER;
 static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swapchain image's last present (TOTK has one window)
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
+static _Atomic uint64_t g_x_early;   // pools deleted early for a new pool over their memory (x_pool_reuse; the log line)
 // Pools finalized, not deleted yet (XJ_POOLREL): a new pool over that memory waits for the queue first (the pool tables
 // are keyed by the memory). Texel writes queued (XJ_TEXWRITE): a texel read waits for the queue then. Under g_xq_mu.
 enum { XPOOLS = 64 };
-static struct { uintptr_t lo, hi; } g_xpool[XPOOLS];
+static struct { uintptr_t lo, hi; int taken; } g_xpool[XPOOLS];   // taken: being deleted (by the queue or, early, by a new pool)
 static int g_nxpool;
 static uint64_t g_xtexw;
 typedef struct { unsigned level, layer0; NVNcopyRegion r; uint8_t data[]; } xtexw;   // the region's texels, rows packed
@@ -2128,7 +2129,14 @@ static void *x_thread(void *unused) {
         if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else if (j.kind == XJ_SHREL) { void vkb_shader_release(void *rel); vkb_shader_release(j.ucap); }
-        else if (j.kind == XJ_POOLREL) { nvn_dirty_remove_range(j.ucap); mtl_pool_del(j.ucap); }
+        else if (j.kind == XJ_POOLREL) {   // unless a new pool over its memory deleted it already (x_pool_reuse)
+            int mine = 0;
+            pthread_mutex_lock(&g_xq_mu);
+            for (int i = 0; i < g_nxpool && !mine; i++)
+                if (g_xpool[i].lo == (uintptr_t)j.ucap && !g_xpool[i].taken) g_xpool[i].taken = mine = 1;
+            pthread_mutex_unlock(&g_xq_mu);
+            if (mine) { nvn_dirty_remove_range(j.ucap); mtl_pool_del(j.ucap); }
+        }
         else if (j.kind == XJ_TEXWRITE) { xtexw *w = j.ucap; mtl_write_texels_image(&j.tex, w->level, w->layer0, &w->r, w->data, 0, 0); free(w); }
         else {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
@@ -2143,7 +2151,7 @@ static void *x_thread(void *unused) {
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
         if (j.kind == XJ_POOLREL)
-            for (int i = 0; i < g_nxpool; i++) if (g_xpool[i].lo == (uintptr_t)j.ucap) { g_xpool[i] = g_xpool[--g_nxpool]; break; }
+            for (int i = 0; i < g_nxpool; i++) if (g_xpool[i].lo == (uintptr_t)j.ucap && g_xpool[i].taken) { g_xpool[i] = g_xpool[--g_nxpool]; break; }
         if (j.kind == XJ_TEXWRITE) g_xtexw--;
         g_xq_done++;
         pthread_cond_broadcast(&g_xq_cv);
@@ -2196,20 +2204,42 @@ void nvn_x_drain(void) { x_drain(XD_GRAPHICS); }   // for the graphics layer (po
 static void x_poolrel(void *mem, uint64_t size) {
     pthread_mutex_lock(&g_xq_mu);
     int full = g_nxpool == XPOOLS;
-    if (!full) { g_xpool[g_nxpool].lo = (uintptr_t)mem; g_xpool[g_nxpool].hi = (uintptr_t)mem + size; g_nxpool++; }
+    if (!full) { g_xpool[g_nxpool].lo = (uintptr_t)mem; g_xpool[g_nxpool].hi = (uintptr_t)mem + size; g_xpool[g_nxpool].taken = 0; g_nxpool++; }
     pthread_mutex_unlock(&g_xq_mu);
     if (full) { x_drain(XD_POOL); nvn_dirty_remove_range(mem); mtl_pool_del(mem); return; }
     xjob j = {.kind = XJ_POOLREL, .ucap = mem};
     x_push(&j);
 }
-static void x_pool_reuse(const void *mem, uint64_t size) {   // a new pool: over the memory of one still to be deleted?
+/* A new pool over the memory of one still to be deleted: that one goes now, here, instead of waiting for the whole queue
+   (x_drain, the recording of about a frame). The game finalizes a pool after waiting for the GPU work that used it
+   (nvnMemoryPoolFinalize), so no submission still queued uses it; its deletion was queued only to keep the pool table
+   in order, and the table is keyed by the memory the new pool takes. Measured on the Steam Deck (2026-11-07): such
+   drains 7-9 ms each, 2-12 a window while the world streams in, in the very windows where a pool creation took 9-14 ms
+   (the streaming-call line) - the game's loader waited and its main thread for the loader. The queued job finds the
+   entry taken and leaves it (the new pool has the same address). TOTK_POOL_EARLY_RELEASE=0: the drain, as before. */
+static void x_pool_reuse(const void *mem, uint64_t size) {
     if (!async_replay()) return;
+    static int early = -1;
+    if (early < 0) { const char *e = getenv("TOTK_POOL_EARLY_RELEASE"); early = !(e && *e == '0'); }
     uintptr_t lo = (uintptr_t)mem, hi = lo + size;
-    int hit = 0;
-    pthread_mutex_lock(&g_xq_mu);
-    for (int i = 0; i < g_nxpool && !hit; i++) hit = g_xpool[i].lo < hi && lo < g_xpool[i].hi;
-    pthread_mutex_unlock(&g_xq_mu);
-    if (hit) x_drain(XD_POOL_REUSE);
+    for (;;) {
+        int hit = 0, busy = 0;
+        uintptr_t old = 0;
+        pthread_mutex_lock(&g_xq_mu);
+        for (int i = 0; i < g_nxpool && !hit; i++)
+            if (g_xpool[i].lo < hi && lo < g_xpool[i].hi) {
+                if (!early) { hit = 1; break; }
+                if (g_xpool[i].taken) { busy = 1; continue; }   // the queue is deleting it right now
+                g_xpool[i].taken = hit = 1;
+                old = g_xpool[i].lo;
+                g_xpool[i] = g_xpool[--g_nxpool];   // (the queued job looks for a taken entry: none, so it leaves it)
+            }
+        pthread_mutex_unlock(&g_xq_mu);
+        if (!early) { if (hit) x_drain(XD_POOL_REUSE); return; }
+        if (hit) { nvn_dirty_remove_range((const void *)old); mtl_pool_del((const void *)old); atomic_fetch_add(&g_x_early, 1); continue; }
+        if (busy) { x_drain(XD_POOL_REUSE); return; }   // rare: wait for the queue's own deletion
+        return;
+    }
 }
 static void x_texwrite(const tex_t *o, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img, size_t wb, uint32_t hb) {
     uint32_t nz = r->depth > 0 ? (uint32_t)r->depth : 1;
@@ -3236,7 +3266,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (!async_replay()) mtl_set_frame(g_frame);
     else if (g_frame % 300 == 0 && dm_stats()) { uint64_t d = atomic_exchange(&g_x_drains, 0), dn = atomic_exchange(&g_x_drain_ns, 0);
         pthread_mutex_lock(&g_xq_mu); uint64_t q = g_xq_in - g_xq_done; pthread_mutex_unlock(&g_xq_mu);
-        LOG("[nvn] translation thread through frame %llu: %llu drain waits / %.1f ms over the last 300 frames, %llu queued items", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q);
+        LOG("[nvn] translation thread through frame %llu: %llu drain waits / %.1f ms over the last 300 frames, %llu queued items; pools deleted early for a new pool over their memory %llu", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q, (unsigned long long)atomic_exchange(&g_x_early, 0));
         { uint64_t sn = atomic_exchange(&g_stream_n, 0), sns = atomic_exchange(&g_stream_ns, 0), smx = atomic_exchange(&g_stream_max, 0);
           uint64_t km[SC_N]; for (int k = 0; k < SC_N; k++) km[k] = atomic_exchange(&g_stream_kmax[k], 0);
           LOG("[nvn] streaming calls (pools, texels) through frame %llu: %.1f a frame, %.2f ms a frame, the longest %.2f ms (pool init %.2f, finalize %.2f, map virtual %.2f, read texels %.2f, write texels %.2f); virtual core %s",
