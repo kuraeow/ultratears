@@ -3296,6 +3296,37 @@ static void uploads_take(VkCommandBuffer *list, int *n) {
     if (!first) g_part_full = 1;   // the chunk after them sees their writes
 }
 static uint64_t g_part_subs, g_part_parts, g_part_first_ns;   // the log line: submissions sent in parts, parts, first part after the start
+static uint64_t g_part_held;   // (g_part_mu) parts held back: they would have begun with a full barrier (the log line)
+// Third version (2026-11-06): a part after the first goes only when it needs no full barrier - no prologue work and no
+// queued upload since the last part. Such work is placed before the part's first chunk behind a full barrier (glue
+// GLUE_FULL, g_part_full: the prologue's writes, and its writes over what earlier parts still read), and a full barrier
+// waits for all the GPU's earlier work: the GPU drained at every such part. While the world streams in, the prologue
+// gets work (pool device copies, uploads) nearly every part: the friend's RX 570 (1080p, limit 60; 0.3.1-75) had 5-7
+// parts a submission and frames of 33-48 ms in bursts exactly where the game streamed (54 in ~2 min of world, against 8
+// with the first version and 20 without parts; frame-compare.md 0). The same cost once took the full barriers out from
+// between chunks (83cc638). totk-pc-recomp's parts carry no such barrier (vk_exec.c maybe_split: one recording, uploads
+// inline). A part held back goes with the next one or with the submission, as with no part at all: always correct.
+// TOTK_VK_PART_DRAIN=1: parts with a full barrier too, as the second version (A/B).
+static int part_drain_ok(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_PART_DRAIN");
+        v = e && *e == '1';
+        VLOG("partial submission: %s", v ? "parts go with a full barrier too (TOTK_VK_PART_DRAIN=1, the second version)"
+                                         : "a part after the first goes only without a full barrier (TOTK_VK_PART_DRAIN=1: as before)");
+    }
+    return v;
+}
+static int uploads_queued(void) {   // uploads not yet taken by a part
+    pthread_once(&g_upq_once, upq_init);
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        pthread_mutex_lock(&g_upq_mu[w]);
+        int q = g_upq_n[w] > g_upq_taken[w];
+        pthread_mutex_unlock(&g_upq_mu[w]);
+        if (q) return 1;
+    }
+    return 0;
+}
 static int part_on(void) {
     static int v = -1;
     if (v < 0) {
@@ -3360,6 +3391,12 @@ static void part_flush(void) {
     int n = 0;
     int first = !g_slot_sent;
     pthread_mutex_lock(&g_pro_mu);   // no prologue work meanwhile; glue writes image layouts the prologue's work may change
+    if (!first && !part_drain_ok() && (g_pro_any || uploads_queued())) {   // it would drain the GPU: held back
+        pthread_mutex_unlock(&g_pro_mu);
+        g_part_held++;
+        pthread_mutex_unlock(&g_part_mu);
+        return;
+    }
     pro_close(list, &n, 1);
     uploads_take(list, &n);
     chunks_glue(g_part_next, e, list, &n);
@@ -3579,10 +3616,11 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
              "glue and submit %.1f", pro_ns / 1e6 / 600, walk_ns / 1e6 / 600, rec_ns / 1e6 / 600, tail_ns / 1e6 / 600);
         if (part)
             VLOG("partial submission: %.0f %% of submissions in parts, %.1f parts each, the first part sent %.1f ms after the start "
-                 "(the whole: %.1f ms)", 100.0 * g_part_subs / 600, g_part_subs ? (double)g_part_parts / g_part_subs : 0.0,
-                 g_part_subs ? g_part_first_ns / 1e6 / g_part_subs : 0.0, wall_ns / 1e6 / 600);
+                 "(the whole: %.1f ms); parts held back from a full barrier %.1f times a submission", 100.0 * g_part_subs / 600,
+                 g_part_subs ? (double)g_part_parts / g_part_subs : 0.0, g_part_subs ? g_part_first_ns / 1e6 / g_part_subs : 0.0,
+                 wall_ns / 1e6 / 600, g_part_held / 600.0);
         prev_rec = rec; wall_ns = walk_ns = chunks = g_glue_images = longest_ns = longest_draws = pro_ns = rec_ns = tail_ns = 0;
-        g_part_subs = g_part_parts = g_part_first_ns = 0;
+        g_part_subs = g_part_parts = g_part_first_ns = g_part_held = 0;
     }
 }
 
