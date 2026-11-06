@@ -1317,8 +1317,8 @@ static void cfg_set(const char *key, const std::string &value) {   // "" removes
 struct Opt { const char *value, *label; };   // label: a text key, else shown as it is
 static const char *opt_label(const Opt &o) { return has_text(o.label) ? T(o.label) : o.label; }
 
-static const Opt WINDOW_OPTS[] = {{"fullscreen", "win_full"}, {"borderless", "win_borderless"}, {"", "win_window"}};
-static const Opt FPS_OPTS[] = {{"30", "30"}, {"40", "40"}, {"45", "45"}, {"", "60"}, {"120", "fps_120"},
+static const Opt WINDOW_OPTS[] = {{"fullscreen", "win_full"}, {"borderless", "win_borderless"}, {"window", "win_window"}};
+static const Opt FPS_OPTS[] = {{"30", "30"}, {"40", "40"}, {"45", "45"}, {"60", "60"}, {"120", "fps_120"},
                                {"144", "fps_144"}, {"display", "fps_display"}, {"unlimited", "fps_unlimited"}};
 static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de", "Deutsch"}, {"es", "Español"},
                                 {"fr", "Français"}, {"it", "Italiano"}, {"nl", "Nederlands"}, {"pt", "Português"},
@@ -1330,7 +1330,7 @@ static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de"
 // Another shape than 16:9 (src/host/render_res.c totk_aspect): the camera takes the output's ratio and the UI is laid out
 // for it (src/host/ui_aspect.c); the sizes are totk-pc-recomp's (installer/steps.py ASPECT_SIZES), 16:10 with the Steam
 // Deck's 1280x800. "display": the screen's own size, whatever its shape.
-static const Opt RES_16_9[] = {{"1280x720", "1280 × 720"}, {"", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
+static const Opt RES_16_9[] = {{"1280x720", "1280 × 720"}, {"1920x1080", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
                                {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};
 static const Opt RES_16_10[] = {{"1280x800", "1280 × 800"}, {"1680x1050", "1680 × 1050"}, {"1920x1200", "1920 × 1200"},
                                 {"2560x1600", "2560 × 1600"}, {"display", "res_display"}};
@@ -1396,6 +1396,23 @@ static const Opt AA_OPTS[] = {{"", "aa_game"}, {"fsr3", "FSR 3.1"}};
 // sharpness= (src/vk/fsr.c, src/gfx/vkb_tsr.c): the RCAS pass of the present's FSR 1 (when the window is larger than the
 // game's output), and of FSR 3.1
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
+
+// The window, resolution and frame limit the game takes when ultratears.cfg sets none: its own on a PC, the Steam Deck's
+// on the Deck (src/host/boot.c deck_defaults: fullscreen, 1280x800, 40 fps). Each option writes its value: an option
+// that wrote "" (the key removed) meant the game's default, so on the Deck the PC's 60 fps, 1920x1080 and window could
+// not be chosen at all - the Deck's defaults came back (the user's Deck ran at 40 with 60 chosen, 2026-11-06) - and an
+// unset key showed the PC's value while the Deck's ran.
+static bool on_deck();
+static std::string cfg_or_platform(const char *key) {
+    std::string v = cfg_get(key);
+    if (!v.empty())
+        return v;
+    bool deck = on_deck();
+    if (!SDL_strcmp(key, "window")) return deck ? "fullscreen" : "window";
+    if (!SDL_strcmp(key, "resolution")) return deck ? "1280x800" : "1920x1080";
+    if (!SDL_strcmp(key, "fps")) return deck ? "40" : "60";
+    return v;
+}
 
 template <size_t N> static int opt_index(const Opt (&opts)[N], const std::string &v, const char *same_as_default = "") {
     std::string value = v == same_as_default ? "" : v;
@@ -1712,12 +1729,12 @@ static void screen_play() {
     if (g_tab == 0) {
         const float ROW = 38;   // seven rows above Play (the design has five at 40)
         row_label(cy, "row_window");
-        int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_get("window")));
+        int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_or_platform("window")));
         if (k >= 0)
             cfg_set("window", WINDOW_OPTS[k].value);
         cy += ROW;
         row_label(cy, "row_res");   // the design: the shape, then the size of that shape
-        std::string res = cfg_get("resolution");
+        std::string res = cfg_or_platform("resolution");
         int a = res_aspect(res);
         if ((k = dropdown_n("res", 748, cy, 0, RES_BY_ASPECT[a].opts, RES_BY_ASPECT[a].n, res_index(a, res), nullptr, 32)) >= 0)
             cfg_set("resolution", RES_BY_ASPECT[a].opts[k].value);
@@ -1748,7 +1765,7 @@ static void screen_play() {
             cfg_set("sharpness", SHARP_OPTS[k].value);
         cy += ROW;
         row_label(cy, "row_fps");
-        if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_get("fps"), "60"))) >= 0)
+        if ((k = dropdown("fps", 748, cy, 0, FPS_OPTS, opt_index(FPS_OPTS, cfg_or_platform("fps")))) >= 0)
             cfg_set("fps", FPS_OPTS[k].value);
         cy += ROW;
         row_label(cy, "row_vsync");
