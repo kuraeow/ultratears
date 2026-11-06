@@ -95,6 +95,8 @@ static inline int dm_detclock_enabled(void) {return 0;}
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION, O_TMEM };   // O_SESSION / O_TMEM: IPC objects owned by ipc.c
 typedef struct event { int signaled; int refs; } event_t;
+static int wake_exact_on(void);
+static uint64_t g_wake_skipped;   // (__atomic) TOTK_WAKE_EXACT, wake_sync_obj
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; uint64_t host_context[2]; int prio, core; uint64_t mask;
@@ -792,6 +794,11 @@ void runtime_threads_report(unsigned frames) {
     fprintf(stderr, "[totk] guest threads per frame: virtual cores held %.2f of %.2f ms, waiting for a virtual core %.2f ms in all, "
             "wake latency %.0f us average (%.0f wakes a frame); host: CPU %.2f ms, waiting for a processor %.2f ms\n", hold_all, 3 * frame_ms, core_all,
             wakes_all ? wake_all / wakes_all / 1e3 : 0.0, wakes_all / frames, cpu_all, dly_all);
+    if (wake_exact_on()) {   // TOTK_WAKE_EXACT: waiters an event signal did not wake (another event)
+        static uint64_t last_skip; uint64_t k = __atomic_load_n(&g_wake_skipped, __ATOMIC_RELAXED);
+        fprintf(stderr, "[totk] exact wakes (TOTK_WAKE_EXACT): %.1f waiters a frame not woken by a signal of another event\n", (double)(k - last_skip) / frames);
+        last_skip = k;
+    }
     for (int i = 0; i < n && i < 10; i++) {
         double away = frame_ms > 0 ? frame_ms - r[i].all - r[i].core - r[i].hold : 0.0;
         fprintf(stderr, "[totk]   thread %#x prio %d: on a core %.1f ms, core wait %.2f ms (%.1f), blocked %.1f ms (lock %.1f, cond %.1f, address %.1f, sync %.1f; %.1f waits), "
@@ -964,6 +971,32 @@ static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = si
 }
 static void wake_sync_waiters(void) {
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }
+}
+/* An event signalled: only the WaitSynchronization waiters that wait on it (TOTK_WAKE_EXACT=1, 2026-11-06). Waking all
+   of them made each take a virtual core (core_take) to look at its handles and sleep again: audio and vsync signal
+   hundreds of times a second, and on the Steam Deck the game's threads queue for the three cores 100-146 ms a frame in
+   sum where the cores are 93 % busy (dense places, 40 fps limit). A waiter with more than four handles (wh keeps four)
+   is woken as before. As totk-pc-recomp's #326 does (the idea; the code is ours). Holding G. */
+static int wake_exact_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_WAKE_EXACT"); on = e && *e == '1'; }
+    return on;
+}
+// g_wake_skipped (at the top): waiters not woken by a signal of an event they do not wait on (the log line)
+static void wake_sync_obj(const event_t *e) {
+    if (!wake_exact_on()) { wake_sync_waiters(); return; }
+    for (thr_t *w = g_wait; w; ) {
+        thr_t *n = w->next;
+        if (w->wkind == 4) {
+            int hit = w->nwh > 4;
+            for (int i = 0; i < w->nwh && i < 4 && !hit; i++) {
+                unsigned k = w->wh[i] - 0x1000;
+                hit = k > 0 && k < MAX_H && g_h[k].type == O_EVENT_R && g_h[k].obj == e;
+            }
+            if (hit) wake(w, -1); else __atomic_fetch_add(&g_wake_skipped, 1, __ATOMIC_RELAXED);
+        }
+        w = n;
+    }
 }
 
 static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
@@ -1175,7 +1208,7 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t r = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
                   if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
+        else if (num == 0x11) { e->signaled = 1; wake_sync_obj(e); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         g_unlock();
@@ -1271,7 +1304,7 @@ void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时�
     g_lock();
     event_t *e = h_get(wh, O_EVENT_W);
     if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
-    e->signaled = 1; wake_sync_waiters();
+    e->signaled = 1; wake_sync_obj(e);
     g_unlock();
 }
 
@@ -1293,7 +1326,7 @@ uint32_t runtime_event_readable(uint32_t hw) {
 }
 void runtime_event_signal(uint32_t hw) {
     g_lock(); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
-    e->signaled = 1; wake_sync_waiters(); g_unlock();
+    e->signaled = 1; wake_sync_obj(e); g_unlock();
 }
 
 // ---------- Diagnostics ----------
