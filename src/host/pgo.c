@@ -23,10 +23,22 @@ void pgo_flush(void);
 void __llvm_profile_set_filename(const char *name);
 int __llvm_profile_write_file(void);
 
+// The runtime truncates its file once, at the start, and appends every later write (the first training run's file held
+// 21 whole snapshots and a cut-off last one, which llvm-profdata refuses). So each write goes to a .tmp, which naming
+// truncates, and replaces the .profraw only when complete: the file holds the latest whole snapshot (the counts are
+// cumulative), and a write cut off by the exit leaves the previous one.
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 void pgo_flush(void) {
+    char tmp[64], out[64];
+    snprintf(tmp, sizeof tmp, "../pgo/ultratears-%d.tmp", (int)getpid());
+    snprintf(out, sizeof out, "../pgo/ultratears-%d.profraw", (int)getpid());
     pthread_mutex_lock(&g_mu);
+    __llvm_profile_set_filename(tmp);
     int r = __llvm_profile_write_file();
+    if (!r) {
+        remove(out);
+        r = rename(tmp, out);
+    }
     pthread_mutex_unlock(&g_mu);
     fprintf(stderr, "[totk] PGO training: counts written%s\n", r ? " - FAILED" : "");
 }
@@ -40,7 +52,6 @@ static void *pgo_thread(void *unused) {
 }
 void pgo_start(void) {
     pgo_mkdir("../pgo");   // the working directory is the game folder (boot.c)
-    __llvm_profile_set_filename("../pgo/ultratears-%p.profraw");
     fprintf(stderr, "[totk] PGO training build: the game's code counts itself, written to ../pgo once a minute\n");
     pthread_t t;
     if (pthread_create(&t, NULL, pgo_thread, NULL) == 0) pthread_detach(t);
