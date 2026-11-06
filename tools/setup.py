@@ -643,6 +643,26 @@ def cfg_lines():
             'textures=data/textures', 'saves=userdata', 'fonts=data/fonts']
 
 
+def on_steam_deck():
+    """The Steam Deck, as the game tells it (src/host/boot.c deck_defaults): SteamDeck=1, or Valve's board with the
+    product Jupiter (LCD) or Galileo (OLED)."""
+    if os.environ.get('SteamDeck') == '1':
+        return True
+    try:
+        vendor = pathlib.Path('/sys/class/dmi/id/board_vendor').read_text().strip()
+        product = pathlib.Path('/sys/class/dmi/id/product_name').read_text().strip()
+    except OSError:
+        return False
+    return vendor == 'Valve' and product in ('Jupiter', 'Galileo')
+
+
+def first_settings(deck=None):
+    """The player's settings a new ultratears.cfg starts with, as if chosen in the launcher: on the Steam Deck the frame
+    limit 40 (a divisor of its screens' 40 Hz modes and of 120 Hz). Only when the file is made: the game has no limit
+    of the Deck's own, so 60 or more is the player's to choose, and an existing file is never changed."""
+    return ['fps=40'] if (on_steam_deck() if deck is None else deck) else []
+
+
 def step_finish(dump, state, cpus):
     fonts = dump / 'sysdata/fonts'
     lines = cfg_lines()
@@ -659,6 +679,8 @@ def step_finish(dump, state, cpus):
         for l in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
             if '=' in l and not l.startswith('#') and l.split('=', 1)[0] not in ours:
                 lines.append(l)
+    else:
+        lines += first_settings()   # a new game folder only: an existing ultratears.cfg keeps the player's as it is
     cfg.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     (ROOT / DEBUG_BAT).unlink(missing_ok=True)
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
