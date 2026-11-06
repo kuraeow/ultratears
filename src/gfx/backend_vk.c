@@ -2628,6 +2628,15 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                 prn = rn; ptc = tc; ppq = pq; ppd = pd;
                 (void)psf;
                 { void vkb_mem_ready_log(double frames); vkb_mem_ready_log(f); }   // TOTK_VK_MEM_READY
+                {   // how many textures the warming took for seen (memory and shape), and with REWARM the same contents
+                    static uint64_t pse, psa;
+                    uint64_t se, sa;
+                    void vkb_tex_prefetch_seen(uint64_t *, uint64_t *);
+                    vkb_tex_prefetch_seen(&se, &sa);
+                    VLOG("per frame: BC7 warming: %.1f textures taken for seen, %.1f with the same contents (TOTK_TEX_PREFETCH_REWARM)",
+                         (double)(se - pse) / f, (double)(sa - psa) / f);
+                    pse = se; psa = sa;
+                }
             }
             static uint64_t pm, psh, ptb;
             uint64_t im_made, im_shared, im_back;

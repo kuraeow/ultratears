@@ -1721,13 +1721,41 @@ static int plan_prepare(vkb_image *im, uplan *P) {   // 1: the bytes are in uplo
 // computes its surfaces' cache keys and reads their pages; the upload then finds them in memory. It changes nothing
 // the upload does: not warmed in time (or the game had not written the texture yet) it reads the disk as before.
 // TOTK_TEX_PREFETCH=0: off.
-enum { PF_QUEUE = 512, PF_SEEN = 4096 };
+// TOTK_TEX_PREFETCH_REWARM=1 (2026-11-06): a texture counts as seen by its object (serial), not by its memory and shape:
+// TotK streams new textures into the memory of old ones of the same shape, which were taken for seen and never warmed
+// (the Steam Deck: 0.1-0.5 a frame warmed before submissions that read 150-324 ms of BC7 from the disk). One whose
+// memory holds what it held at the last warming there (16 samples of 64 bytes) is not warmed again. Its queue is longer.
+enum { PF_QUEUE = 2048, PF_QUEUE_OLD = 512, PF_SEEN = 4096 };
 static tex_t g_pfq[PF_QUEUE];
 static int g_pf_head, g_pf_n;
 static uint64_t g_pf_seen[PF_SEEN];   // recently queued textures (storage and shape): queued once
 static pthread_mutex_t g_pf_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_pf_cv = PTHREAD_COND_INITIALIZER;
-static _Atomic uint64_t g_pf_queued, g_pf_dropped, g_pf_surfaces;
+static _Atomic uint64_t g_pf_queued, g_pf_dropped, g_pf_surfaces, g_pf_seen_skips, g_pf_same;
+static int pf_rewarm(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_TEX_PREFETCH_REWARM");
+        v = e && *e == '1';
+        if (v) VLOG("BC7 warming: by texture object, contents compared by samples (TOTK_TEX_PREFETCH_REWARM)");
+    }
+    return v;
+}
+static uint64_t pf_memkey(const tex_t *t) {
+    const nvn_texdesc *d = &t->d;
+    return (uint64_t)(uintptr_t)t->mem * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
+}
+static uint64_t pf_samples(const tex_t *t) {   // 16 pieces of 64 bytes over its storage (0: unreadable)
+    int plat_safe_read(void *dst, const void *src, size_t n);
+    uint64_t size = t->L.size, h = 1469598103934665603ull;
+    uint8_t b[64];
+    for (int i = 0; i < 16; i++) {
+        uint64_t n = size < 64 ? size : 64, off = size > 64 ? (size - 64) / 15 * (uint64_t)i : 0;
+        if (!n || !plat_safe_read(b, (const uint8_t *)t->mem + off, (size_t)n)) return 0;
+        for (uint64_t k = 0; k < n; k++) h = (h ^ b[k]) * 1099511628211ull;
+    }
+    return h | 1;
+}
 static void prefetch_one(const tex_t *t) {
     const nvn_texdesc *d = &t->d;
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -1773,6 +1801,13 @@ static void *prefetch_thread(void *unused) {
         g_pf_head = (g_pf_head + 1) % PF_QUEUE;
         g_pf_n--;
         pthread_mutex_unlock(&g_pf_mu);
+        if (pf_rewarm()) {   // the same contents as at the last warming of this memory: nothing new to read
+            static uint64_t lastkey[PF_SEEN], lasthash[PF_SEEN];
+            uint64_t mk = pf_memkey(&t), h = pf_samples(&t);
+            size_t i = (size_t)((mk >> 20) % PF_SEEN);
+            if (h && lastkey[i] == mk && lasthash[i] == h) { atomic_fetch_add(&g_pf_same, 1); continue; }
+            lastkey[i] = mk; lasthash[i] = h;
+        }
         prefetch_one(&t);
         nvn_texlayout L;
         nvn_tex_layout(&t.d, &L);
@@ -1798,12 +1833,14 @@ void vkb_tex_prefetch(const tex_t *t) {
     vkb_format(d->format, &aspect, &astc);
     uintptr_t at = (uintptr_t)t->mem;
     if (!astc || at < 0x0800000000ull || at + t->L.size > 0x8000000000ull || totk_vpool_gather(at, 0, NULL)) return;
-    uint64_t key = (uint64_t)at * 0x9E3779B97F4A7C15ull ^ ((uint64_t)d->format << 48 | (uint64_t)d->width << 24 | d->height);
+    uint64_t key = pf_memkey(t);
+    if (pf_rewarm()) key ^= t->serial * 0xC2B2AE3D27D4EB4Full;   // by texture object: new contents in old memory too
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_mutex_lock(&g_pf_mu);
     uint64_t *seen = &g_pf_seen[(key >> 20) % PF_SEEN];
     int fresh = *seen != key;
-    if (fresh && g_pf_n < PF_QUEUE) {
+    if (!fresh) atomic_fetch_add(&g_pf_seen_skips, 1);   // (the log line: how many were taken for seen)
+    if (fresh && g_pf_n < (pf_rewarm() ? PF_QUEUE : PF_QUEUE_OLD)) {
         *seen = key;
         g_pfq[(g_pf_head + g_pf_n) % PF_QUEUE] = *t;
         g_pf_n++;
@@ -1813,6 +1850,7 @@ void vkb_tex_prefetch(const tex_t *t) {
     pthread_mutex_unlock(&g_pf_mu);
     if (fresh) pthread_once(&once, prefetch_start);
 }
+void vkb_tex_prefetch_seen(uint64_t *seen, uint64_t *same) { *seen = atomic_load(&g_pf_seen_skips); *same = atomic_load(&g_pf_same); }
 void vkb_tex_prefetch_stats(uint64_t *queued, uint64_t *dropped, uint64_t *surfaces) {
     *queued = atomic_load(&g_pf_queued); *dropped = atomic_load(&g_pf_dropped); *surfaces = atomic_load(&g_pf_surfaces);
 }
