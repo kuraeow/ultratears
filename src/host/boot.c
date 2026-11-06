@@ -94,9 +94,9 @@ static void deck_defaults(void) {
     if (!deck) return;
     setenv("TOTK_OUTPUT_RES", "1280x800", 0);
     setenv("TOTK_WINDOW", "fullscreen", 0);
-    // No frame limit of its own: the launcher's (60 by default, as on a PC). The Deck's 40 here made the launcher's 60
-    // impossible to choose (2026-11-06), and a handheld that also says SteamDeck=1 (a ROG Ally on Bazzite) held to 40
-    // what it may run at 60: the player picks 40 in the launcher.
+    // No frame limit of its own: the launcher's. Its 40 here made the launcher's 60 impossible to choose (2026-11-06);
+    // now the launcher writes 40 into ultratears.cfg at the Deck's first start (ui.cpp deck_first_fps), a setting
+    // like any other.
     // The recording threads below the game's (nice 5): the user's runs (2026-11-05, routes not the same) had p95 31.8
     // against 33.8 ms and fewer frames over 50 ms; a burst of uploads may take longer (one of 1.2 s in that run)
     setenv("TOTK_RECORD_NICE", "5", 0);

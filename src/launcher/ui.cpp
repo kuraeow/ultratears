@@ -1398,8 +1398,8 @@ static const Opt AA_OPTS[] = {{"", "aa_game"}, {"fsr3", "FSR 3.1"}};
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
 
 // The window, resolution and frame limit the game takes when ultratears.cfg sets none: its own on a PC, the Steam Deck's
-// window and resolution on the Deck (src/host/boot.c deck_defaults: fullscreen, 1280x800; the frame limit is 60 on
-// both, the launcher's alone). Each option writes its value: an option that wrote "" (the key removed) meant the game's
+// window and resolution on the Deck (src/host/boot.c deck_defaults: fullscreen, 1280x800); the frame limit the
+// launcher writes on the Deck at the first start (deck_first_fps: 40), so it shows 40 there until then. Each option writes its value: an option that wrote "" (the key removed) meant the game's
 // default, so on the Deck the PC's 60 fps, 1920x1080 and window could not be chosen at all - the Deck's defaults came
 // back (the user's Deck ran at 40 with 60 chosen, 2026-11-06) - and an unset key showed the PC's value while the
 // Deck's ran.
@@ -1411,7 +1411,7 @@ static std::string cfg_or_platform(const char *key) {
     bool deck = on_deck();
     if (!SDL_strcmp(key, "window")) return deck ? "fullscreen" : "window";
     if (!SDL_strcmp(key, "resolution")) return deck ? "1280x800" : "1920x1080";
-    if (!SDL_strcmp(key, "fps")) return "60";
+    if (!SDL_strcmp(key, "fps")) return deck ? "40" : "60";
     return v;
 }
 
@@ -2220,7 +2220,16 @@ static void gfx_start() {
     G.p = setup_start({exe, "--prepare-shaders"}, U.install, path_join(U.install, "ultratears-prepare.log"));
 }
 
+// The Steam Deck's frame limit the first time the game starts there: 40 (a divisor of its LCD's and OLED's 40 Hz modes and
+// of 120 Hz), written into ultratears.cfg as if chosen, so it is the launcher's setting like any other and 60 or more
+// is the player's to choose. The game has no limit of the Deck's own (src/host/boot.c deck_defaults).
+static void deck_first_fps() {
+    if (on_deck() && cfg_get("fps").empty())
+        cfg_set("fps", "40");
+}
+
 static void play_now() {
+    deck_first_fps();
     if (G.play_mode)   // main.cpp closes the window, then ui_play_finish starts the game
         G.quit = true;
     else
@@ -2265,7 +2274,12 @@ bool ui_window_wanted() { return !G.play_mode || G.show; }
 bool ui_quit_wanted() { return G.quit; }
 // --play, the window closed: on Linux the launcher's process becomes the game (Steam follows it; with the window open its
 // display connection would pass to the game and keep the window up), elsewhere the game is started
-bool ui_play_finish() { return G.quit && (exec_game(U.install) || start_game(U.install)); }
+bool ui_play_finish() {
+    if (!G.quit)
+        return false;
+    deck_first_fps();
+    return exec_game(U.install) || start_game(U.install);
+}
 
 static void screen_play_footer() {
     if (G.p) {   // the graphics prepared, before the game starts
