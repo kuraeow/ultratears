@@ -1398,10 +1398,11 @@ static const Opt AA_OPTS[] = {{"", "aa_game"}, {"fsr3", "FSR 3.1"}};
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
 
 // The window, resolution and frame limit the game takes when ultratears.cfg sets none: its own on a PC, the Steam Deck's
-// on the Deck (src/host/boot.c deck_defaults: fullscreen, 1280x800, 40 fps). Each option writes its value: an option
-// that wrote "" (the key removed) meant the game's default, so on the Deck the PC's 60 fps, 1920x1080 and window could
-// not be chosen at all - the Deck's defaults came back (the user's Deck ran at 40 with 60 chosen, 2026-11-06) - and an
-// unset key showed the PC's value while the Deck's ran.
+// window and resolution on the Deck (src/host/boot.c deck_defaults: fullscreen, 1280x800; the frame limit is 60 on
+// both, the launcher's alone). Each option writes its value: an option that wrote "" (the key removed) meant the game's
+// default, so on the Deck the PC's 60 fps, 1920x1080 and window could not be chosen at all - the Deck's defaults came
+// back (the user's Deck ran at 40 with 60 chosen, 2026-11-06) - and an unset key showed the PC's value while the
+// Deck's ran.
 static bool on_deck();
 static std::string cfg_or_platform(const char *key) {
     std::string v = cfg_get(key);
@@ -1410,7 +1411,7 @@ static std::string cfg_or_platform(const char *key) {
     bool deck = on_deck();
     if (!SDL_strcmp(key, "window")) return deck ? "fullscreen" : "window";
     if (!SDL_strcmp(key, "resolution")) return deck ? "1280x800" : "1920x1080";
-    if (!SDL_strcmp(key, "fps")) return deck ? "40" : "60";
+    if (!SDL_strcmp(key, "fps")) return "60";
     return v;
 }
 
