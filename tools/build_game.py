@@ -112,8 +112,14 @@ def profile_rt(clang):
 # (dev-local/docs/frame-compare.md 0). Code the training never reached keeps the optimization it has without a
 # profile (-pgo-cold-func-opt=default), not the size-first one clang gives cold code. A function whose C changed since
 # (another lifter) does not match its hash and is compiled as without. TOTK_PGO=0: without the profile (A/B).
+# No .text.hot / .text.unlikely sections (-profile-guided-section-prefix=false): ld.lld groups them across all the
+# objects, hot game code first, then ours, then the rest of the game's, and our runtime landed inside the lifted code's
+# address range, which turns the virtual cores' asynchronous preemption off (src/host/threads.c ap_on: "host code inside
+# the lifted code range"). On the Steam Deck every build with the profile ran without it (2026-11-06), and a game
+# thread waited behind a worse-priority core owner up to 5-6 ms at a time instead of 2.3-2.8: the 40-30-40 dips while
+# the world streams in. The layout and inlining by the profile stay; only that grouping goes (COFF did not do it).
 PGO_PROFILE = ROOT / 'pgo/totk-1.4.3.profdata.zst'
-PGO_FLAGS = ' -mllvm -pgo-cold-func-opt=default'
+PGO_FLAGS = ' -mllvm -pgo-cold-func-opt=default -mllvm -profile-guided-section-prefix=false'
 
 
 def pgo_profile(build):
