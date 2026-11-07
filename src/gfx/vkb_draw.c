@@ -1942,6 +1942,7 @@ static int draw_trace(void) {
     }
     return g_trace_at > 0 && vkb_frame() >= (uint64_t)g_trace_at && g_trace_left-- > 0;
 }
+int vkb_draw_tracing(void) { return g_trace_at > 0 && vkb_frame() >= (uint64_t)g_trace_at && g_trace_left > 0; }   // without using one up
 // ---------------- GPU profile (development) ----------------
 // TOTK_GPU_PROF=<present>: a timestamp before and after every draw and dispatch of that frame; the next present prints
 // the GPU time per shader (sorted) and the frame's span. Timestamps inside a pass overlap with neighbouring draws, so

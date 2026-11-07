@@ -3080,10 +3080,37 @@ void dm_nvn_probe_present_interval(void) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
+// Frames ahead of the GPU (TOTK_MAX_FRAMES, default 2; 0: no limit, as before). The game's next image is free by our
+// frame limit's clock, not by the GPU: in a scene the GPU takes longer for than the game, the game queued several frames
+// of GPU work, and the present's copy, behind them in the same queue, reached the screen a few frames late: in a shrine
+// the game made 70 frames a second and 24 were shown, the rest drawn for nothing (2026-11-07). At the present of frame
+// n the game waits for the GPU to finish frame n - MAX_FRAMES, as drivers hold a game to two or three frames ahead.
+enum { PF_RING = 8 };
+static _Atomic uint64_t g_pf_fence[PF_RING], g_pf_frame[PF_RING];   // the last fence when frame n's present was handled
+static int max_frames(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_MAX_FRAMES"); v = e ? atoi(e) : 2; if (v < 0 || v >= PF_RING) v = 2;
+                 LOG("[nvn] frames ahead of the GPU: %s", v ? (v == 2 ? "2 (TOTK_MAX_FRAMES)" : "set by TOTK_MAX_FRAMES") : "no limit (TOTK_MAX_FRAMES=0)"); }
+    return v;
+}
+static void frames_ahead_wait(uint64_t frame) {   // the game thread, after queuing frame's present
+    int k = max_frames();
+    if (!k || frame <= (uint64_t)k) return;
+    uint64_t want = frame - (uint64_t)k, end = now_ns() + 250000000ull;   // a bound: never stuck behind the translation thread
+    unsigned r = (unsigned)(want % PF_RING);
+    while (atomic_load(&g_pf_frame[r]) < want) {   // its present not handled yet (the translation thread is behind)
+        if (now_ns() >= end) return;
+        sched_yield();
+    }
+    uint64_t f = atomic_load(&g_pf_fence[r]), now = now_ns();
+    if (atomic_load(&g_pf_frame[r]) == want && f && now < end) mtl_wait(f, end - now);
+}
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot) {
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
+    { uint64_t n = frame ? frame : g_frame + 1;   // the frame this present ends (frames_ahead_wait)
+      atomic_store(&g_pf_fence[n % PF_RING], mtl_last_fence()); atomic_store(&g_pf_frame[n % PF_RING], n); }
     if (frame) mtl_set_frame(frame);
     gfx_leave();
 }
@@ -3138,7 +3165,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           if (ms) LOG("[nvn] first gameplay frame waited %d ms for pipeline warm-up (%llu draws this frame)", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);
-    uint64_t t0 = now_ns();
+    uint64_t t0 = now_ns(), this_frame = g_frame + 1;   // (frames_ahead_wait)
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
         xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9, .slot = qslot};
         memcpy(j.crop, o->crop, sizeof j.crop);
@@ -3146,6 +3173,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
     } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, qslot);
+    frames_ahead_wait(this_frame);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);

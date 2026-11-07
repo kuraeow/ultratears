@@ -2021,6 +2021,8 @@ static void pp_report(void) {   // at a present after the frame: wait for the GP
     free(ts); free(row);
 }
 
+// A game barrier held inside a pass (OP_BARRIER below): made when the pass ends, for whatever comes after it.
+static __thread int g_barrier_held;
 static void pass_end(void) {
     if (!g_in_pass) return;
     vk.vkCmdEndRendering(vkb_cmd());
@@ -2028,6 +2030,20 @@ static void pass_end(void) {
     vkb_tex_block_flush(vkb_cmd());
     g_in_pass = 0;
     ub_flush(vkb_cmd());   // the pass's kept uniform updates reach memory
+    if (g_barrier_held) { g_barrier_held = 0; full_barrier(vkb_cmd()); }
+}
+// nvnCommandBufferBarrier inside a pass that only orders primitives / fragments and invalidates the texture cache
+// (ORDER_PRIMITIVES 0x1, ORDER_FRAGMENTS 0x2, ORDER_FRAGMENTS_TILED 0x4, INVALIDATE_TEXTURE 0x10): held instead of ending
+// the pass. TotK puts one (0x12) after each of its G-buffer decals, which read the G-buffer pixel they draw into: ~900 a
+// frame in a shrine, each a pass ended and begun again behind a full drain - 11 of the frame's 17.6 GPU ms, and a game at
+// 70 fps shown at 24 (2026-11-07). In a pass the draws write only its targets (a storing draw ends it); a later draw
+// that samples one gets the barrier inside the pass by region (vkb_draw.c, VK_KHR_dynamic_rendering_local_read), the
+// others read nothing written since the pass began, and the held barrier is made when the pass ends.
+// TOTK_VK_HOLD_BARRIER=0: every game barrier ends the pass, as before.
+static int hold_barrier(int bits) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_HOLD_BARRIER"); v = !(e && *e == '0') && !getenv("TOTK_VK_NO_LOCAL_BARRIER"); }
+    return v && g_in_pass && vkc.has_local_read && !(bits & ~0x17);
 }
 
 static uint32_t level_size(uint32_t v, const view_t *view) {
@@ -2851,7 +2867,9 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             break;
         case OP_DISPATCH: if (g_ok == 1) vkb_dispatch(a); break;
         case OP_BARRIER:   // [temporary] everything before is visible to everything after
-            if (g_ok == 1) { pass_end_why(PE_BARRIER); full_barrier(vkb_cmd()); }
+            { int vkb_draw_tracing(void); if (vkb_draw_tracing()) VLOG("[draw] barrier: bits %#x, in a pass %d", (unsigned)*(const int32_t *)a, vkb_in_pass()); }
+            if (g_ok == 1 && hold_barrier(*(const int32_t *)a)) g_barrier_held = 1;
+            else if (g_ok == 1) { pass_end_why(PE_BARRIER); full_barrier(vkb_cmd()); }
             break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_SAMP: break;
         // rendering enable / conditional rendering: draws and clears are skipped while off (dispatches are not)
