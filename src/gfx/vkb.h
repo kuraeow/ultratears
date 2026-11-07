@@ -71,7 +71,8 @@ typedef struct vkb_image {
     int compressed;                // block-compressed format: no attachment / storage use
     int no_block_views;            // a 3D block-compressed image, made without block-texel views (vkb_tex.c make_image)
     int cube;                      // made cube compatible (vkb_tex.c cube_compatible): only such an image gets cube views
-    int gpu_written;               // rendered / cleared / copied to by the GPU: never overwritten from game memory ([temporary])
+    int gpu_written;               // rendered / cleared / copied to by the GPU: not taken from game memory, unless the game
+                                   // changed it after the write-back laid these contents there (vkb_tex.c cpu_rewrote)
     uint64_t upload_stamp;         // nvn_dirty generation of the last upload from game memory (0 = never)
     uint64_t dirty_checked;        // the submission in which the game memory was last checked for CPU writes
     int stale;                     // that check found CPU writes: upload before the next use
@@ -87,6 +88,11 @@ typedef struct vkb_image {
     int cpu_visible;               // its game memory is in a pool the CPU can access: GPU contents are written back to it
     int wb_pending;                // in the write-back queue (vkb_tex.c vkb_tex_writeback_frame)
     uint64_t wb_seq;               // write_seq of the contents last written back (or being)
+    uint64_t write_fence;          // the submission that last wrote it (vkb_image_written: the one being recorded)
+    unsigned write_run;            // presents in a row it was written in (vkb_tex.c fence write-back)
+    uint64_t wb_laid_seq;          // write_seq of the contents last laid out into game memory by the write-back
+    uint64_t wb_stamp;             // ...and the write watch's generation then: later writes are the game's (vkb_tex.c cpu_rewrote)
+    uint64_t wb_checked;           // the submission in which game memory was last checked for them
     struct vkb_image *refresh_from;   // newer contents at the same memory in another size: scaled in before use (vkb_tex.c)
 } vkb_image;
 void vkb_image_written(vkb_image *im);   // the GPU writes it (render target, clear, copy, storage)

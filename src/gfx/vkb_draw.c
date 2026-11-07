@@ -942,6 +942,9 @@ static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
                 memcpy(p + 0x210 + 16 * r, &S.ubo[5][r].addr, 8);
                 memcpy(p + 0x210 + 16 * r + 8, &n, 4);
             }
+        // Graphics: the largest point size at 0x610 (Maxwell's limit; GLSLC clamps gl_PointSize to it). Zero made every
+        // point empty: TotK stamps cut and burnt grass into its 512x512 grass map as points, so cut grass stood.
+        if (stage != 5) { const float max_point = 2047.0f; memcpy(p + 0x610, &max_point, 4); }
     } else {
         for (int r = 0; r < 32; r++) memcpy(p + 0x20 + 8 * r, &S.tex[stage][r], 8);
         for (int r = 0; r < 8; r++) memcpy(p + 0x120 + 8 * r, &S.img[stage][r], 8);

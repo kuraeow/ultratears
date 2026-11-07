@@ -1590,6 +1590,7 @@ static void *retire_thread(void *unused) {
         if (totk_tl_on()) gpu_span(j->slot, j->fence);   // TOTK_TIMELINE: when the GPU ran this command buffer
         gpu_frame(j);
         pc_writeback(j->fence);   // pool copies: GPU writes into game memory, before the game is told
+        { void vkb_tex_wb_retire(uint64_t fence); vkb_tex_wb_retire(j->fence); }   // GPU-drawn images copied at its end (vkb_tex.c), before it counts as done
         if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps); free(j->wb); }   // GPU writes into game memory
         for (int k = 0; k < j->nsnaps; k++) if (((wb_snap_t *)j->snaps)[k].owned) free(((wb_snap_t *)j->snaps)[k].data);
         free(j->snaps);
@@ -2889,6 +2890,7 @@ uint64_t mtl_sub_commit(void) {
     sub_long_check(fence);
     VkCommandBuffer last = g_mt_nlist ? g_mt_list[g_mt_nlist - 1] : g_slots[g_cur].cb;
     vkb_mirrors_submit(last);   // written ranges back to game memory before the fence
+    { void vkb_tex_wb_fence_record(VkCommandBuffer cb, uint64_t fence); vkb_tex_wb_fence_record(last, fence); }   // images the CPU reads after this fence (grass)
     shadow_writeback(last);
     dead_tag(fence);
     gpu_time_end(g_cur, last);

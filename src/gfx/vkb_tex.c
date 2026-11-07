@@ -184,9 +184,18 @@ int mtl_slot_free(void);
 static entry **g_wbq;                 // queued images (wb_pending), g_wbq_mu
 static int g_nwbq, g_capwbq;
 static pthread_mutex_t g_wbq_mu = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { entry *e; uint64_t seq, fence, at, bytes; } wb_job;   // e NULL: dropped meanwhile; at: offset in the arena
-static wb_job g_wbj[WB_MAXJOBS];      // copies in submission order (g_mu held)
+typedef struct { entry *e; uint64_t seq, fence, at, bytes; int at_fence; } wb_job;   // e NULL: dropped meanwhile; at: offset in the arena
+// at_fence: a fence write-back's copy (vkb_tex_wb_fence_record), laid out even when the image was drawn again since: the
+// CPU waiting for that fence reads that submission's contents, and the newer ones come with their own submission. The
+// image is drawn every frame (the grass cut map), and the next frame was nearly always recorded before this one's
+// fence passed: with "not drawn again since" every copy was dropped and none reached game memory (2026-11-07 trace).
+static wb_job g_wbj[WB_MAXJOBS];      // copies in submission order (g_wbj_mu held)
 static int g_nwbj;
+// The jobs and the arena: a lock of their own, taken after g_mu (never the other way), so that the retire thread lays
+// out the fence write-back's copies (vkb_tex_wb_retire) without the images' lock, which a thread may hold while it
+// waits for a fence the retire thread completes.
+static pthread_mutex_t g_wbj_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_wbf_n, g_wbf_bytes;   // fence write-backs laid out (the per-frame log line)
 static void wbq_remove(entry *e) {    // g_wbq_mu held
     for (int i = 0; i < g_nwbq; i++) if (g_wbq[i] == e) { g_wbq[i] = g_wbq[--g_nwbq]; break; }
     e->im.wb_pending = 0;
@@ -199,7 +208,9 @@ static void side_free(entry *t) {    // an image kept beside an entry (twin, blo
 }
 static void entry_drop(entry *e) {   // g_mu held: out of the indexes, destroyed when the GPU is done with it
     if (e->im.wb_pending) { pthread_mutex_lock(&g_wbq_mu); wbq_remove(e); pthread_mutex_unlock(&g_wbq_mu); }
+    pthread_mutex_lock(&g_wbj_mu);
     for (int i = 0; i < g_nwbj; i++) if (g_wbj[i].e == e) g_wbj[i].e = NULL;
+    pthread_mutex_unlock(&g_wbj_mu);
     if (e->shaped) {
         entry **p = &g_shape[shape_of(e->im.storage, &e->im.d)];
         while (*p && *p != e) p = &(*p)->shape_next;
@@ -757,7 +768,11 @@ void vkb_depth_audit_bias(const vkb_image *depth, float units, float factor) {
 void vkb_image_written(vkb_image *im) {
     im->gpu_written = 1;
     im->write_seq = atomic_fetch_add(&g_write_seq, 1) + 1;
-    im->write_frame = vkb_frame();
+    uint64_t f = vkb_frame();
+    if (im->write_frame + 1 == f) im->write_run++;
+    else if (im->write_frame != f) im->write_run = 1;
+    im->write_frame = f;
+    im->write_fence = mtl_last_fence() + 1;   // the submission being recorded
     if (vkb_depth_audit_on()) da_written(im);
     if (im->cpu_visible && !__atomic_exchange_n(&im->wb_pending, 1, __ATOMIC_SEQ_CST)) {   // into the write-back queue
         pthread_mutex_lock(&g_wbq_mu);
@@ -1403,6 +1418,26 @@ enum { UPX_GATHER, UPX_LAYOUT, UPX_KEY, UPX_BC7READ, UPX_RING, UPX_LOCKED, UPX_I
 static _Atomic uint64_t g_upx[UPX_N];
 static inline void upx_add(int k, uint64_t t0) { atomic_fetch_add_explicit(&g_upx[k], runtime_now_ns() - t0, memory_order_relaxed); }
 void vkb_tex_upload_parts(uint64_t v[11]) { for (int i = 0; i < UPX_N; i++) v[i] = atomic_load_explicit(&g_upx[i], memory_order_relaxed); }
+// A GPU-drawn image the game changed in its memory after the write-back laid the GPU's contents there: TotK bakes its
+// 260x260 grass maps on the GPU and marks burnt grass in them on the CPU, and the grass is drawn from them. On the Switch
+// the texture is that memory; here the image kept the GPU's contents and burnt grass stood. Taken from game memory again
+// (an image from game memory until the GPU draws it again) only when that memory holds the image's latest GPU contents
+// (nothing the GPU drew is lost) and the write watch saw writes after them; checked once a submission.
+// TOTK_GPU_CPU_REWRITE=0: never, as before.
+static int cpu_rewrote(vkb_image *im) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_GPU_CPU_REWRITE"); on = !(e && *e == '0'); }
+    if (!on || !im->cpu_visible || !im->storage || !im->wb_stamp || im->wb_laid_seq != im->write_seq) return 0;
+    uint64_t sub = mtl_last_fence() + 1;
+    if (__atomic_exchange_n(&im->wb_checked, sub, __ATOMIC_ACQ_REL) == sub) return 0;
+    nvn_texlayout L;
+    nvn_tex_layout(&im->d, &L);
+    if (!nvn_dirty_tracked(im->storage, L.size) || !nvn_dirty_since(im->storage, L.size, im->wb_stamp)) return 0;
+    im->gpu_written = 0;
+    im->upload_stamp = 0;
+    im->wb_stamp = 0;
+    return 1;
+}
 int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
     uint64_t stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     if (vkb_mt_recording() && __atomic_load_n(&im->uploading, __ATOMIC_ACQUIRE)) {   // another thread is uploading it: its
@@ -1410,6 +1445,7 @@ int vkb_tex_upload(VkCommandBuffer cb, vkb_image *im) {
         pthread_mutex_unlock(&g_up_mu);
         stamp = __atomic_load_n(&im->upload_stamp, __ATOMIC_ACQUIRE);
     }
+    if (im->gpu_written && cpu_rewrote(im)) stamp = 0;
     if (!im->storage || im->gpu_written || (stamp && !vkb_tex_stale(im))) return 0;   // the common case: nothing to do
     uint64_t t0 = runtime_now_ns();
     int r;
@@ -2698,6 +2734,32 @@ static void wb_parts(VkCommandBuffer cb, const vkb_image *im, uint64_t at, int r
 // The pool lets the CPU at it (cpu_visible); a virtual pool's addresses are only reserved (its bytes are in physical
 // pools' pages), so its textures are left out. (VirtualQuery over the write-watched guest window took ~2 ms a call.)
 static int wb_memory_ok(const vkb_image *im) { return im->cpu_visible && !totk_vpool_gather((uintptr_t)im->storage, 0, NULL); }
+// g_wbj_mu held: the copies the GPU has finished (fence <= done) laid out into game memory, if the texture is still the
+// game's and was not drawn again since; out of the job list.
+static void wb_layout_done(uint64_t done, uint64_t *n_out, uint64_t *bytes_out, uint64_t *skip_out) {
+    // copies the GPU has finished: into game memory, if the texture is still the game's and was not drawn again since
+    int k = 0;
+    for (; k < g_nwbj && g_wbj[k].fence <= done; k++) {
+        wb_job *j = &g_wbj[k];
+        entry *e = j->e;
+        if (!e || !e->refs || (!j->at_fence && e->im.write_seq != j->seq)) { (*skip_out)++; continue; }
+        if (!g_wb_coherent) {   // this job's range only (the CPU caches of the whole arena would cost milliseconds)
+            VkDeviceSize atom = vkc.props.limits.nonCoherentAtomSize ? vkc.props.limits.nonCoherentAtomSize : 64;
+            VkDeviceSize lo = j->at / atom * atom, hi = (j->at + j->bytes + atom - 1) / atom * atom;
+            VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = g_wb_mem, .offset = lo, .size = hi > WB_ARENA ? VK_WHOLE_SIZE : hi - lo};
+            vk.vkInvalidateMappedMemoryRanges(vkc.device, 1, &mr);
+        }
+        nvn_texlayout L;   // the GPU's bytes, not the game's writes (vkb_tex.c cpu_rewrote): the write watch skips them
+        nvn_tex_layout(&e->im.d, &L);
+        void *tok = nvn_dirty_gpu_write_begin((void *)e->im.storage, L.size);
+        wb_parts(VK_NULL_HANDLE, &e->im, j->at, 0);
+        nvn_dirty_gpu_write_end(tok);
+        e->im.wb_stamp = nvn_dirty_now();
+        e->im.wb_laid_seq = j->seq;
+        (*n_out)++; *bytes_out += j->bytes;
+    }
+    if (k) memmove(g_wbj, g_wbj + k, sizeof *g_wbj * (size_t)(g_nwbj -= k));
+}
 void vkb_tex_writeback_frame(void) {
     static int on = -1;
     static uint64_t frames, st_n, st_bytes, st_ns, st_skip, st_queued, st_max, st_lay;
@@ -2705,22 +2767,8 @@ void vkb_tex_writeback_frame(void) {
     if (!on || !vkb_ready() || !wb_arena()) return;
     uint64_t t0 = runtime_now_ns(), now = vkb_frame(), done = mtl_done();
     vkb_lock(&g_mu, LK_IMAGES);
-    // copies the GPU has finished: into game memory, if the texture is still the game's and was not drawn again since
-    int k = 0;
-    for (; k < g_nwbj && g_wbj[k].fence <= done; k++) {
-        wb_job *j = &g_wbj[k];
-        entry *e = j->e;
-        if (!e || !e->refs || e->im.write_seq != j->seq) { st_skip++; continue; }
-        if (!g_wb_coherent) {   // this job's range only (the CPU caches of the whole arena would cost milliseconds)
-            VkDeviceSize atom = vkc.props.limits.nonCoherentAtomSize ? vkc.props.limits.nonCoherentAtomSize : 64;
-            VkDeviceSize lo = j->at / atom * atom, hi = (j->at + j->bytes + atom - 1) / atom * atom;
-            VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = g_wb_mem, .offset = lo, .size = hi > WB_ARENA ? VK_WHOLE_SIZE : hi - lo};
-            vk.vkInvalidateMappedMemoryRanges(vkc.device, 1, &mr);
-        }
-        wb_parts(VK_NULL_HANDLE, &e->im, j->at, 0);
-        st_n++; st_bytes += j->bytes;
-    }
-    if (k) memmove(g_wbj, g_wbj + k, sizeof *g_wbj * (size_t)(g_nwbj -= k));
+    pthread_mutex_lock(&g_wbj_mu);
+    wb_layout_done(done, &st_n, &st_bytes, &st_skip);
     uint64_t t1 = runtime_now_ns();
     st_lay += t1 - t0;
     // images that settled: their copies into the arena, in a submission of their own (not waited for: with every
@@ -2747,6 +2795,7 @@ void vkb_tex_writeback_frame(void) {
     }
     st_queued += (uint64_t)g_nwbq;
     pthread_mutex_unlock(&g_wbq_mu);
+    pthread_mutex_unlock(&g_wbj_mu);
     pthread_mutex_unlock(&g_mu);
     if (cb) {
         VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -2755,20 +2804,89 @@ void vkb_tex_writeback_frame(void) {
         vk.vkCmdPipelineBarrier2(cb, &dep);
         uint64_t f = mtl_sub_commit();
         if (f != fence) {   // (one thread commits: never) the jobs wait for the fence they really have
-            vkb_lock(&g_mu, LK_IMAGES);
+            pthread_mutex_lock(&g_wbj_mu);
             for (int i = first; i < g_nwbj; i++) if (g_wbj[i].fence == fence) g_wbj[i].fence = f;
-            pthread_mutex_unlock(&g_mu);
+            pthread_mutex_unlock(&g_wbj_mu);
         }
     }
     uint64_t dt = runtime_now_ns() - t0;
     st_ns += dt;
     if (dt > st_max) st_max = dt;
     if (++frames % 300 == 0 && dm_stats()) {
+        uint64_t fn = atomic_exchange(&g_wbf_n, 0), fb = atomic_exchange(&g_wbf_bytes, 0);
         VLOG("per frame: GPU-drawn images written back to game memory %.2f (%.3f MiB), %.2f skipped (texture gone or drawn again), "
-             "%.1f queued; %.3f ms on the translation thread (%.3f laying out, longest frame %.2f ms)", st_n / 300.0, st_bytes / 300.0 / 1048576.0,
-             st_skip / 300.0, st_queued / 300.0, st_ns / 300.0 / 1e6, st_lay / 300.0 / 1e6, st_max / 1e6);
+             "%.1f queued; %.3f ms on the translation thread (%.3f laying out, longest frame %.2f ms); at fence waits %.2f (%.3f MiB, "
+             "TOTK_WB_FENCE)", st_n / 300.0, st_bytes / 300.0 / 1048576.0, st_skip / 300.0, st_queued / 300.0, st_ns / 300.0 / 1e6,
+             st_lay / 300.0 / 1e6, st_max / 1e6, fn / 300.0, fb / 300.0 / 1048576.0);
         st_n = st_bytes = st_ns = st_skip = st_queued = st_max = st_lay = 0;
     }
+}
+
+// ---- the fence write-back: GPU-drawn images the game reads right after a fence wait (grass cutting and fire)
+// TotK renders a 128x128 RGBA8 map of cut grass into a CPU-cached pool every frame and reads the bytes after the frame's
+// fence wait, without nvnMemoryPoolInvalidateMappedRange; its fire spread reads its 260x260 grass maps the same way.
+// On the Switch the bytes are there once the fence has passed. The write-back above takes only images that settled
+// (not drawn for WB_SETTLE presents), so the cut map, drawn every frame, never went back: the CPU saw no cut and a swing
+// threw no clippings (2026-11-07), and fire did not spread through the grass. totk-pc-recomp writes such targets
+// back at the fence wait (0beafeb, 1a9d089: up to 64 KiB always, larger ones unless drawn in each of the last 16
+// frames). Here, without a drain: at the end of a submission (mtl_sub_commit) the images it wrote that qualify are
+// copied into the arena by that submission itself, and the retire thread lays them out into game memory before it
+// marks the fence done (vkb_tex_wb_retire), so a wait for that fence returns with the bytes in place.
+// TOTK_WB_FENCE=0: off (only the settled write-back, as before).
+enum { WB_FENCE_SMALL = 64 << 10, WB_FENCE_RUN = 16 };
+static int wb_fence_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_WB_FENCE");
+        v = !(e && *e == '0');
+        VLOG("fence write-back of GPU-drawn images: %s", v ? "on (TOTK_WB_FENCE=0: off)" : "off (TOTK_WB_FENCE=0)");
+    }
+    return v;
+}
+void vkb_tex_wb_fence_record(VkCommandBuffer cb, uint64_t fence) {   // the translation thread, at the end of submission fence
+    static int gwb = -1;
+    if (gwb < 0) { const char *e = getenv("TOTK_GPU_WB"); gwb = !e || *e != '0'; }
+    if (!gwb || !wb_fence_on() || !vkb_ready() || !wb_arena()) return;
+    int any = 0;
+    vkb_trk *trk = vkb_trk_get();   // the chunks are glued: image layouts are the images' own, not a chunk's
+    vkb_trk_set(NULL);
+    vkb_lock(&g_mu, LK_IMAGES);
+    pthread_mutex_lock(&g_wbj_mu);
+    pthread_mutex_lock(&g_wbq_mu);
+    for (int i = 0; i < g_nwbq;) {
+        entry *e = g_wbq[i];
+        vkb_image *im = &e->im;
+        uint64_t n, at;
+        if (im->write_fence != fence || im->write_seq == im->wb_seq || !e->refs) { i++; continue; }
+        if (!(n = wb_size(im)) || (n > WB_FENCE_SMALL && im->write_run >= WB_FENCE_RUN) || !wb_memory_ok(im)) { i++; continue; }
+        if (g_nwbj == WB_MAXJOBS || !wb_alloc(n, &at)) break;
+        vkb_image_use(cb, im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        wb_parts(cb, im, at, 1);
+        g_wbj[g_nwbj++] = (wb_job){e, im->write_seq, fence, at, n, 1};
+        im->wb_seq = im->write_seq;
+        wbq_remove(e);   // (the last one moved to i: looked at next)
+        any = 1;
+    }
+    pthread_mutex_unlock(&g_wbq_mu);
+    pthread_mutex_unlock(&g_wbj_mu);
+    pthread_mutex_unlock(&g_mu);
+    vkb_trk_set(trk);
+    if (any) {   // the copies, then the host reads them (at the retire of this fence)
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vk.vkCmdPipelineBarrier2(cb, &dep);
+    }
+}
+// The retire thread, submission fence done on the GPU, before the fence is marked done: the copies up to it into game
+// memory. Only g_wbj_mu (see there).
+void vkb_tex_wb_retire(uint64_t fence) {
+    if (!__atomic_load_n(&g_nwbj, __ATOMIC_RELAXED)) return;
+    uint64_t n = 0, bytes = 0, skip = 0;
+    pthread_mutex_lock(&g_wbj_mu);
+    wb_layout_done(fence, &n, &bytes, &skip);
+    pthread_mutex_unlock(&g_wbj_mu);
+    if (n) { atomic_fetch_add(&g_wbf_n, n); atomic_fetch_add(&g_wbf_bytes, bytes); }
 }
 
 // TOTK_RT_LOG (development): at every present, how many bytes of each image of that format and size are not zero
@@ -2869,7 +2987,9 @@ void vkb_tex_vcheck_run(void) {
         // GPU-written images in game memory the CPU can access: once written back (and not drawn since), game memory
         // should hold the same; a difference is the CPU writing over GPU contents (which never reach the image)
         int gw = im->gpu_written, wb_busy = 0;
+        pthread_mutex_lock(&g_wbj_mu);
         for (int j = 0; gw && j < g_nwbj; j++) wb_busy |= g_wbj[j].e == e;
+        pthread_mutex_unlock(&g_wbj_mu);
         if ((gw ? im->wb_seq != im->write_seq || im->wb_pending || wb_busy : !im->upload_stamp || im->not_uploadable) || im->astc || !im->storage ||
             !bpb || im->depth > 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (im->d.format >= 0x19 && im->d.format <= 0x24)) { skipped++; continue; }
         uint32_t bx = (im->width + bw - 1) / bw, by = (im->height + bh - 1) / bh, pitch = bx * (uint32_t)bpb, layers = im->layers > 64 ? 64 : im->layers;
