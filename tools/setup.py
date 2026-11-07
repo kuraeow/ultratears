@@ -528,6 +528,8 @@ def step_compile(dump, state, cpus):
 # A pack from the same export and translator is up to date; an install from before the pack (data/shaders/ryujinx and
 # its neighbours) is packed as it is, without translating again.
 KEEP_SHADER_WORK = False
+# Fixes made in the pack after packing (tools/pack_fixups.py); a higher number makes them again in a pack made before.
+PACK_FIXUPS = 2
 SHADER_OLD = ['raw', 'ryujinx', 'ryujinx-code', 'jobs.jsonl', 'shaders.tsv', 'ryujinx-results.tsv', 'ryujinx-results-new.tsv']
 
 
@@ -577,6 +579,11 @@ def step_shaders(dump, state, cpus):
             pack = out / 'translated.pack'
             xlate = xlate_id + ('' if bias == '0' else '-g' + bias)
             if state.get(f'{key}-pack') == f'{export}/{xlate}' and pack.is_file():
+                if state.get(f'{key}-fixups') != PACK_FIXUPS:
+                    run([sys.executable, 'tools/pack_fixups.py', pack, DATA], 'fixing the shaders')
+                    state[f'{key}-fixups'] = PACK_FIXUPS
+                    save_state(state)
+                    made.append(out.name + ' (fixes)')
                 continue
             os.environ['TOTK_GATHER_BIAS'] = bias
             old = out / 'ryujinx'
@@ -598,6 +605,8 @@ def step_shaders(dump, state, cpus):
                 save_state(state)
                 out.mkdir(parents=True, exist_ok=True)
                 run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack], 'packing the shaders')
+            run([sys.executable, 'tools/pack_fixups.py', pack, DATA], 'fixing the shaders')
+            state[f'{key}-fixups'] = PACK_FIXUPS
             state[f'{key}-pack'] = f'{export}/{xlate}'
             save_state(state)
             made.append(out.name)
