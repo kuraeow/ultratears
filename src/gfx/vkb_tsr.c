@@ -343,7 +343,12 @@ void vkb_tsr_walk_draw(const p_set_rt *rt, const p_bind_buf *vubo, const char *f
         ev_add(EV_FXAA, -1);
         return;
     }
-    if ((W.phase == PH_ENDED || W.phase == PH_ARMED) && W.have_color && rt->n == 1 && !rt->depth && rt->color[0]) {
+    // The output pass: no depth when the scene is scaled; with the scene at the output's size (scale=100) the game's
+    // EASU draws back into the light target with the scene depth bound - known by its shader then. Missed, no frame was
+    // ever done, and the half-size passes with a D32F depth started "scenes" of their own: the object motion target was
+    // made again at each size change, every frame, until the driver failed (2026-11-08, L27).
+    if ((W.phase == PH_ENDED || W.phase == PH_ARMED) && W.have_color && rt->n == 1 && rt->color[0] &&
+        (!rt->depth || vkb_tsr_fs_easu(fs_key))) {
         uint32_t ow, oh;
         output_size(&ow, &oh);
         const tex_t *c = rt->color[0];
