@@ -12,9 +12,9 @@
  * (realtime); our pacer (gfx/nvn/hle_nvn.c present_cfg) holds frames to the limit. [temporary] Above ~63 fps the game
  * has known problems no port has fixed yet (MacNativeGames #1348: the camera turns too fast, Link does not climb
  * steps): such limits are a beta, said in the log.
- * The step is at least 1/240 s and the limit at most 240 (as totk-pc-recomp cad5b0c, 065428c): with a shorter step 1.4.3
+ * The step is at least 1/240 s and the limit at most 240: with a shorter step 1.4.3
  * aborts with Havok "Out of memory" in the physics pre-solve (main+0x1261630) seconds after some save loads, or crashes
- * reading a body's shape in main+0x1292560 on the Depths load (their issues #241, #29, #92: 240-280 Hz monitors).
+ * reading a body's shape in main+0x1292560 on the Depths load (240-280 Hz monitors).
  * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0: the patches' shipping behaviour, for comparison.
  * TOTK_STEP_FRAMES=<1..8> (default 1; MacNativeGames uses 5): present intervals averaged into the step. With a variable
  * refresh display a frame is shown as long as it took, and an average of 5 lags 2-3 frames behind: after slow frames the
@@ -30,7 +30,7 @@
 #include "../runtime/rt.h"
 
 enum { STEP_MAX = 8, LIMIT_MAX = 240 };   // LIMIT_MAX: 1 / the shortest step the game survives
-static int g_steps = 5;    // TOTK_STEP_FRAMES: display intervals averaged into the step (5, as totk-pc-recomp)
+static int g_steps = 5;    // TOTK_STEP_FRAMES: display intervals averaged into the step (5)
 static int g_limit = -2;   // frames per second; 0 unlimited, -1 the monitor's rate; -2 not read yet
 static int g_realtime = 1, g_cloth = 1, g_highfps = 1;
 static _Atomic uint32_t g_step_bits;   // the step in seconds (float bits): what the game steps each frame
@@ -46,7 +46,7 @@ static void config(void) {
     const char *e = getenv("TOTK_FPS_LIMIT");
     char *end = NULL;
     long n = e ? strtol(e, &end, 10) : 60;
-    /* "unlimited" (the launcher's "Up to 240") is 240, the highest limit, as totk-pc-recomp has no uncapped mode: with no
+    /* "unlimited" (the launcher's "Up to 240") is 240, the highest limit: with no
        pacing at all the game's sound went silent ~10 s after the start (2026-10-31; 60, 120 and 165 kept it) */
     g_limit = !e || !*e ? 60 : !strcmp(e, "display") ? -1 : !strcmp(e, "unlimited") || !strcmp(e, "0") ? LIMIT_MAX
             : (end && !*end && n > LIMIT_MAX) ? LIMIT_MAX : (end && !*end && n >= 30) ? (int)n : 60;
@@ -104,7 +104,7 @@ float totk_fr_step_ticks60(void) { rt_probe(); return totk_fr_step_seconds() * 6
 
 // ---- TOTK_SPEED_PROBE=1 (development): a line per 120 presents (=<n>: per n) with the frame rate, the game seconds stepped against
 // wall seconds and Link's ground speed (at any frame limit the same when game time follows wall time). The player
-// actor is found as totk-pc-recomp's runtime/frame_rate.c player_pos does for 1.4.3 (MIT): [main+0x3add238] +0x1e8 the
+// actor of 1.4.3: [main+0x3add238] +0x1e8 the
 // scene, its component 13 the resident actors, the one named "Player" with its position at +0x2b4. Reads are checked.
 #ifdef _WIN32
 #include <math.h>
@@ -204,7 +204,7 @@ static void step_error(double dt) {
 }
 
 // At every present (gfx/nvn/hle_nvn.c nvnQueuePresentTexture, the game thread), with the frame's display time (its pacer
-// slot, as totk-pc-recomp's frame_step_present): the step follows the frames as shown, pacing waits included.
+// slot): the step follows the frames as shown, pacing waits included.
 void runtime_frame_step_update(uint64_t now_ns) {
     config();
     speed_probe(now_ns);

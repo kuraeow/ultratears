@@ -60,7 +60,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeve
 // Mesa's drivers (RADV on the Steam Deck) keep a shader cache of their own beside ours, by default in ~/.cache and up to
 // 1 GB. A Deck's /home is small and the game usually sits on the SD card: unless MESA_SHADER_CACHE_DIR names a folder,
 // it goes to mesa-cache in the game folder. Read by the driver when the device is made, so set before the instance.
-// (As totk-pc-recomp's vk_device.c mesa_cache_beside_exe, MIT.)
 static void mesa_cache_beside_game(void) {
 #ifndef _WIN32
     if (getenv("MESA_SHADER_CACHE_DIR")) return;
@@ -279,7 +278,7 @@ static int create_device(void) {
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
         // ...and written by the GPU to host memory, which outlives the device (the NVIDIA driver gave 0 checkpoints, 2026-10-27)
         {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
-        // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
+        // the driver's own report of a lost device: what failed and where (AMD, Mesa)
         {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
         // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
         {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},

@@ -199,7 +199,7 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
     return n;
 }
 /* StartSixAxisSensor (the bow drawn): the samples from before it are dropped, so a read in the same frame returned the
-   previous session's states as live and motion aim was dead, then lagged ~60 ms (totk-pc-recomp 7d89fde, MIT). Reads
+   previous session's states as live and motion aim was dead, then lagged ~60 ms. Reads
    return nothing until the next sample, which starts a fresh frame and angle; sampling numbers go on. */
 void runtime_motion_start(void) {
     pthread_mutex_lock(&lock);

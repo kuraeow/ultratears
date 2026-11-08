@@ -19,7 +19,7 @@
  *    L1 / L2 on the Steam Deck), drawn with Inter (compiled in, host/text_entry.c).
  *  - The symbols in the game's texts (its button font, in the Font archives): each action's symbol becomes that of the button
  *    it is bound to (below, totk_ui_prompts_font).
- * The idea of redrawing the guide's key images is MacNativeGames' / totk-pc-recomp's (MIT, tools/button_icons.py);
+ * The idea of redrawing the guide's key images is MacNativeGames' (MIT);
  * the diamond and the code are ours. */
 #include <math.h>
 #include <stdint.h>

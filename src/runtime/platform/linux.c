@@ -31,7 +31,7 @@
 #endif
 // The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h) for older headers: the game is built
 // against the Steam Runtime 3 sysroot's 5.10 headers and runs on newer kernels (SteamOS 3.8+). A kernel without it
-// refuses the calls at run time and the write watch is off. (As totk-pc-recomp's platform/linux.c.)
+// refuses the calls at run time and the write watch is off.
 #ifndef PAGEMAP_SCAN
 struct page_region { __u64 start, end, categories; };
 struct pm_scan_arg {
@@ -112,7 +112,7 @@ void plat_unmap_file(const void *p, uint64_t size) { munmap((void *)p, size); }
 // userfaultfd for asynchronous write protection (the kernel lifts a page's protection on its first write, without
 // stopping anyone), and PAGEMAP_SCAN reports the pages written since their last scan and protects them again in the
 // same call. The kernel's own writes (file reads into game memory) count too; GPU writes do not, as on Windows.
-// On by default (Linux 6.7), as totk-pc-recomp's platform/linux.c does it: the memory pools are copies in Vulkan memory
+// On by default (Linux 6.7): the memory pools are copies in Vulkan memory
 // on Linux (gfx/backend_vk.c, "pool copies"), so nothing imports game memory. Imported (TOTK_POOL_IMPORT=1,
 // development) it cannot work: amdgpu re-maps imported memory for writing after every protection change, so every
 // page reads as written on every scan (4 fps in the title menu); then it is off, nvn_dirty treats pools as untracked
@@ -165,7 +165,7 @@ static int scan_range(uint64_t at, uint64_t end, uint64_t *pages, int n, int max
         // max_pages: the pages past it stay unreported and unprotected, so the next call reports them
         // Written: protection lifted, on a populated page (present or swapped out) that is not the shared zero page.
         // A page never touched counts as written to the kernel and a read maps the zero page there: neither is a write,
-        // as on Windows (totk-pc-recomp's platform/linux.c plat_mem_written).
+        // as on Windows.
         struct pm_scan_arg a = {.size = sizeof a, .flags = (wp ? PM_SCAN_WP_MATCHING : 0) | PM_SCAN_CHECK_WPASYNC, .start = at,
                                 .end = end, .vec = (uint64_t)(uintptr_t)r, .vec_len = 64, .max_pages = (uint64_t)(max - n),
                                 .category_inverted = PAGE_IS_PFNZERO, .category_mask = PAGE_IS_WRITTEN | PAGE_IS_PFNZERO,
@@ -190,8 +190,7 @@ static int scan_range(uint64_t at, uint64_t end, uint64_t *pages, int n, int max
    Before freezing, the whole region is checked for writes not yet reported (another pool's part of it). A region that
    thaws again and again waits longer each time (the threshold doubles, up to FZ_MAX). The kernel's own writes would not
    fault but fail (EFAULT), so plat_commit (called before file reads into guest memory) thaws and holds regions for
-   2 s; a region the game changes the protection of (plat_protect) is never frozen. As totk-pc-recomp's 2 MiB
-   snapshot regions (runtime/vk_memory.c), our own code. TOTK_WATCH_FREEZE=1: on (off by default, see fz_init). */
+   2 s; a region the game changes the protection of (plat_protect) is never frozen. TOTK_WATCH_FREEZE=1: on (off by default, see fz_init). */
 enum { FZ_SHIFT = 21, FZ_IDLE = 8, FZ_MAX = 240, FZ_FREEZING = 254, FZ_FROZEN = 255 };
 static _Atomic uint8_t *g_fz;          // per region: scans in a row with nothing written, or FZ_FREEZING / FZ_FROZEN
 static _Atomic uint8_t *g_fz_strikes;  // per region: thaws by a write (255: never freeze)
@@ -456,7 +455,7 @@ void plat_init(void) {
     require_cpu();
     // The timer slack (how late the kernel may wake a sleeping thread to batch wakeups, 50 us by default) down to 1 us:
     // the frame pacing sleeps to a deadline (plat_sleep_until_ns), as Windows' 1 ms timer resolution does. Threads
-    // started afterwards inherit it. (As totk-pc-recomp's platform/linux.c plat_timer_1ms, MIT.)
+    // started afterwards inherit it.
     prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0);
 }
 
@@ -568,7 +567,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
 // A signal stack for the calling thread (a signal stack is per thread), so the fault and crash handlers still run when
 // its own stack is exhausted. Never freed: threads that end are few, and a stack freed while a handler might run on it
-// would be worse. (As totk-pc-recomp's platform/linux.c alt_stack, MIT.)
+// would be worse.
 void plat_thread_start(void) {
     stack_t cur;
     if (!sigaltstack(NULL, &cur) && !(cur.ss_flags & SS_DISABLE)) return;

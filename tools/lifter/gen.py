@@ -651,8 +651,8 @@ class Module:
     local_flags = False  # and NZCV in a local (tools/lifter/flags.py)
 
     def emit_local(self, entry, end, labels, tables, fb=False):
-        """The function [entry, end) with guest registers and flags in C locals (tools/lifter/regs.py, flags.py, the
-        scheme of totk-pc-recomp recomp/gen.py Emitter.function, MIT), or None where it keeps them in the Cpu: an
+        """The function [entry, end) with guest registers and flags in C locals (tools/lifter/regs.py, flags.py), or
+        None where it keeps them in the Cpu: an
         unresolved computed branch (any instruction is an entry), a patched site, an asm word, or flags the plan
         cannot place (flags.FlagError). fb: the body of a split function (emit_function), whose unresolved branches
         leave for fb_<entry> with the registers and flags in the Cpu, as any exit."""

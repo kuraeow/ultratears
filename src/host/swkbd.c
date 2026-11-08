@@ -11,7 +11,7 @@
  * text is the answer.
  *
  * The ShowKeyboardArg layout (KeyboardConfig, then the work buffer {pointer, size}) follows the SDK's own setters, as
- * MacNativeGames' swkbd_host.c (MIT) and totk-pc-recomp's swkbd.c (MIT) read them; the code is ours. SDK 20.5 (TotK
+ * MacNativeGames' swkbd_host.c (MIT) reads them; the code is ours. SDK 20.5 (TotK
  * 1.4.3) grew KeyboardConfig to 0x518 bytes; the fields used here below +0x3d8 did not move. */
 #include <stdint.h>
 #include <stdio.h>

@@ -1,7 +1,7 @@
 """What a build for Linux reads of the Linux kit (deps/linux) and of clang's own headers, measured on a game folder that
 built the game for Linux (tools/setup.py --platform linux or both: build-linux/): the packages carry only these
 (tools/make_package.py trims the kit of the Windows package, tools/make_package_linux.py the kit and LLVM of the Linux
-one and of the AppImage), as totk-pc-recomp's make_release_linux.py keeps only the sysroot files its build read.
+one and of the AppImage).
 
 Measured, not guessed: the headers ninja recorded for every compiled file of the game, the headers of the texture
 encoder's sources (tools/bc7_build.py builds it on Linux too; clang -M with the same flags), and what lld reads when it

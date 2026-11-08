@@ -7,7 +7,7 @@ binaries (data/shaders/compiled.bin) are made again for it alone. Running it aga
 
 Compute thread groups (2026-11-07): the translation jobs (tools/export_shaders.py) gave no thread-group size, so every
 compute shader was translated with LocalSize 1 1 1, while the game dispatches its groups for the size in the NVN
-program's control section (+0x748: x, y, z; totk-pc-recomp reads it there too): 247 of TotK's 257 compute shaders run
+program's control section (+0x748: x, y, z): 247 of TotK's 257 compute shaders run
 groups of 32, 64, 16x16 or 8x8 threads. Each group ran its first thread only. The effect simulation moved one particle
 in 32 and left the rest where they were born with their first velocity: bomb explosions, gloom, sweat and sparks drew
 needles stretched along that velocity (2026-11-07, the user's Switch screenshots against ours). Each compute shader's

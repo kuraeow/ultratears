@@ -329,7 +329,7 @@ static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOT
    49-61 ms a frame for a virtual core held by a worse-priority thread, the loader threads (50-56) held their cores twice
    as long as elsewhere, and asynchronous preemption was refused ~11,000 times because the owner was in a host call.
    These calls give the virtual core up, as a driver call on the Switch does not hold the game's core (the part of
-   2d9bfec reverted with the rest of it; totk-pc-recomp sets up pools without its core). Measured on the player's PC
+   2d9bfec reverted with the rest of it). Measured on the player's PC
    (2026-11-06, same route): waits behind a worse-priority owner 14.2 -> 4.3 ms a frame, frames over 33 ms 72 -> 34,
    over 50 ms 10 -> 1, loading as fast. On by default since then; TOTK_STREAM_CORE_AWAY=0 keeps the core (A/B).
    Their time is counted either way (the log line "streaming calls"). */
@@ -964,7 +964,7 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
-// Two passes (as totk-pc-recomp's flatten_recording): the first walks the ops and measures, the second copies each run
+// Two passes: the first walks the ops and measures, the second copies each run
 // between jumps with one memcpy into one allocation of the exact size. Copying op by op into a buffer that doubled
 // and was trimmed at the end cost the game thread a realloc chain per recording.
 static uint8_t *flatten_recording(const uint8_t *start) {
@@ -3118,8 +3118,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
-    /* UltraTears: with the frame limit (uncapped, host/frame_rate.c), as totk-pc-recomp's nvnQueuePresentTexture (MIT,
-       nvn_api_obj.c, after MacNativeGames' nvn_pace.h): the display slot is paced here, at the game's present: the
+    /* UltraTears: with the frame limit (uncapped, host/frame_rate.c), after MacNativeGames' nvn_pace.h (MIT): the display slot is paced here, at the game's present: the
        previous slot plus one period of the limit (early: wait for it; late by less than a period: at once, keeping the
        phase; later: from now). The present thread holds the host present until the slot (mtl_present_slot), the image is
        free for the game one period later, and the real-time step follows the slots. */
@@ -3134,7 +3133,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
            frame gets exactly one period from acquire to present, and one a little longer misses its slot even when the
            frames around it had time to spare (the Steam Deck at 40: the game's main thread waited 18 ms a frame for the
            slot in the dense places while frames of 26-37 ms still came, 2026-11-06). With the frame queue
-           (TOTK_FRAME_QUEUE=1, as totk-pc-recomp's frame_queue, nvn_api_obj.c) it is free at its slot: by then its
+           (TOTK_FRAME_QUEUE=1) it is free at its slot: by then its
            present is a copy queued on the translation thread (the acquire waits for that job and the GPU copy), so the
            game draws the next frame while this one waits for its turn, and a frame up to one period longer still makes
            its slot, for up to one frame more input delay. They measured frames over 17.5 ms at 60 fps 25-33 -> 1-8

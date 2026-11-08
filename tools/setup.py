@@ -847,7 +847,6 @@ def main():
     state.setdefault('platforms', ['windows'])
     if os.name != 'nt':   # Linux builds the game for Linux, here
         # The tools' temporary files in the game's folder (temp/): on a Steam Deck /tmp is memory and /home small
-        # (totk-pc-recomp's installer puts its temp folder beside the game for the same reason)
         tmp = ROOT / 'temp'
         tmp.mkdir(exist_ok=True)
         os.environ['TMPDIR'] = str(tmp)

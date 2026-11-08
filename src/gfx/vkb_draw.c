@@ -475,8 +475,7 @@ static VkSamplerAddressMode wrap(uint8_t w) {
 }
 // point: the sampler with nearest filtering and no anisotropy. A depth texture read without a compare lands on one
 // texel on the Switch whatever the sampler's filter, and TOTK binds linear samplers to depth it reads as data:
-// blending neighbouring depths put reconstructed positions in mid-air at object edges (MacNativeGames 6283599,
-// totk-pc-recomp 6029719, both MIT). TOTK_VK_DEPTH_POINT=0: the sampler as the game sets it.
+// blending neighbouring depths put reconstructed positions in mid-air at object edges (MacNativeGames 6283599, MIT). TOTK_VK_DEPTH_POINT=0: the sampler as the game sets it.
 static VkSampler sampler_of(int id, int point) {
     static VkSampler fallback;   // made before threads record (vkb_draw_mt_init)
     vkb_rw_read(&g_reg_mu, LK_TEXREG);
@@ -1159,7 +1158,7 @@ static void mirrors_prepare_fixed(int indexed, const p_draw_idx *di) {
 // there is undefined; NVIDIA compares it. Such an image gets a depth twin of the same size and bits (R32_SFLOAT ->
 // D32_SFLOAT, R16_UNORM -> D16_UNORM), copied through upload memory right before the dispatch that samples it (outside
 // any pass: vkb_dispatch ended it), and the dispatch samples the twin. Draws keep the colour image (no copy inside their
-// pass). As totk-pc-recomp 3b5469a (MIT), after Savage Wind Recomp's depth twins (MIT); the code is ours.
+// pass). After Savage Wind Recomp's depth twins (MIT); the code is ours.
 // [temporary] Suspected for the flickering fog on AMD (GitHub #38, #40; white fog in the open world on the Deck), not
 // confirmed. TOTK_DEPTH_TWIN=0: off; =2: also where the driver compares (to try the path on NVIDIA).
 enum { TWINS = 16 };
@@ -2434,6 +2433,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
         bare = (VkExtent2D){(uint32_t)ceilf(S.vp[0][0] + S.vp[0][2]), (uint32_t)ceilf(S.vp[0][1] + S.vp[0][3])};
     if (!vkb_pass_begin(bare, g_fb)) { vkb_cnt_add(g_skipped[2], 1); vkb_audit(A_DRAW_NO_TARGETS, fs ? fs->key : vs->key); return; }
     VkCommandBuffer cb = vkb_cmd();
+    vkb_oq_draw(cb);   // between a samples-passed reset and report: counted by an occlusion query
     writes_t *W = &B->writes;
     W->n = 0;
     write_stage(W, VK_NULL_HANDLE, vs, 0);

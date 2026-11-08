@@ -85,8 +85,8 @@ VkFormat vkb_format(int f, VkImageAspectFlags *aspect, int *astc) {
     // from the most significant one. The Vulkan format with the same bits, and the components put back in place by the
     // views (packed_swizzle): RGBA4 -> R4G4B4A4 read A,B,G,R; RGB5 / RGB5A1 -> A1R5G5B5 read B,G,R; RGB565 -> R5G6B5
     // read B,G,R (formats every device samples). TOTK's Depths terrain normal (RGB5A1) and blend (RGB565) maps read
-    // with R and B swapped projected the ground textures along the wrong axis and mixed the wrong materials (as
-    // totk-pc-recomp found, vk_formats.c). [temporary] Rendered into, they would store the components swapped.
+    // with R and B swapped projected the ground textures along the wrong axis and mixed the wrong materials.
+    // [temporary] Rendered into, they would store the components swapped.
     case 0x39: return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
     case 0x3A: case 0x3B: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
     case 0x3C: return VK_FORMAT_R5G6B5_UNORM_PACK16;
@@ -240,7 +240,7 @@ uint64_t vkb_tex_feedback_copies(void) { return g_fb_copies; }
 // Cube compatible only where a cube view can come: the game's cube textures, and square arrays of 6 layers or more it
 // renders to (the faces drawn as layers, sampled as a cube). AMD's drivers lay a cube compatible image out otherwise, and
 // every square array made so - TOTK's ground textures, 1024x1024 with 121 layers - showed blocks that moved with the mip
-// level on AMD (totk-pc-recomp 4d7fa27, MIT; Savage Wind Recomp issue #59). TOTK_VK_CUBE_ALL=1: every square array,
+// level on AMD (Savage Wind Recomp issue #59). TOTK_VK_CUBE_ALL=1: every square array,
 // as before.
 static int cube_compatible(int target, uint32_t w, uint32_t h, uint32_t layers, VkImageUsageFlags usage) {
     static int all = -1;
@@ -654,8 +654,7 @@ static int create(vkb_image *im, const tex_t *t) {
     VkImageCreateFlags flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;   // NVN views may reinterpret the format
     int compressed = !astc && f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK;
     /* A 3D block-compressed image gets neither block-texel views nor 2D-array views: AMD's driver 26.10.1 on RDNA2 wrote
-       past the end of a BC4 volume made with both and lost the device at the logo (totk-pc-recomp issue #5, its fix
-       25b200f). The game's GPU encoder writes those volumes through the uncompressed stand-in and a copy
+       past the end of a BC4 volume made with both and lost the device at the logo. The game's GPU encoder writes those volumes through the uncompressed stand-in and a copy
        (vkb_tex_block_target), which needs neither. */
     int bc3d = compressed && type == VK_IMAGE_TYPE_3D;
     if (compressed && !bc3d) flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   // read a block as RGBA16UI / RG32UI (TOTK's GPU BC encoder)
@@ -2827,9 +2826,7 @@ void vkb_tex_writeback_frame(void) {
 // fence wait, without nvnMemoryPoolInvalidateMappedRange; its fire spread reads its 260x260 grass maps the same way.
 // On the Switch the bytes are there once the fence has passed. The write-back above takes only images that settled
 // (not drawn for WB_SETTLE presents), so the cut map, drawn every frame, never went back: the CPU saw no cut and a swing
-// threw no clippings (2026-11-07), and fire did not spread through the grass. totk-pc-recomp writes such targets
-// back at the fence wait (0beafeb, 1a9d089: up to 64 KiB always, larger ones unless drawn in each of the last 16
-// frames). Here, without a drain: at the end of a submission (mtl_sub_commit) the images it wrote that qualify are
+// threw no clippings (2026-11-07), and fire did not spread through the grass. Here, without a drain: at the end of a submission (mtl_sub_commit) the images it wrote that qualify are
 // copied into the arena by that submission itself, and the retire thread lays them out into game memory before it
 // marks the fence done (vkb_tex_wb_retire), so a wait for that fence returns with the bytes in place.
 // TOTK_WB_FENCE=0: off (only the settled write-back, as before).

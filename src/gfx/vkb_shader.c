@@ -932,7 +932,7 @@ static void ahead_start(void) {
 // the game starts (tools/setup.py step graphics, the launcher before Play), on every core, so the first play has no
 // compile stalls. Shaders already in the file cost a lookup each: with nothing to do it prints "ready" in about the
 // time Vulkan takes to start. Progress on stdout: "prepare-shaders: <done> of <total>", then a "done" line.
-// It outlives a driver crash (as totk-pc-recomp dbe8daf, MIT): while a worker hands a shader to the driver, its slot of
+// It outlives a driver crash: while a worker hands a shader to the driver, its slot of
 // prepare-journal.bin (beside the binary file) holds the shader's key, cleared when the call returns. A run that finds
 // a journal moves the keys in it into prepare-skip.txt with the GPU and driver version, and preparation skips what
 // that file lists for them (they compile at their first draw, where the driver may crash again); another driver

@@ -113,7 +113,7 @@ static class SwshXlate
         // UltraTears: sub-texel precision bits of a GPU whose gathers round a coordinate between two texels the other way
         // from Maxwell (AMD, Intel): Ryujinx then biases gather coordinates (TexturePass.InsertCoordGatherBias), so
         // shadow-map filtering picks the same texels and draws no dashed lines along edges. TOTK_GATHER_BIAS, set by
-        // tools/setup.py from the GPU the game uses (8 off NVIDIA); 0 or unset: no bias. As totk-pc-recomp 119884c.
+        // tools/setup.py from the GPU the game uses (8 off NVIDIA); 0 or unset: no bias.
         static readonly int GatherBias = int.TryParse(Environment.GetEnvironmentVariable("TOTK_GATHER_BIAS"), out int gb) ? gb : 0;
         public int QueryHostGatherBiasPrecision() => GatherBias;
         // UltraTears: the SPIR-V generator writes texture offsets as ConstOffset / ConstOffsets, which must be constants.

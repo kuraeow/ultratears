@@ -57,8 +57,7 @@ def get_s(reg):
 # sizes) from these, and its own FSR 1 (EASU) draws the scene onto its canvas. Here the two stores take the size
 # src/host/render_res.c chose instead, when there is one. The output (canvas, UI, swapchain): the swapchain size nnMain
 # writes (main+0xbdb584) and, as the display configuration publishes its active output (main+0x3dcb28), its canvas
-# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res), as
-# totk-pc-recomp's patches-v143.txt carries them.
+# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res).
 def scene_size(axis):   # str s0, [x19, #0xcc4 / #0xcc8]
     orig = {0: 0xbd0cc660, 1: 0xbd0cca60}[axis]
 
@@ -80,8 +79,7 @@ def aspect(orig):
     leave the ratio sead's perspective projection takes in s0. Two camera sites (update: ldr s0, [x19, #0x140]; setup:
     ldr s0, [x22, #0x68]) load the camera's copy of DefaultAspect 1.777778, two viewport routines divide width by height
     (fdiv s0, s0, s1). After the original instruction s0 takes the output's ratio, so a 21:9 output shows more of the
-    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from totk-pc-recomp's
-    recomp/patches-v143.txt (set aspect; MIT, Copyright (c) 2026 Valiantsin Dzerakh), from MacNativeGames'
+    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from MacNativeGames'
     game_patches_v143.c / aspect_patch.h (MIT, Copyright (c) 2026 MacNativeGames contributors)."""
     def f(gen, addr):
         expect(gen, addr, orig, 'aspect')
@@ -179,8 +177,7 @@ def fade(reg):
     return f
 
 
-# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). Site from totk-pc-recomp 1a07a8d
-# (recomp/patches-v143.txt, MIT): 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
+# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
 # main+0x683604 (add w11, w11, #7); the rounded value is the width (+0x3d8) and, through the packed store at +0xf4, the
 # height (+0x3f8). The fixed size goes into w11 just before the rounding.
 def shadow_size(gen, addr):
@@ -188,7 +185,7 @@ def shadow_size(gen, addr):
     return '{ extern int totk_shadow_size(uint32_t *n); uint32_t n_; if (totk_shadow_size(&n_)) c->x[11] = n_; }'
 
 
-# Equipment-switch cooldown (from totk-pc-recomp recomp/patches-v143.txt, MIT; their issue #18, found by JieML1100):
+# Equipment-switch cooldown:
 # the player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is above FLT_EPSILON, but
 # the equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0. Whole 30 Hz steps reach
 # exactly 0; a measured step leaves a rounding remainder, and one in (0, FLT_EPSILON] is never stepped again and keeps
@@ -197,8 +194,7 @@ def cooldown(gen, addr):   # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON) -> movi v1
     return word_or(gen, addr, 0x0f016681, 0x0f000401, fr('totk_fr_realtime'), 'equipment cooldown')
 
 
-# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c; sites from totk-pc-recomp
-# recomp/patches-v143.txt, MIT): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
+# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
 # (main+0x3a1e0) below goes to a host function, which hands what it does not take to the same guest function. Not
 # main+0x547a04: that caller (main+0x547964) resets a static DCtx of its own with which the game's zstd rejects some
 # valid frames, and the game relies on that result. TOTK_ZSTD_NATIVE=0: the guest decoder.

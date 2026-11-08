@@ -1328,7 +1328,7 @@ static const Opt LANG_OPTS[] = {{"", "lang_system"}, {"en-US", "English"}, {"de"
 // scale= its 3D scene in % of that (unset: the game's own 5/6); the game's FSR 1 scales the scene to the output, and the
 // present's FSR 1 the output to a larger window.
 // Another shape than 16:9 (src/host/render_res.c totk_aspect): the camera takes the output's ratio and the UI is laid out
-// for it (src/host/ui_aspect.c); the sizes are totk-pc-recomp's (installer/steps.py ASPECT_SIZES), 16:10 with the Steam
+// for it (src/host/ui_aspect.c); 16:10 with the Steam
 // Deck's 1280x800. "display": the screen's own size, whatever its shape.
 static const Opt RES_16_9[] = {{"1280x720", "1280 × 720"}, {"1920x1080", "1920 × 1080"}, {"2560x1440", "2560 × 1440"},
                                {"3840x2160", "3840 × 2160"}, {"display", "res_display"}};

@@ -5,7 +5,7 @@
 // constants follow it).
 //
 // Where it runs in TotK's frame (1.4.3, measured with TOTK_VK_DRAWTRACE at Lookout Landing, 2560x1440 output, 2128x1200
-// scene; the same order totk-pc-recomp found for DLSS, vk_dlaa.c, MIT):
+// scene):
 //   the G-buffer: passes of 6 and 8 colour targets at the scene size with the scene depth (D32F); target 5 is the light
 //     target (R11G11B10F), the vertex shaders read the scene camera as constant bank c4 (a 0x940-byte block);
 //   lighting into the light target, then transparents and particles into it with the scene depth: the scene is "armed";
@@ -226,26 +226,33 @@ void vkb_tsr_walk_rt(const p_set_rt *rt) {
 
 static double now_ms(void) { return (double)runtime_now_ns() / 1e6; }
 
+// The inverse of a row-major 4x4 matrix (0: singular): the adjugate over the determinant, both from the 2x2 minors of
+// the top two rows (s) and of the bottom two (c).
 static int inv4(const double m[16], double o[16]) {
-    double a[4][8];
-    for (int r = 0; r < 4; r++)
-        for (int k = 0; k < 8; k++) a[r][k] = k < 4 ? m[r * 4 + k] : (k - 4 == r);
-    for (int col = 0; col < 4; col++) {
-        int piv = col;
-        for (int r = col + 1; r < 4; r++)
-            if (fabs(a[r][col]) > fabs(a[piv][col])) piv = r;
-        if (fabs(a[piv][col]) < 1e-300) return 0;
-        for (int k = 0; k < 8; k++) { double t = a[col][k]; a[col][k] = a[piv][k]; a[piv][k] = t; }
-        double d = a[col][col];
-        for (int k = 0; k < 8; k++) a[col][k] /= d;
-        for (int r = 0; r < 4; r++)
-            if (r != col) {
-                double f = a[r][col];
-                for (int k = 0; k < 8; k++) a[r][k] -= f * a[col][k];
-            }
-    }
-    for (int r = 0; r < 4; r++)
-        for (int k = 0; k < 4; k++) o[r * 4 + k] = a[r][k + 4];
+    const double *a = m, *b = m + 4, *c = m + 8, *d = m + 12;   // the rows
+    double s0 = a[0] * b[1] - b[0] * a[1], s1 = a[0] * b[2] - b[0] * a[2], s2 = a[0] * b[3] - b[0] * a[3];
+    double s3 = a[1] * b[2] - b[1] * a[2], s4 = a[1] * b[3] - b[1] * a[3], s5 = a[2] * b[3] - b[2] * a[3];
+    double c0 = c[0] * d[1] - d[0] * c[1], c1 = c[0] * d[2] - d[0] * c[2], c2 = c[0] * d[3] - d[0] * c[3];
+    double c3 = c[1] * d[2] - d[1] * c[2], c4 = c[1] * d[3] - d[1] * c[3], c5 = c[2] * d[3] - d[2] * c[3];
+    double det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    if (!(fabs(det) > 1e-300)) return 0;
+    double k = 1.0 / det;
+    o[0] = (b[1] * c5 - b[2] * c4 + b[3] * c3) * k;
+    o[1] = (-a[1] * c5 + a[2] * c4 - a[3] * c3) * k;
+    o[2] = (d[1] * s5 - d[2] * s4 + d[3] * s3) * k;
+    o[3] = (-c[1] * s5 + c[2] * s4 - c[3] * s3) * k;
+    o[4] = (-b[0] * c5 + b[2] * c2 - b[3] * c1) * k;
+    o[5] = (a[0] * c5 - a[2] * c2 + a[3] * c1) * k;
+    o[6] = (-d[0] * s5 + d[2] * s2 - d[3] * s1) * k;
+    o[7] = (c[0] * s5 - c[2] * s2 + c[3] * s1) * k;
+    o[8] = (b[0] * c4 - b[1] * c2 + b[3] * c0) * k;
+    o[9] = (-a[0] * c4 + a[1] * c2 - a[3] * c0) * k;
+    o[10] = (d[0] * s4 - d[1] * s2 + d[3] * s0) * k;
+    o[11] = (-c[0] * s4 + c[1] * s2 - c[3] * s0) * k;
+    o[12] = (-b[0] * c3 + b[1] * c1 - b[2] * c0) * k;
+    o[13] = (a[0] * c3 - a[1] * c1 + a[2] * c0) * k;
+    o[14] = (-d[0] * s3 + d[1] * s1 - d[2] * s0) * k;
+    o[15] = (c[0] * s3 - c[1] * s1 + c[2] * s0) * k;
     return 1;
 }
 
@@ -888,7 +895,7 @@ int vkb_tsr_rec_draw(const p_set_rt *rt) {   // 1: FSR ran in place of this draw
 // call, in an arena per frame (four in turn: the recording of a frame reads the one of the frame before while the
 // walk fills the next). A block of this frame is found last frame at the same address (an object the game did not
 // write again) or one step away: the game writes an object's blocks into two copies that take turns, the second right
-// after the first, a step of the block's size rounded up to 256 bytes apart (totk-pc-recomp measured it, vk_mvprev.c).
+// after the first, a step of the block's size rounded up to 256 bytes apart.
 // Both neighbours there (copies of adjacent objects interleave): the one more like this frame's.
 // TOTK_AA_OBJMV=0: the camera's motion only.
 enum { ARENAS = 4, BLOCK_MAX = 16384, ATAB = 1 << 14 };

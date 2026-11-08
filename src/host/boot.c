@@ -70,7 +70,7 @@ static int enter_dir(const char *path) { return chdir(path) == 0; }
 #define name_eq strcmp
 #endif
 
-/* The Steam Deck's defaults, for what ultratears.cfg leaves unset (as totk-pc-recomp's device profile, runtime/cfg.c): its
+/* The Steam Deck's defaults, for what ultratears.cfg leaves unset: its
    screen's 1280x800 (16:10: the camera and the UI follow, host/render_res.c), fullscreen; the frame limit is the
    launcher's, as on a PC (no 40 of its own since 2026-11-06, see below). The Deck: SteamDeck=1 (Steam sets it there) or Valve's board, product Jupiter
    (LCD) or Galileo (OLED). Any key the player set wins. */

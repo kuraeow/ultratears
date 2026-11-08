@@ -44,8 +44,8 @@
 
 // The global lock G and the per-thread condition variables. Windows: a slim reader/writer lock and condition variables
 // (user-space fast paths, a spin before sleeping), not winpthreads' mutex (no spin) and condition variable (built on
-// semaphores and locks of its own: several kernel transitions per wait or signal), which ~50 guest threads convoyed on
-// (totk-pc-recomp uses the same pair). Linux: glibc's adaptive mutex, which spins briefly before the futex.
+// semaphores and locks of its own: several kernel transitions per wait or signal), which ~50 guest threads convoyed on.
+// Linux: glibc's adaptive mutex, which spins briefly before the futex.
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -232,7 +232,7 @@ static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1
    the best thread blocked on it, for handing out cores and for preemption. Without it a low-priority owner of a mutex
    the game's main thread waits for (the Steam Deck's log: 4.4 ms a frame blocked on locks) queued for a core behind
    workers of middling priority. The owner is read from the mutex word, so it follows hand-offs; one level only (an
-   owner blocked on another mutex passes nothing on). As totk-pc-recomp runtime/kernel.c eff_prio (MIT).
+   owner blocked on another mutex passes nothing on).
    TOTK_PRIO_INHERIT=1 turns it on (off by default: raw priorities, see pi_on). Holding G. */
 static int ap_on(void);
 static int pi_on(void) {
@@ -292,7 +292,7 @@ static int core_better_waiter(const thr_t *t, int c);
 // the SDK calls SVC 0x36 once it leaves the lock (runtime_ap_sync). Priority inheritance (pi_on) comes with it: without
 // it a better thread takes the core of a low-priority mutex owner it then waits for.
 // The design is MacNativeGames' (games/totk/runtime/threads.c, 8bf0893, MIT, Copyright (c) 2026 MacNativeGames
-// contributors) as totk-pc-recomp runtime/kernel.c and platform/*.c carry it (MIT); the code here is ours.
+// contributors); the code here is ours.
 // TOTK_ASYNC_PREEMPT=0: the checkpoints only, as before (and no inheritance unless TOTK_PRIO_INHERIT=1).
 #define AP_FIRST_NS 250000ull   // a waiter spins this long before the first interruption (most core waits end sooner)
 #define AP_GAP_NS 1000000ull    // and interrupts the same owner at most once a millisecond
@@ -685,7 +685,7 @@ void runtime_core_back(int *away) {
 // the waiter got another core meanwhile, and giving this one up would hand it to a worse thread.
 // Horizon's preemption disable: the SDK's spin locks count TLR+0x100 (disable_count) while they try or hold the lock.
 // Such a thread keeps its core (the request stays for its next checkpoint): taking the core of a spin lock's holder
-// leaves a better thread spinning on that lock (totk-pc-recomp runtime/kernel.c, ap_disabled, from MacNativeGames).
+// leaves a better thread spinning on that lock (as MacNativeGames does).
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null(); if (!t || !t->preempt) return;
     Cpu *c = guest_cpu();
@@ -704,8 +704,7 @@ static void preempt_point_set(thr_t *t) {
 // A pass through a spin wait: a guest loop that only another thread can end (tools/lifter/spin_waits_v143.txt; the
 // lifter calls this on its back-edge). The loop holds a virtual core while it spins, and the thread that would end it
 // may be waiting for that core: once one wait has lasted 50 us (TOTK_SPIN_HANDOFF_US) and any thread waits for a core,
-// the core goes over for a yield and comes back. Passes of one loop at most 20 us apart are one wait. As totk-pc-recomp
-// runtime/kernel.c rt_spin_gate (MIT). TOTK_SPIN=0: the loop keeps its core, as before.
+// the core goes over for a yield and comes back. Passes of one loop at most 20 us apart are one wait. TOTK_SPIN=0: the loop keeps its core, as before.
 static __thread uint64_t sw_head, sw_t0, sw_last;
 void rt_spin_gate(Cpu *c, uint64_t head) {
     (void)c;
@@ -1039,7 +1038,7 @@ int svc_thread(int num, uint64_t *regs) {
         } else if (ns > 0) {
 #ifdef _WIN32   // winpthreads' nanosleep counts whole ms: the SDK's 20 us sleeps did not sleep at all (two takes of G
                 // each), and 1 ms or more came up to 1 ms late. A high-resolution timer, spinning the last 0.2 ms,
-                // with the core already given up (as totk-pc-recomp's sleep_ns).
+                // with the core already given up.
             uint64_t plat_now_ns(void); void plat_sleep_until_ns(uint64_t t);
             plat_sleep_until_ns(plat_now_ns() + (uint64_t)ns);
 #else            // exact on Linux (timer slack 1 us, platform/linux.c)

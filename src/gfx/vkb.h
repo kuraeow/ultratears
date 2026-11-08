@@ -226,6 +226,7 @@ void vkb_rec_begin(void);                       // this thread starts a command 
 void vkb_draw_mt_init(void);                    // objects made on first use, made before threads record (prologue)
 void vkb_draw_prescan(const uint8_t *payload, int indexed, int dispatch);   // the GPU writes a draw / dispatch makes (ucap)
 void vkb_draw_tsr_walk(void);                   // the walk's look at a draw for the temporal upscaler (vkb_tsr.c)
+void vkb_oq_draw(VkCommandBuffer cb);           // a draw in the open pass: samples-passed counting (backend_vk.c, TOTK_OCCLUSION)
 
 // ---- vkb_tsr.c: temporal upscaling and anti-aliasing (FSR 3.1) in place of the game's FSR 1 (antialias=fsr3)
 int vkb_tsr_on(void);

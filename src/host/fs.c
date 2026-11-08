@@ -186,7 +186,7 @@ static uint64_t file_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
 }
-/* RomFS files served from memory in place of the game's (as totk-pc-recomp's romfs.c overlay, MIT): the HeapDef table
+/* RomFS files served from memory in place of the game's: the HeapDef table
    a bigger game resolution needs (render_res.c: its render-target heap and that heap's parent grown) and, above 30 fps,
    the layout archive whose quick menus capture their background at once (ui_capture.c). */
 #define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
@@ -592,7 +592,7 @@ static void unmount(const char *name) {
     if (!romfs_owns(name) && strcmp(name, mount_name)) runtime_fail("unmount of unknown fs mount");
 }
 /* Commit writes the files to the disk on a thread of its own: fsync of every open file on the game's thread stopped it
-   for ~100 ms at each save (totk-pc-recomp measured 95-135 ms; its 6fca957 does it in the background, MIT). Each file
+   for ~100 ms at each save. Each file
    goes as a duplicate of its descriptor, so the game may close or reuse it meanwhile; until they are written the save
    counts as busy (runtime_fs_save_busy), so leaving the game waits for them. */
 static pthread_mutex_t sync_mu = PTHREAD_MUTEX_INITIALIZER;

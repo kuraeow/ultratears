@@ -152,8 +152,8 @@ KERNEL_WRITE_WATCH = (6, 7)   # userfaultfd write protection without faults (WP_
 
 def kernel_version():
     """Linux's version as numbers ((0, 0): unknown, as when not Linux). Below 6.7 the game has no write watch
-    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow (as
-    totk-pc-recomp warns, installer/steps.py). SteamOS 3.8 and later have 6.11+."""
+    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow.
+    SteamOS 3.8 and later have 6.11+."""
     try:
         parts = os.uname().release.split('-')[0].split('.')
         return tuple(int(p) for p in parts[:2])

@@ -1,6 +1,5 @@
 /* The quick menus' background at more than 30 fps, from MacNativeGames games/totk/scripts/make_romfs_patches.py (MIT,
- * Copyright (c) 2026 MacNativeGames contributors), as totk-pc-recomp's tools/make_romfs_patches.py carries it to 1.4.3
- * (MIT): the weapon / shield / material quick menus capture the game picture for their background when the panes
+ * Copyright (c) 2026 MacNativeGames contributors), for 1.4.3: the weapon / shield / material quick menus capture the game picture for their background when the panes
  * C_CaptureBG_00, C_CaptureClearBG_00 and P_CaptureClearBG_00 become visible at frame 1.0 of
  * anim/ShortCutBG_00_In.bflan (AutoBuilder the same with C_CaptureBG_00, anim/AutoBuilder_00_In.bflan) in
  * UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs. With steps shorter than the shipping 30 fps one the
