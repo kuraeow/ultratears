@@ -615,6 +615,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 static void destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem, VkBuffer buf);
+static void wb_held_drop(uint64_t lo, uint64_t hi);   // GPU-only copy backs held (below)
 void mtl_pool_del(const void *mem) {
     if (g_ok != 1) return;
     pool_ent e = {0};
@@ -633,6 +634,7 @@ void mtl_pool_del(const void *mem) {
     if (e.buf) wb_forget(e.buf);
     vkb_rw_write_end(&g_pool_mu);
     if (!e.buf) return;
+    wb_held_drop(e.lo, e.hi);
     if (vkc.has_checkpoints || vkc.has_buffer_marker) VLOG("memory pool %p %#llx..%#llx deleted (present %llu)", mem, (unsigned long long)e.lo, (unsigned long long)e.hi, (unsigned long long)vkb_frame());
     // No wait for the GPU here (the translation thread deletes pools in queue order since 2026-10-28, hle_nvn.c
     // x_poolrel): the game waited for the GPU work that used the pool; its copy in device memory is reused after the
@@ -1001,8 +1003,72 @@ static void wb_merge_one(uint64_t a, uint64_t len, uint64_t stamp, const uint8_t
         p = e;
     }
 }
-static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb_snap_t *snaps, int nsnaps) {
+// GPU outputs the CPU reads without waiting: game memory gets them at a fixed point of the game's frames. TOTK's
+// shrines analyse the scene's depth on the GPU (a compute pass into a 23 KiB buffer) and a game thread reads the result
+// for the next frames' lights - not after the render thread's per-frame wait for the GPU, so on the Switch it simply
+// finds the frame before's result, the GPU being done with it by then. Here the GPU finishes a frame later (the
+// translation thread's lag, then the GPU), and the copy back reached game memory when that submission retired: before
+// that read in one frame, after it in the next. The light shafts and the lit floor along the walls switched between
+// the two results about one frame in six, and in ten when the game thread was slow (2026-11-07; ~40 of 60 frames with
+// the game thread held 5 ms at its submit call; 3-4 with the copy back held as below, as with every frame waited for).
+// So a GPU-only range (the CPU has not written it since the GPU write was recorded) copied back for a submission
+// recorded after present L reaches game memory at present L + 3, on the game thread (mtl_wb_held_present): by then the
+// GPU has done it (frames_ahead_wait has waited for present L + 1), so the reader finds the same frame's result every
+// time, two frames old - at 60 fps as old as one frame on the Switch. A range that overlaps a held one is held too
+// (order), and a range the CPU wrote goes now as before (the CPU's pages win; wb_merge_one). QueueFinish (mtl_finish)
+// applies them all; a pool deleted drops its own. TOTK_WB_HOLD=0: at retirement, as before (A/B).
+typedef struct wb_held { uint64_t frame, lo, len, stamp; struct wb_held *next; uint8_t data[]; } wb_held;
+static wb_held *g_held, **g_held_tail = &g_held;
+static pthread_mutex_t g_held_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wb_hold_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_WB_HOLD"); on = !(e && *e == '0'); VLOG("GPU-only copy backs: %s", on ? "at the present three after their frame" : "when their submission retires (TOTK_WB_HOLD=0)"); }
+    return on;
+}
+static void wb_held_apply(wb_held *h) {
+    wb_merge_one(h->lo, h->len, h->stamp, h->data, NULL, 0);
+    wb_to_pool_copy(h->lo, h->len);
+    free(h);
+}
+static void wb_held_take(uint64_t upto, int all) {   // applies the held ranges of frames <= upto, in order
+    pthread_mutex_lock(&g_held_mu);
+    while (g_held && (all || g_held->frame <= upto)) {
+        wb_held *h = g_held;
+        g_held = h->next;
+        if (!g_held) g_held_tail = &g_held;
+        wb_held_apply(h);
+    }
+    pthread_mutex_unlock(&g_held_mu);
+}
+void mtl_wb_held_present(uint64_t present) { if (present > 2) wb_held_take(present - 2, 0); }   // game thread, at each present (frames: label + 1)
+static void wb_held_drop(uint64_t lo, uint64_t hi) {   // a pool deleted: its memory is the game's again
+    pthread_mutex_lock(&g_held_mu);
+    for (wb_held **pp = &g_held; *pp;) {
+        wb_held *h = *pp;
+        if (h->lo < hi && lo < h->lo + h->len) { *pp = h->next; free(h); } else pp = &h->next;
+    }
+    g_held_tail = &g_held;
+    while (*g_held_tail) g_held_tail = &(*g_held_tail)->next;
+    pthread_mutex_unlock(&g_held_mu);
+}
+static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb_snap_t *snaps, int nsnaps, uint64_t frame) {
+    int hold = frame && wb_hold_on();
     for (int k = 0; k < n; k++, r += 4) {
+        if (hold) {
+            int held = 0;
+            pthread_mutex_lock(&g_held_mu);
+            for (const wb_held *h = g_held; h && !held; h = h->next) held = h->lo < r[0] + r[1] && r[0] < h->lo + h->len;
+            if (held || !nvn_dirty_since((const void *)(uintptr_t)r[0], r[1], r[2])) {
+                wb_held *h = malloc(sizeof *h + r[1]);
+                if (!h) die("held copy back");
+                *h = (wb_held){frame, r[0], r[1], r[2], NULL};
+                memcpy(h->data, src + r[3], r[1]);
+                *g_held_tail = h; g_held_tail = &h->next;
+                pthread_mutex_unlock(&g_held_mu);
+                continue;
+            }
+            pthread_mutex_unlock(&g_held_mu);
+        }
         wb_merge_one(r[0], r[1], r[2], src + r[3], snaps, nsnaps);
         wb_to_pool_copy(r[0], r[1]);
     }
@@ -1591,7 +1657,7 @@ static void *retire_thread(void *unused) {
         gpu_frame(j);
         pc_writeback(j->fence);   // pool copies: GPU writes into game memory, before the game is told
         { void vkb_tex_wb_retire(uint64_t fence); vkb_tex_wb_retire(j->fence); }   // GPU-drawn images copied at its end (vkb_tex.c), before it counts as done
-        if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps); free(j->wb); }   // GPU writes into game memory
+        if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps, j->frame + 1); free(j->wb); }   // GPU writes into game memory (GPU-only ones held: wb_merge)
         for (int k = 0; k < j->nsnaps; k++) if (((wb_snap_t *)j->snaps)[k].owned) free(((wb_snap_t *)j->snaps)[k].data);
         free(j->snaps);
         run_posts(j->ops, j->n);
@@ -2376,39 +2442,58 @@ void mtl_tex_release(tex_t *t) { vkb_tex_release(t); }
 
 // ---------------- presentation ----------------
 
-// TOTK_SHOT=<present number>:<file.bmp>: saves that presented frame (development check of the picture).
+// TOTK_SHOT=<present number>[+<count>]:<file.bmp>: saves that presented frame (development check of the picture); with a
+// count, that many presents in a row to <file>_<present>.bmp, copied into one buffer without waiting on the GPU in between
+// (written once the last one is done), so the frames keep their usual timing (flicker between frames).
 static VkBuffer g_shot_buf;
 static VkDeviceMemory g_shot_mem;
+static long long g_shot_at = -1, g_shot_count = 1;
+static uint64_t g_shot_n[256];
+static int g_shot_got;
 static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_t w, uint32_t h) {
-    static long long at = -1;
-    if (at == -1) { const char *e = getenv("TOTK_SHOT"); at = e ? atoll(e) : 0; }
-    if (at <= 0 || (uint64_t)at != n) return VK_NULL_HANDLE;
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * 4,
-                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf), "shot buffer")) return VK_NULL_HANDLE;
-    VkMemoryRequirements req;
-    vk.vkGetBufferMemoryRequirements(vkc.device, g_shot_buf, &req);
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < vkc.memory.memoryTypeCount && type == UINT32_MAX; i++)
-        if ((req.memoryTypeBits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags &
-            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-            type = i;
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
-    if (type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_shot_mem), "shot memory")) return VK_NULL_HANDLE;
-    vk.vkBindBufferMemory(vkc.device, g_shot_buf, g_shot_mem, 0);
-    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    if (g_shot_at == -1) {
+        const char *e = getenv("TOTK_SHOT"), *c = e ? strchr(e, '+') : NULL;
+        g_shot_at = e ? atoll(e) : 0;
+        if (c) g_shot_count = atoll(c + 1);
+        if (g_shot_count < 1 || g_shot_count > 256) g_shot_count = 1;
+    }
+    // the buffer is made 30 presents ahead: a large allocation at the first frame shot would upset that frame's timing
+    if (g_shot_at <= 0 || n + 30 < (uint64_t)g_shot_at || g_shot_got >= g_shot_count) return VK_NULL_HANDLE;
+    VkDeviceSize one = (VkDeviceSize)w * h * 4;
+    if (!g_shot_buf) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = one * g_shot_count, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf), "shot buffer")) { g_shot_at = 0; return VK_NULL_HANDLE; }
+        VkMemoryRequirements req;
+        vk.vkGetBufferMemoryRequirements(vkc.device, g_shot_buf, &req);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < vkc.memory.memoryTypeCount && type == UINT32_MAX; i++)
+            if ((req.memoryTypeBits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags &
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                type = i;
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_shot_mem), "shot memory")) { g_shot_at = 0; return VK_NULL_HANDLE; }
+        vk.vkBindBufferMemory(vkc.device, g_shot_buf, g_shot_mem, 0);
+    }
+    if (n < (uint64_t)g_shot_at) return VK_NULL_HANDLE;
+    VkBufferImageCopy r = {.bufferOffset = one * g_shot_got, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     vk.vkCmdCopyImageToBuffer(cb, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot_buf, 1, &r);
-    return g_shot_buf;
+    g_shot_n[g_shot_got++] = n;
+    return g_shot_got == g_shot_count ? g_shot_buf : VK_NULL_HANDLE;
 }
 static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
     const char *e = getenv("TOTK_SHOT"), *path = e ? strchr(e, ':') : NULL;
     mtl_wait(fence, UINT64_MAX);
-    void *px = NULL;
-    if (path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &px) == VK_SUCCESS) {
-        FILE *f = fopen(path + 1, "wb");
-        if (f) {   // 32-bit BGRA, top-down
-            uint32_t size = w * h * 4;
-            uint8_t hdr[54] = {'B', 'M'};
+    uint8_t *px = NULL;
+    if (path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, (void **)&px) == VK_SUCCESS) {
+        uint32_t size = w * h * 4;
+        for (int k = 0; k < g_shot_got; k++) {
+            char name[1024];
+            const char *dot = strrchr(path + 1, '.');
+            if (g_shot_count == 1 || !dot) snprintf(name, sizeof name, "%s", path + 1);
+            else snprintf(name, sizeof name, "%.*s_%llu%s", (int)(dot - path - 1), path + 1, (unsigned long long)g_shot_n[k], dot);
+            FILE *f = fopen(name, "wb");
+            if (!f) continue;
+            uint8_t hdr[54] = {'B', 'M'};   // 32-bit BGRA, top-down
             uint32_t v;
             v = 54 + size; memcpy(hdr + 2, &v, 4);
             v = 54; memcpy(hdr + 10, &v, 4);
@@ -2418,10 +2503,10 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
             hdr[26] = 1; hdr[28] = 32;
             memcpy(hdr + 34, &size, 4);
             fwrite(hdr, 1, sizeof hdr, f);
-            fwrite(px, 1, size, f);
+            fwrite(px + (size_t)size * k, 1, size, f);
             fclose(f);
-            VLOG("frame saved to %s (%ux%u)", path + 1, w, h);
         }
+        VLOG("%d frame(s) saved to %s (%ux%u)", g_shot_got, path + 1, w, h);
         vk.vkUnmapMemory(vkc.device, g_shot_mem);
     }
     vk.vkDestroyBuffer(vkc.device, g_shot_buf, NULL);
@@ -3739,5 +3824,5 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
-void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); }
+void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); wb_held_take(0, 1); }   // everything done: the held copy backs too
 void mtl_drain(void) { mtl_finish(); }

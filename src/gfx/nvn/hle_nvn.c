@@ -3174,6 +3174,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
     } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, qslot);
     frames_ahead_wait(this_frame);
+    { void mtl_wb_held_present(uint64_t present); mtl_wb_held_present(this_frame); }   // GPU-only copy backs of present this_frame - 3 (backend_vk.c)
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);
