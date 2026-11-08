@@ -2146,6 +2146,25 @@ static int fxaa_copy(void) {
     return 1;
 }
 
+// The game's FXAA with antialias=smaa or off (vkb_smaa.c): SMAA from its source into its target, or the copy above.
+// 0: not done (the FXAA draw goes ahead). Other draws: one shader key compared (the program is resolved anyway).
+static int fxaa_replace(void) {
+    if (!resolve_program() || !S.sh[1] || !vkb_tsr_fs_fxaa(S.sh[1]->key)) return 0;
+    static int alt = -1;   // TOTK_AA_ALT=1 (development): odd frames keep the game's FXAA (A/B shots within one run)
+    if (alt < 0) { const char *e = getenv("TOTK_AA_ALT"); alt = e && *e == '1'; }
+    if (alt && (vkb_frame() & 1)) return 0;
+    if (vkb_aa_mode() == 2) return fxaa_copy();
+    if (S.sh[1]->ntex < 1) return 0;
+    const p_set_rt *rt = vkb_rt();
+    const view_t *v = NULL;
+    vkb_image *src = handle_image(S.tex[1][S.sh[1]->tex[0].slot], &v), *dst = rt->n > 0 && rt->color[0] ? vkb_image_of(rt->color[0]) : NULL;
+    if (!src || !dst || src == dst) return 0;
+    vkb_pass_end_r(PE_OTHER);
+    int ok = vkb_smaa_run(src, dst);
+    vkb_rec_begin();   // our shaders and sets were bound: the replay binds everything again
+    return ok;
+}
+
 // Per-object motion for FSR 3.1 (vkb_tsr.c): right after a solid draw of the scene's G-buffer pass, the same draw again
 // with its vertex shader's last-frame position variant (bound with last frame's blocks of the banks its position reads,
 // in the slots the variant has for them) and the object motion fragment shader, into the pass's object motion target
@@ -2250,6 +2269,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
         if (t == 1 || (t == 2 && fxaa_copy())) return;
     }
     big_init();
+    if (vkb_aa_mode() && fxaa_replace()) return;
     fixed_buffers();
     vkb_audit_draw_begin();
     const p_draw *dr = (const p_draw *)a;

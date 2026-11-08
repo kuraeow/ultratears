@@ -240,6 +240,7 @@ void vkb_tsr_rec_rt(void);                             // recording, after a ren
 int vkb_tsr_jitter(const p_set_rt *rt, float *jx, float *jy);   // the viewport offset of a draw into these targets
 int vkb_tsr_rec_draw(const p_set_rt *rt);              // recording a draw: 1 when FSR ran in place of it (skip it)
 int vkb_tsr_fs_easu(const char *key);
+int vkb_tsr_fs_fxaa(const char *key);                   // the game's FXAA fragment shader (by its key)
 float vkb_tsr_lod_bias(void);
 // per-object motion (vkb_tsr.c): the object motion target of a pass being begun (its slot), last frame's copy of a block,
 // the fragment shader of a motion draw (its input location, the pass's slot), statistics
@@ -247,6 +248,14 @@ VkImageView vkb_tsr_obj_target(const p_set_rt *rt, int *slot);
 const uint8_t *vkb_tsr_prev_block(int bank, uint64_t addr, const uint8_t *cur, uint32_t n);
 VkShaderEXT vkb_tsr_obj_fs(int in_loc, int out_slot);
 void vkb_tsr_obj_count(int drawn, int found_prev);
+// images of our own passes (FSR 3.1, SMAA): storage, sampled, copy source and destination; GENERAL after their first use
+typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view, mip[6]; VkFormat f; uint32_t w, h, levels; } vkb_gimg;
+int vkb_gimg_make(vkb_gimg *g, VkFormat f, uint32_t w, uint32_t h, uint32_t levels);
+void vkb_gimg_free(vkb_gimg *g);   // later, when the GPU is done with it
+
+// ---- vkb_smaa.c: SMAA 1x or none in place of the game's FXAA (antialias=smaa / off)
+int vkb_aa_mode(void);                                 // 0 the game's FXAA (or FSR 3.1), 1 SMAA, 2 none
+int vkb_smaa_run(vkb_image *src, vkb_image *dst);      // recording, outside a pass: SMAA from src into dst (0: not done)
 int vkb_pass_obj_slot(void);   // backend_vk.c: the object motion target's slot in the open pass (-1: none)                          // added to mipmapped samplers' LOD bias while FSR 3.1 is on
 
 // ---- vkb_mt.c: submissions recorded by several threads (2026-10-24)

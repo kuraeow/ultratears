@@ -332,6 +332,7 @@ int vkb_tsr_fs_easu(const char *key) {
         if (!strncmp(key, EASU_FS[i], strlen(EASU_FS[i]))) return 1;
     return 0;
 }
+int vkb_tsr_fs_fxaa(const char *key) { return key && !strncmp(key, FXAA_FS[0], strlen(FXAA_FS[0])); }
 
 // A draw in the walk: the scene's camera, and the EASU draw where FSR goes.
 static void arena_keep(int bank, uint64_t addr, uint64_t size);
@@ -346,7 +347,7 @@ void vkb_tsr_walk_draw(const p_set_rt *rt, const p_bind_buf *vubo, const char *f
     }
     // the game's FXAA into the light target, after the scene: a copy of its source instead (vkb_draw.c fxaa_copy)
     if (W.phase == PH_ENDED && W.have_color && rt->n == 1 && rt->color[0] && rt->color[0]->mem == W.color.mem && fs_key &&
-        !strncmp(fs_key, FXAA_FS[0], strlen(FXAA_FS[0]))) {
+        vkb_tsr_fs_fxaa(fs_key)) {
         ev_add(EV_FXAA, -1);
         return;
     }
@@ -433,7 +434,7 @@ enum {
     R_MV, R_DIL_MV, R_DIL_DEPTH, R_RECON, R_FP16X1, R_LUMA1, R_LUMA2, R_SPD, R_FAR1, R_SHADE, R_REACT, R_LOCKS,
     R_ACC1, R_ACC2, R_LH1, R_LH2, R_UP1, R_UP2, R_ATOMIC, R_INFO, R_ZERO, R_EXPO, R_OUT, R_COUNT
 };
-typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view, mip[6]; VkFormat f; uint32_t w, h, levels; } gimg;
+typedef vkb_gimg gimg;
 enum { NSETS = 2, NPASS = FSR3_NPASS + 1 };   // + the motion pass
 static struct {
     int tried, ok;
@@ -493,6 +494,8 @@ static void img_free(gimg *g) {
     vkb_destroy_later(g->view, g->img, g->mem);
     memset(g, 0, sizeof *g);
 }
+int vkb_gimg_make(gimg *g, VkFormat f, uint32_t w, uint32_t h, uint32_t levels) { return img_make(g, f, w, h, levels); }
+void vkb_gimg_free(gimg *g) { img_free(g); }
 
 static const fsr3_pass_code *g_passes = fsr3_passes;   // fsr3_passes_h where the GPU does half maths (pipelines)
 

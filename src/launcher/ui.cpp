@@ -1386,13 +1386,18 @@ static std::string res_for_aspect(int a, const std::string &res) {
     }
     return opts[best].value;
 }
-// FSR 1's own modes (AMD: performance 2x, balanced 1.7x, quality 1.5x, ultra quality 1.3x per axis), the game's 5/6,
-// none, and supersampling
-static const Opt SCALE_OPTS[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
-                                 {"", "scale_game"}, {"100", "scale_native"}, {"150", "scale_150"}, {"200", "scale_200"}};
-// antialias= (src/gfx/vkb_tsr.c): how the scene reaches the output, the game's FSR 1 (with its FXAA) or FSR 3.1, which
-// also anti-aliases over frames; the scale above is then FSR 3.1's mode
-static const Opt AA_OPTS[] = {{"", "aa_game"}, {"fsr3", "FSR 3.1"}};
+// The scales: FSR 1's own modes (AMD: performance 2x, balanced 1.7x, quality 1.5x, ultra quality 1.3x per axis), the
+// game's 5/6, and supersampling; 100% is the upscaler "none".
+// The upscaler, beside the scale: none (the scene at the output's size, scale=100; the scale list greyed), the game's
+// FSR 1 (every scale but 100%, supersampling too) or FSR 3.1 (antialias=fsr3, src/gfx/vkb_tsr.c: it also anti-aliases
+// over frames, and does not scale down: below 100% only)
+static const Opt UPSCALER_OPTS[] = {{"none", "up_none"}, {"fsr1", "aa_game"}, {"fsr3", "FSR 3.1"}};
+static const Opt SCALE_FSR1[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
+                                 {"", "scale_game"}, {"150", "scale_150"}, {"200", "scale_200"}};
+static const Opt SCALE_FSR3[] = {{"50", "scale_perf"}, {"59", "scale_bal"}, {"67", "scale_qual"}, {"77", "scale_ultra"},
+                                 {"", "scale_game"}};
+// antialias= without FSR 3.1 (src/gfx/vkb_smaa.c; its own row, gone with FSR 3.1): the game's FXAA, SMAA 1x or none
+static const Opt AA_OPTS[] = {{"", "aa_fxaa"}, {"smaa", "SMAA"}, {"off", "aa_off"}};
 // sharpness= (src/vk/fsr.c, src/gfx/vkb_tsr.c): the RCAS pass of the present's FSR 1 (when the window is larger than the
 // game's output), and of FSR 3.1
 static const Opt SHARP_OPTS[] = {{"0", "sharp_off"}, {"25", "25%"}, {"", "sharp_default"}, {"75", "75%"}, {"100", "100%"}};
@@ -1456,6 +1461,12 @@ template <size_t N> static int segmented(const char *id, float x_right, float cy
 // this instead of the choice (a button that opens a list, as the Debug tab's full rebuild); h: the box's height.
 static int dropdown_n(const char *id, float x_right, float cy, float w, const Opt *opts, size_t N, int sel,
                       const char *shown, float h);
+// A drop-down box that cannot be opened (its choice set by another): greyed, without its chevron.
+static void dropdown_off(float x_right, float cy, float w, const char *shown) {
+    float h = 32, x = x_right - w, y = cy - h / 2;
+    DL->AddRectFilled(P(x, y), P(x_right, y + h), C_SEG, 6 * S);
+    text(g_media.control, x + 12, cy - g_media.control->FontSize / S / 2, C_DIM, shown);
+}
 template <size_t N> static int dropdown(const char *id, float x_right, float cy, float w, const Opt (&opts)[N], int sel,
                                         const char *shown = nullptr, float h = 32) {
     return dropdown_n(id, x_right, cy, w, opts, N, sel, shown, h);
@@ -1728,7 +1739,11 @@ static void screen_play() {
     text(g_media.small, 52, y - g_media.small->FontSize / S / 2, C_SUB, T(g_tab == 0 ? "sec_screen" : "sec_ui_lang"));
     float cy = top + 52;
     if (g_tab == 0) {
-        const float ROW = 38;   // seven rows above Play (the design has five at 40)
+        // seven rows above Play (the design has five at 40); eight with the anti-aliasing row (not with FSR 3.1): the
+        // body scrolls then, as the Controls tab
+        std::string aa = cfg_get("antialias"), sc = cfg_get("scale");
+        int up = aa == "fsr3" ? 2 : sc == "100" ? 0 : 1;   // the upscaler: none, FSR 1, FSR 3.1
+        const float ROW = 38;
         row_label(cy, "row_window");
         int k = segmented("window", 748, cy, WINDOW_OPTS, opt_index(WINDOW_OPTS, cfg_or_platform("window")));
         if (k >= 0)
@@ -1749,18 +1764,36 @@ static void screen_play() {
             cfg_set("resolution", res_for_aspect(k, res));
         cy += ROW;
         row_label(cy, "row_scale");   // the method, then its scale (as the shape, then the size, of the resolution)
-        if ((k = dropdown("scale", 748, cy, 0, SCALE_OPTS, opt_index(SCALE_OPTS, cfg_get("scale")))) >= 0)
-            cfg_set("scale", SCALE_OPTS[k].value);
         {
-            float sw = 126, mw = 0;
-            for (const Opt &o : SCALE_OPTS)
+            float sw = 126, mw = 0;   // the scale box as wide as any of its lists, so that it stays in place
+            for (const Opt &o : SCALE_FSR1)
                 sw = SDL_max(sw, text_w(g_media.control, opt_label(o)) + 52);
-            for (const Opt &o : AA_OPTS)
+            for (const Opt &o : UPSCALER_OPTS)
                 mw = SDL_max(mw, text_w(g_media.control, opt_label(o)) + 50);
-            if ((k = dropdown("aa", 748 - sw - 8, cy, mw, AA_OPTS, opt_index(AA_OPTS, cfg_get("antialias")))) >= 0)
-                cfg_set("antialias", AA_OPTS[k].value);
+            if (up == 0)
+                dropdown_off(748, cy, sw, "100%");
+            else if (up == 1 && (k = dropdown("scale", 748, cy, sw, SCALE_FSR1, opt_index(SCALE_FSR1, sc))) >= 0)
+                cfg_set("scale", SCALE_FSR1[k].value);
+            else if (up == 2 && (k = dropdown("scale", 748, cy, sw, SCALE_FSR3, opt_index(SCALE_FSR3, sc))) >= 0)
+                cfg_set("scale", SCALE_FSR3[k].value);
+            if ((k = dropdown("upscaler", 748 - sw - 8, cy, mw, UPSCALER_OPTS, up)) >= 0 && k != up) {
+                if (k == 2)
+                    cfg_set("antialias", "fsr3");
+                else if (aa == "fsr3")   // FSR 3.1 left: the game's FXAA again
+                    cfg_set("antialias", "");
+                if (k == 0)
+                    cfg_set("scale", "100");
+                else if (sc == "100" || (k == 2 && (sc == "150" || sc == "200")))   // a scale the method takes: the game's
+                    cfg_set("scale", "");
+            }
         }
         cy += ROW;
+        if (up != 2) {
+            row_label(cy, "row_aa");
+            if ((k = dropdown("aa", 748, cy, 0, AA_OPTS, opt_index(AA_OPTS, aa))) >= 0)
+                cfg_set("antialias", AA_OPTS[k].value);
+            cy += ROW;
+        }
         row_label(cy, "row_sharp");
         if ((k = dropdown("sharp", 748, cy, 0, SHARP_OPTS, opt_index(SHARP_OPTS, cfg_get("sharpness"), "50"))) >= 0)
             cfg_set("sharpness", SHARP_OPTS[k].value);
@@ -1803,6 +1836,8 @@ static void screen_play() {
     DL->ChannelsSetCurrent(0);
     DL->AddRectFilled(P(36, top), P(764, cy + 28), C_CARD, 10 * S);
     DL->ChannelsSetCurrent(1);
+    ImGui::SetCursorScreenPos(P(0, cy + 36));   // the body scrolls down to here
+    ImGui::Dummy(ImVec2(1, 1));
 }
 
 // ---------------------------------------------------------------- Controls (the game reads them: src/host/window_sdl.c
