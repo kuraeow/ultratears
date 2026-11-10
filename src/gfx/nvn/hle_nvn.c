@@ -2557,6 +2557,27 @@ int plat_safe_read(void *dst, const void *src, size_t n);   // (runtime/platform
 static int totk_rd64(uint64_t p, uint64_t *v) { *v = 0; return totk_guest_ptr(p, 8) && plat_safe_read(v, (const void *)(uintptr_t)p, 8); }
 static int totk_rd32(uint64_t p, uint32_t *v) { *v = 0; return totk_guest_ptr(p & ~7ull, 8) && plat_safe_read(v, (const void *)(uintptr_t)p, 4); }
 static uint64_t totk_peek64(uint64_t p) { uint64_t v; totk_rd64(p, &v); return v; }
+/* Why a ready request's result can be stale is not known yet: the request as its manager sees it, for the log.
+   main+0x1bd0ce4 submits the owner's request (+0x678) to the manager f_800d0f4e0(system, 0) returns (system
+   [[[0x80395dc78]]+0x128], manager [[system+0xb00]+8]); main+0x2a0d3c files it in the ring of its entry (manager+0x10,
+   0x158 bytes each, index request+0x34; ring +0x118, size +0x110) at its slot (+0x30) and takes its counters (+0x35,
+   +0x36) from the entry's +0x148, modulo manager+0x24. Still filed there, how far that counter went since, and on which
+   game thread the ability reads it. */
+uint32_t runtime_thread_current_handle(void);   // (host/host.h)
+static void totk_request_facts(uint64_t rq, char *s, size_t n) {
+    uint64_t mgr = totk_peek64(totk_peek64(totk_peek64(totk_peek64(totk_peek64(0x80395dc78ull)) + 0x128) + 0xb00) + 8);
+    uint64_t w30 = totk_peek64(rq + 0x30), entry = 0, ring = 0, filed = 0;
+    int slot = (int)(uint32_t)w30, index = (int)(int8_t)(w30 >> 32);
+    uint32_t entries = 0, size = 0, counter = 0, mod = 0;
+    totk_rd32(mgr + 0x8, &entries);
+    totk_rd32(mgr + 0x24, &mod);
+    if (index >= 0 && (uint32_t)index < entries) entry = totk_peek64(mgr + 0x10) + (uint64_t)index * 0x158;
+    if (entry) ring = totk_peek64(entry + 0x118), totk_rd32(entry + 0x110, &size), totk_rd32(entry + 0x148, &counter);
+    if (ring && slot >= 0 && (uint32_t)slot < size) filed = totk_peek64(ring + (uint64_t)slot * 8);
+    snprintf(s, n, "thread %#x; manager %#llx entry %#llx: slot %d holds %#llx (%s), counter %u modulo %u",
+             (unsigned)runtime_thread_current_handle(), (unsigned long long)mgr, (unsigned long long)entry, slot,
+             (unsigned long long)filed, filed == rq ? "this request" : "not this request", (unsigned)counter, (unsigned)mod);
+}
 int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor) {
     static int on = -1;
     static _Atomic uint64_t checked, skipped;
@@ -2574,23 +2595,28 @@ int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor) {
     else if (!totk_rd64(actor + 0x228, &comp)) why = "actor not readable";
     else if (comp && !totk_guest_ptr(comp, 0xb8)) why = "component address";
     else if (comp && (!totk_rd64(comp + 0xb0, &sub) || (sub && !totk_guest_ptr(sub, 0x98)))) why = "component target address";
+    char facts[192];
     if (!why) {
-        if (k == 1) LOG("[totk] ability target: first one checked, live (TOTK_ABILITY_GUARD=0: no test)");
+        if (k == 1) {   // what a live one looks like, beside the skips
+            totk_request_facts(owner + 0x678, facts, sizeof facts);
+            LOG("[totk] ability target: first one checked, live (TOTK_ABILITY_GUARD=0: no test); %s", facts);
+        }
         return 1;
     }
     uint64_t n = ++skipped;
     if (n <= 20 || !(n & (n - 1))) {
         uint64_t rq = owner + 0x678, w28 = totk_peek64(rq + 0x28), w30 = totk_peek64(rq + 0x30);
+        totk_request_facts(rq, facts, sizeof facts);
         LOG("[totk] ability target: stale one skipped (%s): owner %#llx result %#llx actor %#llx link %#llx; %llu skipped of "
             "%llu; request status %u slot %d index %d counters %02x %02x %02x; result record %016llx %016llx %016llx %016llx; "
-            "actor %016llx %016llx %016llx %016llx", why, (unsigned long long)owner, (unsigned long long)result,
+            "actor %016llx %016llx %016llx %016llx; %s", why, (unsigned long long)owner, (unsigned long long)result,
             (unsigned long long)actor, (unsigned long long)link, (unsigned long long)n, (unsigned long long)k,
             (unsigned)(uint32_t)w28, (int)(uint32_t)w30, (int)(int8_t)(w30 >> 32), (unsigned)(uint8_t)(w30 >> 40),
             (unsigned)(uint8_t)(w30 >> 48), (unsigned)(uint8_t)(w30 >> 56), (unsigned long long)totk_peek64(result),
             (unsigned long long)totk_peek64(result + 8), (unsigned long long)totk_peek64(result + 16),
             (unsigned long long)totk_peek64(result + 24), (unsigned long long)totk_peek64(actor),
             (unsigned long long)totk_peek64(actor + 8), (unsigned long long)totk_peek64(actor + 16),
-            (unsigned long long)totk_peek64(actor + 24));
+            (unsigned long long)totk_peek64(actor + 24), facts);
     }
     return 0;
 }
