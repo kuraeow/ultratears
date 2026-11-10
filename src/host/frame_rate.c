@@ -203,10 +203,35 @@ static void step_error(double dt) {
     n = 0; sum_dt = sum_step = 0;
 }
 
+// ---- TOTK_CAMERA_NEAR=<metres> (default 1; 0.1 is the game's own): the near plane of the game's cameras. 1.4.3 keeps
+// it in its data at main+0x2d02970 (0.1, then the far plane 25000 and further clip settings: 0.01 0.1 0.01 0.1 0.025),
+// read by every camera and never written. With D32F depth and a near plane of 0.1 the far landscape (1-3 km) lies in
+// the last ~1e-4 of the depth range, where floats are spaced ~6e-8: the depths of distant terrain, water and the layers
+// drawn on them are rounded into steps of metres, so neighbouring layers tie and a camera turn of 1e-5 rad re-decides
+// them over the whole far view (L27: the distant islands, water edges and horizon shimmer and comb). The game also
+// rebuilds normals from that depth at quarter resolution (fs 9a5e3335514e), which turned the steps into stripes.
+// Near 1 gives the far view ten times finer depth: the tower test (2026-11-10) had 363 000 distinct depth values
+// instead of 63 000 and the quarter-resolution normals' high-frequency noise fell from 40 to 30; a camera step changed
+// the far view 3.7 times the frame-to-frame noise instead of 6. Geometry closer than 1 m to the camera is clipped.
+static void camera_near(void) {
+    static int done;
+    if (done) return;
+    static const float shipped[7] = {0.1f, 25000.0f, 0.01f, 0.1f, 0.01f, 0.1f, 0.025f};
+    float *p = (float *)(uintptr_t)(0x800000000ull + 0x2d02970);
+    const char *e = getenv("TOTK_CAMERA_NEAR");
+    float want = e && *e ? strtof(e, NULL) : 1.0f;
+    done = 1;
+    if (!(want > 0.0f && want < 100.0f)) { LOG("[totk] TOTK_CAMERA_NEAR=%s: not a distance in metres, the game's 0.1\n", e); return; }
+    if (memcmp(p, shipped, sizeof shipped)) { LOG("[totk] camera near plane: the game's data differ from 1.4.3, left as it is\n"); return; }
+    p[0] = want;
+    LOG("[totk] camera near plane %g m (the game's 0.1; TOTK_CAMERA_NEAR)\n", want);
+}
+
 // At every present (gfx/nvn/hle_nvn.c nvnQueuePresentTexture, the game thread), with the frame's display time (its pacer
 // slot): the step follows the frames as shown, pacing waits included.
 void runtime_frame_step_update(uint64_t now_ns) {
     config();
+    camera_near();
     speed_probe(now_ns);
     speed_trace(now_ns);
     if (!g_realtime || !now_ns) return;
