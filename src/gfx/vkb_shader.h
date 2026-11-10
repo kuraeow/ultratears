@@ -49,7 +49,9 @@ typedef struct vkb_shader {
     // bound there (0: none; the translator's slots 18..31 are moved into slots the shader does not use)
     int prev_loc; uint32_t prev_banks; uint8_t prev_of[VKB_NCBUF];
     const struct vkb_shader *prev; int prev_state;   // the variant of this shader: 0 not looked up, 1 ready, -1 none
+    int neg1;                            // TOTK_VK_DEPTH_CLIP_NEG1: its z = (z + w) / 2 taken out (drawn with -1..1 clip)
 } vkb_shader;
+int vkb_depth_clip_neg1(void);   // TOTK_VK_DEPTH_CLIP_NEG1 (vkb_shader.c)
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no translation (logged)
 // The vertex shader object for integer attributes at intmask (signed: sintmask) and drawn with the fragment shader fs

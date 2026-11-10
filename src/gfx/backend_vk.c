@@ -2769,15 +2769,31 @@ out:
     vk.vkDestroyBuffer(vkc.device, st, NULL);
     vk.vkFreeMemory(vkc.device, sm, NULL);
 }
-// TOTK_DUMP=<present number>:<dir>: the frame's render targets (development); TOTK_DUMP_EXIT=1 then exits
+// TOTK_DUMP=<present number>[+<count>]:<dir>: the frame's render targets (development); TOTK_DUMP_EXIT=1 then exits.
+// With a count: that many presents in a row, each into <dir>/p<present> (what one change between frames touches).
 static void dump_check(uint64_t n) {
-    static long long dump_at = -1;
+    static long long dump_at = -1, dump_left;
     static const char *dump_dir;
-    if (dump_at == -1) { const char *e = getenv("TOTK_DUMP"); dump_at = e ? atoll(e) : 0; dump_dir = e && strchr(e, ':') ? strchr(e, ':') + 1 : NULL; }
+    if (dump_at == -1) {
+        const char *e = getenv("TOTK_DUMP");
+        char *end = NULL;
+        dump_at = e ? strtoll(e, &end, 10) : 0;
+        dump_left = end && *end == '+' ? atoll(end + 1) : 0;
+        dump_dir = e && strchr(e, ':') ? strchr(e, ':') + 1 : NULL;
+    }
     if (dump_at > 0 && n >= (uint64_t)dump_at && dump_dir) {   // present numbers can skip: the first at or after it
-        dump_at = -2;
-        vkb_tex_dump(dump_dir);
-        if (getenv("TOTK_DUMP_EXIT")) { fflush(NULL); _Exit(0); }   // short development runs: done after the dump
+        if (dump_left > 0) {
+            char dir[512];
+            snprintf(dir, sizeof dir, "%s/p%llu", dump_dir, (unsigned long long)n);
+            CreateDirectoryA(dump_dir, NULL);
+            CreateDirectoryA(dir, NULL);
+            vkb_tex_dump(dir);
+            dump_at = --dump_left > 0 ? (long long)n + 1 : -2;
+        } else {
+            dump_at = -2;
+            vkb_tex_dump(dump_dir);
+        }
+        if (dump_at == -2 && getenv("TOTK_DUMP_EXIT")) { fflush(NULL); _Exit(0); }   // short development runs: done after the dump
     }
     static long long auto_at = -1;   // TOTK_DUMP_KEY_AT=<present>: F9 pressed there (scripted runs)
     if (auto_at == -1) { const char *e = getenv("TOTK_DUMP_KEY_AT"); auto_at = e ? atoll(e) : 0; }

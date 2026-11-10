@@ -445,6 +445,20 @@ static int dref_clamp(void) {
     if (v < 0) { const char *e = getenv("TOTK_VK_DREF_CLAMP"); v = !(e && *e == '0'); }
     return v;
 }
+// TOTK_VK_DEPTH_CLIP_NEG1=1: the vertex shaders' z = (z + w) / 2 taken out at load (vkb_spv_drop_depth_convert) and the
+// draws clip and map -1..1 themselves (vkb_draw.c, VK_EXT_depth_clip_control), as Maxwell does. L27: the distant
+// water and island edges re-decided on camera steps of 1e-5 rad with a 27 % smaller jump (fixed-step tower test,
+// 2026-11-10). Off by default until checked in play.
+int vkb_depth_clip_neg1(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_DEPTH_CLIP_NEG1");
+        v = e && *e == '1' && vkc.has_depth_clip_control;
+        if (e && *e == '1') LOG("depth clip -1..1 in the draws: %s", v ? "on (TOTK_VK_DEPTH_CLIP_NEG1)" : "off: the GPU lacks VK_EXT_depth_clip_control");
+    }
+    return v;
+}
+
 // Which translation of a shader, as the compiled binaries are keyed (vkb_shbin_variant.stamp), and the rewrites
 // load_module makes. From the pack: the hash of its .res.json and .spv (tools/pack_shaders.py). From a folder: the
 // .res.json's last write (seconds) and size, taken from _stat64 here and from FindFirstFile in ahead_thread.
@@ -452,6 +466,7 @@ static uint32_t stamp_fold(uint64_t h) {
     if (dref_clamp()) h ^= 0x5BD1E995ull << 32;   // binaries made before the clamp are not used (the halves fold below)
     if (!vkc.has_interlock) h ^= 0x27D4EB2Full << 32;   // nor those of modules with the interlock (vkb_spv_drop_interlock)
     if (vkb_split_sets()) h ^= 0x2F0B3C51ull << 32;   // nor those made with one descriptor set (buffers in set 1 now)
+    if (vkb_depth_clip_neg1()) h ^= 0x4E454731ull << 32;   // nor those with the vertex depth conversion (load_module)
     return (uint32_t)(h ^ h >> 32) | 1;   // never 0
 }
 static uint32_t stamp_of(uint64_t mtime_s, uint64_t size) {
@@ -590,6 +605,14 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
         i += wc;
     }
     free(in_set1);
+    if (nvn_stage == 0 && vkb_depth_clip_neg1()) {   // TOTK_VK_DEPTH_CLIP_NEG1: z = (z + w) / 2 out, the draw maps -1..1
+        int found = 0;
+        nw = vkb_spv_drop_depth_convert(spv, nw, &found);
+        nspv = nw * 4;
+        s->neg1 = found > 0;
+        static _Atomic int said;
+        if (!found && atomic_fetch_add(&said, 1) < 8) VLOG("vertex shader %.12s: no depth conversion found (drawn with 0..1 clip)", key);
+    }
     // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
     s->in_mask = vkb_spv_input_mask(spv, nw);
     s->out_mask = vkb_spv_output_mask(spv, nw);

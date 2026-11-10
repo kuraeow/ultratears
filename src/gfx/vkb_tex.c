@@ -2355,6 +2355,10 @@ static void dump_save(const char *dir, const char *prefix, const vkb_image *im, 
         for (uint32_t p = 0; p < w * h; p++) { float v; memcpy(&v, px + (size_t)p * 4, 4); sum += v; if (v < lo) lo = v; if (v > hi) hi = v; }
         VLOG("[dump] %stexture %llu %s %ux%u: min %g mean %g max %g, centre %g", prefix, (unsigned long long)im->serial,
              im->format == VK_FORMAT_R32_SFLOAT ? "R32F" : "depth", w, h, lo, sum / (w * h), hi, ((const float *)px)[(size_t)(h / 2) * w + w / 2]);
+        char raw[1024];   // and the values themselves: <name>.f32, w * h little-endian floats
+        snprintf(raw, sizeof raw, "%s/%s%llu_%02x_%ux%u.f32", dir, prefix, (unsigned long long)im->serial, im->d.format, w, h);
+        FILE *rf = fopen(raw, "wb");
+        if (rf) { for (uint32_t p = 0; p < w * h; p++) fwrite(px + (size_t)p * 4, 4, 1, rf); fclose(rf); }
     }
     char path[1024];
     snprintf(path, sizeof path, "%s/%s%llu_%02x_%ux%u.bmp", dir, prefix, (unsigned long long)im->serial, im->d.format, w, h);

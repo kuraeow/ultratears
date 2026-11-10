@@ -1547,19 +1547,21 @@ static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed sinc
 static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, VkPrimitiveTopology topo) {
     // Nothing changed since the last draw of this command buffer: its ~45 values are recorded already. Not while the
     // depth audit or TOTK_VK_DEPTH_ALWAYS look at each draw.
-    static __thread struct { uint64_t rec; uint32_t gen; int ncolor, oslot; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
+    static __thread struct { uint64_t rec; uint32_t gen; int ncolor, oslot, neg1; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
     int oslot = vkb_pass_obj_slot();   // the temporal upscaler's object motion target (vkb_tsr.c)
+    int neg1 = S.sh[0] && S.sh[0]->neg1;   // TOTK_VK_DEPTH_CLIP_NEG1: this vertex shader's z = (z + w) / 2 was taken out
     static int per_draw = -1;
     if (per_draw < 0) per_draw = getenv("TOTK_VK_DEPTH_ALWAYS") != NULL || getenv("TOTK_VK_DYN_EVERY") != NULL;
     float jx = 0, jy = 0;   // the temporal upscaler's jitter of the scene's draws (vkb_tsr.c)
     vkb_tsr_jitter(vkb_rt(), &jx, &jy);
     if (!per_draw && !no_cache() && !vkb_depth_audit_on() && last.rec == g_rec && B->dc.rec == g_rec && last.gen == t_sgen &&
         last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo &&
-        last.jx == jx && last.jy == jy && last.oslot == oslot) {
+        last.jx == jx && last.jy == jy && last.oslot == oslot && last.neg1 == neg1) {
         vkb_cnt_add(g_dyn_skips, 1);
         return;
     }
     last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo; last.jx = jx; last.jy = jy; last.oslot = oslot;
+    last.neg1 = neg1;
     // viewports (TOTK uses the upper-left window origin, as Vulkan) and the depth range
     VkViewport vps[16];
     int nvp = S.nvp ? S.nvp : 1;
@@ -1598,7 +1600,8 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
     DYN(D_LINEW, float, 1.0f, vk.vkCmdSetLineWidth(cb, v_));
     DYN(D_CLAMP, VkBool32, S.depth_clamp != 0, vk.vkCmdSetDepthClampEnableEXT(cb, v_));
     DYN(D_CLIP, VkBool32, !S.depth_clamp, vk.vkCmdSetDepthClipEnableEXT(cb, v_));
-    DYN(D_CLIPNEG, VkBool32, VK_FALSE, vk.vkCmdSetDepthClipNegativeOneToOneEXT(cb, v_));   // the translator converts z = (z + w) / 2
+    // the translator converts z = (z + w) / 2; TOTK_VK_DEPTH_CLIP_NEG1 takes that out and maps -1..1 here (vkb_shader.c)
+    DYN(D_CLIPNEG, VkBool32, neg1 ? VK_TRUE : VK_FALSE, vk.vkCmdSetDepthClipNegativeOneToOneEXT(cb, v_));
     DYN(D_PROVOKE, VkProvokingVertexModeEXT, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, vk.vkCmdSetProvokingVertexModeEXT(cb, v_));
     // multisample
     DYN(D_SAMPLES, VkSampleCountFlagBits, VK_SAMPLE_COUNT_1_BIT, vk.vkCmdSetRasterizationSamplesEXT(cb, v_));   // [temporary] single-sampled targets
