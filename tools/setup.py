@@ -335,8 +335,21 @@ def load_state():
 
 
 def save_state(state):
+    """Written to a temporary file and moved over setup.json. Windows refuses the write or the move while another
+    program has the file open (an antivirus scanning it, the launcher reading it): a few tries before giving up
+    (GitHub #72, #73: a whole build failed at its last write)."""
     DATA.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=1))
+    tmp = STATE.with_name(STATE.name + '.tmp')
+    text = json.dumps(state, indent=1)
+    for attempt in range(20):
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, STATE)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.25)
 
 
 # ---------------------------------------------------------------- steps

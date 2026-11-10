@@ -402,9 +402,20 @@ def run_limited(cmd, env, mask, on_line=None):
                 on_line(line.rstrip('\n'))
         return p.wait()
     import ctypes
+    import time
     CREATE_SUSPENDED, BELOW_NORMAL_PRIORITY_CLASS = 0x4, 0x4000
-    p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, stdout=pipe,
-                         stderr=subprocess.STDOUT if on_line else None, text=bool(on_line), errors='replace')
+    # a program the build has just linked (bc7build.exe) may be refused for a few seconds while an antivirus checks it
+    # (GitHub #78: "Access denied" from CreateProcess): tried again for up to ~30 s before saying so
+    for attempt in range(60):
+        try:
+            p = subprocess.Popen(cmd, env=env, creationflags=CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, stdout=pipe,
+                                 stderr=subprocess.STDOUT if on_line else None, text=bool(on_line), errors='replace')
+            break
+        except PermissionError:
+            if attempt == 59:
+                sys.exit(f'Windows does not let {cmd[0]} start (access denied): most likely the antivirus blocks it. '
+                         f'Allow the UltraTears folder in the antivirus and start the preparation again.')
+            time.sleep(0.5)
     handle = int(p._handle)
     if not ctypes.windll.kernel32.SetProcessAffinityMask(handle, ctypes.c_size_t(mask)):
         p.kill()
