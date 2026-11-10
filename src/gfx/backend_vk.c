@@ -2653,6 +2653,24 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
     g_shot_buf = VK_NULL_HANDLE;
 }
 static _Atomic long long g_dump_key_at;   // vkb_dump_request (F9)
+// F9's own lines (its draw trace, [dump], [vcheck]: tens of thousands) go to <dir>/f<N>/f9.log from the key to the dump,
+// the game's log keeps one line per snapshot. TOTK_DUMP_KEY_LOG_MB (default 16): past it the rest of the snapshot's
+// lines are dropped. The file is flushed at the dump and closed at the next F9: a line already on its way still lands.
+static FILE *_Atomic g_f9_log;
+static FILE *g_f9_prev;
+static _Atomic long long g_f9_bytes;
+static atomic_int g_f9_over;
+static long long g_f9_cap;
+static char g_f9_dir[512];
+FILE *dm_log_out(void) {
+    FILE *f = atomic_load_explicit(&g_f9_log, memory_order_acquire);
+    return !f ? stderr : atomic_load_explicit(&g_f9_over, memory_order_relaxed) ? NULL : f;
+}
+void dm_log_wrote(FILE *f, int n) {
+    if (atomic_fetch_add(&g_f9_bytes, n) + n < g_f9_cap || atomic_exchange(&g_f9_over, 1)) return;
+    fprintf(f, "[totk-gfx] [limit] f9.log reached %lld MB (TOTK_DUMP_KEY_LOG_MB): the rest of this snapshot's lines are not written\n",
+            g_f9_cap >> 20);
+}
 
 // F9 range check (development): the index, vertex, constant and storage ranges the traced draws read (vkb_vcheck_add), compared once the
 // GPU is idle between the pool's copy in device memory and game memory. A range that differs where the CPU has not
@@ -2782,25 +2800,48 @@ static void dump_check(uint64_t n) {
     static long long auto_at = -1;   // TOTK_DUMP_KEY_AT=<present>: F9 pressed there (scripted runs)
     if (auto_at == -1) { const char *e = getenv("TOTK_DUMP_KEY_AT"); auto_at = e ? atoll(e) : 0; }
     if (auto_at > 0 && n >= (uint64_t)auto_at) { auto_at = 0; vkb_dump_request(); }
-    long long key_at = atomic_load(&g_dump_key_at);   // F9 with TOTK_DUMP_KEY=<dir>: <dir>/f<present>, the game goes on
+    long long key_at = atomic_load(&g_dump_key_at);   // F9 with TOTK_DUMP_KEY=<dir>: <dir>/f<frame>, the game goes on
     if (key_at > 0 && n >= (uint64_t)key_at && atomic_compare_exchange_strong(&g_dump_key_at, &key_at, 0)) {
-        char dir[512];
-        snprintf(dir, sizeof dir, "%s/f%llu", getenv("TOTK_DUMP_KEY"), (unsigned long long)n);
-        CreateDirectoryA(getenv("TOTK_DUMP_KEY"), NULL);
-        CreateDirectoryA(dir, NULL);
-        vkb_tex_dump(dir);
+        vkb_tex_dump(g_f9_dir);
         vcheck_run();
         vkb_tex_vcheck_run();
-        VLOG("F9: frame %llu dumped to %s (its draws traced above)", (unsigned long long)n, dir);
+        vkb_draw_trace_arm(0, 0);   // the trace ends with the snapshot: later draws stay out of f9.log and of the game's log
+        VLOG("F9: frame %llu dumped to %s (its draws traced above)", (unsigned long long)n, g_f9_dir);
+        FILE *lf = atomic_exchange(&g_f9_log, NULL);
+        if (lf) fflush(lf);
+        VLOG("F9: snapshot done: %s", g_f9_dir);
     }
 }
 // TOTK_DUMP_KEY=<dir> (development: catching what a person sees while playing): F9 traces the draws of the next frames
-// (TOTK_VK_DRAWTRACE) and dumps the render targets of the frame after them. Those frames are recorded on one thread
-// (vkb_mt_on), the rest of the game as usual.
+// (TOTK_VK_DRAWTRACE) and dumps the render targets of the frame after them into <dir>/f<frame>, its lines in f9.log
+// there. Those frames are recorded on one thread (vkb_mt_on), the rest of the game as usual. TOTK_DUMP_KEY_MAX (default
+// 20): snapshots per run, then F9 does nothing (each holds the frame's render targets, a few hundred MB).
 void vkb_dump_request(void) {
     const char *d = getenv("TOTK_DUMP_KEY");
     if (!d || !*d || atomic_load(&g_dump_key_at)) return;
+    static int taken;
+    int max = getenv("TOTK_DUMP_KEY_MAX") ? atoi(getenv("TOTK_DUMP_KEY_MAX")) : 20;
+    if (taken >= max) {
+        if (taken++ == max) VLOG("F9: %d snapshots taken, the limit (TOTK_DUMP_KEY_MAX): no more in this run", max);
+        return;
+    }
+    taken++;
+    if (!g_f9_cap) g_f9_cap = (getenv("TOTK_DUMP_KEY_LOG_MB") ? atoll(getenv("TOTK_DUMP_KEY_LOG_MB")) : 16) << 20;
     uint64_t f = vkb_frame();
+    snprintf(g_f9_dir, sizeof g_f9_dir, "%s/f%llu", d, (unsigned long long)f + 3);
+    CreateDirectoryA(d, NULL);
+    CreateDirectoryA(g_f9_dir, NULL);
+    char path[600];
+    snprintf(path, sizeof path, "%s/f9.log", g_f9_dir);
+    FILE *lf = fopen(path, "w");
+    VLOG("F9: snapshot %d of %d: %s (%s)", taken, max, g_f9_dir, lf ? "its lines in f9.log there" : "f9.log not created: its lines here");
+    if (lf) {
+        if (g_f9_prev) fclose(g_f9_prev);
+        g_f9_prev = lf;
+        atomic_store(&g_f9_bytes, 0);
+        atomic_store(&g_f9_over, 0);
+        atomic_store_explicit(&g_f9_log, lf, memory_order_release);
+    }
     vkb_draw_trace_arm(f + 1, getenv("TOTK_DUMP_KEY_DRAWS") ? atoll(getenv("TOTK_DUMP_KEY_DRAWS")) : 6000);   // about two frames on the island
     atomic_store(&g_dump_key_at, (long long)f + 3);
     VLOG("F9: tracing from frame %llu, dump at %llu", (unsigned long long)f + 1, (unsigned long long)f + 3);

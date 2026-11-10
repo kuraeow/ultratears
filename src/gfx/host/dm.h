@@ -5,7 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#define LOG(...) do {fprintf(stderr,"[totk-gfx] " __VA_ARGS__);fputc('\n',stderr);}while(0)
+// F9 (TOTK_DUMP_KEY, backend_vk.c): while a snapshot is taken these lines go to its f9.log, not the game's log, and past
+// TOTK_DUMP_KEY_LOG_MB they are dropped (dm_log_out: NULL)
+FILE *dm_log_out(void);
+void dm_log_wrote(FILE *f, int n);
+#define LOG(...) do {FILE *o_=dm_log_out();if(o_){int n_=fprintf(o_,"[totk-gfx] " __VA_ARGS__);fputc('\n',o_);if(o_!=stderr)dm_log_wrote(o_,n_+1);}}while(0)
 // TOTK_STATS=1 (or TOTK_MEMMAP): the periodic statistics lines (every 300 frames and the like) - off for players, whose
 // log keeps the errors, the long frames and the start-up lines.
 static inline int dm_stats(void) {
@@ -14,7 +18,7 @@ static inline int dm_stats(void) {
     return v;
 }
 void plat_fatal_notice(void);   // runtime/platform.h: the error in a message box (no console), why when out of memory
-#define die(...) do {LOG("FATAL: " __VA_ARGS__);fflush(stderr);plat_fatal_notice();exit(2);}while(0)
+#define die(...) do {fprintf(stderr,"[totk-gfx] FATAL: " __VA_ARGS__);fputc('\n',stderr);fflush(stderr);plat_fatal_notice();exit(2);}while(0)
 typedef struct {const char *name;uint8_t *base;size_t size;} module_t;
 module_t *module_of(const void *p);
 uint64_t now_ns(void);uint64_t guest_ns(void);
