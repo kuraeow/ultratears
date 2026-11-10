@@ -394,6 +394,19 @@ static void use_install(const std::string &folder) {
     U.version_line = package_version_line(U.root);
 }
 
+// Where an update is downloaded (its update/ folder) and, on Linux, where the new UltraTears.AppImage goes. The package
+// folder, unless that is the running AppImage's mount (a game folder without a builder of its own: U.root = U.home),
+// which is read-only (GitHub #74: "Couldn't open /tmp/.mount_.../update/UltraTears.AppImage.part"): then the game
+// folder, where the new AppImage, started, brings the folder up to date itself.
+static std::string update_folder() {
+#ifndef _WIN32
+    const char *appdir = SDL_getenv("APPDIR");
+    if (appdir && *appdir && same_path(U.root, U.home))
+        return U.install;
+#endif
+    return U.root;
+}
+
 static void dump_state() {   // what the dump screen shows for this install folder
     if (data_ready())
         U.dump_st = D_DATA;
@@ -723,7 +736,7 @@ static void poll_update() {
         save();
         if (SDL_getenv("ULTRS_LAUNCHER_DEMO") && SDL_strcmp(SDL_getenv("ULTRS_LAUNCHER_DEMO"), "update") == 0) {
             U.screen = SCR_UPDATE, U.upd_st = 1;   // development: the whole update without a click
-            update_download_start(U.upd, path_join(U.root, "update"));
+            update_download_start(U.upd, path_join(update_folder(), "update"));
         }
     }
     if (U.upd_st == 1) {
@@ -738,7 +751,7 @@ static void poll_update() {
                                   U.root, path_join(U.root, "update/update.log"));
 #else
             std::string err;   // the new AppImage in the game folder, started: it updates the folder itself
-            if (appimage_update(res, U.root, err)) {
+            if (appimage_update(res, update_folder(), err)) {
                 SDL_Event q = {};
                 q.type = SDL_EVENT_QUIT;
                 SDL_PushEvent(&q);
@@ -2215,7 +2228,7 @@ static void screen_update_footer() {
     if (button("upd_go", T(U.upd_st == 3 ? "upd_retry" : "upd_go"), 764 - w1, 408, w1, 48, PRIMARY)) {
         U.upd_err.clear();
         U.upd_st = 1;
-        update_download_start(U.upd, path_join(U.root, "update"));
+        update_download_start(U.upd, path_join(update_folder(), "update"));
     }
     if (button("upd_later", T("upd_later"), 764 - w1 - 12 - w2, 408, w2, 48, DARK)) {
         U.upd_st = 0;
