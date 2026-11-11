@@ -360,6 +360,25 @@ size_t vkb_spv_drop_interlock(uint32_t *w, size_t nw) {
     return o;
 }
 
+// TOTK_VK_NO_INVARIANT (vkb_shader.c): the translator marks the vertex position Invariant (third_party/shader_translator
+// patch 0009), which keeps drivers from reordering its arithmetic. Taken out here for an A/B of its GPU cost.
+size_t vkb_spv_drop_invariant(uint32_t *w, size_t n, int *found) {
+    *found = 0;
+    size_t o = 5;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) return n;   // malformed: leave the module as it was (nothing moved before i)
+        if ((op == 71 && wc == 3 && w[i + 2] == 18) || (op == 72 && wc == 4 && w[i + 3] == 18)) {
+            (*found)++;
+        } else {
+            if (o != i) memmove(&w[o], &w[i], wc * 4);
+            o += wc;
+        }
+        i += wc;
+    }
+    return o;
+}
+
 // TOTK_VK_DEPTH_CLIP_NEG1 (vkb_shader.c): the translator's z = fma(z, 0.5, w * 0.5) before the divide taken out of a vertex
 // shader (the Fma becomes a copy of z), in place; the draw maps -1..1 to the depth range in the fixed function instead
 // (VK_EXT_depth_clip_control negativeOneToOne), as Maxwell does: the window depth then comes from the

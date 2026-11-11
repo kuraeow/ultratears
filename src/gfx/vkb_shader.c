@@ -459,6 +459,17 @@ int vkb_depth_clip_neg1(void) {
     return v;
 }
 
+// TOTK_VK_NO_INVARIANT=1: the vertex position's Invariant decoration taken out at load (vkb_spv_drop_invariant), an A/B
+// of its GPU cost (2026-10-30: ~10 % of the GPU time in the world on a PC; it came back with patch 0009 on 2026-11-02).
+// FSR 3.1's object motion draws a moving object again with its last-frame variant and LEQUAL against the scene depth,
+// which relies on both computing the same position: check it with the switch on. Use with TOTK_SHADER_BIN=<another
+// file>: the binaries of the other setting are dropped from the file in use (vkb_shbin_compact).
+static int no_invariant(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_NO_INVARIANT"); v = e && *e == '1'; if (v) LOG("vertex position not invariant (TOTK_VK_NO_INVARIANT)"); }
+    return v;
+}
+
 // Which translation of a shader, as the compiled binaries are keyed (vkb_shbin_variant.stamp), and the rewrites
 // load_module makes. From the pack: the hash of its .res.json and .spv (tools/pack_shaders.py). From a folder: the
 // .res.json's last write (seconds) and size, taken from _stat64 here and from FindFirstFile in ahead_thread.
@@ -467,6 +478,7 @@ static uint32_t stamp_fold(uint64_t h) {
     if (!vkc.has_interlock) h ^= 0x27D4EB2Full << 32;   // nor those of modules with the interlock (vkb_spv_drop_interlock)
     if (vkb_split_sets()) h ^= 0x2F0B3C51ull << 32;   // nor those made with one descriptor set (buffers in set 1 now)
     if (vkb_depth_clip_neg1()) h ^= 0x4E454731ull << 32;   // nor those with the vertex depth conversion (load_module)
+    if (no_invariant()) h ^= 0x494E5630ull << 32;   // nor those with the Invariant position (and back)
     return (uint32_t)(h ^ h >> 32) | 1;   // never 0
 }
 static uint32_t stamp_of(uint64_t mtime_s, uint64_t size) {
@@ -580,6 +592,7 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
     size_t ncl = 0;
     if (dref_clamp() && vkb_spv_clamp_dref(spv, nw, &clamped, &ncl)) { free(spv); spv = clamped; nw = ncl; }
     if (!vkc.has_interlock) nw = vkb_spv_drop_interlock(spv, nw);   // a device without it refused these modules (RX 570)
+    if (no_invariant()) { int found; nw = vkb_spv_drop_invariant(spv, nw, &found); }
     nspv = nw * 4;
     int split = nvn_stage <= 1 && vkb_split_sets();   // vertex and fragment shaders (compute keeps one set)
     uint32_t bound = spv[3], *in_set1 = split ? calloc((bound + 31) / 32, 4) : NULL;   // ids of buffer variables
