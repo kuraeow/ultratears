@@ -8,6 +8,8 @@
 и Steam Deck из вашей собственной копии игры. Это не эмулятор: код игры заранее переводится в нативный, а шейдеры и
 текстуры готовятся при сборке игры, а не во время игры.
 
+<a href="https://recomplauncher.com/game/ultratears"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 > [!IMPORTANT]
 > **Файлов игры здесь нет.** Нужна ваша собственная копия игры с обновлением 1.4.3, снятая с вашей консоли в виде обычных
 > папок `exefs` и `romfs`. Проект не даёт файлов игры, ключей, прошивки и инструментов для дампа, а UltraTears ничего
