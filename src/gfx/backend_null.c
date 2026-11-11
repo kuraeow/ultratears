@@ -23,14 +23,11 @@ void mtl_shot_at_present(const tex_t *t) { (void)t; }
 int mtl_has_window(void) { return 0; }
 int mtl_display_hz(void) { return 60; }
 double mtl_presented_time(uint64_t n) { (void)n; return 0; }
-void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_note_world(void) {}
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 uint32_t mtl_present_qos(void) { return 0; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) { (void)timeout_ns; (void)frame_ticks; return 0; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return 0; }
-int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; *t0 = *t1 = 0; return 0; }
 
 // ---------------- mtl_*: statistics (all zero) ----------------
 void mtl_alloc_stats(uint64_t *a, uint64_t *b, int *c) { *a = *b = 0; *c = 0; }

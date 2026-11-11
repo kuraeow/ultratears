@@ -1,9 +1,12 @@
 // The translated shaders in one file instead of a folder of ~57,000 (issue #22): data/shaders/translated.pack, written by
 // tools/pack_shaders.py (the format is described there). Mapped read-only: a lookup is a binary search of the index
 // and copies, no file calls; the pages read are the system's file cache, not the game's memory.
+// Version 2 (2026-11-11): a shader's SPIR-V is one zstd frame (3.4 GiB of modules pack to a quarter); a record whose
+// stored length is 0, and every record of version 1, holds the module as it is.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zstd.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -18,7 +21,7 @@ void plat_unmap_file(const void *p, uint64_t size);
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
-typedef struct { uint8_t key[32]; uint64_t json_off, spv_off; uint32_t json_len, spv_len, stamp, zero; } rec_t;   // 64 bytes
+typedef struct { uint8_t key[32]; uint64_t json_off, spv_off; uint32_t json_len, spv_len, stamp, spv_stored; } rec_t;   // 64 bytes
 static const uint8_t *g_map;
 static const rec_t *g_idx;
 static size_t g_n, g_size;
@@ -48,7 +51,7 @@ static void open_pack(void) {
     memcpy(&version, p + 8, 4);
     memcpy(&count, p + 12, 4);
     memcpy(&at, p + 16, 8);
-    if (memcmp(p, "UTSPACK1", 8) || version != 1 || at + (uint64_t)count * sizeof(rec_t) > (uint64_t)sz.QuadPart) {
+    if (memcmp(p, "UTSPACK1", 8) || (version != 1 && version != 2) || at + (uint64_t)count * sizeof(rec_t) > (uint64_t)sz.QuadPart) {
         VLOG("shader pack %s: not a shader pack or damaged", path);
         UnmapViewOfFile(p);
         return;
@@ -84,13 +87,19 @@ int vkb_shpack_get(const char *key, char **json, uint32_t **spv, size_t *spv_byt
         int c = memcmp(g_idx[mid].key, k, 32);
         if (!c) {
             const rec_t *r = &g_idx[mid];
-            if (r->json_off + r->json_len > g_size || r->spv_off + r->spv_len > g_size) return 0;
+            size_t stored = r->spv_stored ? r->spv_stored : r->spv_len;   // spv_stored: the bytes of its zstd frame
+            if (r->json_off + r->json_len > g_size || r->spv_off + stored > g_size) return 0;
             char *j = malloc((size_t)r->json_len + 1);
             uint32_t *s = malloc(r->spv_len ? r->spv_len : 4);
             if (!j || !s) { free(j); free(s); return 0; }
             memcpy(j, g_map + r->json_off, r->json_len);
             j[r->json_len] = 0;
-            memcpy(s, g_map + r->spv_off, r->spv_len);
+            if (!r->spv_stored) memcpy(s, g_map + r->spv_off, r->spv_len);
+            else if (ZSTD_decompress(s, r->spv_len, g_map + r->spv_off, stored) != r->spv_len) {
+                VLOG("shader pack: shader %.12s does not unpack (the file is damaged)", key);
+                free(j); free(s);
+                return 0;
+            }
             *json = j; *spv = s; *spv_bytes = r->spv_len; *stamp = r->stamp;
             return 1;
         }

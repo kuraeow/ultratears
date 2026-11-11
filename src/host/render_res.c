@@ -14,11 +14,11 @@
  * Heap: the render targets of the output and the scene live in agl's DynamicTextureAllocatorMem, sized in
  * System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs (113664 KiB, carved from "Graphics", 201728 KiB); at 2560x1440 the
  * shipped size runs out at the title screen. Both grow by the shipped size times the output's pixel ratio above 1920x1080
- * plus the scene's above 1600x900 (totk-pc-recomp's formula, from MacNativeGames' measurement); fs.c serves the rewritten
+ * plus the scene's above 1600x900 (from MacNativeGames' measurement); fs.c serves the rewritten
  * table (totk_heapdef_build) in place of the original and svc.c adds the amount to the application pool, so no other
  * heap shrinks. Without the rewritten table the game keeps its own sizes.
  *
- * Sun shadow map (the shadow_size code patch; as totk-pc-recomp 1a07a8d, MIT): each frame the game sizes its shadow
+ * Sun shadow map (the shadow_size code patch): each frame the game sizes its shadow
  * cascades (a D16 array of 4 layers, base 960) to the area they cover, down to ~400 near the ground, so foliage shadows
  * turn blocky, and every change of size moves the shadow texels, so leaf shadows jump instead of sliding. The Switch
  * does the same; the community mods fix the size. shadow_map= (TOTK_SHADOW_RES): "game" (default) or a fixed size
@@ -142,8 +142,8 @@ static int is_16x9(unsigned w, unsigned h) {
 
 // Another shape than 16:9 (16:10 as the Steam Deck's 1280x800, 21:9, 32:9): the camera takes the output's ratio (the
 // aspect code patch, tools/lifter/patches.py: so a 21:9 output shows more of the world at the sides, Hor+, instead of
-// a stretched 16:9 view) and the UI's layouts are laid out for it (host/ui_aspect.c, through fs.c). As
-// totk-pc-recomp's runtime/resolution.c res_init (MIT). 0: the game's own 16:9.
+// a stretched 16:9 view) and the UI's layouts are laid out for it (host/ui_aspect.c, through fs.c). 0: the game's
+// own 16:9.
 int totk_aspect(float *ratio) {
     if (!active() || is_16x9(R.ow, R.oh)) return 0;
     *ratio = (float)R.ow / (float)R.oh;

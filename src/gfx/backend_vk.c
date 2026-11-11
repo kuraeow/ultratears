@@ -28,6 +28,7 @@
 #include "nvn/nvn_obj.h"
 #include "../vk/present.h"
 #include "vkb.h"
+#include "../runtime/bufcat.h"
 #include "vkb_shader.h"
 #include "vkb_audit.h"
 #include "vkb_lock.h"
@@ -55,7 +56,7 @@ static uint64_t gpu_ticks(void) { return runtime_now_ns() * 12 / 625; }   // the
 // pool itself as a copy of game memory (Linux, "pool copies")
 typedef struct { uintptr_t lo, hi, base; VkBuffer buf; VkDeviceMemory mem; const void *key; VkDeviceSize bytes;
                  VkBuffer sbuf; VkDeviceSize soff; uint32_t sh; uint8_t no_shadow, filled; uint64_t stamp, sync_sub, used_sub, defer_pass, wb_sub;
-                 uint8_t *cmap; uint32_t ch; uint8_t cfilled; uint64_t cstamp; } pool_ent;
+                 uint8_t *cmap; uint32_t ch; uint8_t cfilled; uint64_t cstamp, pc_sub; } pool_ent;
 static pool_ent *g_pools;
 static int g_npools, g_capools;
 static _Atomic uint64_t g_pool_gen;   // the table changed (a pool added, removed or made unshadowed): vkb_pool_use's cache
@@ -81,17 +82,52 @@ void vkb_rw_write(vkb_rw *l, int kind) {
 void vkb_rw_write_end(vkb_rw *l) { ReleaseSRWLockExclusive((PSRWLOCK)l); }
 #else
 #include <pthread.h>
+/* Linux: writers first (TOTK_RWLOCK_WRITER=0: glibc's default, readers first). glibc's default lets readers in while a
+   writer waits, and the recording threads read the pool table for nearly every draw, so a writer waited until the
+   recording of the frame was done: the game's own streaming calls (a memory pool made: mtl_pool_add takes g_pool_mu
+   for writing) took up to 11-23 ms on the Steam Deck and the friend's PC, the game's loader waited in them, its main
+   thread for the loader - the 40-30-40 dips while the world streams in, Linux only (Windows' SRW locks let a waiting
+   writer go first). Waits are counted as on Windows (the per-frame "lock
+   waits" line showed 0.00 on Linux). No reader here takes the same lock again while holding it, which writer
+   preference would deadlock. */
+static pthread_mutex_t g_rw_init_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t *get_rw(vkb_rw *l) {
-    if (!l->opaque) {
-        pthread_rwlock_t *rw = (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
-        pthread_rwlock_init(rw, NULL);
-        l->opaque = rw;
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&l->opaque, __ATOMIC_ACQUIRE);
+    if (rw) return rw;
+    pthread_mutex_lock(&g_rw_init_mu);
+    if (!(rw = l->opaque)) {
+        static int writer = -1;
+        if (writer < 0) { const char *e = getenv("TOTK_RWLOCK_WRITER"); writer = !(e && *e == '0'); }
+        rw = (pthread_rwlock_t *)calloc(1, sizeof(pthread_rwlock_t));
+        pthread_rwlockattr_t a;
+        pthread_rwlockattr_init(&a);
+        if (writer) pthread_rwlockattr_setkind_np(&a, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        pthread_rwlock_init(rw, &a);
+        pthread_rwlockattr_destroy(&a);
+        __atomic_store_n((pthread_rwlock_t **)&l->opaque, rw, __ATOMIC_RELEASE);
     }
-    return (pthread_rwlock_t *)l->opaque;
+    pthread_mutex_unlock(&g_rw_init_mu);
+    return rw;
 }
-void vkb_rw_read(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_rdlock(get_rw(l)); }
+static void rw_waited(int kind, uint64_t t0) {
+    atomic_fetch_add_explicit(&vkb_lock_wait_ns[kind], runtime_now_ns() - t0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&vkb_lock_waits[kind], 1, memory_order_relaxed);
+}
+void vkb_rw_read(vkb_rw *l, int kind) {
+    pthread_rwlock_t *rw = get_rw(l);
+    if (!pthread_rwlock_tryrdlock(rw)) return;
+    uint64_t t0 = runtime_now_ns();
+    pthread_rwlock_rdlock(rw);
+    rw_waited(kind, t0);
+}
 void vkb_rw_read_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
-void vkb_rw_write(vkb_rw *l, int kind) { (void)kind; pthread_rwlock_wrlock(get_rw(l)); }
+void vkb_rw_write(vkb_rw *l, int kind) {
+    pthread_rwlock_t *rw = get_rw(l);
+    if (!pthread_rwlock_trywrlock(rw)) return;
+    uint64_t t0 = runtime_now_ns();
+    pthread_rwlock_wrlock(rw);
+    rw_waited(kind, t0);
+}
 void vkb_rw_write_end(vkb_rw *l) { pthread_rwlock_unlock(get_rw(l)); }
 #endif
 
@@ -209,7 +245,7 @@ static void memory_log(void) {
         vk.vkGetPhysicalDeviceMemoryProperties2(vkc.gpu, &p);
         int n = 0;
         for (uint32_t h = 0; h < p.memoryProperties.memoryHeapCount && n < (int)sizeof drv - 64; h++)
-            n += snprintf(drv + n, sizeof drv - (size_t)n, " heap %u%s %.0f of %.0f MiB;", h,
+            n = bufcat(drv, sizeof drv, n, " heap %u%s %.0f of %.0f MiB;", h,
                           p.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (video)" : "",
                           b.heapUsage[h] / 1048576.0, b.heapBudget[h] / 1048576.0);
     }
@@ -217,6 +253,14 @@ static void memory_log(void) {
          "host %.0f MiB (peak %.0f); game memory imported %.0f MiB", drv[0] ? drv : " -", atomic_load(&g_mem_bytes[MK_DEVICE]) / 1048576.0,
          (unsigned long long)atomic_load(&g_mem_count[MK_DEVICE]), atomic_load(&g_mem_peak[MK_DEVICE]) / 1048576.0, vkb_shadow_bytes() / 1048576.0,
          atomic_load(&g_mem_bytes[MK_HOST]) / 1048576.0, atomic_load(&g_mem_peak[MK_HOST]) / 1048576.0, atomic_load(&g_mem_bytes[MK_IMPORT]) / 1048576.0);
+    {   // ours by use (vkb_mtag)
+        static const char *const nm[MT_N] = {"other", "images", "upload rings", "descriptors", "pool copies", "mirrors", "uniform copies",
+                                             "write-back", "copy back"};
+        char line[512]; int n = 0;
+        for (int t = 0; t < MT_N && n < (int)sizeof line - 48; t++)
+            n = bufcat(line, sizeof line, n, " %s %.0f MiB;", nm[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
+        VLOG("memory: ours by use:%s", line);
+    }
     vkb_shader_report();
     uint64_t rc, rb, rp, rpk, rmade, rfreed;
     vkb_ring_stats(&rc, &rb, &rp);
@@ -237,7 +281,7 @@ static void memory_log(void) {
         char tl[384];
         int at = 0;
         for (int t = 0; t < MT_N; t++)
-            at += snprintf(tl + at, sizeof tl - (size_t)at, " %s %.0f;", tn[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
+            at = bufcat(tl, sizeof tl, at, " %s %.0f;", tn[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
         VLOG("memory: ours by use (MiB):%s", tl);
     }
 }
@@ -312,8 +356,8 @@ static int import_host(uintptr_t a, uintptr_t b, VkBuffer *out_buf, VkDeviceMemo
 // ---------------- pool copies (Linux) ----------------
 // amdgpu checks every imported host range (a userptr) at every submission, page by page: on the Steam Deck the two
 // vkQueueSubmit2 calls of a frame took ~15 ms each with TOTK's ~1.1 GiB of imported pools (2026-11-01), and with
-// imports the write watch cannot work (runtime/platform/linux.c). So on Linux, as totk-pc-recomp does it
-// (runtime/vk_memory.c, "shadow storage"), each pool is a host-visible buffer of our own holding a copy of its game
+// imports the write watch cannot work (runtime/platform/linux.c). So on Linux each pool is a host-visible buffer of
+// our own holding a copy of its game
 // memory at the same offsets, and the two are kept the same around the GPU's work:
 //  - CPU -> copy: right before a submission is submitted (pc_sync), the pools it uses get the pages written since their
 //    copy was last brought up to date (the write watch, nvn_dirty_runs); a pool not tracked gets all of it.
@@ -323,7 +367,7 @@ static int import_host(uintptr_t a, uintptr_t b, VkBuffer *out_buf, VkDeviceMemo
 //  - Both wrote: byte by byte, as the device copies on Windows do it (wb_merge, wb_bytes). A recorded GPU write is the
 //    whole range a shader may store to, mostly far more than it stores, and TOTK binds the same ranges every frame, so
 //    there is nearly always an earlier submission's write not back yet. When the copies left those ranges out whole
-//    (totk-pc-recomp's rule, ours until 2026-11-01), the CPU's updates to the bytes the GPU does not store never
+//    (our rule until 2026-11-01), the CPU's updates to the bytes the GPU does not store never
 //    reached the GPU, and the copy back put the copy's old bytes over them in game memory (L20 on the Steam Deck: the
 //    Depths ground not drawn, Link lit wrongly). Now each GPU write keeps game memory's bytes as of its submission's
 //    sync (its snapshot, `was`): a byte that differs from it later is the CPU's, newer than the GPU's work (the game
@@ -393,16 +437,21 @@ static void pc_put(const pool_ent *p, uint64_t a, uint64_t b, int i, int whole) 
     memcpy(p->cmap + (a - p->base), (const void *)(uintptr_t)a, b - a);
     g_pc_in_bytes += b - a;
 }
+static uint64_t g_pc_copy_ns;   // of g_pc_ns: copying (the rest is the write watch's scan; the log line, g_pc_mu)
 static void pc_run(void *ctx, size_t off, size_t n) {   // nvn_dirty_runs: off from the pool's start
     const pool_ent *p = ctx;
+    uint64_t t0 = runtime_now_ns();
     pc_put(p, p->lo + off, p->lo + off + n, 0, 0);
+    g_pc_copy_ns += runtime_now_ns() - t0;
 }
 // Before submission `fence` is submitted (g_pool_mu read, g_pc_mu held): the pools it used brought up to date.
 static void pc_sync_pool(pool_ent *p) {
     if (!p->cfilled) {   // the first use: all of it (writes up to now are in it)
         nvn_dirty_since((const void *)p->lo, p->hi - p->lo, UINT64_MAX);
         p->cstamp = nvn_dirty_now();
+        uint64_t t0 = runtime_now_ns();
         pc_put(p, p->lo, p->hi, 0, 1);
+        g_pc_copy_ns += runtime_now_ns() - t0;
         p->cfilled = 1;
         return;
     }
@@ -420,8 +469,14 @@ static void pc_sync(uint64_t fence) {
     uint64_t t0 = runtime_now_ns();
     vkb_rw_read(&g_pool_mu, LK_POOLS);
     pthread_mutex_lock(&g_pc_mu);
+    // once a submission: with partial submission (vkb_mt_submit) at the first part that uses the pool, as the GPU may be
+    // reading the copy for the parts already submitted
     for (int i = 0; i < g_npools; i++)
-        if (g_pools[i].cmap && __atomic_load_n(&g_pools[i].used_sub, __ATOMIC_RELAXED) == fence) pc_sync_pool(&g_pools[i]);
+        if (g_pools[i].cmap && g_pools[i].pc_sub != fence && __atomic_load_n(&g_pools[i].used_sub, __ATOMIC_RELAXED) == fence) {
+            pc_sync_pool(&g_pools[i]);
+            g_pools[i].pc_sub = fence;
+        }
+    uint64_t ts = runtime_now_ns();
     for (int k = 0; k < g_npc_pend; k++) {   // this submission's GPU writes: game memory as the GPU starts from it
         pc_range *r = &g_pc_pend[k];
         if (r->fence) continue;
@@ -431,6 +486,7 @@ static void pc_sync(uint64_t fence) {
             g_pc_snap_bytes += r->hi - r->lo;
         }
     }
+    g_pc_copy_ns += runtime_now_ns() - ts;
     g_pc_ns += runtime_now_ns() - t0;
     pthread_mutex_unlock(&g_pc_mu);
     vkb_rw_read_end(&g_pool_mu);
@@ -445,26 +501,43 @@ static void pc_back(const pool_ent *p, const pc_range *r, int k) {
     const uint8_t *c = p->cmap + (r->lo - p->base);
     uint8_t *g = (uint8_t *)(uintptr_t)r->lo;
     uint64_t n = r->hi - r->lo, kept = 0;
+    // the first byte the CPU kept on each page (marked written again below), up to KMAX; more: found by a scan
+    enum { KMAX = 64 };
+    uint64_t kept_at[KMAX];
+    // Blocks of 4 KiB where game memory still holds the snapshot (nearly all: the CPU rarely writes what the GPU
+    // writes) go over whole; a block that differs, by 64 bytes; only a 64-byte piece that differs, byte by byte (the
+    // retire thread took ~18 % of a Steam Deck core byte by byte, 2026-11-04).
     if (!r->was) memcpy(g, c, n);
     else
         for (uint64_t x = 0, kept_page = UINT64_MAX; x < n;) {
-            uint64_t m = n - x < 64 ? n - x : 64;
-            if (!memcmp(g + x, r->was + x, m)) { memcpy(g + x, c + x, m); x += m; continue; }
-            for (uint64_t e = x + m; x < e; x++) {
-                if (g[x] == r->was[x]) { g[x] = c[x]; continue; }
-                uint64_t page = (r->lo + x) >> 12;
-                if (page != kept_page) { kept_page = page; kept++; }
+            uint64_t big = n - x < 4096 ? n - x : 4096;
+            if (!memcmp(g + x, r->was + x, big)) { memcpy(g + x, c + x, big); x += big; continue; }
+            for (uint64_t eb = x + big; x < eb;) {
+                uint64_t m = eb - x < 64 ? eb - x : 64;
+                if (!memcmp(g + x, r->was + x, m)) { memcpy(g + x, c + x, m); x += m; continue; }
+                for (uint64_t e = x + m; x < e; x++) {
+                    if (g[x] == r->was[x]) { g[x] = c[x]; continue; }
+                    uint64_t page = (r->lo + x) >> 12;
+                    if (page != kept_page) { if (kept < KMAX) kept_at[kept] = x; kept_page = page; kept++; }
+                }
             }
         }
     nvn_dirty_gpu_write_end(tok);   // before the marks below: they are the CPU's
-    for (uint64_t x = 0; kept && x < n; x++)   // the first kept byte of each page
-        if (g[x] != c[x]) { __atomic_fetch_or(&g[x], 0, __ATOMIC_RELAXED); x += 0xfff - ((r->lo + x) & 0xfff); }
+    if (kept <= KMAX)
+        for (uint64_t i = 0; i < kept; i++) __atomic_fetch_or(&g[kept_at[i]], 0, __ATOMIC_RELAXED);
+    else
+        for (uint64_t x = 0; x < n; x++)   // the first kept byte of each page
+            if (g[x] != c[x]) { __atomic_fetch_or(&g[x], 0, __ATOMIC_RELAXED); x += 0xfff - ((r->lo + x) & 0xfff); }
     g_pc_kept += kept;
-    for (int j = k; j < g_npc_pend; j++) {
+    for (int j = k; j < g_npc_pend; j++) {   // the GPU's bytes into the snapshots of later writes over them
         pc_range *o = &g_pc_pend[j];
         if (o == r || !o->was || o->buf != r->buf || o->lo >= r->hi || o->hi <= r->lo) continue;
         uint64_t lo = o->lo > r->lo ? o->lo : r->lo, hi = o->hi < r->hi ? o->hi : r->hi;
-        for (uint64_t a = lo; a < hi; a++) if (g[a - r->lo] == c[a - r->lo]) o->was[a - o->lo] = c[a - r->lo];
+        for (uint64_t a = lo; a < hi;) {   // where game memory now holds the copy's bytes (all but the kept ones): whole
+            uint64_t m = hi - a < 4096 ? hi - a : 4096;
+            if (!memcmp(g + (a - r->lo), c + (a - r->lo), m)) { memcpy(o->was + (a - o->lo), c + (a - r->lo), m); a += m; continue; }
+            for (uint64_t e = a + m; a < e; a++) if (g[a - r->lo] == c[a - r->lo]) o->was[a - o->lo] = c[a - r->lo];
+        }
     }
     g_pc_back_bytes += n;
 }
@@ -543,6 +616,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 static void destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem, VkBuffer buf);
+static void wb_held_drop(uint64_t lo, uint64_t hi);   // GPU-only copy backs held (below)
 void mtl_pool_del(const void *mem) {
     if (g_ok != 1) return;
     pool_ent e = {0};
@@ -561,6 +635,7 @@ void mtl_pool_del(const void *mem) {
     if (e.buf) wb_forget(e.buf);
     vkb_rw_write_end(&g_pool_mu);
     if (!e.buf) return;
+    wb_held_drop(e.lo, e.hi);
     if (vkc.has_checkpoints || vkc.has_buffer_marker) VLOG("memory pool %p %#llx..%#llx deleted (present %llu)", mem, (unsigned long long)e.lo, (unsigned long long)e.hi, (unsigned long long)vkb_frame());
     // No wait for the GPU here (the translation thread deletes pools in queue order since 2026-10-28, hle_nvn.c
     // x_poolrel): the game waited for the GPU work that used the pool; its copy in device memory is reused after the
@@ -717,6 +792,9 @@ static int sync_gather(pool_ent *p, uint64_t sub, int may_end) {
     p->filled = 1;
     p->stamp = stamp;
     p->sync_sub = sub;
+    // pool copies (Linux, a discrete GPU): the device copy is filled from the pool's copy, which pc_sync brings up to
+    // date right before the submission - for the pools used in it, so this one counts as used
+    if (p->cmap && __atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
     return 1;
 }
 // What a GPU write's range held before it, for wb_merge: in a page the CPU also wrote, the GPU gets every byte the CPU
@@ -774,16 +852,21 @@ static wb_snap_t *snap_new(uint64_t addr, uint64_t len) {   // NULL: the same ra
     *s = (wb_snap_t){addr, len, NULL, 0};
     return s;
 }
-static void snap_take(const pool_ent *p, uint64_t addr, uint64_t len) {
+static int g_slot_sent;   // partial submission (vkb_mt_submit): parts of this submission are on the GPU
+// late: partial submission sent parts that may hold GPU writes to this pool already (wb_add): a copy of the device
+// copy made now, in a later part of the prologue, could hold them, so the page rule instead
+// (g_slot_sent is read under g_pro_mu, which part_flush holds when it sets it: a part sent after the look is not missed)
+static void snap_take(const pool_ent *p, uint64_t addr, uint64_t len, int late) {
     VkDeviceSize n = (len + 15) & ~(VkDeviceSize)15;
     VkBuffer bf;
     uint8_t *map;
     int cpu_wrote = nvn_dirty_since((const void *)(uintptr_t)addr, len, p->stamp);   // else game memory is "before" itself
     if (cpu_wrote && (t_recording || !vkb_in_pass()) && g_bf_used + n <= BF_CAP && (map = bf_map(vkb_slot(), &bf))) {
-        wb_snap_t *s = snap_new(addr, len);
-        if (!s) return;
-        s->data = map + g_bf_used;
         if (t_recording) vkb_pro_begin();   // threads recording: in the prologue, after the copy's update there
+        if (late && g_slot_sent) { if (t_recording) vkb_pro_end(); return; }   // the page rule
+        wb_snap_t *s = snap_new(addr, len);
+        if (!s) { if (t_recording) vkb_pro_end(); return; }
+        s->data = map + g_bf_used;
         VkCommandBuffer cb = vkb_cmd();
         shadow_barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         VkBufferCopy r = {p->soff + (addr - p->base), g_bf_used, len};
@@ -804,8 +887,9 @@ static void snap_take(const pool_ent *p, uint64_t addr, uint64_t len) {
     g_snap_bytes += len;
 }
 static void wb_add(pool_ent *p, uint64_t addr, uint64_t len) {   // a GPU write to p's copy (g_pool_mu written, or read + g_wb_mu)
+    int late = __atomic_load_n(&p->wb_sub, __ATOMIC_RELAXED) == g_fence + 1;   // GPU writes to it in this submission already
     __atomic_store_n(&p->wb_sub, g_fence + 1, __ATOMIC_RELAXED);
-    snap_take(p, addr, len);
+    snap_take(p, addr, len, late);
     VkDeviceSize o = addr - p->base;
     if (g_nwb && g_wb[g_nwb - 1].dst == p->buf && o <= g_wb[g_nwb - 1].doff + g_wb[g_nwb - 1].n && g_wb[g_nwb - 1].doff <= o + len) {
         wb_t *w = &g_wb[g_nwb - 1];   // overlaps or touches the last one: merged
@@ -892,25 +976,102 @@ static int wb_bytes(uint64_t p, uint64_t e, const uint8_t *gpu, const wb_snap_t 
     if (tok) nvn_dirty_gpu_write_end(tok);
     return tok != NULL;
 }
-static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb_snap_t *snaps, int nsnaps) {
+// Pool copies with device copies (Linux, a discrete GPU): what the copy back put into game memory goes into the pool's
+// own copy too. Reads of a pool without a current device copy (in a pass, before its update) go to that copy, which is
+// game memory as it was at the last sync; on Windows they read game memory itself, which has the GPU's writes by then.
+static void wb_to_pool_copy(uint64_t a, uint64_t len) {
+    if (!vkb_pool_copies()) return;
+    vkb_rw_read(&g_pool_mu, LK_POOLS);
+    const pool_ent *p = pool_find((uintptr_t)a, len);
+    if (p && p->cmap) memcpy(p->cmap + (a - p->base), (const void *)(uintptr_t)a, len);
+    vkb_rw_read_end(&g_pool_mu);
+}
+static void wb_merge_one(uint64_t a, uint64_t len, uint64_t stamp, const uint8_t *src, const wb_snap_t *snaps, int nsnaps) {
+    if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src, len); g_wb_pages += (len + 4095) / 4096; return; }
+    for (uint64_t p = a; p < a + len;) {   // page by page
+        uint64_t e = ((p >> 12) + 1) << 12;
+        if (e > a + len) e = a + len;
+        g_wb_pages++;
+        if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
+            if (wb_bytes(p, e, src + (p - a), snaps, nsnaps)) { g_wb_byte_pages++; p = e; continue; }
+            g_wb_kept_pages++;
+            static int logged, want = -1;   // TOTK_WB_LOG=1 (development): which GPU writes the CPU's pages replaced
+            if (want < 0) want = getenv("TOTK_WB_LOG") != NULL;
+            if (want && logged++ < 2000)
+                VLOG("[wb] GPU write %#llx+%llu: page %#llx kept for the CPU's writes (frame %llu)", (unsigned long long)a,
+                     (unsigned long long)len, (unsigned long long)p, (unsigned long long)vkb_frame());
+        } else wb_put(p, src + (p - a), e - p);
+        p = e;
+    }
+}
+// GPU outputs the CPU reads without waiting: game memory gets them at a fixed point of the game's frames. TOTK's
+// shrines analyse the scene's depth on the GPU (a compute pass into a 23 KiB buffer) and a game thread reads the result
+// for the next frames' lights - not after the render thread's per-frame wait for the GPU, so on the Switch it simply
+// finds the frame before's result, the GPU being done with it by then. Here the GPU finishes a frame later (the
+// translation thread's lag, then the GPU), and the copy back reached game memory when that submission retired: before
+// that read in one frame, after it in the next. The light shafts and the lit floor along the walls switched between
+// the two results about one frame in six, and in ten when the game thread was slow (2026-11-07; ~40 of 60 frames with
+// the game thread held 5 ms at its submit call; 3-4 with the copy back held as below, as with every frame waited for).
+// So a GPU-only range (the CPU has not written it since the GPU write was recorded) copied back for a submission
+// recorded after present L reaches game memory at present L + 3, on the game thread (mtl_wb_held_present): by then the
+// GPU has done it (frames_ahead_wait has waited for present L + 1), so the reader finds the same frame's result every
+// time, two frames old - at 60 fps as old as one frame on the Switch. A range that overlaps a held one is held too
+// (order), and a range the CPU wrote goes now as before (the CPU's pages win; wb_merge_one). QueueFinish (mtl_finish)
+// applies them all; a pool deleted drops its own. TOTK_WB_HOLD=0: at retirement, as before (A/B).
+typedef struct wb_held { uint64_t frame, lo, len, stamp; struct wb_held *next; uint8_t data[]; } wb_held;
+static wb_held *g_held, **g_held_tail = &g_held;
+static pthread_mutex_t g_held_mu = PTHREAD_MUTEX_INITIALIZER;
+static int wb_hold_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_WB_HOLD"); on = !(e && *e == '0'); VLOG("GPU-only copy backs: %s", on ? "at the present three after their frame" : "when their submission retires (TOTK_WB_HOLD=0)"); }
+    return on;
+}
+static void wb_held_apply(wb_held *h) {
+    wb_merge_one(h->lo, h->len, h->stamp, h->data, NULL, 0);
+    wb_to_pool_copy(h->lo, h->len);
+    free(h);
+}
+static void wb_held_take(uint64_t upto, int all) {   // applies the held ranges of frames <= upto, in order
+    pthread_mutex_lock(&g_held_mu);
+    while (g_held && (all || g_held->frame <= upto)) {
+        wb_held *h = g_held;
+        g_held = h->next;
+        if (!g_held) g_held_tail = &g_held;
+        wb_held_apply(h);
+    }
+    pthread_mutex_unlock(&g_held_mu);
+}
+void mtl_wb_held_present(uint64_t present) { if (present > 2) wb_held_take(present - 2, 0); }   // game thread, at each present (frames: label + 1)
+static void wb_held_drop(uint64_t lo, uint64_t hi) {   // a pool deleted: its memory is the game's again
+    pthread_mutex_lock(&g_held_mu);
+    for (wb_held **pp = &g_held; *pp;) {
+        wb_held *h = *pp;
+        if (h->lo < hi && lo < h->lo + h->len) { *pp = h->next; free(h); } else pp = &h->next;
+    }
+    g_held_tail = &g_held;
+    while (*g_held_tail) g_held_tail = &(*g_held_tail)->next;
+    pthread_mutex_unlock(&g_held_mu);
+}
+static void wb_merge(const uint64_t *r, int n, const uint8_t *src, const wb_snap_t *snaps, int nsnaps, uint64_t frame) {
+    int hold = frame && wb_hold_on();
     for (int k = 0; k < n; k++, r += 4) {
-        uint64_t a = r[0], len = r[1], stamp = r[2];
-        if (!nvn_dirty_since((const void *)(uintptr_t)a, len, stamp)) { wb_put(a, src + r[3], len); g_wb_pages += (len + 4095) / 4096; continue; }
-        for (uint64_t p = a; p < a + len;) {   // page by page
-            uint64_t e = ((p >> 12) + 1) << 12;
-            if (e > a + len) e = a + len;
-            g_wb_pages++;
-            if (nvn_dirty_since((const void *)(uintptr_t)p, e - p, stamp)) {
-                if (wb_bytes(p, e, src + r[3] + (p - a), snaps, nsnaps)) { g_wb_byte_pages++; p = e; continue; }
-                g_wb_kept_pages++;
-                static int logged, want = -1;   // TOTK_WB_LOG=1 (development): which GPU writes the CPU's pages replaced
-                if (want < 0) want = getenv("TOTK_WB_LOG") != NULL;
-                if (want && logged++ < 2000)
-                    VLOG("[wb] GPU write %#llx+%llu: page %#llx kept for the CPU's writes (frame %llu)", (unsigned long long)a,
-                         (unsigned long long)len, (unsigned long long)p, (unsigned long long)vkb_frame());
-            } else wb_put(p, src + r[3] + (p - a), e - p);
-            p = e;
+        if (hold) {
+            int held = 0;
+            pthread_mutex_lock(&g_held_mu);
+            for (const wb_held *h = g_held; h && !held; h = h->next) held = h->lo < r[0] + r[1] && r[0] < h->lo + h->len;
+            if (held || !nvn_dirty_since((const void *)(uintptr_t)r[0], r[1], r[2])) {
+                wb_held *h = malloc(sizeof *h + r[1]);
+                if (!h) die("held copy back");
+                *h = (wb_held){frame, r[0], r[1], r[2], NULL};
+                memcpy(h->data, src + r[3], r[1]);
+                *g_held_tail = h; g_held_tail = &h->next;
+                pthread_mutex_unlock(&g_held_mu);
+                continue;
+            }
+            pthread_mutex_unlock(&g_held_mu);
         }
+        wb_merge_one(r[0], r[1], r[2], src + r[3], snaps, nsnaps);
+        wb_to_pool_copy(r[0], r[1]);
     }
 }
 static void shadow_writeback(VkCommandBuffer cb) {   // end of a submission: GPU writes to the slot's host memory
@@ -995,30 +1156,56 @@ static void pool_hit_note(const pool_ent *p, uint64_t addr, uint64_t len, uint64
 static void used_mark(pool_ent *p, uint64_t sub) {   // read first: a store only when it changes
     if (__atomic_load_n(&p->used_sub, __ATOMIC_RELAXED) != sub) __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
 }
+// Per recording thread, the last GPU writes it recorded (exact ranges): a shader that stores to the same buffer draw
+// after draw registered the same write every time, through the table's write path and its lock, though the first one
+// in a submission already holds it (its copy back, its snapshot of what was there before: wb_add, pc_pend_add).
+// TOTK_POOL_WRITE_MEMO=0: every time, as before (A/B).
+enum { POOL_WRS = 8 };
+static __thread struct { uint64_t lo, hi, sub, gen; } t_pool_wr[POOL_WRS];
+static __thread unsigned t_pool_wr_next;
+static void pool_use_impl(uint64_t addr, uint64_t len, int write, uint64_t sub, uint64_t gen);
 void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
     if (g_ok != 1 || !addr || !len) return;
     uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
     if (!write)
         for (int k = 0; k < POOL_HITS; k++)
             if (t_pool_hit[k].sub == sub && t_pool_hit[k].gen == gen && addr >= t_pool_hit[k].lo && addr + len <= t_pool_hit[k].hi) return;
+    static int memo = -1;
+    if (memo < 0) { const char *e = getenv("TOTK_POOL_WRITE_MEMO"); memo = !(e && *e == '0'); }
+    if (write && memo)
+        for (int k = 0; k < POOL_WRS; k++)
+            if (t_pool_wr[k].sub == sub && t_pool_wr[k].gen == gen && t_pool_wr[k].lo == addr && t_pool_wr[k].hi == addr + len) return;
+    pool_use_impl(addr, len, write, sub, gen);
+    if (write && memo) {
+        unsigned k = t_pool_wr_next++ % POOL_WRS;
+        t_pool_wr[k].lo = addr; t_pool_wr[k].hi = addr + len; t_pool_wr[k].sub = sub; t_pool_wr[k].gen = gen;
+    }
+}
+static void pool_use_impl(uint64_t addr, uint64_t len, int write, uint64_t sub, uint64_t gen) {
+    int shadow = vkb_shadow_on();
+    VkBuffer pc_buf = VK_NULL_HANDLE;   // pool copies: a GPU write that lands in the pool's copy itself (pc_pend_add)
+    uint64_t pc_n = 0;
+    int pc_added = 0;
     if (vkb_pool_copies()) {   // the pool is synced before the submission (pc_sync); a GPU write goes back after it
         vkb_rw_read(&g_pool_mu, LK_POOLS);
         // a range running on past its pool's end (GPU addresses, vkb_span_addr): the pool it starts in, up to its end
-        pool_ent *p = pool_find_mut((uintptr_t)addr, len);
-        if (!p) p = pool_find_mut((uintptr_t)addr, 1);
-        VkBuffer b = p ? p->buf : VK_NULL_HANDLE;
-        uint64_t n = p && addr + len > p->hi ? p->hi - addr : len;
+        pool_ent *strict = pool_find_mut((uintptr_t)addr, len), *p = strict ? strict : pool_find_mut((uintptr_t)addr, 1);
+        pc_buf = p ? p->buf : VK_NULL_HANDLE;
+        pc_n = p && addr + len > p->hi ? p->hi - addr : len;
         if (p) used_mark(p, sub);
-        if (p && !write && !vkb_shadow_on()) pool_hit_note(p, addr, len, sub, gen);
+        if (p && !write && !shadow) pool_hit_note(p, addr, len, sub, gen);
+        // with device copies (a discrete GPU) the write goes to the pool's device copy unless it has none
+        pc_added = p && write && !(shadow && strict && !strict->no_shadow);
         vkb_rw_read_end(&g_pool_mu);
-        if (p && write) pc_pend_add(b, addr, n);
+        if (pc_added) pc_pend_add(pc_buf, addr, pc_n);
     }
-    if (!vkb_shadow_on()) return;
+    if (!shadow) return;
     vkb_rw_read(&g_pool_mu, LK_POOLS);   // the common cases: a pool already current in this submission, or not copied
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
     int done = !p || p->no_shadow || (p->sync_sub == sub && !write);
     if (p) used_mark(p, sub);
     if (p && done && !write) pool_hit_note(p, addr, len, sub, gen);
+    int late = p && write && p->no_shadow && !pc_added && pc_buf == p->buf;   // lost its device copy since the look above
     if (!done && write && p->sync_sub == sub) {
         pthread_mutex_lock(&g_wb_mu);
         wb_add(p, addr, len);
@@ -1027,28 +1214,52 @@ void vkb_pool_use(uint64_t addr, uint64_t len, int write) {
         done = 1;
     }
     vkb_rw_read_end(&g_pool_mu);
+    if (late) pc_pend_add(pc_buf, addr, pc_n);
     if (done) return;
     atomic_fetch_add_explicit(&g_pool_use_n[write ? 1 : 0], 1, memory_order_relaxed);
     vkb_rw_write(&g_pool_mu, LK_POOLS);
     p = pool_find_mut((uintptr_t)addr, len);   // the table may have changed between the locks
+    int to_copy = 0;
     if (p) {
         p->used_sub = sub;
         // threads recording: the copies go into the prologue, before every chunk (no pass to end)
         int ok = p->sync_sub == sub || sync_gather(p, sub, write || t_recording);
         sync_flush();
         if (ok && write) wb_add(p, addr, len);
+        to_copy = !ok && write && !pc_added && pc_buf == p->buf;   // pool copies: no device copy, so the write lands in its copy
     }
     vkb_rw_write_end(&g_pool_mu);
+    if (to_copy) pc_pend_add(pc_buf, addr, pc_n);
 }
+// Per recording thread, the last pools whose GPU address cannot change for the rest of the submission (no device copy
+// may come: none on this machine or the pool has none for good, or its copy is current): the table's lock and search
+// were taken for every buffer a draw binds (the read lock alone ~7 % of each recording thread on the Steam Deck,
+// 2026-11-04). Valid for one submission and one version of the table (g_pool_gen).
+enum { ADDR_HITS = 4 };
+static __thread struct { uint64_t lo, hi, sub, gen, base; VkBuffer buf; VkDeviceSize boff; } t_addr_hit[ADDR_HITS];
+static __thread unsigned t_addr_next;
 int vkb_pool_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (g_ok != 1) return 0;
+    uint64_t sub = g_fence + 1, gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    static int on = -1;   // TOTK_POOL_ADDR_CACHE=0: the table every time, as before (A/B)
+    if (on < 0) { const char *e = getenv("TOTK_POOL_ADDR_CACHE"); on = !(e && *e == '0'); }
+    for (int k = 0; k < ADDR_HITS && on; k++)
+        if (t_addr_hit[k].sub == sub && t_addr_hit[k].gen == gen && addr >= t_addr_hit[k].lo && addr + len <= t_addr_hit[k].hi) {
+            *buf = t_addr_hit[k].buf; *off = t_addr_hit[k].boff + (addr - t_addr_hit[k].base);
+            return 1;
+        }
     vkb_rw_read(&g_pool_mu, LK_POOLS);
     pool_ent *p = pool_find_mut((uintptr_t)addr, len);
     if (p) {
-        uint64_t sub = g_fence + 1;
         __atomic_store_n(&p->used_sub, sub, __ATOMIC_RELAXED);
-        if (p->sh && p->sync_sub == sub) { *buf = p->sbuf; *off = p->soff + (addr - p->base); }
+        int shadow = p->sh && p->sync_sub == sub;
+        if (shadow) { *buf = p->sbuf; *off = p->soff + (addr - p->base); }
         else { *buf = p->buf; *off = addr - p->base; }
+        if (on && (shadow || !vkb_shadow_on() || p->no_shadow)) {
+            unsigned k = t_addr_next++ % ADDR_HITS;
+            t_addr_hit[k].lo = p->lo; t_addr_hit[k].hi = p->hi; t_addr_hit[k].sub = sub; t_addr_hit[k].gen = gen; t_addr_hit[k].base = p->base;
+            t_addr_hit[k].buf = *buf; t_addr_hit[k].boff = shadow ? p->soff : 0;
+        }
     }
     vkb_rw_read_end(&g_pool_mu);
     return p != NULL;
@@ -1200,7 +1411,9 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
 }
 
 // ---------------- submissions ----------------
-typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; } post_op;   // 1 event, 2 counter
+// 1 event, 2 counter report, 3 samples-passed reset (TOTK_OCCLUSION); for 2 and 3 mode 1: counted by occlusion
+// queries, piece: the piece of the count the report or reset ends (oq_* below)
+typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type; uint32_t piece; } post_op;
 typedef struct { VkCommandPool pool; VkCommandBuffer cb; uint64_t fence; } cmd_slot;
 #define SLOTS VKB_SLOTS
 static cmd_slot g_slots[SLOTS];
@@ -1210,15 +1423,143 @@ static int g_npost, g_capost;
 static uint64_t g_op_count[OP_COUNT_];
 static int g_op_said[OP_COUNT_];
 
-typedef struct job { uint64_t fence; post_op *ops; int n; int slot; uint64_t *wb; int nwb; struct job *next; struct wb_snap_s *snaps; int nsnaps; } job;
+typedef struct job { uint64_t fence; post_op *ops; int n; int slot; uint64_t *wb; int nwb; struct job *next; struct wb_snap_s *snaps; int nsnaps;
+                     uint64_t frame, t_sub;   // frame, t_sub: the game frame it belongs to, when it went to the queue (gpu_frame)
+                     struct oq_pair *oq; int noq; } job;   // its occlusion queries (TOTK_OCCLUSION)
 static job *g_jobs, **g_jobs_tail = &g_jobs;
 
-static void run_posts(const post_op *ops, int n) {
+// ---------- Samples passed: Vulkan occlusion queries (TOTK_OCCLUSION=1; off: every report says "visible") ----------
+// NVN's SAMPLES_PASSED counter is a running count on the queue: RESET_COUNTER zeroes it, each draw after it adds the
+// samples that passed the depth and stencil tests, REPORT_COUNTER writes the count. TOTK resets, draws the proxies of
+// what it tests, reports, 3-8 times a frame in the field (~21 in a fight), reads the counts back on the CPU and culls
+// what counted 0. Counted here, with the walk and chunked recording on several threads:
+// - Counting runs from a reset to the next report (draws outside are not counted); once the game reports twice without
+//   a reset, every draw is counted from then on (the cumulative NVN counter). The resets and reports cut the command
+//   stream into pieces, numbered in order. The walk (or one thread) keeps the state in g_oq_walk; each chunk starts with
+//   a copy of it (chunk_open) and steps it through the same resets and reports, so the numbers agree without a lock.
+// - The first counted draw in a pass begins a query (precise where the device has occlusionQueryPrecise); it ends with
+//   the pass or at the next reset or report, in the command buffer it began in. Each ended query goes to the
+//   submission's list as (piece, slot).
+// - The retire thread, after the fence, goes through the posts in order: the queries of the pieces up to the one a post
+//   ends are added to the count, a reset zeroes it, a report writes it. Queries of a piece that goes on into the next
+//   submission are added at the end. Slots come from one ring and are read and reset on the host (hostQueryReset); a
+//   full ring or a result not available after the fence counts as visible (one sample): a miss costs work, never an object.
+typedef struct { uint32_t counting, reported, keep, piece; } oq_st;
+typedef struct oq_pair { uint32_t piece, slot; } oq_pair;
+#define OQ_N 4096
+#define OQ_LOST UINT32_MAX              // a counted draw without a slot (ring full): visible
+static int g_oq_on = -1;                // -1 not decided yet
+static VkQueryPool g_oq_pool;
+static VkQueryControlFlags g_oq_flags;
+static uint8_t g_oq_busy[OQ_N];         // from its begin until the retire thread read and reset it
+static uint32_t g_oq_next;              // next ring slot (atomic)
+static oq_st g_oq_walk;                 // the walk's (or the one thread's) state, in command order
+static __thread oq_st *t_oqs = &g_oq_walk;
+static __thread int t_oq_open = -1;     // this thread's active query: slot, command buffer, piece
+static __thread VkCommandBuffer t_oq_cb;
+static __thread uint32_t t_oq_piece;
+static pthread_mutex_t g_oq_mu = PTHREAD_MUTEX_INITIALIZER;
+static oq_pair *g_oq_list;              // the submission being recorded: its ended queries
+static int g_oq_n, g_oq_cap;
+static uint64_t g_oq_count;             // retire thread: samples since the last reset
+static uint64_t g_oq_stat[5];           // log line: reports, zero reports, queries, draws uncounted, results not available
+static pthread_once_t g_oq_once = PTHREAD_ONCE_INIT;
+
+static void oq_init(void) {
+    int on = 0;
+    const char *e = getenv("TOTK_OCCLUSION");
+    if (e && *e == '1' && g_ok == 1) {
+        VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+        vk.vkGetPhysicalDeviceFeatures2(vkc.gpu, &f2);   // vk.c enables every feature the device has
+        VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = OQ_N};
+        if (!f12.hostQueryReset) VLOG("samples passed: no hostQueryReset, reported as visible");
+        else if (vk_check(vk.vkCreateQueryPool(vkc.device, &ci, NULL, &g_oq_pool), "occlusion query pool")) {
+            vk.vkResetQueryPool(vkc.device, g_oq_pool, 0, OQ_N);
+            g_oq_flags = f2.features.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0;
+            on = 1;
+            VLOG("samples passed: counted by occlusion queries (TOTK_OCCLUSION=1, %s)", g_oq_flags ? "precise" : "not precise");
+        }
+    }
+    __atomic_store_n(&g_oq_on, on, __ATOMIC_RELEASE);
+}
+static int oq_on(void) {
+    int v = __atomic_load_n(&g_oq_on, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v;
+    pthread_once(&g_oq_once, oq_init);
+    return g_oq_on;
+}
+static void oq_add(uint32_t piece, uint32_t slot) {
+    pthread_mutex_lock(&g_oq_mu);
+    if (g_oq_n == g_oq_cap) {
+        g_oq_cap = g_oq_cap ? 2 * g_oq_cap : 64;
+        if (!(g_oq_list = realloc(g_oq_list, sizeof *g_oq_list * (size_t)g_oq_cap))) die("occlusion queries");
+    }
+    g_oq_list[g_oq_n++] = (oq_pair){piece, slot};
+    pthread_mutex_unlock(&g_oq_mu);
+}
+static void oq_close(void) {   // this thread's active query ends (pass end, reset, report)
+    if (t_oq_open < 0) return;
+    vk.vkCmdEndQuery(t_oq_cb, g_oq_pool, (uint32_t)t_oq_open);
+    oq_add(t_oq_piece, (uint32_t)t_oq_open);
+    t_oq_open = -1;
+}
+void vkb_oq_draw(VkCommandBuffer cb) {   // vkb_draw: a draw about to be recorded in the open pass
+    if (!t_oqs->counting || t_oq_open >= 0) return;   // (counting is never set while TOTK_OCCLUSION is off)
+    uint32_t q = __atomic_fetch_add(&g_oq_next, 1, __ATOMIC_RELAXED) % OQ_N;
+    if (__atomic_exchange_n(&g_oq_busy[q], 1, __ATOMIC_ACQ_REL)) {
+        __atomic_fetch_add(&g_oq_stat[3], 1, __ATOMIC_RELAXED);
+        oq_add(t_oqs->piece, OQ_LOST);
+        return;
+    }
+    vk.vkCmdBeginQuery(cb, g_oq_pool, q, g_oq_flags);
+    __atomic_fetch_add(&g_oq_stat[2], 1, __ATOMIC_RELAXED);
+    t_oq_open = (int)q; t_oq_cb = cb; t_oq_piece = t_oqs->piece;
+}
+static uint32_t oq_event(int report) {   // a samples-passed reset or report in command order: the piece it ends
+    oq_st *s = t_oqs;
+    oq_close();
+    uint32_t piece = s->piece++;
+    if (!report) { s->counting = 1; s->reported = 0; return piece; }
+    if (s->reported && !s->keep) {
+        s->keep = 1;
+        if (s == &g_oq_walk) VLOG("samples passed reported twice without a reset: counting every draw from now on");
+    }
+    s->reported = 1;
+    if (!s->keep) s->counting = 0;
+    return piece;
+}
+static uint64_t oq_result(uint32_t slot) {   // retire thread, after the fence: the slot's samples, the slot free again
+    if (slot == OQ_LOST) return 1;
+    uint64_t v[2] = {0, 0};
+    VkResult r = vk.vkGetQueryPoolResults(vkc.device, g_oq_pool, slot, 1, sizeof v, v, sizeof v,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if ((r != VK_SUCCESS && r != VK_NOT_READY) || !v[1]) { __atomic_fetch_add(&g_oq_stat[4], 1, __ATOMIC_RELAXED); v[0] = 1; }
+    vk.vkResetQueryPool(vkc.device, g_oq_pool, slot, 1);
+    __atomic_store_n(&g_oq_busy[slot], 0, __ATOMIC_RELEASE);
+    return v[0];
+}
+static int oq_cmp(const void *a, const void *b) {
+    int32_t d = (int32_t)(((const oq_pair *)a)->piece - ((const oq_pair *)b)->piece);
+    return (d > 0) - (d < 0);
+}
+
+static void run_posts(const post_op *ops, int n, oq_pair *oq, int noq) {
+    int qi = 0;
+    if (noq > 1) qsort(oq, (size_t)noq, sizeof *oq, oq_cmp);
     for (int i = 0; i < n; i++) {
         if (ops[i].kind == 1) {
             if (ops[i].mode == 1) *ops[i].val += ops[i].v;
             else *ops[i].val = ops[i].v;
-        } else {
+        } else if (ops[i].mode == 1) {   // counted samples passed
+            while (qi < noq && (int32_t)(oq[qi].piece - ops[i].piece) <= 0) g_oq_count += oq_result(oq[qi++].slot);
+            if (ops[i].kind == 3) { g_oq_count = 0; continue; }
+            uint64_t rec[2] = {g_oq_count, gpu_ticks()};
+            g_oq_stat[0]++;
+            if (!g_oq_count) g_oq_stat[1]++;
+            guest_prepare_write((void *)(uintptr_t)ops[i].addr, sizeof rec);
+            memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
+        } else if (ops[i].kind == 2) {
             // NVNcounterData {counter, timestamp}. Samples passed: [temporary] reported as visible until draws are replayed
             // (with 0 the game culls every queried object); timestamps and other types report counter 0, as on Metal.
             uint64_t rec[2] = {ops[i].type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, gpu_ticks()};
@@ -1226,6 +1567,7 @@ static void run_posts(const post_op *ops, int n) {
             memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec);
         }
     }
+    while (qi < noq) g_oq_count += oq_result(oq[qi++].slot);   // a piece the next submission ends
 }
 
 static void cpend_done(uint64_t fence);   // conditional rendering (below): the submission's counter reports are in memory
@@ -1396,6 +1738,36 @@ static void dead_reap(uint64_t done) {   // the GPU finished up to `done`
 }
 
 static void gpu_span(int slot, uint64_t fence);
+/* The GPU's work per game frame (hle_nvn.c's long-frame log, mtl_gpu_ms): the submissions made after mtl_set_frame(f)
+   count for frame f. For each: its GPU time (its two timestamps), when it ended (about when the retire thread saw its
+   fence: it waits on fences in order) and so began, and how long after it went to the queue the GPU began it (behind
+   earlier work). Filled by the retire thread; read 8 frames later. */
+#define GF_N 64
+static struct { uint64_t f, ns, beg, end; double lag_ms; unsigned subs; } g_gf[GF_N];
+static _Atomic uint64_t g_gf_frame;
+static int g_tsq_ready(void);
+static VkQueryPool g_tsq_pool(void);
+void mtl_set_frame(uint64_t f) { atomic_store(&g_gf_frame, f); }
+static void gpu_frame(const job *j) {
+    uint64_t t[2], end = runtime_now_ns();
+    if (!g_tsq_ready() || j->slot < 0) return;
+    if (vk.vkGetQueryPoolResults(vkc.device, g_tsq_pool(), (uint32_t)(2 * j->slot), 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] <= t[0]) return;
+    uint64_t dur = (uint64_t)((double)(t[1] - t[0]) * vkc.props.limits.timestampPeriod), beg = end > dur ? end - dur : 0;
+    __typeof__(g_gf[0]) *g = &g_gf[j->frame % GF_N];
+    if (g->f != j->frame) memset(g, 0, sizeof *g), g->f = j->frame, g->beg = beg;
+    g->ns += dur, g->subs++;
+    if (beg < g->beg) g->beg = beg;
+    if (end > g->end) g->end = end;
+    double lag = beg > j->t_sub ? (beg - j->t_sub) / 1e6 : 0;
+    if (lag > g->lag_ms) g->lag_ms = lag;
+}
+double mtl_gpu_ms(uint64_t f) { return g_gf[f % GF_N].f == f ? g_gf[f % GF_N].ns / 1e6 : -1; }
+int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
+    if (g_gf[f % GF_N].f != f || !g_gf[f % GF_N].subs) { *t0 = *t1 = 0; return 0; }
+    *t0 = g_gf[f % GF_N].beg, *t1 = g_gf[f % GF_N].end;
+    return 1;
+}
+double mtl_gpu_lag_ms(uint64_t f) { return g_gf[f % GF_N].f == f ? g_gf[f % GF_N].lag_ms : 0; }
 // Retires submissions in order: waits for the GPU, writes their events and counters, completes their fence.
 static void *retire_thread(void *unused) {
     (void)unused;
@@ -1413,11 +1785,14 @@ static void *retire_thread(void *unused) {
         VkResult r = vk.vkWaitSemaphores(vkc.device, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) { vk_check(r, "vkWaitSemaphores"); checkpoint_report(); die("GPU submission %llu lost", (unsigned long long)j->fence); }
         if (totk_tl_on()) gpu_span(j->slot, j->fence);   // TOTK_TIMELINE: when the GPU ran this command buffer
+        gpu_frame(j);
         pc_writeback(j->fence);   // pool copies: GPU writes into game memory, before the game is told
-        if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps); free(j->wb); }   // GPU writes into game memory
+        { void vkb_tex_wb_retire(uint64_t fence); vkb_tex_wb_retire(j->fence); }   // GPU-drawn images copied at its end (vkb_tex.c), before it counts as done
+        if (j->wb) { wb_merge(j->wb, j->nwb, g_wbst[j->slot].map, (const wb_snap_t *)j->snaps, j->nsnaps, j->frame + 1); free(j->wb); }   // GPU writes into game memory (GPU-only ones held: wb_merge)
         for (int k = 0; k < j->nsnaps; k++) if (((wb_snap_t *)j->snaps)[k].owned) free(((wb_snap_t *)j->snaps)[k].data);
         free(j->snaps);
-        run_posts(j->ops, j->n);
+        run_posts(j->ops, j->n, j->oq, j->noq);
+        free(j->oq);
         cpend_done(j->fence);
         complete(j->fence);
         dead_reap(j->fence);
@@ -1436,6 +1811,8 @@ void retire_start(void) {
 static VkQueryPool g_tsq;
 static int g_ts_used[SLOTS];
 static uint64_t g_gpu_ns, g_slot_wait_ns;
+static int g_tsq_ready(void) { return g_tsq != VK_NULL_HANDLE; }
+static VkQueryPool g_tsq_pool(void) { return g_tsq; }
 static void gpu_time_begin(int slot) {   // into the slot's own command buffer (the submission's first)
     if (!g_tsq) {
         VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * SLOTS};
@@ -1469,14 +1846,20 @@ static void gpu_time_end(int slot, VkCommandBuffer cb) {   // into the submissio
 // A submission whose recording took over 100 ms: where the time went (log line "long submission"). The game waits for
 // its recording at the present: these are the hitches when new parts of the world arrive.
 extern uint64_t vkb_astc_ns, vkb_shader_load_ns;
-static uint64_t g_sub_t0, g_sub_snap[11];
-static void sub_snap(uint64_t v[11]) {
+enum { SUB_SNAP = 41 };   // [14..24]: vkb_tex.c's upload parts (vkb_tex_upload_parts); [25..40]: its slow BC7 reads
+static uint64_t g_sub_t0, g_sub_snap[SUB_SNAP];
+void vkb_tex_upload_parts(uint64_t v[11]);
+void vkb_tex_slow_reads(uint64_t v[16]);
+static void sub_snap(uint64_t v[SUB_SNAP]) {
     v[0] = vkb_step_ns[PK_CREATE]; v[1] = vkb_step_ns[PK_UPLOAD]; v[2] = vkb_astc_ns; v[3] = vkb_shader_load_ns;
     v[4] = g_sh_scan_ns; v[5] = g_sh_in_bytes;
     v[6] = vkb_step_ns[PK_ALLOC]; v[7] = vkb_step_ns[PK_UCAP]; v[8] = vkb_step_ns[PK_SYNC]; v[9] = vkb_step_ns[PK_SUBMIT]; v[10] = g_slot_wait_ns;
+    v[11] = vkb_step_ns[PK_UPWAIT]; v[12] = vkb_step_ns[PK_SLOWDRAW]; v[13] = vkb_step_n[PK_SLOWDRAW];
+    vkb_tex_upload_parts(&v[14]);
+    vkb_tex_slow_reads(&v[25]);
 }
 static void sub_long_check(uint64_t fence) {
-    uint64_t now = runtime_now_ns(), v[11];
+    uint64_t now = runtime_now_ns(), v[SUB_SNAP];
     if (!g_sub_t0 || now - g_sub_t0 < 100000000ull) return;
     sub_snap(v);
     static int said;
@@ -1488,6 +1871,28 @@ static void sub_long_check(uint64_t fence) {
              (v[2] - g_sub_snap[2]) / 1e6, (v[3] - g_sub_snap[3]) / 1e6, (v[6] - g_sub_snap[6]) / 1e6, (v[7] - g_sub_snap[7]) / 1e6,
              (v[4] - g_sub_snap[4]) / 1e6, (v[5] - g_sub_snap[5]) / 1048576.0, (unsigned long long)vkb_draw_count(),
              (v[9] - g_sub_snap[9]) / 1e6, (v[8] - g_sub_snap[8]) / 1e6);
+    if (said <= 64)
+        VLOG("long submission %llu: uploads waiting for one another %.0f ms; draw calls over 1 ms after a shader change %llu, %.0f ms",
+             (unsigned long long)fence, (v[11] - g_sub_snap[11]) / 1e6, (unsigned long long)(v[13] - g_sub_snap[13]), (v[12] - g_sub_snap[12]) / 1e6);
+    if (said <= 64) {   // the uploads by part (vkb_tex.c UPX_*), over all recording threads
+        uint64_t *a = &v[14], *b = &g_sub_snap[14];
+        VLOG("long submission %llu: uploads by part: %llu prepared (%llu from virtual pools, %.1f MiB) and %llu inline; gathering "
+             "from virtual pools %.0f ms, texel layout %.0f ms, BC7 keys %.0f ms, BC7 reads %.0f ms, upload memory %.0f ms, under the "
+             "uploads lock %.0f ms (of it inline uploads %.0f ms)", (unsigned long long)fence, (unsigned long long)(a[7] - b[7]),
+             (unsigned long long)(a[8] - b[8]), (a[10] - b[10]) / 1048576.0, (unsigned long long)(a[9] - b[9]), (a[0] - b[0]) / 1e6,
+             (a[1] - b[1]) / 1e6, (a[2] - b[2]) / 1e6, (a[3] - b[3]) / 1e6, (a[4] - b[4]) / 1e6, (a[5] - b[5]) / 1e6, (a[6] - b[6]) / 1e6);
+        // the textures whose BC7 reads went to the disk (over 1 ms each), by what the warming had done (vkb_tex.c PFS_*)
+        uint64_t *c = &v[25], *d = &g_sub_snap[25], n[7], all = 0, ns = 0;
+        for (int i = 0; i < 7; i++) n[i] = c[i] - d[i], all += n[i], ns += c[7 + i] - d[7 + i];
+        if (all)
+            VLOG("long submission %llu: slow BC7 reads: %llu textures (%.0f ms); warmed %llu (%.0f ms, warmed %.0f presents before), queued "
+                 "not warmed yet %llu (%.0f ms), queue full %llu, taken for seen %llu, in a virtual pool %llu (%.0f ms), outside game memory %llu, "
+                 "not known %llu (%.0f ms); initialized %.0f presents before on average", (unsigned long long)fence, (unsigned long long)all,
+                 ns / 1e6, (unsigned long long)n[6], (c[13] - d[13]) / 1e6, n[6] ? (double)(c[15] - d[15]) / (double)n[6] : 0.0,
+                 (unsigned long long)n[3], (c[10] - d[10]) / 1e6, (unsigned long long)n[4], (unsigned long long)n[5], (unsigned long long)n[1],
+                 (c[8] - d[8]) / 1e6, (unsigned long long)n[2], (unsigned long long)n[0], (c[7] - d[7]) / 1e6,
+                 all > n[0] ? (double)(c[14] - d[14]) / (double)(all - n[0]) : 0.0);
+    }
 }
 
 int mtl_slot_free(void) {   // a submission can begin without waiting for the GPU (work that can wait checks first)
@@ -1600,7 +2005,14 @@ static int cond_eval(const p_render_cond *c) {   // 1: rendering enabled
 void mtl_sub_counter(uint64_t addr, uint32_t type) {
     g_counter_types[type & 31]++;
     cpend_push(addr, g_fence + 1, 0, type != NVN_COUNTER_TYPE_SAMPLES_PASSED);   // the counter word run_posts will write
-    post((post_op){2, NULL, 0, 0, addr, type});
+    int oq = type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_on();
+    post((post_op){2, NULL, (uint32_t)oq, 0, addr, type, oq ? oq_event(1) : 0});
+}
+static void sub_reset(uint32_t type) {   // RESET_COUNTER (the walk or one thread): only samples passed counts
+    if (type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_on()) post((post_op){3, NULL, 1, 0, 0, type, oq_event(0)});
+}
+static void chunk_counter(uint32_t type, int report) {   // a chunk: the walk posted it; the count's state steps the same
+    if (type == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_on()) oq_event(report);
 }
 
 // Everything before is visible to everything after (step 1: transfers only; passes get precise barriers later).
@@ -1735,6 +2147,8 @@ int vkb_in_pass(void) { return g_in_pass; }
 const p_set_rt *vkb_rt(void) { return &g_rt; }
 uint64_t vkb_frame(void) { return atomic_load(&g_ticket); }
 int vkb_rt_count(void) { return g_rt.n < 0 ? 0 : g_rt.n > 8 ? 8 : g_rt.n; }
+static __thread int t_obj_slot = -1;   // pass_begin: the object motion target's slot in the open pass
+int vkb_pass_obj_slot(void) { return g_in_pass ? t_obj_slot : -1; }
 VkExtent2D vkb_rt_extent(void) { return g_pass_extent; }
 int vkb_ready(void) { return g_ok == 1; }
 
@@ -1812,13 +2226,30 @@ static void pp_report(void) {   // at a present after the frame: wait for the GP
     free(ts); free(row);
 }
 
+// A game barrier held inside a pass (OP_BARRIER below): made when the pass ends, for whatever comes after it.
+static __thread int g_barrier_held;
 static void pass_end(void) {
     if (!g_in_pass) return;
+    oq_close();   // an occlusion query begun in the pass ends in it
     vk.vkCmdEndRendering(vkb_cmd());
     pp_end(vkb_cmd());
     vkb_tex_block_flush(vkb_cmd());
     g_in_pass = 0;
     ub_flush(vkb_cmd());   // the pass's kept uniform updates reach memory
+    if (g_barrier_held) { g_barrier_held = 0; full_barrier(vkb_cmd()); }
+}
+// nvnCommandBufferBarrier inside a pass that only orders primitives / fragments and invalidates the texture cache
+// (ORDER_PRIMITIVES 0x1, ORDER_FRAGMENTS 0x2, ORDER_FRAGMENTS_TILED 0x4, INVALIDATE_TEXTURE 0x10): held instead of ending
+// the pass. TotK puts one (0x12) after each of its G-buffer decals, which read the G-buffer pixel they draw into: ~900 a
+// frame in a shrine, each a pass ended and begun again behind a full drain - 11 of the frame's 17.6 GPU ms, and a game at
+// 70 fps shown at 24 (2026-11-07). In a pass the draws write only its targets (a storing draw ends it); a later draw
+// that samples one gets the barrier inside the pass by region (vkb_draw.c, VK_KHR_dynamic_rendering_local_read), the
+// others read nothing written since the pass began, and the held barrier is made when the pass ends.
+// TOTK_VK_HOLD_BARRIER=0: every game barrier ends the pass, as before.
+static int hold_barrier(int bits) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_HOLD_BARRIER"); v = !(e && *e == '0') && !getenv("TOTK_VK_NO_LOCAL_BARRIER"); }
+    return v && g_in_pass && vkc.has_local_read && !(bits & ~0x17);
 }
 
 static uint32_t level_size(uint32_t v, const view_t *view) {
@@ -1874,7 +2305,20 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         // The draw covers one part, the CPU may have filled the rest: TOTK writes level 0 of a 32x32x32 noise volume and
         // draws its mips from it (then compresses them into BC4, L21); the image counted as GPU-written from that first
         // draw on, level 0 was never uploaded and every level stayed zero.
-        if (im && !im->gpu_written && !im->upload_stamp && (im->levels > 1 || im->layers > 1 || im->depth > 1)) vkb_tex_upload(cb, im);
+        // Single-level colour targets too (#64, L29): a new image starts with whatever the device memory held; the
+        // console's texture is its memory. TOTK re-creates the desert's 512x512 R16 height map after a fast travel and
+        // only stamps small rectangles into it, relying on the rest - our image kept another image's bytes there and
+        // the sand rose into walls up to the sky. Once per new image. TOTK_VK_RT_INIT=0: as before (only the above).
+        static int rt_init = -1;
+        if (rt_init < 0) { const char *e = getenv("TOTK_VK_RT_INIT"); rt_init = !(e && *e == '0'); }
+        if (im && !im->gpu_written && !im->upload_stamp &&
+            (im->levels > 1 || im->layers > 1 || im->depth > 1 || (rt_init && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT))) {
+            static _Atomic int said;
+            if (im->levels == 1 && im->layers == 1 && im->depth == 1 && atomic_fetch_add(&said, 1) < 16)
+                VLOG("new render target %llu (format %#x %ux%u) filled from game memory before its first draw, present %llu",
+                     (unsigned long long)im->serial, im->d.format, im->width, im->height, (unsigned long long)vkb_frame());
+            vkb_tex_upload(cb, im);
+        }
         uint32_t bw, bh;
         VkImageView bview = im && im->compressed && !vkb_view(im, v, 1, -1) ? vkb_tex_block_target(cb, im, v, &bw, &bh) : VK_NULL_HANDLE;
         if (bview) {   // GPU compression: drawn into an image of blocks, copied into the texture at the pass end (L21)
@@ -1919,6 +2363,17 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         if (lw < w) w = lw;
         if (lh < h) h = lh;
         any = 1;
+    }
+    {   // the temporal upscaler's object motion target at a slot the scene's G-buffer pass leaves free (vkb_tsr.c)
+        int os;
+        VkImageView ov = any ? vkb_tsr_obj_target(&g_rt, &os) : VK_NULL_HANDLE;
+        t_obj_slot = ov ? os : -1;
+        if (ov) {
+            for (int i = ncolor; i < os; i++) color[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            color[os] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = ov,
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            if (os >= ncolor) ncolor = os + 1;
+        }
     }
     vkb_image *dim = g_rt.depth ? vkb_image_of(g_rt.depth) : NULL;
     if (dim && dim->refresh_from) vkb_tex_refresh(cb, dim);
@@ -2140,39 +2595,62 @@ void mtl_tex_release(tex_t *t) { vkb_tex_release(t); }
 
 // ---------------- presentation ----------------
 
-// TOTK_SHOT=<present number>:<file.bmp>: saves that presented frame (development check of the picture).
+// TOTK_SHOT=<present number>[+<count>]:<file.bmp>: saves that presented frame (development check of the picture); with a
+// count, that many presents in a row to <file>_<present>.bmp, copied into one buffer without waiting on the GPU in between
+// (written once the last one is done), so the frames keep their usual timing (flicker between frames).
+// TOTK_SHOT_STEP=<presents>: after that, again every so many presents (a scripted walk through menus), each to
+// <file>_<present>.bmp.
 static VkBuffer g_shot_buf;
 static VkDeviceMemory g_shot_mem;
+static long long g_shot_at = -1, g_shot_count = 1, g_shot_step;
+static uint64_t g_shot_n[256];
+static int g_shot_got;
 static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_t w, uint32_t h) {
-    static long long at = -1;
-    if (at == -1) { const char *e = getenv("TOTK_SHOT"); at = e ? atoll(e) : 0; }
-    if (at <= 0 || (uint64_t)at != n) return VK_NULL_HANDLE;
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)w * h * 4,
-                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf), "shot buffer")) return VK_NULL_HANDLE;
-    VkMemoryRequirements req;
-    vk.vkGetBufferMemoryRequirements(vkc.device, g_shot_buf, &req);
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < vkc.memory.memoryTypeCount && type == UINT32_MAX; i++)
-        if ((req.memoryTypeBits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags &
-            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-            type = i;
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
-    if (type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_shot_mem), "shot memory")) return VK_NULL_HANDLE;
-    vk.vkBindBufferMemory(vkc.device, g_shot_buf, g_shot_mem, 0);
-    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+    if (g_shot_at == -1) {
+        const char *e = getenv("TOTK_SHOT"), *c = e ? strchr(e, '+') : NULL;
+        g_shot_at = e ? atoll(e) : 0;
+        if (c) g_shot_count = atoll(c + 1);
+        if (g_shot_count < 1 || g_shot_count > 256) g_shot_count = 1;
+        const char *st = getenv("TOTK_SHOT_STEP");
+        g_shot_step = st ? atoll(st) : 0;
+    }
+    // the buffer is made 30 presents ahead: a large allocation at the first frame shot would upset that frame's timing
+    if (g_shot_at <= 0 || n + 30 < (uint64_t)g_shot_at || g_shot_got >= g_shot_count) return VK_NULL_HANDLE;
+    VkDeviceSize one = (VkDeviceSize)w * h * 4;
+    if (!g_shot_buf) {
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = one * g_shot_count, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        if (!vk_check(vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf), "shot buffer")) { g_shot_at = 0; return VK_NULL_HANDLE; }
+        VkMemoryRequirements req;
+        vk.vkGetBufferMemoryRequirements(vkc.device, g_shot_buf, &req);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < vkc.memory.memoryTypeCount && type == UINT32_MAX; i++)
+            if ((req.memoryTypeBits & (1u << i)) && (vkc.memory.memoryTypes[i].propertyFlags &
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                type = i;
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || !vk_check(vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_shot_mem), "shot memory")) { g_shot_at = 0; return VK_NULL_HANDLE; }
+        vk.vkBindBufferMemory(vkc.device, g_shot_buf, g_shot_mem, 0);
+    }
+    if (n < (uint64_t)g_shot_at) return VK_NULL_HANDLE;
+    VkBufferImageCopy r = {.bufferOffset = one * g_shot_got, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     vk.vkCmdCopyImageToBuffer(cb, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot_buf, 1, &r);
-    return g_shot_buf;
+    g_shot_n[g_shot_got++] = n;
+    return g_shot_got == g_shot_count ? g_shot_buf : VK_NULL_HANDLE;
 }
 static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
     const char *e = getenv("TOTK_SHOT"), *path = e ? strchr(e, ':') : NULL;
     mtl_wait(fence, UINT64_MAX);
-    void *px = NULL;
-    if (path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &px) == VK_SUCCESS) {
-        FILE *f = fopen(path + 1, "wb");
-        if (f) {   // 32-bit BGRA, top-down
-            uint32_t size = w * h * 4;
-            uint8_t hdr[54] = {'B', 'M'};
+    uint8_t *px = NULL;
+    if (path && vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, (void **)&px) == VK_SUCCESS) {
+        uint32_t size = w * h * 4;
+        for (int k = 0; k < g_shot_got; k++) {
+            char name[1024];
+            const char *dot = strrchr(path + 1, '.');
+            if ((g_shot_count == 1 && g_shot_step <= 0) || !dot) snprintf(name, sizeof name, "%s", path + 1);
+            else snprintf(name, sizeof name, "%.*s_%llu%s", (int)(dot - path - 1), path + 1, (unsigned long long)g_shot_n[k], dot);
+            FILE *f = fopen(name, "wb");
+            if (!f) continue;
+            uint8_t hdr[54] = {'B', 'M'};   // 32-bit BGRA, top-down
             uint32_t v;
             v = 54 + size; memcpy(hdr + 2, &v, 4);
             v = 54; memcpy(hdr + 10, &v, 4);
@@ -2182,15 +2660,16 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
             hdr[26] = 1; hdr[28] = 32;
             memcpy(hdr + 34, &size, 4);
             fwrite(hdr, 1, sizeof hdr, f);
-            fwrite(px, 1, size, f);
+            fwrite(px + (size_t)size * k, 1, size, f);
             fclose(f);
-            VLOG("frame saved to %s (%ux%u)", path + 1, w, h);
         }
+        VLOG("%d frame(s) saved to %s (%ux%u)", g_shot_got, path + 1, w, h);
         vk.vkUnmapMemory(vkc.device, g_shot_mem);
     }
     vk.vkDestroyBuffer(vkc.device, g_shot_buf, NULL);
     vk.vkFreeMemory(vkc.device, g_shot_mem, NULL);
     g_shot_buf = VK_NULL_HANDLE;
+    if (g_shot_step > 0) { g_shot_at = (long long)g_shot_n[0] + g_shot_step; g_shot_got = 0; }   // TOTK_SHOT_STEP: the next one
 }
 static _Atomic long long g_dump_key_at;   // vkb_dump_request (F9)
 
@@ -2309,15 +2788,31 @@ out:
     vk.vkDestroyBuffer(vkc.device, st, NULL);
     vk.vkFreeMemory(vkc.device, sm, NULL);
 }
-// TOTK_DUMP=<present number>:<dir>: the frame's render targets (development); TOTK_DUMP_EXIT=1 then exits
+// TOTK_DUMP=<present number>[+<count>]:<dir>: the frame's render targets (development); TOTK_DUMP_EXIT=1 then exits.
+// With a count: that many presents in a row, each into <dir>/p<present> (what one change between frames touches).
 static void dump_check(uint64_t n) {
-    static long long dump_at = -1;
+    static long long dump_at = -1, dump_left;
     static const char *dump_dir;
-    if (dump_at == -1) { const char *e = getenv("TOTK_DUMP"); dump_at = e ? atoll(e) : 0; dump_dir = e && strchr(e, ':') ? strchr(e, ':') + 1 : NULL; }
+    if (dump_at == -1) {
+        const char *e = getenv("TOTK_DUMP");
+        char *end = NULL;
+        dump_at = e ? strtoll(e, &end, 10) : 0;
+        dump_left = end && *end == '+' ? atoll(end + 1) : 0;
+        dump_dir = e && strchr(e, ':') ? strchr(e, ':') + 1 : NULL;
+    }
     if (dump_at > 0 && n >= (uint64_t)dump_at && dump_dir) {   // present numbers can skip: the first at or after it
-        dump_at = -2;
-        vkb_tex_dump(dump_dir);
-        if (getenv("TOTK_DUMP_EXIT")) { fflush(NULL); _Exit(0); }   // short development runs: done after the dump
+        if (dump_left > 0) {
+            char dir[512];
+            snprintf(dir, sizeof dir, "%s/p%llu", dump_dir, (unsigned long long)n);
+            CreateDirectoryA(dump_dir, NULL);
+            CreateDirectoryA(dir, NULL);
+            vkb_tex_dump(dir);
+            dump_at = --dump_left > 0 ? (long long)n + 1 : -2;
+        } else {
+            dump_at = -2;
+            vkb_tex_dump(dump_dir);
+        }
+        if (dump_at == -2 && getenv("TOTK_DUMP_EXIT")) { fflush(NULL); _Exit(0); }   // short development runs: done after the dump
     }
     static long long auto_at = -1;   // TOTK_DUMP_KEY_AT=<present>: F9 pressed there (scripted runs)
     if (auto_at == -1) { const char *e = getenv("TOTK_DUMP_KEY_AT"); auto_at = e ? atoll(e) : 0; }
@@ -2367,8 +2862,17 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             {
                 static uint64_t pct[32];
                 char cl[256]; int cn = 0;
-                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn += snprintf(cl + cn, sizeof cl - (size_t)cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
+                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn = bufcat(cl, sizeof cl, cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
                 if (cn) VLOG("per frame: counter reports by type:%s", cl);
+                static uint64_t pq[5];
+                if (g_oq_on > 0) {
+                    uint64_t q[5];
+                    for (int k = 0; k < 5; k++) q[k] = __atomic_load_n(&g_oq_stat[k], __ATOMIC_RELAXED);
+                    VLOG("per frame: samples passed (TOTK_OCCLUSION) %.1f reports, %.1f of them 0; %.1f queries, %.2f draws uncounted, %.2f results not available",
+                         (double)(q[0] - pq[0]) / f, (double)(q[1] - pq[1]) / f, (double)(q[2] - pq[2]) / f, (double)(q[3] - pq[3]) / f,
+                         (double)(q[4] - pq[4]) / f);
+                    memcpy(pq, q, sizeof q);
+                }
             }
             {
                 static uint64_t pc, pb, pn, ph, pd;
@@ -2387,16 +2891,27 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             if (vkb_pool_copies()) {
                 static uint64_t pci, pcw, pcb, pcn, pck, pcs;
                 pthread_mutex_lock(&g_pc_mu);
-                uint64_t ci = g_pc_in_bytes, cw = g_pc_whole, cb = g_pc_back_bytes, cn = g_pc_ns, ck = g_pc_kept, cs = g_pc_snap_bytes;
+                uint64_t ci = g_pc_in_bytes, cw = g_pc_whole, cb = g_pc_back_bytes, cn = g_pc_ns, ck = g_pc_kept, cs = g_pc_snap_bytes,
+                         cc = g_pc_copy_ns;
                 int pend = g_npc_pend;
                 pthread_mutex_unlock(&g_pc_mu);
+                static uint64_t pcc;
                 VLOG("per frame: pool copies (%.1f MiB of host-visible memory) brought up to date %.2f MiB (%.1f pools untracked: whole) "
-                     "in %.2f ms before the submits, GPU writes into game memory %.3f MiB (snapshots %.3f MiB, %.1f pages with "
-                     "the CPU's newer bytes kept); %d GPU writes not back yet",
+                     "in %.2f ms before the submits (copying %.2f ms, the rest the write watch's scan), GPU writes into game memory "
+                     "%.3f MiB (snapshots %.3f MiB, %.1f pages with the CPU's newer bytes kept); %d GPU writes not back yet",
                      (double)vkb_poolmem_bytes() / 1048576.0, (double)(ci - pci) / 1048576.0 / f, (double)(cw - pcw) / f,
-                     (double)(cn - pcn) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f, (double)(cs - pcs) / 1048576.0 / f,
-                     (double)(ck - pck) / f, pend);
-                pci = ci; pcw = cw; pcb = cb; pcn = cn; pck = ck; pcs = cs;
+                     (double)(cn - pcn) / 1e6 / f, (double)(cc - pcc) / 1e6 / f, (double)(cb - pcb) / 1048576.0 / f,
+                     (double)(cs - pcs) / 1048576.0 / f, (double)(ck - pck) / f, pend);
+                pci = ci; pcw = cw; pcb = cb; pcn = cn; pck = ck; pcs = cs; pcc = cc;
+                {   // runtime/platform/linux.c: regions of the write watch not scanned (read-only until written)
+                    void plat_watch_freeze_stats(uint64_t *, uint64_t *, uint64_t *);
+                    static uint64_t pth, psk;
+                    uint64_t fm, th, sk;
+                    plat_watch_freeze_stats(&fm, &th, &sk);
+                    if (fm || th) VLOG("per frame: write watch: %llu MiB frozen (not scanned), %.0f MiB of scans skipped, %.2f thaws by a write",
+                                       (unsigned long long)fm, (double)(sk - psk) / f, (double)(th - pth) / f);
+                    pth = th; psk = sk;
+                }
             }
             if (vkb_shadow_on()) {
                 static uint64_t pin, pib, pob, pdf, psc, pwp, pwk, pwb, pu0, pu1, pu2;
@@ -2435,6 +2950,17 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                      "(%.1f ms each), %.1f MiB queued, %llu dropped", (double)(bi - pi) / f, (double)(h - ph) / f, (double)(mi - pmi) / f,
                      (double)(en - pe) / f, en > pe ? (double)(ens - pens) / 1e6 / (double)(en - pe) : 0.0, q / 1048576.0, (unsigned long long)dr);
                 ph = h; pmi = mi; pe = en; pi = bi; pens = ens;
+                // uploads waiting for the cache's pages (the disk), and the warming ahead of them (vkb_tex_prefetch)
+                static uint64_t prn, ptc, ppq, ppd;
+                uint64_t rn, tc, pq, pd, psf;
+                vkb_bc7_read_stats(&rn, &tc);
+                void vkb_tex_prefetch_stats(uint64_t *, uint64_t *, uint64_t *);
+                vkb_tex_prefetch_stats(&pq, &pd, &psf);
+                VLOG("per frame: BC7 cache reads by uploads %.2f ms; warmed ahead: %.1f textures queued, %.1f surfaces read, %.1f not queued (queue full)",
+                     (double)(rn - prn) / 1e6 / f, (double)(pq - ppq) / f, (double)(tc - ptc) / f, (double)(pd - ppd) / f);
+                prn = rn; ptc = tc; ppq = pq; ppd = pd;
+                (void)psf;
+                { void vkb_mem_ready_log(double frames); vkb_mem_ready_log(f); }   // TOTK_VK_MEM_READY
             }
             static uint64_t pm, psh, ptb;
             uint64_t im_made, im_shared, im_back;
@@ -2453,7 +2979,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             for (int k = 0; k < PE_COUNT; k++) {
                 uint64_t ended = vkb_cnt_sum(vkb_pass_end_n[k]);
                 if (ended > prev[k] && at < (int)sizeof line - 48)
-                    at += snprintf(line + at, sizeof line - (size_t)at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
+                    at = bufcat(line, sizeof line, at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
                 prev[k] = ended;
             }
             if (at) VLOG("passes ended per frame by:%s", line);
@@ -2571,8 +3097,12 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             mtl_sub_event(val, m, v);
             break;
         }
-        case OP_REPORT_COUNTER: { if (mode == EX_CHUNK) break; uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
-        case OP_RESET_COUNTER: break;
+        case OP_REPORT_COUNTER: {
+            uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8);
+            if (mode == EX_CHUNK) chunk_counter((uint32_t)t, 1); else mtl_sub_counter(ad, (uint32_t)t);
+            break;
+        }
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (mode == EX_CHUNK) chunk_counter((uint32_t)t, 0); else sub_reset((uint32_t)t); break; }
         case OP_COPY_B2B: {
             uint64_t s, d, n;
             memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8);
@@ -2582,11 +3112,12 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
         }
         case OP_SET_RT:
             // The same targets again (TOTK sets them before many draws): the pass goes on. Ending it stored and loaded
-            // every attachment and drained the GPU between draws into the same targets (totk-pc-recomp vk_exec.c set_rt
-            // compares the same way). TOTK_VK_RT_KEEP=0: a new pass every time, as before.
+            // every attachment and drained the GPU between draws into the same targets. TOTK_VK_RT_KEEP=0: a new pass every time, as before.
             if (!(g_in_pass && rt_keep() && !memcmp(&g_rt, a, sizeof g_rt))) {
                 pass_end_why(PE_SET_RT); if (mode == EX_ONE) split_if_due(); memcpy(&g_rt, a, sizeof g_rt);
             }
+            if (mode == EX_ONE) vkb_tsr_walk_rt(&g_rt);   // one thread: the walk's look comes here (vkb_tsr.c)
+            vkb_tsr_rec_rt();
             trace_rt(); break;
         case OP_CLEAR_COLOR: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: if (g_render_off) vkb_cnt_add(g_cond_skipped, 1); else if (g_ok == 1) clear_ds((const p_clear_ds *)a); break;
@@ -2602,11 +3133,14 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             break;
         case OP_DRAW: case OP_DRAW_IDX:
             if (g_render_off) { vkb_cnt_add(g_cond_skipped, 1); rt_log(1); break; }
+            if (mode == EX_ONE) vkb_draw_tsr_walk();
             if (g_ok == 1) vkb_draw(a, h.op == OP_DRAW_IDX);
             break;
         case OP_DISPATCH: if (g_ok == 1) vkb_dispatch(a); break;
         case OP_BARRIER:   // [temporary] everything before is visible to everything after
-            if (g_ok == 1) { pass_end_why(PE_BARRIER); full_barrier(vkb_cmd()); }
+            { int vkb_draw_tracing(void); if (vkb_draw_tracing()) VLOG("[draw] barrier: bits %#x, in a pass %d", (unsigned)*(const int32_t *)a, vkb_in_pass()); }
+            if (g_ok == 1 && hold_barrier(*(const int32_t *)a)) g_barrier_held = 1;
+            else if (g_ok == 1) { pass_end_why(PE_BARRIER); full_barrier(vkb_cmd()); }
             break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_SAMP: break;
         // rendering enable / conditional rendering: draws and clears are skipped while off (dispatches are not)
@@ -2626,8 +3160,9 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
 
 // Threads recording (vkb_mt_submit): the submission's command buffers after the slot's own, the last one for the work at
 // its end (copies back, the GPU end time).
-enum { MT_MAXCH = 96 };
-static VkCommandBuffer g_mt_list[2 * MT_MAXCH + 2];
+// UPQ_MAX: uploads of a submission sent in parts each in a command buffer of its own (vkb_upload_begin), at most
+enum { MT_MAXCH = 96, UPQ_MAX = 1024, MT_LIST = 2 * MT_MAXCH + 4 + 2 * VKB_MAXREC + 2 * (UPQ_MAX + VKB_MAXREC) };
+static VkCommandBuffer g_mt_list[MT_LIST];   // (+ the uploads' command buffers, vkb_upload_begin)
 static int g_mt_nlist;
 uint64_t mtl_sub_commit(void) {
     uint64_t fence = ++g_fence;
@@ -2639,21 +3174,23 @@ uint64_t mtl_sub_commit(void) {
     }
     int n = g_npost;
     g_npost = 0;
-    if (g_ok != 1) { run_posts(ops, n); free(ops); complete(fence); return fence; }
+    if (g_ok != 1) { run_posts(ops, n, NULL, 0); free(ops); complete(fence); return fence; }
     pass_end_why(PE_SUBMIT);
     sub_long_check(fence);
     VkCommandBuffer last = g_mt_nlist ? g_mt_list[g_mt_nlist - 1] : g_slots[g_cur].cb;
     vkb_mirrors_submit(last);   // written ranges back to game memory before the fence
+    { void vkb_tex_wb_fence_record(VkCommandBuffer cb, uint64_t fence); vkb_tex_wb_fence_record(last, fence); }   // images the CPU reads after this fence (grass)
     shadow_writeback(last);
     dead_tag(fence);
     gpu_time_end(g_cur, last);
     cmd_slot *s = &g_slots[g_cur];
     s->fence = fence;
-    vk.vkEndCommandBuffer(s->cb);
+    if (!g_slot_sent) vk.vkEndCommandBuffer(s->cb);
     if (g_mt_nlist) vk.vkEndCommandBuffer(last);
-    VkCommandBufferSubmitInfo cbi[2 * MT_MAXCH + 3];
+    static VkCommandBufferSubmitInfo cbi[MT_LIST + 1];   // (the translation thread only)
     int ncbi = 0;
-    cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
+    if (!g_slot_sent) cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb};
+    g_slot_sent = 0;
     for (int i = 0; i < g_mt_nlist; i++)
         cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = g_mt_list[i]};
     VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_timeline, .value = fence,
@@ -2671,8 +3208,16 @@ uint64_t mtl_sub_commit(void) {
     if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2"); die("GPU submission failed"); }
     job *j = malloc(sizeof *j);
     if (!j) die("retire job");
-    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, (struct wb_snap_s *)g_wb_snaps, g_wb_nsnaps};   // g_wb_ranges: in the slot's copy back memory
+    *j = (job){fence, ops, n, g_cur, g_wb_ranges, g_wb_nranges, NULL, (struct wb_snap_s *)g_wb_snaps, g_wb_nsnaps, atomic_load(&g_gf_frame), ts0};   // g_wb_ranges: in the slot's copy back memory
     g_wb_ranges = NULL; g_wb_snaps = NULL; g_wb_nsnaps = 0;
+    if (g_oq_n) {   // its occlusion queries (all ended: every pass of it has ended)
+        pthread_mutex_lock(&g_oq_mu);
+        if (!(j->oq = malloc(sizeof *j->oq * (size_t)g_oq_n))) die("occlusion queries");
+        memcpy(j->oq, g_oq_list, sizeof *j->oq * (size_t)g_oq_n);
+        j->noq = g_oq_n;
+        g_oq_n = 0;
+        pthread_mutex_unlock(&g_oq_mu);
+    }
     totk_tl(TL_COMMIT, fence, 1);
     pthread_mutex_lock(&g_mu);
     *g_jobs_tail = j;
@@ -2709,8 +3254,7 @@ uint64_t mtl_sub_commit(void) {
 // (OP_BARRIER), so a chunk boundary needs only what the cut itself adds: after the prologue everything (its uploads and
 // pool copies), into a pass cut inside its targets' writes (it begins again with LOAD), and after a chunk whose shaders
 // stored the storage writes (that flag is its recording thread's: the next chunk may be recorded on another). Before,
-// a full ALL_COMMANDS barrier drained the GPU before each of the 16-32 chunks of a frame (totk-pc-recomp splits with none,
-// vk_exec.c). TOTK_VK_CHUNK_BARRIER=1: the full barrier between all chunks, as before.
+// a full ALL_COMMANDS barrier drained the GPU before each of the 16-32 chunks of a frame. TOTK_VK_CHUNK_BARRIER=1: the full barrier between all chunks, as before.
 // [temporary] Mirrors of written storage buffers are not made (one thread only); TOTK_VK_RECORD_THREADS=1 records as before.
 // A pass longer than 5/4 of the chunk size (the Great Sky Island's G-buffer pass: ~2100 draws, one chunk of 12 of the
 // submission's 14 ms while the other threads waited) is cut inside: the chunk ends its pass and the next one begins it
@@ -2720,17 +3264,21 @@ uint64_t mtl_sub_commit(void) {
 // The chunk size follows the threads: a submission waits for its longest chunk, so about four chunks a thread of the
 // previous submission's draws (2026-10-31, the Depths run: chunks of ~490 draws, the longest 8.5 ms of a 10 ms
 // submission while three threads waited), between MT_MIN and MT_DRAWS; TOTK_VK_CHUNK_DRAWS=<n> sets it.
-enum { MT_DRAWS = 400, MT_MIN = 96 };
+enum { MT_DRAWS = 400, MT_MIN = 96, PART_FIRST = 64 };   // PART_FIRST: partial submission's first chunk (walk_op)
+static int part_on(void);
+static void part_flush(void);
 static int g_chunk_draws = MT_DRAWS;   // this submission's: a chunk ends at a render target change after it, inside a pass after 5/4 of it
 static uint64_t g_prev_draws;          // the draws of the previous submission
 struct mt_chunk {
     int h0, h1; const uint8_t *p0, *p1;   // its first command, and the one after its last (h1 == the handle count: the end)
     uint64_t seq;                         // the position before its first command
-    void *state; p_set_rt rt; int render_off; int64_t stride;   // the state it starts in
+    void *state; p_set_rt rt; int render_off; int64_t stride; oq_st oq;   // the state it starts in
     VkCommandBuffer cb;
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
     int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
+    int done;                             // recorded (g_mt_mu): partial submission sends the recorded ones in order
+    uint64_t tsr[6];                      // the temporal upscaler's jitter state at its start (vkb_tsr.c)
 };
 static mt_chunk g_ch[MT_MAXCH];
 static int g_nch;
@@ -2751,15 +3299,18 @@ static vkb_trk g_pro_trk;
 static __thread VkCommandBuffer t_pro_cb;
 static __thread vkb_trk *t_pro_trk;
 static __thread int t_pro_depth;
-// command buffers per slot and recording thread; [VKB_MAXREC]: the prologue's, the moves' and the end's
+static int g_pro_any;   // g_pro_mu: something was recorded into the prologue's current command buffer
+// command buffers per slot and recording thread; [VKB_MAXREC]: the moves' and the end's (the translation thread);
+// [VKB_MAXREC + 1]: the prologue's (a new one may be begun while the moves' are recorded: a pool is used by one thread)
 typedef struct { VkCommandPool pool; VkCommandBuffer *cb; int n, used; } wpool_t;
-static wpool_t g_wp[SLOTS][VKB_MAXREC + 1];
+enum { WP_MOVES = VKB_MAXREC, WP_PRO = VKB_MAXREC + 1 };
+static wpool_t g_wp[SLOTS][VKB_MAXREC + 2];
 
 int vkb_mt_on(void) {
     static int n = -1;
     if (n < 0) {
-        /* Half the logical processors the process may run on, at most 8: the game itself keeps 3-4 threads busy, so a
-           Steam Deck (8) records with 4, a 4-processor machine with 2, 16 and more with 8. */
+        /* The logical processors the process may run on (its affinity): only a machine with fewer than three records
+           with fewer threads. */
 #ifdef _WIN32
         SYSTEM_INFO si;
         GetSystemInfo(&si);
@@ -2775,12 +3326,11 @@ int vkb_mt_on(void) {
         int cpus = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (cpus < 1) cpus = 4;
 #endif
-        // 3/8 of the logical processors, at most 4: the game keeps 4-6 threads of its own busy, and recording threads
-        // beyond what is left took cores from it and from each other. With 8 processors (2026-11-03, a Depths forest,
-        // unlimited frames): 4 threads 13.4-13.7 ms a frame (p95 16.2-16.6) and 36.9 ms of recording, 3 threads 12.8-12.9
-        // (p95 14.7-15.4) and 25.8 ms, 2 threads 14.3-15.0 and 18.4 ms. Half of them, up to 8, before.
+        // Three on every machine (the player's decision, 2026-11-06, from the runs on the PC, the friend's machine and
+        // the Steam Deck: three was the best of them; the rule "processors less two, at most 4" gave 4 on 6 and 8
+        // processors and was not better), fewer only where the process has fewer processors.
         const char *e = getenv("TOTK_VK_RECORD_THREADS");
-        n = e && *e ? atoi(e) : cpus >= 4 ? (cpus * 3 / 8 < 4 ? cpus * 3 / 8 : 4) : 1;
+        n = e && *e ? atoi(e) : cpus < 3 ? cpus : 3;
         if (n > VKB_MAXREC) n = VKB_MAXREC;
         if (n < 1) n = 1;
         static const char *const diag[] = {"TOTK_VK_DRAWTRACE", "TOTK_VK_TRACE", "TOTK_SNAP", "TOTK_GPU_PROF", "TOTK_GPU_PASSPROF",
@@ -2817,13 +3367,14 @@ static VkCommandBuffer wp_get(int slot, int w) {   // a command buffer of that t
     return cb;
 }
 void vkb_mt_slot_reset(int slot) {   // the slot's previous submission has completed (no thread is recording)
-    for (int w = 0; w <= VKB_MAXREC; w++)
+    for (int w = 0; w <= WP_PRO; w++)
         if (g_wp[slot][w].used) { vk.vkResetCommandPool(vkc.device, g_wp[slot][w].pool, 0); g_wp[slot][w].used = 0; }
 }
 
 void vkb_pro_begin(void) {
     if (!t_recording || t_pro_depth++) return;
     pthread_mutex_lock(&g_pro_mu);
+    g_pro_any = 1;
     t_pro_cb = t_cb; t_pro_trk = vkb_trk_get();
     t_cb = g_pro_cb;
     vkb_trk_set(&g_pro_trk);
@@ -2849,15 +3400,19 @@ static void mt_record(mt_chunk *c) {
     g_rt = c->rt;
     g_render_off = c->render_off;
     vkb_copy_stride(c->stride);
+    oq_st oqs = c->oq;   // samples-passed counting as the walk was at the chunk's start
+    t_oqs = &oqs;
     g_in_pass = 0;
     vkb_stores_take();
     t_seq = c->seq;
+    vkb_tsr_rec_begin(c->tsr);
     for (int i = c->h0; i < g_mt_n; i++) {
         const uint8_t *p = i == c->h0 ? c->p0 : (const uint8_t *)(uintptr_t)g_mt_h[i];
         if (chunk_end_at(c, i, p) || exec_ops(p, 0, EX_CHUNK, i, c)) break;
     }
     pass_end_why(PE_SUBMIT);
     c->stores = vkb_stores_take();
+    t_oqs = &g_oq_walk;
     vk.vkEndCommandBuffer(c->cb);
     vkb_trk_set(NULL);
     t_recording = 0;
@@ -2871,8 +3426,9 @@ static int mt_take(void) {   // the next chunk cut and not taken, or -1
     pthread_mutex_unlock(&g_mt_mu);
     return k;
 }
-static void mt_recorded(void) {
+static void mt_recorded(mt_chunk *c) {
     pthread_mutex_lock(&g_mt_mu);
+    c->done = 1;
     g_mt_done++;
     pthread_cond_broadcast(&g_mt_done_cv);
     pthread_mutex_unlock(&g_mt_mu);
@@ -2883,13 +3439,18 @@ static void *mt_thread(void *arg) {
     snprintf(name, sizeof name, "totk-record-%d", t_worker);
     pthread_setname_np(name);
     { void plat_thread_boost(void); plat_thread_boost(); }   // the frame waits for these, as for the translation thread
+    { const char *e = getenv("TOTK_DIRTY_SHARED"); if (!(e && *e == '0')) nvn_dirty_epoch_reader(); }
+    // TOTK_RECORD_NICE=<n> (experiment): this thread below the game's threads, which hold the three virtual cores and
+    // waited 55-86 ms a frame for one on the Steam Deck while the cores were 68 % busy (2026-11-05)
+    { const char *e = getenv("TOTK_RECORD_NICE"); void plat_thread_nice(int); if (e && *e) plat_thread_nice(atoi(e)); }   // its texture checks use the submission's write watch scans (nvn_dirty_win.c; =0: own scans, as before)
     for (;;) {
         pthread_mutex_lock(&g_mt_mu);
         while (g_mt_next >= g_mt_avail) pthread_cond_wait(&g_mt_cv, &g_mt_mu);
         int k = g_mt_next++;
         pthread_mutex_unlock(&g_mt_mu);
         mt_record(&g_ch[k]);
-        mt_recorded();
+        mt_recorded(&g_ch[k]);
+        if (part_on()) part_flush();   // the recorded prefix to the GPU now, not when the translation thread looks next
     }
     return NULL;
 }
@@ -2903,7 +3464,10 @@ static void chunk_open(int hidx, const uint8_t *p) {   // a chunk starts at p, i
     c->rt = g_rt;
     c->render_off = g_render_off;
     c->stride = vkb_copy_stride_get();
+    c->oq = g_oq_walk;
     c->split = 0;
+    c->done = 0;
+    vkb_tsr_state_save(c->tsr);
     g_mt_draws = 0;
 }
 static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends before p: recording threads may take it
@@ -2918,8 +3482,10 @@ static void chunk_close(int hidx, const uint8_t *p) {   // the open chunk ends b
 static int walk_op(const uint8_t *p, int hidx) {   // before a command at depth 0: a new chunk at a render target change
     op_hdr h;
     memcpy(&h, p, sizeof h);
-    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= (uint64_t)g_chunk_draws * 5 / 4 && g_rt.n > 0;   // inside a pass with colour targets
-    if (((h.op == OP_SET_RT && g_mt_draws >= (uint64_t)g_chunk_draws) || split) && g_nch < MT_MAXCH - 1) {
+    // partial submission: the first chunk short, so that the GPU has work soon after the walk (part_flush)
+    uint64_t lim = g_nch == 0 && part_on() && g_chunk_draws > PART_FIRST ? PART_FIRST : (uint64_t)g_chunk_draws;
+    int split = (h.op == OP_DRAW || h.op == OP_DRAW_IDX) && g_mt_draws >= lim * 5 / 4 && g_rt.n > 0;   // inside a pass with colour targets
+    if (((h.op == OP_SET_RT && g_mt_draws >= lim) || split) && g_nch < MT_MAXCH - 1) {
         chunk_close(hidx, p);
         chunk_open(hidx, p);
         g_ch[g_nch].split = split && h.op != OP_SET_RT;
@@ -2935,18 +3501,19 @@ static void walk_command(uint32_t op, const uint8_t *a) {
         break;
     }
     case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
+    case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); sub_reset((uint32_t)t); break; }
     case OP_COPY_B2B: { uint64_t d, n; memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); if (n) vkb_ucap_drop(d, n); break; }   // GPU writes
     case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); if (n) vkb_ucap_update(d, n, a + 16); break; }
     case OP_COPY_T2B: { uint64_t ad, len; if (vkb_copy_t2b_range((const p_copy_b2t *)a, &ad, &len)) vkb_ucap_drop(ad, len); break; }
     case OP_COPY_STRIDE: vkb_copy_stride(((const p_copy_stride *)a)->stride); break;
-    case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); break;
+    case OP_SET_RT: memcpy(&g_rt, a, sizeof g_rt); vkb_tsr_walk_rt(&g_rt); break;
     case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL:
     case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO:
     case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_IMG: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
         vkb_state(op, a);
         break;
     case OP_DRAW: case OP_DRAW_IDX:
-        if (!g_render_off) { g_mt_draws++; vkb_draw_prescan(a, op == OP_DRAW_IDX, 0); }
+        if (!g_render_off) { g_mt_draws++; vkb_draw_prescan(a, op == OP_DRAW_IDX, 0); vkb_draw_tsr_walk(); }
         break;
     case OP_DISPATCH: g_mt_draws++; vkb_draw_prescan(a, 0, 1); break;
     case OP_RENDER_ENABLE: g_render_off = !((const p_flag *)a)->value; break;
@@ -3011,9 +3578,310 @@ static void glue(VkCommandBuffer cb, vkb_trk *t, int need) {
     if (t->n) atomic_fetch_add_explicit(&vkb_layout_epoch_all, 1, memory_order_relaxed);
 }
 
+// ---- partial submission (on by default since 2026-11-06; TOTK_VK_PARTIAL_SUBMIT=0: off) ----
+// The GPU stood idle while a submission was recorded, and the game then waited for that same submission: on the
+// player's PC (2026-11-05, TOTK_TIMELINE, frames 4200-4530) 4.3 of the 6.8 ms of recording before each wait of 5 ms
+// and more (frame-compare.md 3b). So the translation thread sends the chunks recorded so far, in order, while the
+// others are still being recorded; the last part is the submission itself (the end, its fence, its retire
+// job). A part's chunks are glued as before; the slot's command buffer goes with the first part.
+// The prologue goes in parts too: a part closes the prologue's command buffer (g_pro_mu) and it is placed before the
+// part's first chunk, behind a full barrier; work for the prologue after that goes into a new one, placed before the
+// next part's first chunk. That keeps the prologue's rule "before every chunk that may use it": a chunk sees an upload
+// or a pool's device copy as done (upload_stamp, sync_sub) only after the prologue work was recorded under g_pro_mu,
+// and it is recorded before this thread sees it done and takes g_pro_mu to close the part, so the work is in this
+// part's prologue or an earlier one. Pool copies (Linux) are synced once a submission, at the first part using them
+// (pc_sync). [temporary] The GPU time of a submission (its two timestamps) includes the waits between its parts.
+// Second version (2026-11-06): the first one sent its first part 7.4-9.4 ms into a recording of 6-18 ms (the friend's
+// RX 570, the Steam Deck; frame-compare.md 3и) - after the prologue, the walk and a chunk of the translation thread's
+// own - so the GPU still began when the frame was nearly recorded, and the game's thread waited for "record, then
+// draw" as before (12-21 ms in long frames). Now the first chunk is short (PART_FIRST draws), every thread that records a chunk sends the
+// recorded prefix (g_part_mu: one at a time), the first part as soon as the walk is done, and the texture uploads of
+// the recording threads go with the parts (each in a command buffer of its own, vkb_upload_begin) instead of all into
+// the prologue under one lock.
+enum { PART_DRAWS = 64, PART_MAX = 16 };
+static int g_part_next, g_part_n, g_part_full;   // the first chunk not sent; parts sent; the next chunk's glue waits for all
+static uint64_t g_part_t, g_glue_images;           // when the last part went; images moved between chunks (the log line)
+static pthread_mutex_t g_part_mu = PTHREAD_MUTEX_INITIALIZER;   // part_flush and the submission's end, one at a time
+static int g_walk_done, g_part_closing;            // (g_part_mu) parts may go; the submission is sending the rest
+static uint64_t g_part_t0;                         // when the submission's recording began
+// uploads with partial submission: each in its own command buffer, ended by its thread and queued until a part takes it
+typedef struct { VkCommandBuffer cb; vkb_trk trk; } upq_e;
+static upq_e *g_upq[VKB_MAXREC];
+static int g_upq_n[VKB_MAXREC], g_upq_cap[VKB_MAXREC], g_upq_taken[VKB_MAXREC];
+static pthread_mutex_t g_upq_mu[VKB_MAXREC];
+static pthread_once_t g_upq_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_upq_total;   // queued this submission (UPQ_MAX: then into the prologue, as without the split)
+static void upq_init(void) { for (int w = 0; w < VKB_MAXREC; w++) pthread_mutex_init(&g_upq_mu[w], NULL); }
+// The uploads queued so far into list, each after its move (the first with a full barrier); g_pro_mu held.
+static void uploads_take(VkCommandBuffer *list, int *n) {
+    pthread_once(&g_upq_once, upq_init);
+    int first = 1;
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        pthread_mutex_lock(&g_upq_mu[w]);   // an upload being recorded now is waited for (its image may be marked uploaded)
+        for (int i = g_upq_taken[w]; i < g_upq_n[w]; i++) {
+            VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+            glue(m, &g_upq[w][i].trk, first ? GLUE_FULL : 0);
+            first = 0;
+            vk.vkEndCommandBuffer(m);
+            list[(*n)++] = m;
+            list[(*n)++] = g_upq[w][i].cb;
+        }
+        g_upq_taken[w] = g_upq_n[w];
+        pthread_mutex_unlock(&g_upq_mu[w]);
+    }
+    if (!first) g_part_full = 1;   // the chunk after them sees their writes
+}
+static uint64_t g_part_subs, g_part_parts, g_part_first_ns;   // the log line: submissions sent in parts, parts, first part after the start
+static uint64_t g_part_held;   // (g_part_mu) parts held back: they would have begun with a full barrier (the log line)
+// Third version (2026-11-06): a part after the first goes only when it needs no full barrier - no prologue work and no
+// queued upload since the last part. Such work is placed before the part's first chunk behind a full barrier (glue
+// GLUE_FULL, g_part_full: the prologue's writes, and its writes over what earlier parts still read), and a full barrier
+// waits for all the GPU's earlier work: the GPU drained at every such part. While the world streams in, the prologue
+// gets work (pool device copies, uploads) nearly every part: the friend's RX 570 (1080p, limit 60; 0.3.1-75) had 5-7
+// parts a submission and frames of 33-48 ms in bursts exactly where the game streamed (54 in ~2 min of world, against 8
+// with the first version and 20 without parts; frame-compare.md 0). The same cost once took the full barriers out from
+// between chunks (83cc638). A part held back goes with the next one or with the submission, as with no part at all: always correct.
+// TOTK_VK_PART_DRAIN=1: parts with a full barrier too, as the second version (A/B).
+static int part_drain_ok(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_PART_DRAIN");
+        v = e && *e == '1';
+        VLOG("partial submission: %s", v ? "parts go with a full barrier too (TOTK_VK_PART_DRAIN=1, the second version)"
+                                         : "a part after the first goes only without a full barrier (TOTK_VK_PART_DRAIN=1: as before)");
+    }
+    return v;
+}
+// Fourth version (2026-11-06, night): a part held back for a full barrier goes all the same when the GPU has done
+// everything sent before it, for then the barrier waits for nothing. The third version held it whatever the GPU did:
+// right for the friend's RX 570, busy all the time (a drain there was a stall), wrong for the Steam Deck, whose GPU ran
+// through the first part and stood idle until the end of the recording - and parts were held exactly while the world
+// streamed in (texture uploads queued, prologue work), so the Deck dipped 40-30-40 in the same places, in the dense ones
+// frames over 33 ms 55 a minute against 34 with the second version (frame-compare.md 0). Each part signals g_part_sem;
+// idle: it and the submissions before reached their values. TOTK_VK_PART_IDLE=0: held whatever the GPU does (third).
+static VkSemaphore g_part_sem;   // (g_part_mu) parts' own timeline: part g_part_seq signals g_part_seq
+static uint64_t g_part_seq, g_part_idle_sent;   // (g_part_mu) parts sent; held-back parts sent for an idle GPU (the log line)
+static int part_idle_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_PART_IDLE");
+        v = !(e && *e == '0');
+        VLOG("partial submission: %s", v ? "a part held back for a full barrier goes when the GPU is idle (TOTK_VK_PART_IDLE=0: held)"
+                                         : "a part held back for a full barrier waits whatever the GPU does (TOTK_VK_PART_IDLE=0)");
+    }
+    return v;
+}
+static int gpu_idle(void) {   // (g_part_mu) the GPU has done every submission and part sent so far
+    if (!g_part_sem) return 0;
+    uint64_t main = 0, part = 0;
+    if (vk.vkGetSemaphoreCounterValue(vkc.device, g_timeline, &main) != VK_SUCCESS ||
+        vk.vkGetSemaphoreCounterValue(vkc.device, g_part_sem, &part) != VK_SUCCESS) return 0;
+    return main >= __atomic_load_n(&g_fence, __ATOMIC_ACQUIRE) && part >= g_part_seq;
+}
+static int uploads_queued(void) {   // uploads not yet taken by a part
+    pthread_once(&g_upq_once, upq_init);
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        pthread_mutex_lock(&g_upq_mu[w]);
+        int q = g_upq_n[w] > g_upq_taken[w];
+        pthread_mutex_unlock(&g_upq_mu[w]);
+        if (q) return 1;
+    }
+    return 0;
+}
+static int part_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_PARTIAL_SUBMIT");
+        v = !(e && *e == '0');   // on by default since 2026-11-06 (the player's PC: frames over 25 ms 100 -> 23 a minute)
+        VLOG("partial submission: %s", v ? "recorded chunks go to the GPU in order while the rest are recorded (TOTK_VK_PARTIAL_SUBMIT=0: off)"
+                                         : "off, the submission in one call (TOTK_VK_PARTIAL_SUBMIT=0)");
+    }
+    return v;
+}
+// The prologue's command buffer so far into list (with its moves); a new one begun. g_pro_mu held, or no thread recording.
+static void pro_close(VkCommandBuffer *list, int *n, int more) {
+    if (!g_slot_sent) {   // the first: the slot's command buffer moves its images
+        vk.vkEndCommandBuffer(g_pro_cb);
+        glue(g_slots[g_cur].cb, &g_pro_trk, GLUE_FULL);
+        list[(*n)++] = g_pro_cb;
+    } else if (g_pro_any) {
+        vk.vkEndCommandBuffer(g_pro_cb);
+        VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+        glue(m, &g_pro_trk, GLUE_FULL);
+        vk.vkEndCommandBuffer(m);
+        list[(*n)++] = m;
+        list[(*n)++] = g_pro_cb;
+        g_part_full = 1;   // the chunk after it sees the prologue's writes
+    } else if (!more) vk.vkEndCommandBuffer(g_pro_cb);   // empty: not sent
+    else return;           // empty: kept for what comes
+    if (more) {
+        g_pro_cb = wp_get(g_cur, WP_PRO);
+        vkb_trk_reset(&g_pro_trk);
+        g_pro_any = 0;
+    }
+}
+static void chunks_glue(int a, int b, VkCommandBuffer *list, int *n) {   // chunks [a, b), each after its move
+    for (int k = a; k < b; k++) {
+        VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+        g_glue_images += (uint64_t)g_ch[k].trk.n;
+        int need = k == 0 || g_part_full ? GLUE_FULL : (g_ch[k].split ? GLUE_ATTACH : 0) | (g_ch[k - 1].stores ? GLUE_STORES : 0);
+        g_part_full = 0;
+        glue(m, &g_ch[k].trk, need);
+        vk.vkEndCommandBuffer(m);
+        list[(*n)++] = m;
+        list[(*n)++] = g_ch[k].cb;
+    }
+}
+// After the walk, on any thread that records chunks: the chunks recorded in order since the last part, if enough.
+static void part_flush(void) {
+    if (pthread_mutex_trylock(&g_part_mu)) return;   // another thread is sending: it sees what is recorded
+    if (!g_walk_done || g_part_closing || g_part_n >= PART_MAX) { pthread_mutex_unlock(&g_part_mu); return; }
+    pthread_mutex_lock(&g_mt_mu);
+    int e = g_part_next;
+    uint64_t draws = 0;
+    while (e < g_nch && g_ch[e].done) draws += g_ch[e++].draws;
+    int all = g_nch;
+    pthread_mutex_unlock(&g_mt_mu);
+    uint64_t now = runtime_now_ns();
+    // all recorded: the submission itself sends them; after the first part, at most one a millisecond
+    if (e == g_part_next || e == all || draws < (g_part_n ? PART_DRAWS : 1) || (g_part_n && now - g_part_t < 1000000)) {
+        pthread_mutex_unlock(&g_part_mu);
+        return;
+    }
+    static VkCommandBuffer list[MT_LIST];   // (g_part_mu)
+    int n = 0;
+    int first = !g_slot_sent;
+    pthread_mutex_lock(&g_pro_mu);   // no prologue work meanwhile; glue writes image layouts the prologue's work may change
+    if (!first && !part_drain_ok() && (g_pro_any || uploads_queued())) {   // it would drain the GPU: held back, unless idle
+        if (!(part_idle_on() && gpu_idle())) {
+            pthread_mutex_unlock(&g_pro_mu);
+            g_part_held++;
+            pthread_mutex_unlock(&g_part_mu);
+            return;
+        }
+        g_part_idle_sent++;
+    }
+    if (!g_part_sem) {   // the parts' timeline, made at the first part
+        VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo ci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
+        if (!vk_check(vk.vkCreateSemaphore(vkc.device, &ci, NULL, &g_part_sem), "parts' timeline semaphore")) g_part_sem = VK_NULL_HANDLE;
+    }
+    pro_close(list, &n, 1);
+    uploads_take(list, &n);
+    chunks_glue(g_part_next, e, list, &n);
+    g_slot_sent = 1;   // under g_pro_mu: snap_take reads it there
+    pthread_mutex_unlock(&g_pro_mu);
+    g_part_next = e;
+    static VkCommandBufferSubmitInfo cbi[MT_LIST + 1];
+    int ncbi = 0;
+    if (first) {
+        vk.vkEndCommandBuffer(g_slots[g_cur].cb);
+        cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = g_slots[g_cur].cb};
+    }
+    for (int i = 0; i < n; i++)
+        cbi[ncbi++] = (VkCommandBufferSubmitInfo){VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = list[i]};
+    VkSemaphoreSubmitInfo psig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_part_sem, .value = g_part_seq + 1,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};   // gpu_idle
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)ncbi, .pCommandBufferInfos = cbi,
+                        .signalSemaphoreInfoCount = g_part_sem ? 1u : 0u, .pSignalSemaphoreInfos = &psig};
+    uint64_t tps = runtime_now_ns();
+    pc_sync(g_fence + 1);   // pool copies these chunks use (each pool once a submission)
+    vkb_step_add(PK_SYNC, tps);
+    uint64_t ts0 = runtime_now_ns();
+    vk_queue_lock();
+    VkResult r = vk.vkQueueSubmit2(vkc.queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    vkb_step_add(PK_SUBMIT, ts0);
+    if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2 (part)"); die("GPU submission failed"); }
+    if (first) g_part_first_ns += ts0 - g_part_t0;
+    if (g_part_sem) g_part_seq++;
+    g_part_n++;
+    g_part_t = runtime_now_ns();
+    pthread_mutex_unlock(&g_part_mu);
+}
+
+// ---- texture uploads in a command buffer per recording thread (TOTK_VK_UPLOAD_SPLIT=1, 2026-11-06) ----
+// Every upload of a submission went into the shared prologue under one lock (g_up_mu in vkb_tex.c, g_pro_mu here): the
+// BC7 image made, the layout change and the copies. On the Steam Deck the work under it and the waits for it were 50-90
+// ms of a long submission while the world streamed in (2026-11-06, the uploads-by-part line), the recording threads
+// taking turns. With the switch a prepared upload (vkb_tex.c plan_record) goes into a command buffer of its recording
+// thread's own, with its own layout tracking, under a lock of the image alone; these command buffers run after the
+// prologue and before every chunk, as the prologue's uploads did (the CPU wrote the bytes before the submission). An
+// image is uploaded once a submission (the image's lock and its upload stamp), so no two of them touch it. Uploads that
+// are not prepared (ASTC decoded on the CPU, untracked memory) go into the prologue as before. With partial submission
+// each upload is a command buffer of its own that the next part takes (uploads_take), at most UPQ_MAX a submission.
+// [experimental] On by default since 2026-11-06 (the player's decision; TOTK_VK_UPLOAD_SPLIT=0: one prologue, as before).
+// The Steam Deck, ~6 min with against ~2 min without: waits for one another's uploads 12-50 -> 0-11 ms in long
+// submissions, frames over 50 ms 13 -> 7 a minute. One black artifact over half the screen once, not yet told apart
+// from the old black holes on AMD (GitHub #38): if such reports come, test with =0 first.
+static VkCommandBuffer g_upcb[VKB_MAXREC];
+static vkb_trk g_uptrk[VKB_MAXREC];
+static __thread VkCommandBuffer t_up_cb_save;
+static __thread vkb_trk *t_up_trk_save;
+static int up_split_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_UPLOAD_SPLIT");
+        v = !(e && *e == '0');
+        VLOG("texture uploads: %s", v ? "a command buffer per recording thread, a lock per image [experimental] (TOTK_VK_UPLOAD_SPLIT=0: one prologue)"
+                                      : "one prologue, one lock (TOTK_VK_UPLOAD_SPLIT=0)");
+    }
+    return v;
+}
+int vkb_upload_split(void) {
+    return t_recording && !t_pro_depth && up_split_on() && (!part_on() || atomic_load(&g_upq_total) < UPQ_MAX);
+}
+void vkb_upload_begin(void) {   // (vkb_upload_split): records into this thread's uploads command buffer from here
+    int w = t_worker;
+    t_up_cb_save = t_cb; t_up_trk_save = vkb_trk_get();
+    if (part_on()) {   // its own command buffer, queued for the next part when it ends (uploads_take)
+        pthread_once(&g_upq_once, upq_init);
+        pthread_mutex_lock(&g_upq_mu[w]);   // until vkb_upload_end
+        if (g_upq_n[w] == g_upq_cap[w]) {
+            int cap = g_upq_cap[w] ? g_upq_cap[w] * 2 : 64;
+            upq_e *q = realloc(g_upq[w], sizeof *q * (size_t)cap);
+            if (!q) die("upload queue");
+            memset(q + g_upq_cap[w], 0, sizeof *q * (size_t)(cap - g_upq_cap[w]));
+            g_upq[w] = q; g_upq_cap[w] = cap;
+        }
+        upq_e *e = &g_upq[w][g_upq_n[w]];
+        e->cb = wp_get(g_cur, w);
+        vkb_trk_reset(&e->trk);
+        atomic_fetch_add(&g_upq_total, 1);
+        t_cb = e->cb;
+        vkb_trk_set(&e->trk);
+        return;
+    }
+    if (!g_upcb[w]) { g_upcb[w] = wp_get(g_cur, w); vkb_trk_reset(&g_uptrk[w]); }
+    t_cb = g_upcb[w];
+    vkb_trk_set(&g_uptrk[w]);
+}
+void vkb_upload_end(void) {
+    if (part_on()) {
+        int w = t_worker;
+        vk.vkEndCommandBuffer(t_cb);
+        g_upq_n[w]++;
+        pthread_mutex_unlock(&g_upq_mu[w]);
+    }
+    t_cb = t_up_cb_save; vkb_trk_set(t_up_trk_save);
+}
+static void uploads_close(VkCommandBuffer *list, int *n) {   // after the prologue: each thread's uploads, after its move
+    for (int w = 0; w < VKB_MAXREC; w++) {
+        if (!g_upcb[w]) continue;
+        vk.vkEndCommandBuffer(g_upcb[w]);
+        VkCommandBuffer m = wp_get(g_cur, WP_MOVES);
+        glue(m, &g_uptrk[w], GLUE_FULL);
+        vk.vkEndCommandBuffer(m);
+        list[(*n)++] = m;
+        list[(*n)++] = g_upcb[w];
+        g_upcb[w] = VK_NULL_HANDLE;
+        g_part_full = 1;   // the chunk after them sees their writes
+    }
+}
+
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits
     uint64_t t0 = runtime_now_ns();
-    static uint64_t walk_ns, wall_ns, subs, chunks, said_at, glue_images, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
+    static uint64_t walk_ns, wall_ns, subs, chunks, said_at, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
     static int started;
     if (!started) {
         started = 1;
@@ -3035,8 +3903,20 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     g_nch = 0;
     pthread_mutex_unlock(&g_mt_mu);
     // the prologue: objects made on first use, the pool copies of the last submissions
-    g_pro_cb = wp_get(g_cur, VKB_MAXREC);
+    g_pro_cb = wp_get(g_cur, WP_PRO);
     vkb_trk_reset(&g_pro_trk);
+    g_pro_any = 0;
+    int part = part_on();
+    pthread_mutex_lock(&g_part_mu);   // (a recording thread may still be leaving part_flush of the last submission)
+    g_part_next = g_part_n = g_part_full = 0;
+    g_walk_done = g_part_closing = 0;
+    g_part_t0 = t0;
+    pthread_mutex_unlock(&g_part_mu);
+    memset(g_upcb, 0, sizeof g_upcb);
+    memset(g_upq_n, 0, sizeof g_upq_n);
+    memset(g_upq_taken, 0, sizeof g_upq_taken);
+    atomic_store(&g_upq_total, 0);
+    g_slot_sent = 0;
     t_recording = 1;
     vkb_pro_begin();
     vkb_draw_mt_init();
@@ -3056,27 +3936,36 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     g_walk_rt = g_rt; g_walk_off = g_render_off; g_walk_stride = vkb_copy_stride_get(); g_walk_have = 1;
     uint64_t tr = runtime_now_ns();
     walk_ns += tr - tw;
-    // this thread records chunks too, then waits for the others
-    for (int k; (k = mt_take()) >= 0;) { mt_record(&g_ch[k]); mt_recorded(); }
+    // this thread records chunks too, then waits for the others (partial submission: sending what is recorded in order)
+    if (part) {
+        pthread_mutex_lock(&g_part_mu);
+        g_walk_done = 1;
+        pthread_mutex_unlock(&g_part_mu);
+        part_flush();
+    }
+    for (int k; (k = mt_take()) >= 0;) { mt_record(&g_ch[k]); mt_recorded(&g_ch[k]); if (part) part_flush(); }
     pthread_mutex_lock(&g_mt_mu);
-    while (g_mt_done < g_nch) pthread_cond_wait(&g_mt_done_cv, &g_mt_mu);
+    while (g_mt_done < g_nch) {
+        pthread_cond_wait(&g_mt_done_cv, &g_mt_mu);
+        if (part) { pthread_mutex_unlock(&g_mt_mu); part_flush(); pthread_mutex_lock(&g_mt_mu); }
+    }
     pthread_mutex_unlock(&g_mt_mu);
+    if (part) {   // no part from here on: the rest goes with the submission
+        pthread_mutex_lock(&g_part_mu);
+        g_part_closing = 1;
+        pthread_mutex_unlock(&g_part_mu);
+    }
     uint64_t tt = runtime_now_ns();
     rec_ns += tt - tr;
     // in order: the slot's command buffer moves images into the prologue's layouts, then each chunk's move and the chunk
-    vk.vkEndCommandBuffer(g_pro_cb);
-    glue(g_slots[g_cur].cb, &g_pro_trk, GLUE_FULL);
+    // (after parts: the prologue's work since the last part, then the chunks not sent)
     g_mt_nlist = 0;
-    g_mt_list[g_mt_nlist++] = g_pro_cb;
-    for (int k = 0; k < g_nch; k++) {
-        VkCommandBuffer m = wp_get(g_cur, VKB_MAXREC);
-        glue_images += (uint64_t)g_ch[k].trk.n;
-        glue(m, &g_ch[k].trk, k == 0 ? GLUE_FULL : (g_ch[k].split ? GLUE_ATTACH : 0) | (g_ch[k - 1].stores ? GLUE_STORES : 0));
-        vk.vkEndCommandBuffer(m);
-        g_mt_list[g_mt_nlist++] = m;
-        g_mt_list[g_mt_nlist++] = g_ch[k].cb;
-    }
-    g_mt_list[g_mt_nlist++] = wp_get(g_cur, VKB_MAXREC);   // the end
+    pro_close(g_mt_list, &g_mt_nlist, 0);
+    if (part) uploads_take(g_mt_list, &g_mt_nlist);
+    else uploads_close(g_mt_list, &g_mt_nlist);
+    chunks_glue(g_part_next, g_nch, g_mt_list, &g_mt_nlist);
+    g_mt_list[g_mt_nlist++] = wp_get(g_cur, WP_MOVES);   // the end
+    if (g_part_n) { g_part_subs++; g_part_parts += (uint64_t)g_part_n + 1; }
     mtl_sub_commit();
     g_mt_nlist = 0;
     uint64_t te = runtime_now_ns();
@@ -3095,10 +3984,16 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
         uint64_t rec = vkb_cnt_sum(g_mt_rec_ns);
         VLOG("recording threads: per submission %.1f ms until submitted (walk %.1f ms), chunks %.1f, chunk recording %.1f ms in all "
              "threads, the longest chunk %.1f ms (%.0f draws), images moved between chunks %.0f", wall_ns / 1e6 / 600, walk_ns / 1e6 / 600,
-             chunks / 600.0, (rec - prev_rec) / 1e6 / 600, longest_ns / 1e6 / 600, longest_draws / 600.0, glue_images / 600.0);
+             chunks / 600.0, (rec - prev_rec) / 1e6 / 600, longest_ns / 1e6 / 600, longest_draws / 600.0, g_glue_images / 600.0);
         VLOG("recording threads: phases per submission: prologue %.1f ms, walk %.1f, chunks until the last is recorded %.1f, "
              "glue and submit %.1f", pro_ns / 1e6 / 600, walk_ns / 1e6 / 600, rec_ns / 1e6 / 600, tail_ns / 1e6 / 600);
-        prev_rec = rec; wall_ns = walk_ns = chunks = glue_images = longest_ns = longest_draws = pro_ns = rec_ns = tail_ns = 0;
+        if (part)
+            VLOG("partial submission: %.0f %% of submissions in parts, %.1f parts each, the first part sent %.1f ms after the start "
+                 "(the whole: %.1f ms); parts held back from a full barrier %.1f times a submission, sent for an idle GPU %.1f",
+                 100.0 * g_part_subs / 600, g_part_subs ? (double)g_part_parts / g_part_subs : 0.0,
+                 g_part_subs ? g_part_first_ns / 1e6 / g_part_subs : 0.0, wall_ns / 1e6 / 600, g_part_held / 600.0, g_part_idle_sent / 600.0);
+        prev_rec = rec; wall_ns = walk_ns = chunks = g_glue_images = longest_ns = longest_draws = pro_ns = rec_ns = tail_ns = 0;
+        g_part_subs = g_part_parts = g_part_first_ns = g_part_held = g_part_idle_sent = 0;
     }
 }
 
@@ -3124,5 +4019,5 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
-void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); }
+void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); wb_held_take(0, 1); }   // everything done: the held copy backs too
 void mtl_drain(void) { mtl_finish(); }

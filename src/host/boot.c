@@ -70,14 +70,17 @@ static int enter_dir(const char *path) { return chdir(path) == 0; }
 #define name_eq strcmp
 #endif
 
-/* The Steam Deck's defaults, for what ultratears.cfg leaves unset (as totk-pc-recomp's device profile, runtime/cfg.c): its
-   screen's 1280x800 (16:10: the camera and the UI follow, host/render_res.c), fullscreen, 40 fps (a divisor of the LCD's
-   and OLED's 40 Hz modes, and of 120 Hz). The Deck: SteamDeck=1 (Steam sets it there) or Valve's board, product Jupiter
+/* The Steam Deck's defaults, for what ultratears.cfg leaves unset: its
+   screen's 1280x800 (16:10: the camera and the UI follow, host/render_res.c), fullscreen; the frame limit is the
+   launcher's, as on a PC (no 40 of its own since 2026-11-06, see below). The Deck: SteamDeck=1 (Steam sets it there) or Valve's board, product Jupiter
    (LCD) or Galileo (OLED). Any key the player set wins. */
 static void deck_defaults(void) {
 #ifndef _WIN32
     const char *env = getenv("SteamDeck");
     int deck = env && !strcmp(env, "1");
+    // started by Steam on the Deck: SDL's text input opens Steam's on-screen keyboard (host/text_entry.c, the game's
+    // software keyboard); only then, as without Steam the steam:// link would start Steam itself
+    if (deck) setenv("SDL_ENABLE_STEAM_SCREEN_KEYBOARD", "1", 0);
     if (!deck) {
         char vendor[64] = "", product[64] = "";
         FILE *v = fopen("/sys/class/dmi/id/board_vendor", "r"), *p = fopen("/sys/class/dmi/id/product_name", "r");
@@ -91,9 +94,17 @@ static void deck_defaults(void) {
     if (!deck) return;
     setenv("TOTK_OUTPUT_RES", "1280x800", 0);
     setenv("TOTK_WINDOW", "fullscreen", 0);
-    setenv("TOTK_FPS_LIMIT", "40", 0);
-    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s fps (the Deck's defaults where ultratears.cfg sets none)\n",
-            getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_FPS_LIMIT"));
+    // No frame limit of its own: the launcher's. Its 40 here made the launcher's 60 impossible to choose (2026-11-06);
+    // a new game folder on the Deck starts with fps=40 in ultratears.cfg (tools/setup.py first_settings), a setting
+    // like any other.
+    // The recording threads below the game's (nice 5): the user's runs (2026-11-05, routes not the same) had p95 31.8
+    // against 33.8 ms and fewer frames over 50 ms; a burst of uploads may take longer (one of 1.2 s in that run)
+    setenv("TOTK_RECORD_NICE", "5", 0);
+    // The Deck's buttons as labelled on it (A the bottom one: the Xbox layout, window_sdl.c binds_load), with the
+    // prompts for it (ui_prompts.c); pad_layout=nintendo in ultratears.cfg (the launcher's Controls tab) keeps the Switch's
+    setenv("TOTK_BIND_pad_layout", "xbox", 0);
+    fprintf(stderr, "[totk] Steam Deck: output %s, window %s, %s button layout (the Deck's defaults where "
+            "ultratears.cfg sets none)\n", getenv("TOTK_OUTPUT_RES"), getenv("TOTK_WINDOW"), getenv("TOTK_BIND_pad_layout"));
 #endif
 }
 
@@ -125,14 +136,26 @@ static const char *default_exefs(void) {
                 // the player's settings (the launcher's Play screen writes them)
                 {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
                 {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
-                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"},
+                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}, {"antialias", "TOTK_AA"},
                 {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
-                {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
+                {"fps_overlay", "TOTK_FPS_OVERLAY"},   // the frame counter (F10 in the game)
+                // the launcher's Sticks and gyro page (window_sdl.c dead_zone, motion_fusion.c)
+                {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
+                {"gyro_deadzone", "TOTK_GYRO_DEADZONE"},
+                // the launcher's Keyboard page (mouse_direct.c)
+                {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"},
+                // the launcher's Mods page (mods.c)
+                {"mods_dir", "TOTK_MODS_DIR"}, {"mods_order", "TOTK_MODS_ORDER"}, {"mods_off", "TOTK_MODS_OFF"},
+                {"cheats_on", "TOTK_CHEATS_ON"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
             }
             else if (!strncmp(line, "TOTK_", 5)) setenv(line, eq + 1, 0);
+            else if (!strncmp(line, "pad_", 4) || !strncmp(line, "key_", 4)) {   // the launcher's Controls tab (window_sdl.c binds_load)
+                char var[96];
+                if (snprintf(var, sizeof var, "TOTK_BIND_%s", line) < (int)sizeof var) setenv(var, eq + 1, 0);
+            }
             else
                 for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++)
                     if (!strcmp(line, keys[i][0])) setenv(keys[i][1], eq + 1, 0);
@@ -215,9 +238,11 @@ int main(int argc, char **argv) {
     uint64_t t0 = runtime_now_ns();
     loader_load(exefs);
     dispatch_init();
+    { void mods_code_load(void); mods_code_load(); }   // player mods' code patches and code cheats (mods.c)
     fprintf(stderr, "[totk] modules loaded and linked in %.0f ms\n", (runtime_now_ns() - t0) / 1e6);
 
     runtime_profiler_start();
+    { void pgo_start(void); pgo_start(); }   // the PGO training build only (src/host/pgo.c)
 
     // The window takes the main thread (SDL wants its events there); the game gets its own. TOTK_HEADLESS=1: no
     // window, no sound device, the game on the main thread (automated runs).

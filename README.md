@@ -55,11 +55,67 @@ also put a newer `UltraTears.AppImage` into the game folder in place of the old 
 <details>
 <summary>Controls</summary>
 
-The controller's button layout follows the Switch (A is the right button).
+The controller's button layout follows the Switch (A is the right button); on the Steam Deck it follows the Deck's own
+labels (A is the bottom button).
 
-Keyboard: WASD move, arrow keys camera, J = A, K / Space = B, I = X, U = Y, Q / E = L / R, Alt / Shift = ZL / ZR,
-Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, F11 or Alt+Enter full screen. Mouse support is
-planned.
+Keyboard and mouse: WASD move, the mouse (or the arrow keys) turns the camera and aims, E = A, Left Shift = B,
+Space = X, left click / T = Y, Q = L, R = R, right click / Z = ZL, F / X = ZR, Esc = + (menu), Tab / M = − (map),
+Left Ctrl / C = stick buttons, 1 2 3 4 = d-pad (left, up, right, down; the mouse's side buttons are left and right),
+F11 or Alt+Enter full screen. Holding L, the mouse picks an ability; holding a d-pad key, the wheel or moving the mouse
+sideways steps through weapons, shields and materials. Mouse sensitivity, the bow's and inverted up and down are on the
+**Keyboard** page of the launcher's **Controls** tab.
+
+Both can be changed in the launcher's **Controls** tab: every button and key (mouse buttons too), and the controller's
+layout (Nintendo: A is the right button; Xbox / Steam Deck: A is the bottom one). The game's button prompts follow
+your layout and bindings. The **Sticks and gyro** page sets each stick's and the gyro's dead zone, for a stick that
+drifts.
+</details>
+
+<details>
+<summary>Upscaling and anti-aliasing</summary>
+
+On the launcher's **General** tab:
+
+- **Scene scale:** the scene can be drawn below the screen's resolution and upscaled with **FSR 1** (the game's own) or
+  **FSR 3.1** (temporal, sharper and steadier in motion), or drawn at full size (**None**).
+- **Anti-aliasing** (without FSR 3.1, which anti-aliases by itself): the game's **FXAA**, **SMAA** (smoother edges for
+  little GPU time) or **Off**.
+</details>
+
+<details>
+<summary>Mods and cheats</summary>
+
+Mods made for the Switch emulators work as they are. In the launcher's **Mods** tab click **Open mods folder** and
+unpack each mod into a folder of its own there, so that its `romfs`, `exefs` or `cheats` folder sits directly in it
+(`atmosphere/contents/0100F2C0115B6000/...` works too). The same tab turns each mod and each cheat on or off and sets
+the mods' order: when two mods change the same file, the one higher in the list wins. Mods and cheats need no rebuild
+of the game.
+
+- RomFS mods (textures, models, text, ...), ExeFS patches (`.ips`, `.pchtxt`) and Atmosphere cheats (`.txt` named by
+  the game's build ID) for game version 1.4.3.
+- Patches and cheats that change the game's code are prepared when you press **Play**, a few seconds when they
+  changed. On Linux and the Steam Deck this needs the game folder set up by the AppImage; in a folder made on Windows
+  for the Deck, only RomFS mods and cheats that change data work.
+- A texture from a mod causes a short hitch the first time it is seen.
+</details>
+
+<details>
+<summary>Chinese and Korean text</summary>
+
+For Simplified Chinese, Traditional Chinese and Korean the game uses the Switch's own system fonts. They are part of
+the console's system software, not of the game, so the port can't make them from the dump. Without them the game stops
+when it starts in one of these languages; all other languages don't need them.
+
+Put the console's shared font files, taken from your own Switch, into `sysdata\fonts\` next to `exefs` and `romfs` in
+your dump folder before **Prepare the game** (or later straight into `data\fonts\` in the game folder):
+
+```text
+dump\
+└── sysdata\fonts\   0-standard.bfttf, 1-chinese-simplified.bfttf, 2-chinese-simplified-extension.bfttf,
+                     3-chinese-traditional.bfttf, 4-korean.bfttf, 5-nintendo-extension.bfttf
+```
+
+Put in all six; the game reads only the ones it asks for.
 </details>
 
 ## Building from source

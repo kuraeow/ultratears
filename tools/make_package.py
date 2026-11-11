@@ -143,7 +143,7 @@ def clang64_files_used(home):
     # libraries: what lld reads in the links of the game, the texture encoder and the launcher (--verbose)
     ninja = (home / 'build/build.ninja').read_text()
     rsp = re.search(r'^build UltraTears\.exe: link (.*)$', ninja, re.M).group(1).split()   # ninja deletes the .rsp
-    link = re.search(r'command = clang (.*) -o \$out @\$out.rsp (.*)', ninja)
+    link = re.search(r'command = (?:clang|\$cc) (.*) -o \$out @\$out.rsp (.*)', ninja)
     flags = link.group(1).split() + link.group(2).split()
     for objs, libs in ((rsp, flags), ([], ['-static', '-pthread', '-lzstd', '-lc++']), ([], build_launcher.LIBS.split())):
         probe = tmp / 'probe.c'

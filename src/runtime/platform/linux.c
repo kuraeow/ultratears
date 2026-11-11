@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +31,7 @@
 #endif
 // The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h) for older headers: the game is built
 // against the Steam Runtime 3 sysroot's 5.10 headers and runs on newer kernels (SteamOS 3.8+). A kernel without it
-// refuses the calls at run time and the write watch is off. (As totk-pc-recomp's platform/linux.c.)
+// refuses the calls at run time and the write watch is off.
 #ifndef PAGEMAP_SCAN
 struct page_region { __u64 start, end, categories; };
 struct pm_scan_arg {
@@ -56,6 +57,11 @@ struct pm_scan_arg {
 // ---- guest address space
 static void watch_init(uint64_t lo, uint64_t hi);
 static void watch_register(uint64_t lo, uint64_t hi);
+static void fz_reset(void);
+static void fz_thaw_range(uint64_t lo, uint64_t hi, int hold);
+static void fz_never(uint64_t lo, uint64_t hi);
+static void fz_init(void);
+static int fz_fault(uint64_t fa);
 
 // Everything readable/writable from the start, like macOS: the guest maps at 4K granularity, and untouched pages
 // cost nothing (MAP_NORESERVE: the 12 GB window doesn't count against overcommit).
@@ -76,11 +82,15 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     if (mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
              -1, 0) != (void *)(uintptr_t)lo) return false;
+    fz_reset();               // the fresh mapping is writable everywhere
     watch_register(lo, hi);   // the new mapping is not registered with userfaultfd yet
     return true;
 }
 
-void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+// The whole window is backed from the start; before the kernel itself writes guest memory (file reads into a game
+// buffer, host/fs.c) the frozen regions there become writable again and stay so for a while (a write by the kernel
+// into a read-only page fails with EFAULT instead of faulting).
+void plat_commit(uint64_t addr, uint64_t size) { if (size) fz_thaw_range(addr, addr + size, 1); }
 void plat_memory_map(void) {}
 
 // A file mapped read-only, its first len bytes (0: all of it); *size: the bytes mapped. NULL: not there. (The graphics
@@ -102,7 +112,7 @@ void plat_unmap_file(const void *p, uint64_t size) { munmap((void *)p, size); }
 // userfaultfd for asynchronous write protection (the kernel lifts a page's protection on its first write, without
 // stopping anyone), and PAGEMAP_SCAN reports the pages written since their last scan and protects them again in the
 // same call. The kernel's own writes (file reads into game memory) count too; GPU writes do not, as on Windows.
-// On by default (Linux 6.7), as totk-pc-recomp's platform/linux.c does it: the memory pools are copies in Vulkan memory
+// On by default (Linux 6.7): the memory pools are copies in Vulkan memory
 // on Linux (gfx/backend_vk.c, "pool copies"), so nothing imports game memory. Imported (TOTK_POOL_IMPORT=1,
 // development) it cannot work: amdgpu re-maps imported memory for writing after every protection change, so every
 // page reads as written on every scan (4 fps in the title menu); then it is off, nvn_dirty treats pools as untracked
@@ -142,21 +152,22 @@ static void watch_init(uint64_t lo, uint64_t hi) {
     g_pagemap = pagemap;
     g_watch_lo = lo;
     g_watch_hi = hi;
+    fz_init();
     watch_register(lo, hi);
 }
 
-int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
-    if (g_pagemap < 0 || addr < g_watch_lo || addr + size > g_watch_hi || max <= 0) return -1;
+// The written pages of [at, end) into pages[n..max) (resetting them when wp); -1: the scan failed. *all: the whole
+// range was looked at (not stopped by max).
+static int scan_range(uint64_t at, uint64_t end, uint64_t *pages, int n, int max, int wp, int *all) {
     struct page_region r[64];
-    uint64_t at = addr, end = addr + size;
-    int n = 0;
+    *all = 0;
     while (at < end && n < max) {
         // max_pages: the pages past it stay unreported and unprotected, so the next call reports them
         // Written: protection lifted, on a populated page (present or swapped out) that is not the shared zero page.
         // A page never touched counts as written to the kernel and a read maps the zero page there: neither is a write,
-        // as on Windows (totk-pc-recomp's platform/linux.c plat_mem_written).
-        struct pm_scan_arg a = {.size = sizeof a, .flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC, .start = at, .end = end,
-                                .vec = (uint64_t)(uintptr_t)r, .vec_len = 64, .max_pages = (uint64_t)(max - n),
+        // as on Windows.
+        struct pm_scan_arg a = {.size = sizeof a, .flags = (wp ? PM_SCAN_WP_MATCHING : 0) | PM_SCAN_CHECK_WPASYNC, .start = at,
+                                .end = end, .vec = (uint64_t)(uintptr_t)r, .vec_len = 64, .max_pages = (uint64_t)(max - n),
                                 .category_inverted = PAGE_IS_PFNZERO, .category_mask = PAGE_IS_WRITTEN | PAGE_IS_PFNZERO,
                                 .category_anyof_mask = PAGE_IS_PRESENT | PAGE_IS_SWAPPED, .return_mask = PAGE_IS_WRITTEN};
         long k = ioctl(g_pagemap, PAGEMAP_SCAN, &a);
@@ -166,11 +177,185 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         if (a.walk_end <= at) break;
         at = a.walk_end;
     }
+    *all = at >= end || n < max;
+    return n;
+}
+
+/* Frozen regions (UltraTears, 2026-11-04). Every submission scans the pools it uses (about 1.2 GiB on the Steam Deck),
+   and most of it - meshes, textures - is never written after loading: the scans took 1.8 ms of the translation thread
+   per frame right before the submit (the Deck's log of 2026-11-04). A 2 MiB region of the window whose scans found
+   nothing written FZ_IDLE times in a row is made read-only and not scanned any more. Its pages keep their write
+   protection from the last scan, so nothing is lost: the first write faults (crash_handler -> fz_fault), the region
+   becomes writable and thawed again, the write lifts the page's protection as before, and the next scan reports it.
+   Before freezing, the whole region is checked for writes not yet reported (another pool's part of it). A region that
+   thaws again and again waits longer each time (the threshold doubles, up to FZ_MAX). The kernel's own writes would not
+   fault but fail (EFAULT), so plat_commit (called before file reads into guest memory) thaws and holds regions for
+   2 s; a region the game changes the protection of (plat_protect) is never frozen. TOTK_WATCH_FREEZE=1: on (off by default, see fz_init). */
+enum { FZ_SHIFT = 21, FZ_IDLE = 8, FZ_MAX = 240, FZ_FREEZING = 254, FZ_FROZEN = 255 };
+static _Atomic uint8_t *g_fz;          // per region: scans in a row with nothing written, or FZ_FREEZING / FZ_FROZEN
+static _Atomic uint8_t *g_fz_strikes;  // per region: thaws by a write (255: never freeze)
+static _Atomic uint64_t *g_fz_hold;    // per region: no freezing before this time (ns)
+static uint64_t g_fz_n;
+static int g_fz_on;
+static _Atomic uint64_t g_fz_frozen_now, g_fz_thaws, g_fz_skipped;
+
+static void fz_init(void) {
+    // [temporary] off by default (=1: on): on the Steam Deck (2026-11-04) the main thread's write into a thawed region
+    // faulted again and again (signal 11 at the title menu, 584 MiB frozen) - not understood yet
+    const char *e = getenv("TOTK_WATCH_FREEZE");
+    if (!(e && !strcmp(e, "1"))) return;
+    g_fz_n = (g_watch_hi - g_watch_lo + (1ull << FZ_SHIFT) - 1) >> FZ_SHIFT;
+    g_fz = calloc(g_fz_n, 1);
+    g_fz_strikes = calloc(g_fz_n, 1);
+    g_fz_hold = calloc(g_fz_n, sizeof *g_fz_hold);
+    g_fz_on = g_fz && g_fz_strikes && g_fz_hold && !(g_watch_lo & ((1ull << FZ_SHIFT) - 1));
+}
+static void fz_reset(void) {
+    if (!g_fz_on) return;
+    for (uint64_t i = 0; i < g_fz_n; i++) atomic_store(&g_fz[i], 0);
+    atomic_store(&g_fz_frozen_now, 0);
+}
+static uint64_t fz_lo(uint64_t i) { return g_watch_lo + (i << FZ_SHIFT); }
+static uint64_t fz_hi(uint64_t i) { uint64_t h = fz_lo(i) + (1ull << FZ_SHIFT); return h < g_watch_hi ? h : g_watch_hi; }
+// Region i writable again (from a fault or before a host write); 1 if it was frozen or freezing.
+static int fz_thaw(uint64_t i) {
+    uint8_t s = atomic_load(&g_fz[i]);
+    if (s < FZ_FREEZING) return 0;
+    if (!atomic_compare_exchange_strong(&g_fz[i], &s, 0)) return 1;   // another thread thawed it
+    mprotect((void *)(uintptr_t)fz_lo(i), fz_hi(i) - fz_lo(i), PROT_READ | PROT_WRITE);
+    if (s == FZ_FROZEN) atomic_fetch_sub(&g_fz_frozen_now, 1);
+    return 1;
+}
+static volatile int g_fz_diag_rc, g_fz_diag_b;   // fz_report: the last unfrozen fault's mprotect errno, how many
+// SIGSEGV at fa (crash_handler, any thread): a write into a frozen region. Async-signal-safe (atomics, mprotect).
+static int fz_fault(uint64_t fa) {
+    if (!g_fz_on || fa < g_watch_lo || fa >= g_watch_hi) return 0;
+    uint64_t i = (fa - g_watch_lo) >> FZ_SHIFT;
+    if (!fz_thaw(i)) {
+        // Not frozen: a freeze that a thaw overtook may have left it read-only for a moment (fz_idle puts that right
+        // too). Writable again, once per address in a row (a fault that writability does not cure is a real one), and
+        // never where the game set the protection itself.
+        static __thread uint64_t last;
+        if (atomic_load(&g_fz_strikes[i]) == 255 || last == fa) { last = 0; return 0; }
+        last = fa;
+        g_fz_diag_rc = mprotect((void *)(uintptr_t)fz_lo(i), fz_hi(i) - fz_lo(i), PROT_READ | PROT_WRITE) ? errno : 0;
+        g_fz_diag_b++;
+        return 1;
+    }
+    uint8_t k = atomic_load(&g_fz_strikes[i]);
+    if (k < 254) atomic_store(&g_fz_strikes[i], k + 1);
+    atomic_fetch_add(&g_fz_thaws, 1);
+    return 1;
+}
+// A fault in the guest window that fz_fault did not cure (crash_handler, the process ends after it): what the frozen
+// regions knew of it and the kernel's mapping there, for the log (the Steam Deck's signal 11 of 2026-11-04).
+#include <sys/utsname.h>
+static void fz_report(uint64_t fa, int code, long err) {
+    if (!g_fz_on || fa < g_watch_lo || fa >= g_watch_hi) return;
+    uint64_t i = (fa - g_watch_lo) >> FZ_SHIFT;
+    struct utsname u;
+    if (uname(&u)) u.release[0] = 0;
+    fprintf(stderr, "[fz] fault %#llx (si_code %d, error %#lx): region %llu state %u strikes %u hold %s; unfrozen faults %d, "
+                    "last mprotect errno %d; frozen %llu MiB, thaws %llu; kernel %s\n",
+            (unsigned long long)fa, code, err, (unsigned long long)i, (unsigned)atomic_load(&g_fz[i]),
+            (unsigned)atomic_load(&g_fz_strikes[i]), atomic_load(&g_fz_hold[i]) > plat_now_ns() ? "on" : "off", g_fz_diag_b,
+            g_fz_diag_rc, (unsigned long long)atomic_load(&g_fz_frozen_now) * 2, (unsigned long long)atomic_load(&g_fz_thaws),
+            u.release);
+    FILE *m = fopen("/proc/self/maps", "r");   // the mappings around it
+    char line[512];
+    while (m && fgets(line, sizeof line, m)) {
+        unsigned long long lo, hi;
+        if (sscanf(line, "%llx-%llx", &lo, &hi) == 2 && hi > fz_lo(i) - (4ull << 20) && lo < fz_hi(i) + (4ull << 20))
+            fprintf(stderr, "[fz]   %s", line);
+    }
+    if (m) fclose(m);
+}
+static void fz_thaw_range(uint64_t lo, uint64_t hi, int hold) {
+    if (!g_fz_on || hi <= g_watch_lo || lo >= g_watch_hi) return;
+    if (lo < g_watch_lo) lo = g_watch_lo;
+    if (hi > g_watch_hi) hi = g_watch_hi;
+    uint64_t until = hold ? plat_now_ns() + 2000000000ull : 0;
+    for (uint64_t i = (lo - g_watch_lo) >> FZ_SHIFT; i <= (hi - 1 - g_watch_lo) >> FZ_SHIFT; i++) {
+        if (hold && atomic_load(&g_fz_hold[i]) < until) atomic_store(&g_fz_hold[i], until);
+        fz_thaw(i);
+    }
+}
+static void fz_never(uint64_t lo, uint64_t hi) {
+    if (!g_fz_on || hi <= g_watch_lo || lo >= g_watch_hi) return;
+    if (lo < g_watch_lo) lo = g_watch_lo;
+    if (hi > g_watch_hi) hi = g_watch_hi;
+    for (uint64_t i = (lo - g_watch_lo) >> FZ_SHIFT; i <= (hi - 1 - g_watch_lo) >> FZ_SHIFT; i++) atomic_store(&g_fz_strikes[i], 255);
+    fz_thaw_range(lo, hi, 0);
+}
+// Region i was scanned in part with nothing written: one more idle scan; at the threshold, frozen.
+static void fz_idle(uint64_t i) {
+    uint8_t s = atomic_load(&g_fz[i]), k = atomic_load(&g_fz_strikes[i]);
+    if (s >= FZ_FREEZING || k == 255) return;
+    unsigned need = k >= 5 ? FZ_MAX : (unsigned)FZ_IDLE << k;
+    if (need > FZ_MAX) need = FZ_MAX;
+    if (s + 1u < need) { atomic_compare_exchange_strong(&g_fz[i], &s, s + 1); return; }
+    if (atomic_load(&g_fz_hold[i]) > plat_now_ns()) return;
+    if (!atomic_compare_exchange_strong(&g_fz[i], &s, FZ_FREEZING)) return;   // one thread freezes it
+    uint64_t lo = fz_lo(i), hi = fz_hi(i);
+    if (mprotect((void *)(uintptr_t)lo, hi - lo, PROT_READ)) { uint8_t f = FZ_FREEZING; atomic_compare_exchange_strong(&g_fz[i], &f, 0); return; }
+    if (atomic_load(&g_fz[i]) != FZ_FREEZING) {   // thawed meanwhile (a host write coming): its protection after ours undone
+        mprotect((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE);
+        return;
+    }
+    // writes before the protection that no scan has reported yet (the region's other pools): not frozen
+    uint64_t one;
+    int all, w = scan_range(lo, hi, &one, 0, 1, 0, &all);
+    uint8_t f = FZ_FREEZING;
+    if (w != 0) {
+        if (atomic_compare_exchange_strong(&g_fz[i], &f, 0)) mprotect((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE);
+        return;
+    }
+    if (atomic_compare_exchange_strong(&g_fz[i], &f, FZ_FROZEN)) atomic_fetch_add(&g_fz_frozen_now, 1);
+}
+void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *skipped_mib) {
+    *frozen_mib = atomic_load(&g_fz_frozen_now) * 2;
+    *thaws = atomic_load(&g_fz_thaws);
+    *skipped_mib = atomic_load(&g_fz_skipped) >> 20;
+}
+
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    if (g_pagemap < 0 || addr < g_watch_lo || addr + size > g_watch_hi || max <= 0) return -1;
     *page = 4096;
+    uint64_t at = addr, end = addr + size;
+    int n = 0, all;
+    if (!g_fz_on) return scan_range(at, end, pages, 0, max, 1, &all);
+    while (at < end && n < max) {   // frozen regions are skipped; each run of the others is one scan
+        uint64_t i = (at - g_watch_lo) >> FZ_SHIFT, j = i, e;
+        if (atomic_load(&g_fz[i]) == FZ_FROZEN) {
+            e = fz_hi(i) < end ? fz_hi(i) : end;
+            atomic_fetch_add(&g_fz_skipped, e - at);
+            at = e;
+            continue;
+        }
+        while (fz_hi(j) < end && atomic_load(&g_fz[j + 1]) != FZ_FROZEN) j++;
+        e = fz_hi(j) < end ? fz_hi(j) : end;
+        int k = scan_range(at, e, pages, n, max, 1, &all);
+        if (k < 0) return -1;
+        // the run's regions: written ones start counting again, the others had one more idle scan (only where the scan
+        // looked at all of it: past max the rest is unknown)
+        int p = n;
+        for (uint64_t r = i; r <= j; r++) {
+            uint64_t rh = fz_hi(r);
+            int written = 0;
+            while (p < k && pages[p] < rh) written = 1, p++;
+            if (!all && (p == k || rh > pages[k - 1])) break;
+            if (written) { uint8_t s = atomic_load(&g_fz[r]); if (s < FZ_FREEZING) atomic_compare_exchange_strong(&g_fz[r], &s, 0); }
+            else fz_idle(r);
+        }
+        n = k;
+        if (!all) break;
+        at = e;
+    }
     return n;
 }
 
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
+    fz_never(addr, addr + size);   // the game's own protection: never frozen (a thaw would make it writable)
     int p = prot == PLAT_PROT_NONE ? PROT_NONE : prot == PLAT_PROT_READ ? PROT_READ : PROT_READ | PROT_WRITE;
     return mprotect((void *)(uintptr_t)addr, size, p);
 }
@@ -190,6 +375,14 @@ void plat_sleep_until_ns(uint64_t t) {
 // Real-time scheduling where the user may have it (rtkit / limits.conf), else just a higher priority: keeps the
 // vsync thread on time while the guest threads load every core.
 void plat_thread_boost(void) {}   // [temporary] Linux / Steam Deck: nice / SCHED_* for the replay thread - with the Deck port
+void plat_thread_background(void) { setpriority(PRIO_PROCESS, (id_t)gettid(), 10); }   // (per thread on Linux)
+void plat_thread_nice(int n) { if (n > 0) setpriority(PRIO_PROCESS, (id_t)gettid(), n > 19 ? 19 : n); }
+// (a page the game protected - SetMemoryPermission - fails the copy instead of faulting)
+#include <sys/uio.h>
+int plat_safe_read(void *dst, const void *src, size_t n) {
+    struct iovec l = {dst, n}, r = {(void *)src, n};
+    return process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)n;
+}
 
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;
@@ -262,7 +455,7 @@ void plat_init(void) {
     require_cpu();
     // The timer slack (how late the kernel may wake a sleeping thread to batch wakeups, 50 us by default) down to 1 us:
     // the frame pacing sleeps to a deadline (plat_sleep_until_ns), as Windows' 1 ms timer resolution does. Threads
-    // started afterwards inherit it. (As totk-pc-recomp's platform/linux.c plat_timer_1ms, MIT.)
+    // started afterwards inherit it.
     prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0);
 }
 
@@ -356,6 +549,12 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP], sp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP], lr = 0;
     if (sig != SIGSEGV || (fa & ~0xFFFull) != (sp & ~0xFFFull)) lr = *(uint64_t *)(uintptr_t)sp;
 #endif
+    if (sig == SIGSEGV && fz_fault(fa)) return;   // a write into a frozen region of the write watch
+#if defined(__x86_64__)
+    if (sig == SIGSEGV) fz_report(fa, si->si_code, (long)uc->uc_mcontext.gregs[REG_ERR]);
+#else
+    if (sig == SIGSEGV) fz_report(fa, si->si_code, 0);
+#endif
     if (rt_fault_watch(fa, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
@@ -368,7 +567,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
 // A signal stack for the calling thread (a signal stack is per thread), so the fault and crash handlers still run when
 // its own stack is exhausted. Never freed: threads that end are few, and a stack freed while a handler might run on it
-// would be worse. (As totk-pc-recomp's platform/linux.c alt_stack, MIT.)
+// would be worse.
 void plat_thread_start(void) {
     stack_t cur;
     if (!sigaltstack(NULL, &cur) && !(cur.ss_flags & SS_DISABLE)) return;

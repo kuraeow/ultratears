@@ -18,6 +18,7 @@
 #include "vkb_audit.h"
 #include "vkb_lock.h"
 #include "nvn/nvn_dirty.h"
+#include "../runtime/bufcat.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -46,13 +47,16 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 // play the rings grow at every burst of texture uploads and gave the memory back seconds later, so each burst made
 // chunks again - vkAllocateMemory of tens of MiB of mapped device memory, up to ~100 ms in one submission (2026-11-03,
 // the user's play log: hitches of 60-370 ms while moving). Out of memory (vkb_ring_reclaim) frees them too.
-enum { SPARE_MAX = 256u << 20, NSPARE = 64 };
+// 128 MiB: without resizable BAR the rings are system memory, and 256 left a PC 0.2 GiB closer to its commit limit
+// (2026-11-04: out of memory after 10 min; rings 340-400 MiB with the spares).
+enum { SPARE_MAX = 128u << 20, NSPARE = 64 };
 static chunk_t g_spare[NSPARE];
 static int g_nspare;
 static VkDeviceSize g_spare_bytes;
 static pthread_mutex_t g_spare_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_ring_reused;
 static void chunk_destroy(chunk_t *c);
+static __thread int t_reserving;   // vkb_ring_reserve's thread making chunks ahead
 static int spare_take(chunk_t *c, VkDeviceSize size) {   // the smallest spare chunk of at least size
     pthread_mutex_lock(&g_spare_mu);
     int best = -1;
@@ -69,7 +73,7 @@ static int spare_take(chunk_t *c, VkDeviceSize size) {   // the smallest spare c
     return best >= 0;
 }
 static int chunk_new(chunk_t *c, VkDeviceSize size) {
-    if (spare_take(c, size)) return 1;
+    if (!t_reserving && spare_take(c, size)) return 1;
     uint64_t t0 = runtime_now_ns();
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -94,8 +98,49 @@ static int chunk_new(chunk_t *c, VkDeviceSize size) {
     uint64_t now = atomic_fetch_add(&g_ring_bytes, size) + size, p = atomic_load(&g_ring_peak);
     while (now > p && !atomic_compare_exchange_weak(&g_ring_peak, &p, now)) {}
     atomic_fetch_add(&g_ring_made, 1);
-    vkb_step_add(PK_ALLOC, t0);
+    if (!t_reserving) vkb_step_add(PK_ALLOC, t0);   // (made ahead: no submission waited for it)
     return 1;
+}
+// Upload memory made ahead, off the recording threads (vkb_tex.c's prefetch thread, when textures were initialized that
+// will be uploaded soon): a burst of uploads - a place streaming in, a respawn - grew the rings by hundreds of MiB in one
+// submission, made by the driver there (memory made 24-200 ms in one submission, 2026-11-04). Chunks of RING_MAX up to
+// `bytes` (at most RESERVE_MAX) wait among the spares; past SPARE_MAX they go back RESERVE_HOLD after the last reserve.
+enum { RESERVE_MAX = 256u << 20 };
+#define RESERVE_HOLD 5000000000ull
+static _Atomic uint64_t g_reserve_at, g_reserved;
+uint64_t vkb_ring_reserved(void) { return atomic_load(&g_reserved); }   // chunks made ahead (the log)
+void vkb_ring_reserve(uint64_t bytes) {
+    if (bytes > RESERVE_MAX) bytes = RESERVE_MAX;
+    atomic_store(&g_reserve_at, runtime_now_ns());
+    for (;;) {
+        pthread_mutex_lock(&g_spare_mu);
+        int room = g_spare_bytes < bytes && g_nspare < NSPARE;
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!room) return;
+        chunk_t c;
+        t_reserving = 1;
+        int made = chunk_new(&c, RING_MAX);
+        t_reserving = 0;
+        if (!made) return;
+        pthread_mutex_lock(&g_spare_mu);
+        int kept = g_nspare < NSPARE;
+        if (kept) { g_spare[g_nspare++] = c; g_spare_bytes += c.size; }
+        pthread_mutex_unlock(&g_spare_mu);
+        if (!kept) { chunk_destroy(&c); return; }
+        atomic_fetch_add(&g_reserved, 1);
+    }
+}
+static void spare_expire(void) {   // the reserve's extra spares, a while after the last reserve
+    if (runtime_now_ns() - atomic_load(&g_reserve_at) < RESERVE_HOLD) return;
+    pthread_mutex_lock(&g_spare_mu);
+    while (g_spare_bytes > SPARE_MAX && g_nspare) {
+        chunk_t c = g_spare[--g_nspare];
+        g_spare_bytes -= c.size;
+        pthread_mutex_unlock(&g_spare_mu);
+        chunk_destroy(&c);
+        pthread_mutex_lock(&g_spare_mu);
+    }
+    pthread_mutex_unlock(&g_spare_mu);
 }
 static void chunk_free(chunk_t *c) {   // no submission uses it (its slot's last one is done): to the spares if they have room
     pthread_mutex_lock(&g_spare_mu);
@@ -153,6 +198,8 @@ void vkb_slot_reset(int slot) {   // the slot's previous submission has complete
     pthread_mutex_lock(&g_ring_mu);
     for (int w = 0; w < VKB_MAXREC; w++) ring_trim(&g_res[slot][w]);
     pthread_mutex_unlock(&g_ring_mu);
+    spare_expire();
+    { void vkb_mem_ready_kick(void); vkb_mem_ready_kick(); }   // TOTK_VK_MEM_READY: memory made ahead for this submission's kind
     for (int w = 0; w < VKB_MAXREC; w++) {
         slot_res *r = &g_res[slot][w];
         for (int i = 0; i < r->n; i++) r->c[i].used = 0;
@@ -429,8 +476,7 @@ static VkSamplerAddressMode wrap(uint8_t w) {
 }
 // point: the sampler with nearest filtering and no anisotropy. A depth texture read without a compare lands on one
 // texel on the Switch whatever the sampler's filter, and TOTK binds linear samplers to depth it reads as data:
-// blending neighbouring depths put reconstructed positions in mid-air at object edges (MacNativeGames 6283599,
-// totk-pc-recomp 6029719, both MIT). TOTK_VK_DEPTH_POINT=0: the sampler as the game sets it.
+// blending neighbouring depths put reconstructed positions in mid-air at object edges (MacNativeGames 6283599, MIT). TOTK_VK_DEPTH_POINT=0: the sampler as the game sets it.
 static VkSampler sampler_of(int id, int point) {
     static VkSampler fallback;   // made before threads record (vkb_draw_mt_init)
     vkb_rw_read(&g_reg_mu, LK_TEXREG);
@@ -486,7 +532,8 @@ static VkSampler sampler_of(int id, int point) {
         .minFilter = p->minf == 1 || p->minf == 3 || p->minf == 5 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .mipmapMode = p->minf == 4 || p->minf == 5 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = wrap(p->ws), .addressModeV = wrap(p->wt), .addressModeW = wrap(p->wr),
-        .mipLodBias = p->lod_bias, .anisotropyEnable = p->aniso > 1.0f, .maxAnisotropy = p->aniso > 16.0f ? 16.0f : p->aniso,
+        .mipLodBias = p->lod_bias + (mip ? vkb_tsr_lod_bias() : 0.0f),   // a lower scene size under FSR 3.1: sharper mips
+        .anisotropyEnable = p->aniso > 1.0f, .maxAnisotropy = p->aniso > 16.0f ? 16.0f : p->aniso,
         .compareEnable = p->cmp_mode == 1, .compareOp = (VkCompareOp)(p->cmp_func ? p->cmp_func - 1 : 7),
         .minLod = p->lod_min, .maxLod = mip ? p->lod_max : 0.25f,   // no mipmap filter: the base level only (GL)
         .borderColor = border};
@@ -673,6 +720,7 @@ static void fb_copies(void) {   // outside a pass: the sampled targets copied (n
 static VkBuffer g_zero;   // 64 KiB of zeros for unbound buffers
 static __thread const char *g_akey;   // the shader whose bindings are written (audit)
 static VkBuffer g_support;
+enum { ATTR_CONST_OFF = 65536 - 16 };   // in g_support: the value of a disabled vertex attribute
 static void fixed_buffers(void) {
     if (g_zero) return;
     // Ryujinx SupportBuffer: alpha test off, no BGRA swaps, render scale 1 (73 entries from byte 192), 1392 bytes
@@ -694,6 +742,8 @@ static void fixed_buffers(void) {
         vk.vkMapMemory(vkc.device, m, 0, VK_WHOLE_SIZE, 0, (void **)&p);
         memset(p, 0, 65536);
         if (k) for (int i = 0; i < 73; i++) { float one = 1.0f; memcpy(p + 192 + 16 * i, &one, 4); }
+        if (k) { float one = 1.0f; memcpy(p + ATTR_CONST_OFF + 12, &one, 4); }
+        if (k) { uint32_t probe[4] = {3, 0, 0, 0x3f800000}; memcpy(p + ATTR_CONST_OFF - 16, probe, 16); }   // TOTK_VK_ATTR_CONST=2: x = bits 3 (a bone past a one-bone palette)   // (0, 0, 0, 1): disabled vertex attributes
     }
 }
 
@@ -895,6 +945,9 @@ static VkDescriptorBufferInfo driver_bank(int bank, int stage) {
                 memcpy(p + 0x210 + 16 * r, &S.ubo[5][r].addr, 8);
                 memcpy(p + 0x210 + 16 * r + 8, &n, 4);
             }
+        // Graphics: the largest point size at 0x610 (Maxwell's limit; GLSLC clamps gl_PointSize to it). Zero made every
+        // point empty: TotK stamps cut and burnt grass into its 512x512 grass map as points, so cut grass stood.
+        if (stage != 5) { const float max_point = 2047.0f; memcpy(p + 0x610, &max_point, 4); }
     } else {
         for (int r = 0; r < 32; r++) memcpy(p + 0x20 + 8 * r, &S.tex[stage][r], 8);
         for (int r = 0; r < 8; r++) memcpy(p + 0x120 + 8 * r, &S.img[stage][r], 8);
@@ -1109,7 +1162,7 @@ static void mirrors_prepare_fixed(int indexed, const p_draw_idx *di) {
 // there is undefined; NVIDIA compares it. Such an image gets a depth twin of the same size and bits (R32_SFLOAT ->
 // D32_SFLOAT, R16_UNORM -> D16_UNORM), copied through upload memory right before the dispatch that samples it (outside
 // any pass: vkb_dispatch ended it), and the dispatch samples the twin. Draws keep the colour image (no copy inside their
-// pass). As totk-pc-recomp 3b5469a (MIT), after Savage Wind Recomp's depth twins (MIT); the code is ours.
+// pass). After Savage Wind Recomp's depth twins (MIT); the code is ours.
 // [temporary] Suspected for the flickering fog on AMD (GitHub #38, #40; white fog in the open world on the Deck), not
 // confirmed. TOTK_DEPTH_TWIN=0: off; =2: also where the driver compares (to try the path on NVIDIA).
 enum { TWINS = 16 };
@@ -1235,6 +1288,7 @@ static VkImageView twin_view(VkCommandBuffer cb, vkb_image *im, VkImageViewType 
     return view;
 }
 
+static __thread const VkDescriptorBufferInfo *t_cb_override;   // obj_motion_draw: last frame's blocks for these slots
 static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, int stage) {
     uint32_t base = stage == 1 ? VKB_STAGE_BINDINGS : 0;
     VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment, sa = vkc.props.limits.minStorageBufferOffsetAlignment;
@@ -1243,7 +1297,8 @@ static void write_stage(writes_t *W, VkDescriptorSet set, const vkb_shader *sh, 
     for (int slot = 0; slot < VKB_NCBUF; slot++) {
         if (!(sh->cbuf_mask & (1u << slot))) continue;
         VkDescriptorBufferInfo info;
-        if (slot == 1) {   // the shader's own constants: one copy per command buffer (they never change)
+        if (t_cb_override && t_cb_override[slot].buffer) info = t_cb_override[slot];
+        else if (slot == 1) {   // the shader's own constants: one copy per command buffer (they never change)
             uint32_t n = sh->c1_size ? (sh->c1_size + 15) & ~15u : 16;
             c1_t *c = &B->c1[((uintptr_t)sh * 0x9E3779B97F4A7C15ull) >> 54];
             if (c->sh != sh || c->rec != g_sub || no_cache()) {
@@ -1496,15 +1551,21 @@ static int dyn(int k, const void *v, size_t n) {   // 1: record it (changed sinc
 static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, VkPrimitiveTopology topo) {
     // Nothing changed since the last draw of this command buffer: its ~45 values are recorded already. Not while the
     // depth audit or TOTK_VK_DEPTH_ALWAYS look at each draw.
-    static __thread struct { uint64_t rec; uint32_t gen; int ncolor; VkExtent2D ext; VkPrimitiveTopology topo; } last;
+    static __thread struct { uint64_t rec; uint32_t gen; int ncolor, oslot, neg1; VkExtent2D ext; VkPrimitiveTopology topo; float jx, jy; } last;
+    int oslot = vkb_pass_obj_slot();   // the temporal upscaler's object motion target (vkb_tsr.c)
+    int neg1 = S.sh[0] && S.sh[0]->neg1;   // TOTK_VK_DEPTH_CLIP_NEG1: this vertex shader's z = (z + w) / 2 was taken out
     static int per_draw = -1;
     if (per_draw < 0) per_draw = getenv("TOTK_VK_DEPTH_ALWAYS") != NULL || getenv("TOTK_VK_DYN_EVERY") != NULL;
+    float jx = 0, jy = 0;   // the temporal upscaler's jitter of the scene's draws (vkb_tsr.c)
+    vkb_tsr_jitter(vkb_rt(), &jx, &jy);
     if (!per_draw && !no_cache() && !vkb_depth_audit_on() && last.rec == g_rec && B->dc.rec == g_rec && last.gen == t_sgen &&
-        last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo) {
+        last.ncolor == ncolor && last.ext.width == ext.width && last.ext.height == ext.height && last.topo == topo &&
+        last.jx == jx && last.jy == jy && last.oslot == oslot && last.neg1 == neg1) {
         vkb_cnt_add(g_dyn_skips, 1);
         return;
     }
-    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo;
+    last.rec = g_rec; last.gen = t_sgen; last.ncolor = ncolor; last.ext = ext; last.topo = topo; last.jx = jx; last.jy = jy; last.oslot = oslot;
+    last.neg1 = neg1;
     // viewports (TOTK uses the upper-left window origin, as Vulkan) and the depth range
     VkViewport vps[16];
     int nvp = S.nvp ? S.nvp : 1;
@@ -1514,6 +1575,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
         if (S.has_dr) { vps[i].minDepth = S.dr[0]; vps[i].maxDepth = S.dr[1]; }
         if (vps[i].width <= 0) vps[i].width = 1;
         if (vps[i].height == 0) vps[i].height = 1;
+        vps[i].x += jx, vps[i].y += jy;
         // The translator writes clip space with y up (GL / Metal, MacNativeGames' target); Vulkan's points down.
         // A negative-height viewport flips it back (core since Vulkan 1.1), so the shaders stay as translated.
         vps[i].y += vps[i].height;
@@ -1542,7 +1604,8 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
     DYN(D_LINEW, float, 1.0f, vk.vkCmdSetLineWidth(cb, v_));
     DYN(D_CLAMP, VkBool32, S.depth_clamp != 0, vk.vkCmdSetDepthClampEnableEXT(cb, v_));
     DYN(D_CLIP, VkBool32, !S.depth_clamp, vk.vkCmdSetDepthClipEnableEXT(cb, v_));
-    DYN(D_CLIPNEG, VkBool32, VK_FALSE, vk.vkCmdSetDepthClipNegativeOneToOneEXT(cb, v_));   // the translator converts z = (z + w) / 2
+    // the translator converts z = (z + w) / 2; TOTK_VK_DEPTH_CLIP_NEG1 takes that out and maps -1..1 here (vkb_shader.c)
+    DYN(D_CLIPNEG, VkBool32, neg1 ? VK_TRUE : VK_FALSE, vk.vkCmdSetDepthClipNegativeOneToOneEXT(cb, v_));
     DYN(D_PROVOKE, VkProvokingVertexModeEXT, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, vk.vkCmdSetProvokingVertexModeEXT(cb, v_));
     // multisample
     DYN(D_SAMPLES, VkSampleCountFlagBits, VK_SAMPLE_COUNT_1_BIT, vk.vkCmdSetRasterizationSamplesEXT(cb, v_));   // [temporary] single-sampled targets
@@ -1576,7 +1639,9 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
         DYN(D_SWM0 + f, uint32_t, S.stencil[f].write_mask, vk.vkCmdSetStencilWriteMask(cb, face, v_));
         DYN(D_SREF0 + f, uint32_t, S.stencil[f].ref, vk.vkCmdSetStencilReference(cb, face, v_));
     }
-    // colour: blend per target, write masks, logic op
+    // colour: blend per target, write masks, logic op; the temporal upscaler's object motion target (vkb_tsr.c), at a
+    // slot the game leaves free in the pass, is not written by the game's draws
+    if (oslot >= ncolor) ncolor = oslot + 1;
     if (ncolor > 0) {
         VkBool32 en[8];
         VkColorBlendEquationEXT eq[8];
@@ -1590,6 +1655,7 @@ static void set_dynamic_state(VkCommandBuffer cb, int ncolor, VkExtent2D ext, Vk
                                             blend_factor(b->src_a), blend_factor(b->dst_a), blend_op(b->eq_a)}
                 : (VkColorBlendEquationEXT){VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
             wm[i] = (S.chmask.mask >> (4 * i)) & 0xF;
+            if (i == oslot) en[i] = VK_FALSE, wm[i] = 0;
         }
         if (dyn(D_BLEN, en, sizeof en[0] * (size_t)ncolor)) vk.vkCmdSetColorBlendEnableEXT(cb, 0, (uint32_t)ncolor, en);
         if (dyn(D_BEQ, eq, sizeof eq[0] * (size_t)ncolor)) vk.vkCmdSetColorBlendEquationEXT(cb, 0, (uint32_t)ncolor, eq);
@@ -1730,6 +1796,28 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
         attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = (uint32_t)i,
                                                              .binding = a.stream, .format = f, .offset = a.offset};
         used |= 1u << a.stream;
+    }
+    // An input the vertex shader reads that the game left disabled: the Switch's GPU gives (0, 0, 0, 1), as Eden does
+    // (EmitGetAttribute). Without an attribute Vulkan leaves it undefined; NVIDIA gave leftovers, so a disabled bone
+    // index of TOTK's rigid skinning (vs da777def3340, in_attr6) picked random bones and the mesh tore into a flapping
+    // sheet in some loads (L28). The constant: 16 bytes of g_support, stride 0, on a free binding.
+    static int attr_const = -1;
+    if (attr_const < 0) { const char *e = getenv("TOTK_VK_ATTR_CONST"); attr_const = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    uint32_t have = 0;
+    for (uint32_t i = 0; i < na; i++) have |= 1u << attr[i].location;
+    uint32_t miss = attr_const && S.sh[0] ? S.sh[0]->in_mask & ~have & 0xFFFFu : 0;
+    int cslot = -1;
+    for (int s = 15; miss && s >= 0 && cslot < 0; s--)
+        if (!(used >> s & 1)) cslot = s;
+    if (cslot >= 0) {
+        for (uint32_t l = 0; l < 16; l++)
+            if (miss >> l & 1)
+                attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = l,
+                                                                     .binding = (uint32_t)cslot, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0};
+        bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = (uint32_t)cslot,
+            .stride = 0, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
+        VkDeviceSize off = attr_const == 2 ? ATTR_CONST_OFF - 16 : ATTR_CONST_OFF, size = 16, stride = 0, key[4] = {(VkDeviceSize)(uintptr_t)g_support, off, 16, 0};
+        if (dyn(D_VB0 + cslot, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, (uint32_t)cslot, 1, &g_support, &off, &size, &stride);
     }
     for (uint32_t s = 0; s < 16; s++) {
         if (!(used & (1u << s))) continue;
@@ -1882,6 +1970,7 @@ static int draw_trace(void) {
     }
     return g_trace_at > 0 && vkb_frame() >= (uint64_t)g_trace_at && g_trace_left-- > 0;
 }
+int vkb_draw_tracing(void) { return g_trace_at > 0 && vkb_frame() >= (uint64_t)g_trace_at && g_trace_left > 0; }   // without using one up
 // ---------------- GPU profile (development) ----------------
 // TOTK_GPU_PROF=<present>: a timestamp before and after every draw and dispatch of that frame; the next present prints
 // the GPU time per shader (sorted) and the frame's span. Timestamps inside a pass overlap with neighbouring draws, so
@@ -1967,13 +2056,13 @@ static void trace_resources(const vkb_shader *sh, int stage) {
         vkb_rw_read(&g_reg_mu, LK_TEXREG);
         if (sid < g_nsreg && g_sreg[sid].valid) {
             const samp_par *sp = &g_sreg[sid].p;
-            if (sp->cmp_mode) n += snprintf(line + n, sizeof line - n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
+            if (sp->cmp_mode) n = bufcat(line, sizeof line, n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
             if (getenv("TOTK_VK_TRACE_SAMPLERS"))   // NVN values: wrap 0 clamp .. 7 clamp to edge, filters 0 nearest 1 linear
-                n += snprintf(line + n, sizeof line - n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
+                n = bufcat(line, sizeof line, n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
                               sp->wr, sp->minf, sp->magf, sp->border[0], sp->border[1], sp->border[2], sp->border[3]);
         }
         vkb_rw_read_end(&g_reg_mu);
-        if (sh->tex[i].type & 0x400) n += snprintf(line + n, sizeof line - n, "(shadow)");   // Ryujinx SamplerType.Shadow
+        if (sh->tex[i].type & 0x400) n = bufcat(line, sizeof line, n, "(shadow)");   // Ryujinx SamplerType.Shadow
     }
     for (int i = 0; i < sh->nimg && n < 900; i++) {
         const view_t *v = NULL;
@@ -1983,12 +2072,12 @@ static void trace_resources(const vkb_shader *sh, int stage) {
     }
     for (int slot = 3; slot < VKB_NCBUF && n < 900; slot++)
         if (sh->cbuf_mask & (1u << slot))
-            n += snprintf(line + n, sizeof line - n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
+            n = bufcat(line, sizeof line, n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
                           (unsigned long long)S.ubo[stage][slot - 3].size);
     for (int i = 0; i < sh->nsbuf && n < 900; i++) {
         uint8_t slot = sh->sbuf[i].slot;
         const p_bind_buf *b = slot == 0xFF ? NULL : sh->sbuf[i].kind == VKB_SB_TABLE ? &S.ssbo[stage][slot] : &S.ubo[stage][slot];
-        n += snprintf(line + n, sizeof line - n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
+        n = bufcat(line, sizeof line, n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
                       b ? (unsigned long long)b->addr : 0ull, b ? (unsigned long long)b->size : 0ull);
     }
     VLOG("%s", line);
@@ -2006,6 +2095,159 @@ static void trace_resources(const vkb_shader *sh, int stage) {
             }
         }
     }
+}
+
+// TOTK_BONES=<vertex shader key prefix>:<cbuf slot>:<bytes>:<bone>:<present> (development, L28): at the first draw with
+// that vertex shader and a uniform buffer of that size in that slot from that present on, that bone (a 3x4 matrix at
+// vec4 3*bone) goes to host/watch.c: where it lives in game memory, and which code writes it.
+void runtime_bones_probe(const float *m12, uint64_t skip_lo, uint64_t skip_hi, uint64_t copy);
+// TOTK_BONES_SPREAD=<vs key prefix>:<present> (development, L28): every draw of that vertex shader in that present logs
+// its first two bones (c5, 3x4 each, in view space) in world space and their distance (a mesh stretched between bones).
+static void bones_spread(void) {
+    static const char *e;
+    static int init;
+    static long long at;
+    static size_t kl;
+    if (!init) {
+        init = 1;
+        e = getenv("TOTK_BONES_SPREAD");
+        const char *c = e ? strchr(e, ':') : NULL;
+        if (c) { kl = (size_t)(c - e); at = atoll(c + 1); }
+    }
+    if (!kl || vkb_frame() < (uint64_t)at || vkb_frame() > (uint64_t)at + 2 || !S.sh[0] || !S.sh[0]->key || strncmp(S.sh[0]->key, e, kl)) return;
+    const p_bind_buf *u = &S.ubo[0][5 - 3], *c7 = &S.ubo[0][7 - 3];
+    if (!u->addr || u->size < 96) return;
+    float w[2][3];
+    for (int k = 0; k < 2; k++) {
+        float b[12];
+        memcpy(b, (const void *)(uintptr_t)(u->addr + 48 * (uint64_t)k), 48);
+        for (int r = 0; r < 3; r++) w[k][r] = b[4 * r + 3] + (c7->addr && c7->size >= 128 ? ((const float *)(uintptr_t)(c7->addr + 112))[r] : 0);   // the shader: bone * position + c7[7]
+    }
+    float d = sqrtf((w[0][0] - w[1][0]) * (w[0][0] - w[1][0]) + (w[0][1] - w[1][1]) * (w[0][1] - w[1][1]) + (w[0][2] - w[1][2]) * (w[0][2] - w[1][2]));
+    uint64_t h[2] = {0, 0};   // FNV-1a of streams 0 and 1 in game memory; bone index histogram (byte 6 of stream 0)
+    unsigned nb[4] = {0, 0, 0, 0};
+    for (int st = 0; st < 2; st++) {
+        uint64_t a = S.vbuf[st].address, n = S.vbuf[st].size, x = 1469598103934665603ull;
+        if (!a || n > (64u << 20)) continue;
+        for (uint64_t i = 0; i < n; i++) x = (x ^ ((const uint8_t *)(uintptr_t)a)[i]) * 1099511628211ull;
+        h[st] = x;
+        if (st == 0 && S.vstream[0].stride == 8)
+            for (uint64_t i = 6; i < n; i += 8) nb[((const uint8_t *)(uintptr_t)a)[i] > 2 ? 3 : ((const uint8_t *)(uintptr_t)a)[i]]++;
+    }
+    VLOG("[spread]   s0=%#llx+%llu hash %016llx, s1=%#llx+%llu hash %016llx; bone index 0/1/2/other: %u %u %u %u",
+         (unsigned long long)S.vbuf[0].address, (unsigned long long)S.vbuf[0].size, (unsigned long long)h[0],
+         (unsigned long long)S.vbuf[1].address, (unsigned long long)S.vbuf[1].size, (unsigned long long)h[1], nb[0], nb[1], nb[2], nb[3]);
+    VLOG("[spread] frame %llu vs %.12s c5=%#llx+%llu c7=%#llx: bone 0 %g %g %g, bone 1 %g %g %g: %g m", (unsigned long long)vkb_frame(),
+         S.sh[0]->key, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)c7->addr, w[0][0], w[0][1], w[0][2],
+         w[1][0], w[1][1], w[1][2], d);
+}
+
+static void bones_check(void) {
+    bones_spread();
+    static const char *e;
+    static int init, slot, bone, done;
+    static long long at, bytes;
+    static size_t kl;
+    if (!init) {
+        init = 1;
+        e = getenv("TOTK_BONES");
+        const char *c = e ? strchr(e, ':') : NULL;
+        if (c && sscanf(c, ":%d:%lld:%d:%lld", &slot, &bytes, &bone, &at) == 4 && slot >= 3 && slot < VKB_NCBUF) kl = (size_t)(c - e);
+    }
+    if (!kl || done || vkb_frame() < (uint64_t)at || !S.sh[0] || !S.sh[0]->key || strncmp(S.sh[0]->key, e, kl)) return;
+    const p_bind_buf *u = &S.ubo[0][slot - 3];
+    static uint64_t sizes[32];
+    static int nsizes;
+    int known = 0;
+    for (int i = 0; i < nsizes; i++) known |= sizes[i] == u->size;
+    if (!known && nsizes < 32) {
+        sizes[nsizes++] = u->size;
+        VLOG("[bones] frame %llu candidate: vs %.12s c%d=%#llx+%llu", (unsigned long long)vkb_frame(), S.sh[0]->key, slot,
+             (unsigned long long)u->addr, (unsigned long long)u->size);
+    }
+    if (!u->addr || (bytes && (long long)u->size != bytes) || (uint64_t)(bone + 1) * 48 > u->size) return;
+    done = 1;
+    float b[12], v[12], m[12];
+    memcpy(b, (const void *)(uintptr_t)(u->addr + (uint64_t)bone * 48), 48);
+    // the bone is in view space: world = inverse(view) * bone, the view being c4[0..2] (a rigid 3x4)
+    const p_bind_buf *cv = &S.ubo[0][4 - 3];
+    if (cv->addr && cv->size >= 48) {
+        memcpy(v, (const void *)(uintptr_t)cv->addr, 48);
+        for (int r = 0; r < 3; r++)
+            for (int k = 0; k < 4; k++) {
+                float s = 0;
+                for (int j = 0; j < 3; j++) s += v[4 * j + r] * (k < 3 ? b[4 * j + k] : b[4 * j + 3] - v[4 * j + 3]);
+                m[4 * r + k] = s;
+            }
+        VLOG("[bones] view %g %g %g %g | %g %g %g %g | %g %g %g %g", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+    } else memcpy(m, b, 48);
+    VLOG("[bones] frame %llu, vs %.12s c%d=%#llx+%llu bone %d: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)vkb_frame(),
+         S.sh[0]->key, slot, (unsigned long long)u->addr, (unsigned long long)u->size, bone, m[0], m[1], m[2], m[3], m[4], m[5], m[6],
+         m[7], m[8], m[9], m[10], m[11]);
+    runtime_bones_probe(m, u->addr & ~((64ull << 20) - 1), (u->addr & ~((64ull << 20) - 1)) + (64ull << 20), u->addr + (uint64_t)bone * 48);
+}
+
+// TOTK_VK_SKIPSCAN=<frame>:<frames per slot> (development, L28: which draw is a broken object on screen): over the 30
+// frames before <frame> the vertex shaders of draws with a bone palette (c5, a multiple of 48 bytes, 2+ bones) are
+// collected in order; from <frame> on, slot i (<frames per slot> frames each) does not draw shader i. With TOTK_SHOT
+// over the same frames, the shot where the object is gone names its shader (the slots are logged).
+static int skipscan(void) {
+    static const char *keys[1024];
+    static int nkeys, init, per, minb = 96, nbits;
+    static long long at;
+    static volatile int lk;
+    if (!init) {
+        const char *e = getenv("TOTK_VK_SKIPSCAN");
+        if (!e || sscanf(e, "%lld:%d:%d", &at, &per, &minb) < 2 || per < 1) at = -1;   // [:<min palette bytes>]
+        init = 1;
+    }
+    if (at < 0 || !S.sh[0] || !S.sh[0]->key) return 0;
+    long long f = (long long)vkb_frame();
+    if (f < at - 30) return 0;
+    // <min palette bytes> 0: every vertex shader, by bit planes: slot 2j skips the shaders whose index has bit j set,
+    // slot 2j+1 those with it clear (a shader is named by which slots remove the object)
+    const char *key = S.sh[0]->key;
+    int k = 0;
+    if (f < at) {
+        const p_bind_buf *u = &S.ubo[0][5 - 3];
+        static const char *only;   // TOTK_VK_SKIPSCAN_KEYS=<key prefix>,...: only these shaders
+        if (!only) { only = getenv("TOTK_VK_SKIPSCAN_KEYS"); if (!only) only = ""; }
+        if (*only) {
+            int hit = 0;
+            for (const char *q = only; *q;) {
+                size_t n = strcspn(q, ",");
+                if (n && !strncmp(key, q, n)) hit = 1;
+                q += n + (q[n] == ',');
+            }
+            if (!hit) return 0;
+        } else
+        if (minb > 0 && (!u->addr || u->size < (uint64_t)minb || u->size % 48)) return 0;
+        if (minb < 0) {   // -1: vertex shaders that read a storage buffer (the world's bone palette)
+            int rd = 0;
+            for (int i = 0; i < S.sh[0]->nsbuf; i++) rd |= S.sh[0]->sbuf[i].read;
+            if (!rd) return 0;
+        }
+        while (__atomic_exchange_n(&lk, 1, __ATOMIC_ACQUIRE)) {}
+        while (k < nkeys && keys[k] != key) k++;
+        if (k == nkeys && nkeys < 1024) {
+            keys[nkeys++] = key;
+            if (minb > 0)
+                VLOG("[skipscan] slot %d = frames %lld-%lld: vs %.12s (c5 %llu bytes)", k, at + (long long)k * per,
+                     at + (long long)(k + 1) * per - 1, key, (unsigned long long)u->size);
+            else
+                VLOG("[skipscan] vs %d: %.12s", k, key);
+            nbits = 0;
+            while ((1 << nbits) < nkeys) nbits++;
+        }
+        __atomic_store_n(&lk, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    long long slot = (f - at) / per;
+    if (minb > 0) return slot < nkeys && keys[slot] == key;
+    if (slot >= 2 * nbits) return 0;
+    while (k < nkeys && keys[k] != key) k++;
+    if (k == nkeys) return 0;   // a shader first seen during the scan: drawn
+    return ((k >> (slot / 2)) & 1) == !(slot & 1);
 }
 
 // TOTK_VK_SKIP=<key prefix>,...: draws with these vertex / fragment shaders are not drawn (development: bisecting)
@@ -2054,8 +2296,162 @@ void vkb_draw_mt_init(void) {
     sampler_of(-1, 0);
 }
 
+// The walk's look at a draw for the temporal upscaler (vkb_tsr.c): the scene camera (vertex c4) and the fragment shader.
+void vkb_draw_tsr_walk(void) {
+    if (!vkb_tsr_on()) return;
+    big_init();   // one recording thread: called before vkb_draw, which makes this thread's state (B) otherwise
+    const char *fs = resolve_program() && S.sh[1] ? S.sh[1]->key : NULL;
+    static int said;   // once: the depth convention of the scene's draws (FSR 3.1 is built for one)
+    if (!said && vkb_rt()->n >= 3 && vkb_rt()->depth && S.has_ds && S.ds.dw && S.ubo[0][1].size == 0x940) {
+        said = 1;
+        LOG("[vk] antialiasing: the scene's depth test %u (NVN 1-8: never less equal lequal greater notequal gequal always), "
+            "depth range %s %g..%g", (unsigned)S.ds.df, S.has_dr ? "set" : "default", S.has_dr ? S.dr[0] : 0.0, S.has_dr ? S.dr[1] : 1.0);
+    }
+    vkb_tsr_walk_draw(vkb_rt(), S.ubo[0], fs);
+}
+
+// The game's FXAA under FSR 3.1 (vkb_tsr.c): its source, the tonemapped scene, copied into its target (the light target)
+// as it is; FSR anti-aliases it instead. 0: not done (the FXAA draw goes ahead).
+static int fxaa_copy(void) {
+    if (!resolve_program() || !S.sh[1] || S.sh[1]->ntex < 1) return 0;
+    const p_set_rt *rt = vkb_rt();
+    const view_t *v = NULL;
+    vkb_image *src = handle_image(S.tex[1][S.sh[1]->tex[0].slot], &v), *dst = rt->n > 0 && rt->color[0] ? vkb_image_of(rt->color[0]) : NULL;
+    if (!src || !dst || src == dst || src->format != dst->format || src->width != dst->width || src->height != dst->height) return 0;
+    vkb_pass_end_r(PE_OTHER);
+    VkCommandBuffer cb = vkb_cmd();
+    vkb_image_use(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    vkb_image_use(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy c = {{src->aspect, 0, 0, 1}, {0, 0, 0}, {dst->aspect, 0, 0, 1}, {0, 0, 0}, {dst->width, dst->height, 1}};
+    vk.vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    vkb_image_written(dst);
+    return 1;
+}
+
+// The game's FXAA with antialias=smaa or off (vkb_smaa.c): SMAA from its source into its target, or the copy above.
+// 0: not done (the FXAA draw goes ahead). Other draws: one shader key compared (the program is resolved anyway).
+static int fxaa_replace(void) {
+    if (!resolve_program() || !S.sh[1] || !vkb_tsr_fs_fxaa(S.sh[1]->key)) return 0;
+    static int alt = -1;   // TOTK_AA_ALT=1 (development): odd frames keep the game's FXAA (A/B shots within one run)
+    if (alt < 0) { const char *e = getenv("TOTK_AA_ALT"); alt = e && *e == '1'; }
+    if (alt && (vkb_frame() & 1)) return 0;
+    if (vkb_aa_mode() == 2) return fxaa_copy();
+    if (S.sh[1]->ntex < 1) return 0;
+    const p_set_rt *rt = vkb_rt();
+    const view_t *v = NULL;
+    vkb_image *src = handle_image(S.tex[1][S.sh[1]->tex[0].slot], &v), *dst = rt->n > 0 && rt->color[0] ? vkb_image_of(rt->color[0]) : NULL;
+    if (!src || !dst || src == dst) return 0;
+    vkb_pass_end_r(PE_OTHER);
+    int ok = vkb_smaa_run(src, dst);
+    vkb_rec_begin();   // our shaders and sets were bound: the replay binds everything again
+    return ok;
+}
+
+// Per-object motion for FSR 3.1 (vkb_tsr.c): right after a solid draw of the scene's G-buffer pass, the same draw again
+// with its vertex shader's last-frame position variant (bound with last frame's blocks of the banks its position reads,
+// in the slots the variant has for them) and the object motion fragment shader, into the pass's object motion target
+// only, tested against the depth the draw just wrote and writing none. Only where a block other than the camera's
+// changed since last frame (the object moved); then the command buffer's caches start over (other shaders, sets and
+// state were bound).
+static void obj_motion_draw(VkCommandBuffer cb, const vkb_shader *vs, int indexed, const p_draw_idx *di, const p_draw *dr,
+                            uint32_t inst, uint32_t ints, uint32_t sint) {
+    int oslot = vkb_pass_obj_slot();
+    if (oslot < 0 || !S.has_ds || !S.ds.dt || !S.ds.dw) return;
+    const vkb_shader *pv = vkb_shader_prevpos(vs);
+    if (!pv || pv->unsupported || pv->prev_loc < 0) return;
+    // 1. did an object block change? (the parts of a model share theirs: the last answer per bank is kept)
+    static __thread uint8_t *cur;
+    static __thread struct { uint64_t addr, seq; uint32_t n; const uint8_t *prev; int moved; } memo[8];
+    if (!cur && !(cur = malloc(16384))) return;
+    const uint8_t *prev[VKB_NCBUF] = {0};
+    uint32_t len[VKB_NCBUF] = {0};
+    int moved = 0, found = 0;
+    uint64_t now = vkb_frame() + 1;   // a memo lasts within a frame
+    for (int k = 3; k < VKB_NCBUF; k++) {
+        int bank = pv->prev_of[k];
+        if (bank < 5 || bank > 7) continue;
+        const p_bind_buf *u = &S.ubo[0][bank - 3];
+        uint32_t n = u->size > 16384 ? 16384 : (uint32_t)u->size;
+        if (!u->addr || !n) continue;
+        if (memo[bank].addr == u->addr && memo[bank].n == n && memo[bank].seq == now) {
+            prev[k] = memo[bank].prev, moved |= memo[bank].moved;
+        } else {
+            vkb_ucap_read(u->addr, cur, n);
+            prev[k] = vkb_tsr_prev_block(bank, u->addr, cur, n);
+            int m = prev[k] && memcmp(prev[k], cur, n);
+            memo[bank].addr = u->addr, memo[bank].n = n, memo[bank].seq = now, memo[bank].prev = prev[k], memo[bank].moved = m;
+            moved |= m;
+        }
+        len[k] = n;
+        found |= prev[k] != NULL;
+    }
+    vkb_tsr_obj_count(moved, found);
+    if (!moved) return;
+    // 2. last frame's blocks into this submission's upload memory: the object's, and the camera's
+    VkDeviceSize ua = vkc.props.limits.minUniformBufferOffsetAlignment;
+    VkDescriptorBufferInfo ovr[VKB_NCBUF];
+    memset(ovr, 0, sizeof ovr);
+    for (int k = 3; k < VKB_NCBUF; k++) {
+        int bank = pv->prev_of[k];
+        if (!bank) continue;
+        const p_bind_buf *u = &S.ubo[0][bank - 3];
+        if (!u->addr || !u->size) continue;
+        if (bank == 4) {   // the camera: without last frame's, the camera pass's vector stays
+            len[k] = u->size > 16384 ? 16384 : (uint32_t)u->size;
+            vkb_ucap_read(u->addr, cur, len[k]);
+            if (!(prev[k] = vkb_tsr_prev_block(4, u->addr, cur, len[k]))) return;
+        }
+        if (!prev[k]) {   // other banks, and a block new this frame: this frame's
+            ovr[k] = guest_range(u->addr, u->size, ua, 1);
+            continue;
+        }
+        uint32_t n = len[k], m = (n + 15) & ~15u;
+        VkBuffer b;
+        VkDeviceSize off;
+        uint8_t *p = vkb_ring_alloc(m, ua, &b, &off);
+        memcpy(p, prev[k], n);
+        if (m > n) memset(p + n, 0, m - n);
+        ovr[k] = (VkDescriptorBufferInfo){b, off, m};
+    }
+    VkShaderEXT fobj = vkb_tsr_obj_fs(pv->prev_loc, oslot);
+    VkShaderEXT vobj = ints ? vkb_shader_variant(pv, ints, sint, NULL) : pv->obj;
+    if (!fobj || !vobj) return;
+    writes_t *W = &B->writes;
+    W->n = 0;
+    t_cb_override = ovr;
+    write_stage(W, VK_NULL_HANDLE, pv, 0);
+    t_cb_override = NULL;
+    if (vkb_split_sets()) bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_IMAGES), 0, resolve_set(W, VKB_LAYOUT_BUFFERS, VKB_PART_BUFFERS));
+    else bind_set(cb, resolve_set(W, VKB_LAYOUT_GRAPHICS, VKB_PART_ALL), 0, VK_NULL_HANDLE);
+    VkShaderStageFlagBits stages[5] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                                       VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_GEOMETRY_BIT};
+    VkShaderEXT objs[5] = {vobj, fobj, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
+    uint32_t nc = (uint32_t)vkb_rt_count();
+    if ((uint32_t)oslot >= nc) nc = (uint32_t)oslot + 1;
+    VkBool32 en[8] = {0};
+    VkColorComponentFlags wm[8] = {0};
+    wm[oslot] = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    vk.vkCmdSetColorBlendEnableEXT(cb, 0, nc, en);
+    vk.vkCmdSetColorWriteMaskEXT(cb, 0, nc, wm);
+    vk.vkCmdSetLogicOpEnableEXT(cb, VK_FALSE);
+    vk.vkCmdSetAlphaToCoverageEnableEXT(cb, VK_FALSE);
+    vk.vkCmdSetDepthTestEnable(cb, VK_TRUE);
+    vk.vkCmdSetDepthWriteEnable(cb, VK_FALSE);
+    vk.vkCmdSetDepthCompareOp(cb, VK_COMPARE_OP_LESS_OR_EQUAL);
+    vk.vkCmdSetStencilTestEnable(cb, VK_FALSE);
+    if (indexed) vk.vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
+    else vk.vkCmdDraw(cb, (uint32_t)dr->count, inst, (uint32_t)dr->first, (uint32_t)dr->base_instance);
+    vkb_rec_begin();   // the next draw records its state, shaders and sets again (every cache of this command buffer)
+}
+
 void vkb_draw(const uint8_t *a, int indexed) {
+    {   // FSR 3.1 (vkb_tsr.c): 1 it ran in place of the game's EASU draw; 2 the game's FXAA draw is replaced by a copy
+        int t = vkb_tsr_rec_draw(vkb_rt());
+        if (t == 1 || (t == 2 && fxaa_copy())) return;
+    }
     big_init();
+    if (vkb_aa_mode() && fxaa_replace()) return;
     fixed_buffers();
     vkb_audit_draw_begin();
     const p_draw *dr = (const p_draw *)a;
@@ -2075,12 +2471,12 @@ void vkb_draw(const uint8_t *a, int indexed) {
         for (int i = 0; i < rt->n && i < 8; i++)
             if (rt->color[i]) {
                 vkb_image *ti = vkb_image_of(rt->color[i]);
-                tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
+                tn = bufcat(tl, sizeof tl, tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
                                ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
             }
         if (rt->depth) {
             vkb_image *ti = vkb_image_of(rt->depth);
-            tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
+            tn = bufcat(tl, sizeof tl, tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
                            ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
         }
         VLOG("[draw]   targets:%s", tn ? tl : " -");
@@ -2106,11 +2502,11 @@ void vkb_draw(const uint8_t *a, int indexed) {
                 memcpy(&a, &S.vattr[i], sizeof a);
                 if (!a.fmt) continue;
                 used |= 1u << a.stream;
-                vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " a%d=s%u+%u/%#x", i, (unsigned)a.stream, (unsigned)a.offset, (unsigned)a.fmt);
+                vn = bufcat(vl, sizeof vl, vn, " a%d=s%u+%u/%#x", i, (unsigned)a.stream, (unsigned)a.offset, (unsigned)a.fmt);
             }
             for (uint32_t s = 0; s < 16 && vn < (int)sizeof vl - 80; s++)
                 if (used >> s & 1)
-                    vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " | s%u=%#llx+%llu stride %u%s", s, (unsigned long long)S.vbuf[s].address,
+                    vn = bufcat(vl, sizeof vl, vn, " | s%u=%#llx+%llu stride %u%s", s, (unsigned long long)S.vbuf[s].address,
                                    (unsigned long long)S.vbuf[s].size, (unsigned)S.vstream[s].stride, S.vstream[s].divisor ? " instanced" : "");
             if (indexed) snprintf(vl + vn, sizeof vl - (size_t)vn, " | index %#llx type %d base %d first inst %d", (unsigned long long)di->ibuf,
                                   di->itype, di->base_vertex, di->base_instance);
@@ -2156,13 +2552,14 @@ void vkb_draw(const uint8_t *a, int indexed) {
         if (S.sh[0]) trace_resources(S.sh[0], 0);
         if (S.sh[1]) trace_resources(S.sh[1], 1);
     }
+    bones_check();
     if (!resolve_program() || !S.sh[0]) {
         vkb_cnt_add(g_skipped[0], 1);
         vkb_audit(S.bad_key ? A_SHADER_UNSUPPORTED : A_DRAW_NO_PROGRAM, S.bad_key);
         if (trace) VLOG("[draw]   skipped: no program / translation");
         return;
     }
-    if (skip_listed()) return;
+    if (skip_listed() || skipscan()) return;
     int ok;
     VkPrimitiveTopology topo = topology(indexed ? di->prim : dr->prim, &ok);
     if (!ok) {
@@ -2239,6 +2636,7 @@ void vkb_draw(const uint8_t *a, int indexed) {
         bare = (VkExtent2D){(uint32_t)ceilf(S.vp[0][0] + S.vp[0][2]), (uint32_t)ceilf(S.vp[0][1] + S.vp[0][3])};
     if (!vkb_pass_begin(bare, g_fb)) { vkb_cnt_add(g_skipped[2], 1); vkb_audit(A_DRAW_NO_TARGETS, fs ? fs->key : vs->key); return; }
     VkCommandBuffer cb = vkb_cmd();
+    vkb_oq_draw(cb);   // between a samples-passed reset and report: counted by an occlusion query
     writes_t *W = &B->writes;
     W->n = 0;
     write_stage(W, VK_NULL_HANDLE, vs, 0);
@@ -2256,7 +2654,8 @@ void vkb_draw(const uint8_t *a, int indexed) {
     if (S.has_ms && S.ms.enable && S.ms.samples > 1) vkb_audit(A_MULTISAMPLE, fs ? fs->key : vs->key);
     if (vkb_render_suppressed()) vkb_audit(A_RENDER_DISABLED, fs ? fs->key : vs->key);
     VkShaderEXT objs[5] = {vobj, fs ? fs->obj : VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    if (dyn(D_SHADERS, objs, sizeof objs)) vk.vkCmdBindShadersEXT(cb, 5, stages, objs);
+    int shaders_changed = 0;
+    if (dyn(D_SHADERS, objs, sizeof objs)) { shaders_changed = 1; vk.vkCmdBindShadersEXT(cb, 5, stages, objs); }
     set_dynamic_state(cb, vkb_rt_count(), vkb_rt_extent(), topo);
     if (vkc.has_feedback_dynamic) {   // required state with shader objects once the feature is enabled
         VkImageAspectFlags loop = (g_fb & 0xFF ? VK_IMAGE_ASPECT_COLOR_BIT : 0) | (g_fb & VKB_FB_DEPTH ? g_fb_rt[8]->aspect : 0);
@@ -2301,6 +2700,9 @@ void vkb_draw(const uint8_t *a, int indexed) {
         }
         VkIndexType it = di->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         vk.vkCmdBindIndexBuffer(cb, buf, off, it);
+    }
+    uint64_t draw_t0 = shaders_changed ? runtime_now_ns() : 0;
+    if (indexed) {
         int gq = gprof_begin();
         vk.vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         gprof_end(gq, fs ? fs : vs, 0, (uint32_t)di->count, inst);
@@ -2309,6 +2711,11 @@ void vkb_draw(const uint8_t *a, int indexed) {
         vk.vkCmdDraw(cb, (uint32_t)dr->count, inst, (uint32_t)dr->first, (uint32_t)dr->base_instance);
         gprof_end(gq, fs ? fs : vs, 0, (uint32_t)dr->count, inst);
     }
+    if (draw_t0) {   // the long-submission line: a draw call after a shader change that took over 1 ms (the driver)
+        uint64_t dt = runtime_now_ns() - draw_t0;
+        if (dt > 1000000) { atomic_fetch_add_explicit(&vkb_step_ns[PK_SLOWDRAW], dt, memory_order_relaxed); atomic_fetch_add_explicit(&vkb_step_n[PK_SLOWDRAW], 1, memory_order_relaxed); }
+    }
+    obj_motion_draw(cb, vs, indexed, di, dr, inst, int_inputs, sint);   // a moving object's motion (FSR 3.1)
     if (vs->stores || (fs && fs->stores)) {
         g_stores_pending = 1;
         if (vs->stores) written_add(vs, 0);

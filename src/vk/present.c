@@ -7,7 +7,9 @@
 #include "vk.h"
 
 #include <SDL3/SDL.h>
+#include <errno.h>
 #include <math.h>
+#include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -139,6 +141,15 @@ typedef struct {
 } out_t;
 static out_t g_out[OUTS];
 static uint64_t g_out_seq;       // under mu
+// The frame queue (TOTK_FRAME_QUEUE=1, gfx/nvn/hle_nvn.c nvnQueuePresentTexture): the game may draw a frame while the
+// one before waits for its slot, so a pending frame is one still to be shown in its turn, not one a newer frame makes
+// stale: frames are shown oldest first and none is dropped for a newer one (dropping it would be the very skipped
+// frame the queue is there to avoid). Without it, the newest pending frame wins as before.
+static int out_fifo(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_FRAME_QUEUE"); v = e && *e == '1'; }
+    return v;
+}
 
 static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < vkc.memory.memoryTypeCount; i++)
@@ -195,7 +206,7 @@ void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int cro
     out_t *o = &g_out[slot];
     o->timeline = timeline; o->value = value; o->seq = ++g_out_seq; o->state = 1; o->not_before = not_before;
     if (crop) memcpy(o->crop, crop, sizeof o->crop); else memset(o->crop, 0, sizeof o->crop);
-    for (int i = 0; i < OUTS; i++)   // older pending frames are never shown
+    for (int i = 0; i < OUTS && !out_fifo(); i++)   // older pending frames are never shown (with the frame queue: they are)
         if (i != slot && g_out[i].state == 1 && g_out[i].seq < o->seq) g_out[i].state = 0;
     frames_in++;
     pthread_cond_signal(&cv);
@@ -247,6 +258,8 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
         void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
         vk_overlay_frame();   // the frame counter (overlay.c, F10)
         vk_overlay_record(cb, images[idx], extent, format, slot);
+        void vk_text_panel_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
+        vk_text_panel_record(cb, images[idx], extent, format, slot);   // the software keyboard's field (host/text_entry.c)
     }
     barrier(cb, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -281,13 +294,31 @@ static void *present_thread(void *unused) {
     (void)unused;
     uint64_t shown = 0;
     unsigned slot = 0;
+    int last = -1;   // the output image shown last (the game frame repeated under the text field)
+    int text_entry_visible(void);   // host/text_entry.c
     for (;;) {
         pthread_mutex_lock(&mu);
-        while (frames_in == shown) pthread_cond_wait(&cv, &mu);
-        shown = frames_in;   // frames that came while the last one was shown are skipped: only the newest counts
+        int again = 0;
+        while (frames_in == shown && !again) {
+            /* While the software keyboard's field is open the game may draw nothing (the thread that asked for it waits):
+               the last frame is shown again with the field over it every 33 ms, so typing shows. */
+            if (!text_entry_visible() || last < 0) { pthread_cond_wait(&cv, &mu); continue; }
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_nsec += 33000000;
+            if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            if (pthread_cond_timedwait(&cv, &mu, &dl) == ETIMEDOUT && frames_in == shown && g_out[last].state == 0) again = 1;
+        }
         int pick = -1;
-        for (int i = 0; i < OUTS; i++) if (g_out[i].state == 1 && (pick < 0 || g_out[i].seq > g_out[pick].seq)) pick = i;
-        if (pick >= 0) g_out[pick].state = 2;
+        if (again) pick = last;
+        else {
+            shown = frames_in;   // frames that came while the last one was shown are skipped: only the newest counts
+            for (int i = 0; i < OUTS; i++)   // the newest pending frame, or with the frame queue the oldest (in its turn)
+                if (g_out[i].state == 1 && (pick < 0 || (out_fifo() ? g_out[i].seq < g_out[pick].seq : g_out[i].seq > g_out[pick].seq))) pick = i;
+            for (int i = 0; i < OUTS && out_fifo(); i++)   // a newer one still pending: the loop goes on to it, not to sleep
+                if (i != pick && g_out[i].state == 1) shown = frames_in - 1;
+        }
+        if (pick >= 0) g_out[pick].state = 2, last = pick;
         pthread_mutex_unlock(&mu);
         /* The steady rate (host/frame_rate.c): a frame drawn before its slot waits for it here, so frames reach the
            screen one period apart whatever their work; a frame more than half a second away is a clock change. */
@@ -322,6 +353,11 @@ void vkp_frame(void) {
 }
 
 void vkp_resized(void) { atomic_store(&resized, 1); }
+void vkp_wake(void) {   // (host/text_entry.c: its field opened) the present thread looks again
+    pthread_mutex_lock(&mu);
+    pthread_cond_signal(&cv);
+    pthread_mutex_unlock(&mu);
+}
 uint64_t vkp_presented(void) { return atomic_load(&presented); }
 uint64_t vkp_frames(void) {
     pthread_mutex_lock(&mu);

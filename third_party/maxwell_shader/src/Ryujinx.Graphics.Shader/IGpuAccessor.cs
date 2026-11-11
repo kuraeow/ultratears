@@ -293,6 +293,22 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// UltraTears: true when a vertex shader should also write last frame's position (Transforms/PreviousPosition.cs).
+        /// </summary>
+        bool QueryPreviousPosition()
+        {
+            return false;
+        }
+
+        /// <summary>
+        /// UltraTears: where PreviousPosition put last frame's position (user output location, -1: not made) and the
+        /// user banks it depends on (bit n: cn).
+        /// </summary>
+        void ReportPreviousPosition(int location, int banks)
+        {
+        }
+
+        /// <summary>
         /// Queries host support scaled vertex formats, where a integer value is converted to floating-point.
         /// </summary>
         /// <returns>True if the host support scaled vertex formats, false otherwise</returns>

@@ -230,7 +230,7 @@ def python_for(home):
 
 
 def install_python_linux(home):
-    """deps/python on Linux: python-build-standalone's interpreter (as totk-pc-recomp's AppImage carries it) with the
+    """deps/python on Linux: python-build-standalone's interpreter with the
     manylinux wheels unpacked into its site-packages."""
     import tarfile
     lh = manifest()['linux_host']
@@ -323,8 +323,7 @@ def llvm_for(home):
 
 
 def install_llvm(home):
-    """deps/llvm on Linux: the parts of LLVM's release the build uses (as totk-pc-recomp's make_release_linux.py takes
-    them: clang, lld, llvm-ar, llvm-objcopy, the clang resource headers; 2 GB downloaded once, ~150 MB kept), ninja,
+    """deps/llvm on Linux: the parts of LLVM's release the build uses (clang, lld, llvm-ar, llvm-objcopy, the clang resource headers; 2 GB downloaded once, ~150 MB kept), ninja,
     and LLVM's license (its binary release carries none)."""
     import tarfile
     lh = manifest()['linux_host']

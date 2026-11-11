@@ -149,7 +149,9 @@ void media_load(SDL_Renderer *r, float scale) {
         0x0020, 0x00FF,   // Latin-1
         0x0400, 0x052F,   // Cyrillic
         0x2010, 0x2027,   // dashes, quotes, the ellipsis
+        0x2116, 0x2116,   // № (numbered cheat names, the Mods tab)
         0x2190, 0x2193,   // arrows
+        0x2212, 0x2212,   // − (the minus button, the Controls tab)
         0x2248, 0x2248,   // ≈
         0,
     };

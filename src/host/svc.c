@@ -30,6 +30,8 @@
 #define HEAP_CAP      (4ULL << 30)   /* 1.4.3 sets a 2.2 GiB heap during nninitStartup */
 #define ASLR_START    LOW_START
 #define ASLR_SIZE     ((1ULL << 39) - LOW_START)
+uint64_t runtime_region_base(int which);   // the cheat VM's memory regions (mods.c): 1 heap, 2 alias, 3 ASLR
+uint64_t runtime_region_base(int which) { return which == 1 ? HEAP_START : which == 2 ? ALIAS_START : ASLR_START; }
 #define SYSTEM_RESOURCE_BUDGET (32ULL << 20)
 #define APP_POOL_BASE 0xcd500000ULL  /* retail application pool, 3.2 GiB (MacNativeGames' default without 2K heaps) */
 uint64_t totk_heap_extra_bytes(void);   /* render_res.c: a bigger game resolution grows the render-target heap by this */
@@ -241,6 +243,12 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, uint64_t pc) {
     if (runtime_ipc_svc(num, r)) return r[0];
     runtime_memory_init();
     switch (num) {
+    case 0x36: {   // SynchronizePreemptionState: an SDK spin lock left with interrupt_flag set (threads.c, asynchronous preemption)
+        void runtime_ap_sync(void);
+        runtime_ap_sync();
+        r[0] = 0;
+        return r[0];
+    }
     case 0x02: r[0] = module_permission(r[0], r[1], (unsigned)r[2]); return r[0];
     case 0x03: r[0] = module_lock_permission(r[0], r[1], (unsigned)r[2], (unsigned)r[3]); return r[0];
     case 0x29: {   /* GetInfo */

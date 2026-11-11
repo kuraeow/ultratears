@@ -56,7 +56,8 @@ uint64_t guest_call_args(uint64_t fn, int n, const uint64_t *args) {
 
 // Every `svc #imm` of the recompiled code lands here (cpu.h).
 void runtime_core_checkpoint(void);   // threads.c: give the core up to a better waiting thread
-void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_core_checkpoint(); runtime_svc(imm, c->x, pc); }
+extern __thread int rt_host_depth;   // runtime/dispatch.c: an SVC is a host call (asynchronous preemption)
+void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_core_checkpoint(); rt_host_depth++; runtime_svc(imm, c->x, pc); rt_host_depth--; }
 
 _Noreturn void runtime_fail(const char *message) {
     fprintf(stderr, "[totk] FATAL: %s\n", message);

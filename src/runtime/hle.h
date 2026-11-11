@@ -27,3 +27,9 @@ void hle_native_thunk(Cpu *c);
 #define HLE_NATIVE(sym, cfn, kind)                                                          \
     __attribute__((used, section(HLE_SECTION))) static const HleImplEntry                   \
         HLE_CAT(hle_entry_, __LINE__) = {sym, hle_native_thunk, (void *)(cfn), kind};
+// The same for a call that waits for the disk or the OS (nn::fs): on the Switch it is an IPC request that blocks its
+// thread, so the thread gives its virtual core up for the call (host/threads.c runtime_core_away) and the game's
+// other threads run meanwhile. The function must not hold a host lock when it returns. (The kind is stored in capitals.)
+#define HLE_NATIVE_BLOCKING(sym, cfn, kind)                                                 \
+    __attribute__((used, section(HLE_SECTION))) static const HleImplEntry                   \
+        HLE_CAT(hle_entry_, __LINE__) = {sym, hle_native_thunk, (void *)(cfn), (char)((kind) - 32)};

@@ -164,6 +164,11 @@ def say(msg):
 
 
 def is_checkout():
+    # A builder package (tools/make_package.py lists its files in package-files.txt) is never the source, even with a
+    # .git in its folder: a player's package was taken for a checkout, its files were copied into build\, clang was
+    # installed there again and the build failed at the shader translator, which a package does not carry (2026-11-03)
+    if (ROOT / 'package-files.txt').is_file():
+        return False
     try:
         r = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
     except OSError:   # git not installed: a builder package, not a checkout
@@ -238,8 +243,16 @@ def choose_dump(home, requested):
     return (ROOT / 'dump').resolve()
 
 
+# Files only the source has (tools/make_package.py NOT_IN_PACKAGE): without them this is no full checkout
+SOURCE_ONLY = ('tools/build_xlate.py', 'tools/make_package.py', 'src/launcher')
+
+
 def build_from_checkout(a):
     home = (a.output or ROOT / 'build').resolve()
+    missing = [f for f in SOURCE_ONLY if not (ROOT / f).exists()]
+    if missing:   # a .git over a folder that is not the whole source: say so now, not at a step that needs them
+        sys.exit(f'This folder has a Git repository but not the UltraTears source ({", ".join(missing)} missing). '
+                 f'If it is a downloaded release, extract it again into a new, empty folder.')
     try:
         changed, removed = sync_source(home)
         say(f'UltraTears source -> {home}: {changed} files updated, {removed} removed')
@@ -322,8 +335,21 @@ def load_state():
 
 
 def save_state(state):
+    """Written to a temporary file and moved over setup.json. Windows refuses the write or the move while another
+    program has the file open (an antivirus scanning it, the launcher reading it): a few tries before giving up
+    (GitHub #72, #73: a whole build failed at its last write)."""
     DATA.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps(state, indent=1))
+    tmp = STATE.with_name(STATE.name + '.tmp')
+    text = json.dumps(state, indent=1)
+    for attempt in range(20):
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, STATE)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.25)
 
 
 # ---------------------------------------------------------------- steps
@@ -515,6 +541,9 @@ def step_compile(dump, state, cpus):
 # A pack from the same export and translator is up to date; an install from before the pack (data/shaders/ryujinx and
 # its neighbours) is packed as it is, without translating again.
 KEEP_SHADER_WORK = False
+# Fixes made in the pack after packing (tools/pack_fixups.py); a higher number makes them again in a pack made before.
+# 3: the pack compressed (tools/pack_shaders.py, version 2) - pack_fixups.py writes an older pack again, 3.4 -> ~0.9 GiB.
+PACK_FIXUPS = 3
 SHADER_OLD = ['raw', 'ryujinx', 'ryujinx-code', 'jobs.jsonl', 'shaders.tsv', 'ryujinx-results.tsv', 'ryujinx-results-new.tsv']
 
 
@@ -564,11 +593,16 @@ def step_shaders(dump, state, cpus):
             pack = out / 'translated.pack'
             xlate = xlate_id + ('' if bias == '0' else '-g' + bias)
             if state.get(f'{key}-pack') == f'{export}/{xlate}' and pack.is_file():
+                if state.get(f'{key}-fixups') != PACK_FIXUPS:
+                    run([sys.executable, 'tools/pack_fixups.py', pack, DATA, '--jobs', cpus], 'fixing the shaders')
+                    state[f'{key}-fixups'] = PACK_FIXUPS
+                    save_state(state)
+                    made.append(out.name + ' (fixes)')
                 continue
             os.environ['TOTK_GATHER_BIAS'] = bias
             old = out / 'ryujinx'
             if key == 'shaders' and old.is_dir() and state.get('shaders-xlate') == xlate and not work.exists():
-                run([sys.executable, 'tools/pack_shaders.py', old, pack], 'packing the shaders')
+                run([sys.executable, 'tools/pack_shaders.py', old, pack, '--jobs', cpus], 'packing the shaders')
             else:
                 if state.get('shaders-export') != export or not (work / 'jobs.jsonl').is_file():
                     run([sys.executable, 'tools/export_shaders.py', DATA / 'romfs', work, DATA / 'exefs'], 'finding the shaders')
@@ -584,7 +618,9 @@ def step_shaders(dump, state, cpus):
                     state['shaders-xlate'] = xlate
                 save_state(state)
                 out.mkdir(parents=True, exist_ok=True)
-                run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack], 'packing the shaders')
+                run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack, '--jobs', cpus], 'packing the shaders')
+            run([sys.executable, 'tools/pack_fixups.py', pack, DATA, '--jobs', cpus], 'fixing the shaders')
+            state[f'{key}-fixups'] = PACK_FIXUPS
             state[f'{key}-pack'] = f'{export}/{xlate}'
             save_state(state)
             made.append(out.name)
@@ -630,6 +666,26 @@ def cfg_lines():
             'textures=data/textures', 'saves=userdata', 'fonts=data/fonts']
 
 
+def on_steam_deck():
+    """The Steam Deck, as the game tells it (src/host/boot.c deck_defaults): SteamDeck=1, or Valve's board with the
+    product Jupiter (LCD) or Galileo (OLED)."""
+    if os.environ.get('SteamDeck') == '1':
+        return True
+    try:
+        vendor = pathlib.Path('/sys/class/dmi/id/board_vendor').read_text().strip()
+        product = pathlib.Path('/sys/class/dmi/id/product_name').read_text().strip()
+    except OSError:
+        return False
+    return vendor == 'Valve' and product in ('Jupiter', 'Galileo')
+
+
+def first_settings(deck=None):
+    """The player's settings a new ultratears.cfg starts with, as if chosen in the launcher: on the Steam Deck the frame
+    limit 40 (a divisor of its screens' 40 Hz modes and of 120 Hz). Only when the file is made: the game has no limit
+    of the Deck's own, so 60 or more is the player's to choose, and an existing file is never changed."""
+    return ['fps=40'] if (on_steam_deck() if deck is None else deck) else []
+
+
 def step_finish(dump, state, cpus):
     fonts = dump / 'sysdata/fonts'
     lines = cfg_lines()
@@ -646,6 +702,8 @@ def step_finish(dump, state, cpus):
         for l in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
             if '=' in l and not l.startswith('#') and l.split('=', 1)[0] not in ours:
                 lines.append(l)
+    else:
+        lines += first_settings()   # a new game folder only: an existing ultratears.cfg keeps the player's as it is
     cfg.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     (ROOT / DEBUG_BAT).unlink(missing_ok=True)
     (ROOT / 'build/UltraTears.exe').unlink(missing_ok=True)   # where builds before 0.1.0 linked it
@@ -803,7 +861,6 @@ def main():
     state.setdefault('platforms', ['windows'])
     if os.name != 'nt':   # Linux builds the game for Linux, here
         # The tools' temporary files in the game's folder (temp/): on a Steam Deck /tmp is memory and /home small
-        # (totk-pc-recomp's installer puts its temp folder beside the game for the same reason)
         tmp = ROOT / 'temp'
         tmp.mkdir(exist_ok=True)
         os.environ['TMPDIR'] = str(tmp)

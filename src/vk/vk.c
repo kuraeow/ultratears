@@ -60,7 +60,6 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeve
 // Mesa's drivers (RADV on the Steam Deck) keep a shader cache of their own beside ours, by default in ~/.cache and up to
 // 1 GB. A Deck's /home is small and the game usually sits on the SD card: unless MESA_SHADER_CACHE_DIR names a folder,
 // it goes to mesa-cache in the game folder. Read by the driver when the device is made, so set before the instance.
-// (As totk-pc-recomp's vk_device.c mesa_cache_beside_exe, MIT.)
 static void mesa_cache_beside_game(void) {
 #ifndef _WIN32
     if (getenv("MESA_SHADER_CACHE_DIR")) return;
@@ -72,6 +71,14 @@ static void mesa_cache_beside_game(void) {
     setenv("MESA_SHADER_CACHE_DIR", dir, 0);
 #endif
 }
+
+// The Khronos shader object layer (Vulkan SDK) stands in for VK_EXT_shader_object where the driver lacks it (Intel's
+// Windows drivers: Iris Xe, Arc B570; GitHub #49, #53). The setup's check offers to go on through it, but nothing
+// enabled it, so the game stopped at "Vulkan 1.3 with VK_EXT_shader_object is required". When the device lacks the
+// extension and the layer is installed, vk_init now builds the instance again with it (and descriptor sets, as
+// tools/gpu_check.py asks for). Slower and not supported. TOTK_VK_SO_LAYER=0: never.
+#define SO_LAYER "VK_LAYER_KHRONOS_shader_object"
+static int g_so_layer, g_no_shader_object;
 
 static int create_instance(SDL_Window *window) {
     mesa_cache_beside_game();
@@ -106,9 +113,13 @@ static int create_instance(SDL_Window *window) {
         with_debug[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         exts = with_debug;
     }
+    const char *layers[2];
+    uint32_t nlayers = 0;
+    if (validate) layers[nlayers++] = layer;
+    if (g_so_layer) layers[nlayers++] = SO_LAYER;
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = next, .ppEnabledExtensionNames = exts,
-                               .enabledLayerCount = validate ? 1u : 0u, .ppEnabledLayerNames = &layer};
+                               .enabledLayerCount = nlayers, .ppEnabledLayerNames = layers};
     if (!vk_check(vk.vkCreateInstance(&ci, NULL, &vkc.instance), "vkCreateInstance")) return 0;
 #define LOAD(f) vk.f = (PFN_##f)gipa(vkc.instance, #f);
     VK_FN_INSTANCE(LOAD)
@@ -267,7 +278,7 @@ static int create_device(void) {
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
         // ...and written by the GPU to host memory, which outlives the device (the NVIDIA driver gave 0 checkpoints, 2026-10-27)
         {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
-        // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
+        // the driver's own report of a lost device: what failed and where (AMD, Mesa)
         {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
         // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
         {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},
@@ -286,7 +297,9 @@ static int create_device(void) {
     vk.vkGetPhysicalDeviceFeatures2(vkc.gpu, &f2);
     vkc.has_shader_object = vkc.has_shader_object && fso.shaderObject;
     if (!vkc.has_shader_object) {
-        LOG("VK_EXT_shader_object is required but is not supported by this GPU or driver");
+        LOG("VK_EXT_shader_object is required but is not supported by this GPU or driver%s",
+            g_so_layer ? " (not even through " SO_LAYER ")" : "");
+        g_no_shader_object = 1;
         return 0;
     }
     // the shaders' interlock is the pixel one (vkb_spv_drop_interlock removes it where this is missing)
@@ -369,6 +382,27 @@ int vk_init(SDL_Window *window) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     if (!state) state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
+    if (state < 0 && g_no_shader_object && !g_so_layer) {
+        const char *e = getenv("TOTK_VK_SO_LAYER");
+        if (!(e && *e == '0') && has_layer(SO_LAYER)) {
+            LOG("trying again through " SO_LAYER " (installed with the Vulkan SDK): slower, possibly with artefacts, not supported");
+            if (vkc.surface) vk.vkDestroySurfaceKHR(vkc.instance, vkc.surface, NULL);   // (create_instance makes it)
+            vkc.surface = VK_NULL_HANDLE;
+            vk.vkDestroyInstance(vkc.instance, NULL);
+            vkc.instance = VK_NULL_HANDLE;
+            vkc.gpu = VK_NULL_HANDLE;
+            g_so_layer = 1;
+            g_no_shader_object = 0;
+            if (!getenv("TOTK_VK_DESCRIPTOR_SETS")) {   // (vkb_desc.c; tools/gpu_check.py asks for it with the layer)
+#ifdef _WIN32
+                _putenv_s("TOTK_VK_DESCRIPTOR_SETS", "1");
+#else
+                setenv("TOTK_VK_DESCRIPTOR_SETS", "1", 0);
+#endif
+            }
+            state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
+        }
+    }
     pthread_mutex_unlock(&mu);
     return state == 1;
 }

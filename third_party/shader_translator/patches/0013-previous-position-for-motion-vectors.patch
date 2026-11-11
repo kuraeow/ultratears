@@ -1,0 +1,396 @@
+diff --git a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+index 24728f1..33f8030 100644
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -292,6 +292,22 @@ namespace Ryujinx.Graphics.Shader
+             return true;
+         }
+ 
++        /// <summary>
++        /// UltraTears: true when a vertex shader should also write last frame's position (Transforms/PreviousPosition.cs).
++        /// </summary>
++        bool QueryPreviousPosition()
++        {
++            return false;
++        }
++
++        /// <summary>
++        /// UltraTears: where PreviousPosition put last frame's position (user output location, -1: not made) and the
++        /// user banks it depends on (bit n: cn).
++        /// </summary>
++        void ReportPreviousPosition(int location, int banks)
++        {
++        }
++
+         /// <summary>
+         /// Queries host support scaled vertex formats, where a integer value is converted to floating-point.
+         /// </summary>
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+index af359a6..a8ac9e0 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -65,7 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+             _stage = stage;
+             _stagePrefix = GetShaderStagePrefix(stage);
+ 
+-            _cbSlotToBindingMap = new SetBindingPair[18];
++            _cbSlotToBindingMap = new SetBindingPair[32];   // UltraTears: 18..31 last frame's banks (Transforms/PreviousPosition.cs)
+             _sbSlotToBindingMap = new SetBindingPair[16];
+             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Transforms/PreviousPosition.cs b/src/Ryujinx.Graphics.Shader/Translation/Transforms/PreviousPosition.cs
+new file mode 100644
+index 0000000..153b620
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Shader/Translation/Transforms/PreviousPosition.cs
+@@ -0,0 +1,332 @@
++using Ryujinx.Graphics.Shader.IntermediateRepresentation;
++using System.Collections.Generic;
++using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
++
++namespace Ryujinx.Graphics.Shader.Translation.Transforms
++{
++    // UltraTears (2026-11-04): last frame's position of a vertex, for per-object motion vectors (the port's temporal
++    // upscaler, src/gfx/vkb_tsr.c). The position a vertex shader writes depends on the game's uniform banks of this frame:
++    // the camera (c4), the object's place (c7), its bones (c5), the clock that moves wind (c14) and others. Every value
++    // the position store depends on that is computed, directly or through other values, from a user bank c3..c16 is
++    // computed again in a second chain of operations beside the first, reading bank n from slot n + PrevSlotOffset
++    // instead, where the runtime binds the block that bank had last frame; the position this chain gives goes to a user
++    // output the shader does not write. Control flow is the original's; operations that cannot run twice (stores, texture
++    // and image operations, calls) keep their first result. The approach follows totk-pc-recomp's translator patch 0015
++    // (MIT); the code is the port's own.
++    static class PreviousPosition
++    {
++        public const int PrevSlotOffset = 15;   // banks c3..c16 -> slots 18..31
++
++        private static int PrevSlot(int slot) => slot >= 3 && slot <= 16 ? slot + PrevSlotOffset : -1;
++
++        // Returns the output location written (-1: none), and in banks the user banks (bit n: cn) the position reads.
++        public static int Run(BasicBlock[] blocks, ResourceManager resources, AttributeUsage attributes, out int banks)
++        {
++            banks = 0;
++
++            int location = -1;
++            for (int l = Constants.MaxAttributes - 1; l >= 0 && location < 0; l--)
++            {
++                if ((attributes.UsedOutputAttributes & (1 << l)) == 0)
++                {
++                    location = l;
++                }
++            }
++
++            if (location < 0)
++            {
++                return -1;
++            }
++
++            // What the position stores depend on: every operation reached backwards from their values.
++            HashSet<INode> needed = new();
++            Stack<Operand> pending = new();
++            bool any = false;
++
++            foreach (BasicBlock block in blocks)
++            {
++                foreach (INode node in block.Operations)
++                {
++                    if (IsPositionStore(node))
++                    {
++                        any = true;
++                        pending.Push(((Operation)node).GetSource(2));
++                    }
++                }
++            }
++
++            if (!any)
++            {
++                return -1;
++            }
++
++            while (pending.Count != 0)
++            {
++                Operand value = pending.Pop();
++
++                if (value?.Type != OperandType.LocalVariable || value.AsgOp is not INode def || !needed.Add(def))
++                {
++                    continue;
++                }
++
++                for (int s = 0; s < def.SourcesCount; s++)
++                {
++                    pending.Push(def.GetSource(s));
++                }
++            }
++
++            // The bank loads among them: bank n's binding and the binding of its last-frame slot.
++            Dictionary<int, int> prevBinding = new();
++
++            foreach (INode node in needed)
++            {
++                if (node is Operation op && BankOfLoad(op, resources) is int slot && slot >= 0)
++                {
++                    banks |= 1 << slot;
++                    int binding = op.GetSource(0).Value;
++
++                    if (!prevBinding.ContainsKey(binding))
++                    {
++                        prevBinding[binding] = resources.GetConstantBufferBinding(PrevSlot(slot));
++                    }
++                }
++
++                for (int s = 0; s < node.SourcesCount; s++)
++                {
++                    Operand src = node.GetSource(s);
++
++                    if (src?.Type == OperandType.ConstantBuffer && PrevSlot(src.GetCbufSlot()) >= 0)
++                    {
++                        banks |= 1 << src.GetCbufSlot();
++                    }
++                }
++            }
++
++            if (banks == 0)
++            {
++                return -1;
++            }
++
++            // The values that differ last frame: those reading a bank, and what is computed from them (to a fixed point,
++            // as phis carry values around loops).
++            HashSet<Operand> differs = new();
++
++            for (bool grew = true; grew;)
++            {
++                grew = false;
++
++                foreach (BasicBlock block in blocks)
++                {
++                    foreach (INode node in block.Operations)
++                    {
++                        if (!needed.Contains(node) || !ReadsLastFrame(node, differs, prevBinding))
++                        {
++                            continue;
++                        }
++
++                        for (int d = 0; d < node.DestsCount; d++)
++                        {
++                            Operand dest = node.GetDest(d);
++
++                            if (dest?.Type == OperandType.LocalVariable && differs.Add(dest))
++                            {
++                                grew = true;
++                            }
++                        }
++                    }
++                }
++            }
++
++            // The second chain: a copy of each such operation right after it, into new locals.
++            Dictionary<Operand, Operand> last = new();
++            List<(INode, INode)> pairs = new();
++
++            foreach (BasicBlock block in blocks)
++            {
++                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
++                {
++                    INode n = node.Value;
++
++                    if (!needed.Contains(n) || !WritesAny(n, differs))
++                    {
++                        continue;
++                    }
++
++                    INode copy = null;
++
++                    if (n is PhiNode phi)
++                    {
++                        Operand dest = Local();
++                        last[phi.Dest] = dest;
++                        copy = new PhiNode(dest);
++                    }
++                    else if (n is Operation op && op.GetType() == typeof(Operation) && Repeatable(op))
++                    {
++                        Operand[] dests = new Operand[op.DestsCount];
++
++                        for (int d = 0; d < dests.Length; d++)
++                        {
++                            Operand dest = op.GetDest(d);
++
++                            if (dest?.Type == OperandType.LocalVariable)
++                            {
++                                dests[d] = Local();
++                                last[dest] = dests[d];
++                            }
++                            else
++                            {
++                                dests[d] = dest;
++                            }
++                        }
++
++                        Operand[] sources = new Operand[op.SourcesCount];
++
++                        for (int s = 0; s < sources.Length; s++)
++                        {
++                            sources[s] = op.GetSource(s);
++                        }
++
++                        Operation c = op.StorageKind != StorageKind.None && dests.Length == 1
++                            ? new Operation(op.Inst, op.StorageKind, dests[0], sources)
++                            : new Operation(op.Inst, op.Index, dests, sources);
++                        c.ForcePrecise = op.ForcePrecise;
++                        copy = c;
++                    }
++
++                    if (copy != null)
++                    {
++                        node = block.Operations.AddAfter(node, copy);
++                        pairs.Add((n, copy));
++                    }
++                }
++            }
++
++            // The copies read last frame's values and banks.
++            foreach ((INode original, INode copy) in pairs)
++            {
++                if (copy is PhiNode phiCopy)
++                {
++                    PhiNode phi = (PhiNode)original;
++
++                    for (int s = 0; s < phi.SourcesCount; s++)
++                    {
++                        phiCopy.AddSource(phi.GetBlock(s), LastOf(phi.GetSource(s), last));
++                    }
++
++                    continue;
++                }
++
++                Operation op = (Operation)original, c = (Operation)copy;
++
++                for (int s = 0; s < op.SourcesCount; s++)
++                {
++                    Operand src = op.GetSource(s);
++
++                    if (s == 0 && IsBankLoadInst(op) && src.Type == OperandType.Constant && prevBinding.TryGetValue(src.Value, out int b))
++                    {
++                        c.SetSource(s, Const(b));
++                    }
++                    else if (src?.Type == OperandType.ConstantBuffer && PrevSlot(src.GetCbufSlot()) >= 0)
++                    {
++                        c.SetSource(s, Cbuf(PrevSlot(src.GetCbufSlot()), src.GetCbufOffset()));
++                    }
++                    else
++                    {
++                        c.SetSource(s, LastOf(src, last));
++                    }
++                }
++            }
++
++            // Every position store also stores last frame's component to the output.
++            foreach (BasicBlock block in blocks)
++            {
++                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
++                {
++                    if (IsPositionStore(node.Value))
++                    {
++                        Operation op = (Operation)node.Value;
++                        Operation store = new(Instruction.Store, StorageKind.Output, null,
++                            Const((int)IoVariable.UserDefined), Const(location), op.GetSource(1), LastOf(op.GetSource(2), last));
++                        node = block.Operations.AddAfter(node, store);
++                    }
++                }
++            }
++
++            attributes.SetOutputUserAttribute(location);
++
++            return location;
++        }
++
++        // Store Output Position: (IoVariable.Position, component, value)
++        private static bool IsPositionStore(INode node)
++        {
++            return node is Operation op && op.Inst == Instruction.Store && op.StorageKind == StorageKind.Output &&
++                   op.SourcesCount == 3 && op.GetSource(0).Type == OperandType.Constant &&
++                   (IoVariable)op.GetSource(0).Value == IoVariable.Position;
++        }
++
++        private static bool IsBankLoadInst(Operation op)
++        {
++            return op.Inst == Instruction.Load && op.StorageKind == StorageKind.ConstantBuffer && op.SourcesCount > 0;
++        }
++
++        // The user bank (3..16) a load reads, or -1.
++        private static int BankOfLoad(Operation op, ResourceManager resources)
++        {
++            if (!IsBankLoadInst(op) || op.GetSource(0).Type != OperandType.Constant ||
++                !resources.TryGetConstantBufferSlot(op.GetSource(0).Value, out int slot))
++            {
++                return -1;
++            }
++
++            return PrevSlot(slot) >= 0 ? slot : -1;
++        }
++
++        // Not stores, calls, atomics, image or texture operations (textures are TextureOperation, left out by type).
++        private static bool Repeatable(Operation op)
++        {
++            Instruction i = op.Inst & Instruction.Mask;
++            return i != Instruction.Store && i != Instruction.Call && !i.IsAtomic() && !i.IsImage() && !i.IsTextureQuery() &&
++                   i != Instruction.TextureSample;
++        }
++
++        private static Operand LastOf(Operand value, Dictionary<Operand, Operand> last)
++        {
++            return value != null && last.TryGetValue(value, out Operand l) ? l : value;
++        }
++
++        private static bool WritesAny(INode node, HashSet<Operand> values)
++        {
++            for (int d = 0; d < node.DestsCount; d++)
++            {
++                if (node.GetDest(d) is Operand dest && values.Contains(dest))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        private static bool ReadsLastFrame(INode node, HashSet<Operand> differs, Dictionary<int, int> prevBinding)
++        {
++            if (node is Operation op && IsBankLoadInst(op) && op.GetSource(0).Type == OperandType.Constant &&
++                prevBinding.ContainsKey(op.GetSource(0).Value))
++            {
++                return true;
++            }
++
++            for (int s = 0; s < node.SourcesCount; s++)
++            {
++                Operand src = node.GetSource(s);
++
++                if (src != null && ((src.Type == OperandType.ConstantBuffer && PrevSlot(src.GetCbufSlot()) >= 0) || differs.Contains(src)))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+index 9d9a587..3b26dd8 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -301,6 +301,13 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+                     Optimizer.RunPass(context);
+                     TransformPasses.RunPass(context);
++
++                    // UltraTears: last frame's position beside this frame's (Transforms/PreviousPosition.cs)
++                    if (i == 0 && Definitions.Stage == ShaderStage.Vertex && GpuAccessor.QueryPreviousPosition())
++                    {
++                        int location = PreviousPosition.Run(cfg.Blocks, resourceManager, AttributeUsage, out int banks);
++                        GpuAccessor.ReportPreviousPosition(location, banks);
++                    }
+                 }
+ 
+                 funcs[i] = new Function(cfg.Blocks, $"fun{i}", false, inArgumentsCount, outArgumentsCount);

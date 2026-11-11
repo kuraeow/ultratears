@@ -4,7 +4,7 @@
  *  - Windows file calls (mkdir, directory types via stat, rename that refuses to replace, _commit);
  *  - RomFS: the runtime index (tools/make_romfs_index.py, MacNativeGames' TOTKRFS1 layout) and the extracted
  *    romfs.bin, both already verified at extraction, or (the player's dump) a folder of plain files, indexed by
- *    walking it at start (tools/setup.py checks it against the expected version); overlays (mods, data patches), split images and the startup
+ *    walking it at start (tools/setup.py checks it against the expected version); player mods are served from their own folders (mods.c), split images and the startup
  *    re-hash are not ported yet. RomFS directory listing stays unsupported, as in MacNativeGames.
  * Save, temporary and cache storage are host directories under the profile directory (TOTK_PROFILE_DIR, default
  * userdata); application save data is created on first start, as the system launcher does. */
@@ -22,6 +22,7 @@
 #endif
 
 #include "host.h"
+#include "mods.h"
 #include "../runtime/hle.h"
 
 #define R_PATH_NOT_FOUND 0x202u
@@ -59,7 +60,15 @@ static uint64_t rom_handles[NROM];   /* file index + 1; 0 is free */
 static pthread_mutex_t rom_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t offset, size; uint32_t name, len; } Entry;
 _Static_assert(sizeof(Entry) == 24, "index entry layout");
-static Entry entry(uint64_t i) { Entry e; memcpy(&e, index_bytes + 24 + i * 24, 24); return e; }
+/* Player mods' files (mods.c) are numbered after the RomFS's own: file_count + k is g_mf[k], read from its own file. */
+static const ModFile *g_mf;
+static size_t g_nmf;
+static Entry entry(uint64_t i) {
+    Entry e;
+    if (i >= file_count) return (Entry){0, g_mf[i - file_count].size, 0, 0};
+    memcpy(&e, index_bytes + 24 + i * 24, 24);
+    return e;
+}
 static const char *entry_name(Entry e) { return (const char *)index_bytes + strings_offset + e.name; }
 
 /* A RomFS folder (the player's extraction: plain files): the index is built by walking it, in the same layout as the
@@ -182,17 +191,30 @@ static uint64_t lower(const char *p) {
     while (lo < hi) { uint64_t m = lo + (hi - lo) / 2; if (strcmp(entry_name(entry(m)), p) < 0) lo = m + 1; else hi = m; }
     return lo;
 }
-static uint64_t file_index(const char *p) {
+static uint64_t base_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
 }
-/* RomFS files served from memory in place of the game's (as totk-pc-recomp's romfs.c overlay, MIT): the HeapDef table
+static size_t mod_lower(const char *p) {   // first mod file whose path is >= p
+    size_t lo = 0, hi = g_nmf;
+    while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (strcmp(g_mf[m].rel, p) < 0) lo = m + 1; else hi = m; }
+    return lo;
+}
+// The file the game gets for RomFS path p: a mod's (file_count + k) before the RomFS's own.
+static uint64_t file_index(const char *p) {
+    if (g_nmf) {
+        size_t k = mod_lower(p);
+        if (k < g_nmf && !strcmp(g_mf[k].rel, p)) return file_count + k;
+    }
+    return base_index(p);
+}
+/* RomFS files served from memory in place of the game's: the HeapDef table
    a bigger game resolution needs (render_res.c: its render-target heap and that heap's parent grown) and, above 30 fps,
    the layout archive whose quick menus capture their background at once (ui_capture.c). */
 #define HEAPDEF "System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs"
 #define UI_COMMON "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"
 #define ZS_DICTS "Pack/ZsDic.pack.zs"
-enum { NOVR = 4 };
+enum { NOVR = 8 };
 static struct { uint64_t index; uint8_t *data; uint64_t size; } ovr[NOVR];
 static int novr;
 static int ovr_find(uint64_t i) { for (int k = 0; k < novr; k++) if (ovr[k].index == i) return k; return -1; }
@@ -203,7 +225,11 @@ static void *rom_file(const char *path, size_t max, size_t *n) {
     Entry e = entry(i);
     void *in = e.size && e.size < max ? malloc((size_t)e.size) : NULL;
     int ok = in != NULL;
-    if (ok && rom_folder) {
+    if (ok && i >= file_count) {
+        int fd = mods_open_file(g_mf[i - file_count].full);
+        ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok && rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, path);
         int fd = open(full, O_RDONLY | O_BINARY);
@@ -220,12 +246,125 @@ static void ovr_add(const char *path, void *data, size_t n) {
     ovr[novr].index = file_index(path), ovr[novr].data = data, ovr[novr].size = n;
     novr++;
 }
+/* ---- player mods (mods.c): their files numbered after the RomFS's own, and the resource size table rebuilt for them */
+// RomFS indices + 1 by the hash of the path without case, for a mod path spelled otherwise (built at the first such path)
+static uint32_t *ci_table;
+static size_t ci_mask;
+static uint64_t ci_hash(const char *s) {
+    uint64_t h = 14695981039346656037ull;
+    for (; *s; s++) h = (h ^ (uint8_t)(*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) * 1099511628211ull;
+    return h;
+}
+static int rom_has(const char *rel, const char **spelling, void *ctx) {
+    (void)ctx;
+    if (base_index(rel) != UINT64_MAX) return 1;
+    if (!ci_table) {
+        for (ci_mask = 1; ci_mask < file_count * 2; ci_mask <<= 1) {}
+        ci_table = calloc(ci_mask, sizeof *ci_table);
+        need(ci_table != NULL, "RomFS case index memory");
+        ci_mask--;
+        for (uint64_t i = 0; i < file_count; i++)
+            for (size_t k = ci_hash(entry_name(entry(i))) & ci_mask;; k = (k + 1) & ci_mask)
+                if (!ci_table[k]) { ci_table[k] = (uint32_t)i + 1; break; }
+    }
+    for (size_t k = ci_hash(rel) & ci_mask; ci_table[k]; k = (k + 1) & ci_mask)
+        if (!strcasecmp(entry_name(entry(ci_table[k] - 1)), rel)) { *spelling = entry_name(entry(ci_table[k] - 1)); break; }
+    return 0;
+}
+static void *base_file(uint64_t i, size_t *n, size_t max) {   // the RomFS's own copy of file i
+    Entry e = entry(i);
+    void *d = e.size < max ? malloc(e.size ? (size_t)e.size : 1) : NULL;
+    int ok = d != NULL;
+    if (ok && rom_folder) {
+        char full[8192];
+        snprintf(full, sizeof full, "%s/%s", rom_dir, entry_name(e));
+        int fd = open(full, O_RDONLY | O_BINARY);
+        ok = fd >= 0 && pread(fd, d, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok)
+        ok = pread(image_fd, d, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
+    if (!ok) { free(d); return NULL; }
+    *n = (size_t)e.size;
+    return d;
+}
+static void *mod_file(size_t k, size_t *n, size_t max) {
+    if (g_mf[k].size >= max) return NULL;
+    void *d = malloc(g_mf[k].size ? (size_t)g_mf[k].size : 1);
+    int fd = d ? mods_open_file(g_mf[k].full) : -1;
+    int ok = fd >= 0 && pread(fd, d, (size_t)g_mf[k].size, 0) == (ssize_t)g_mf[k].size;
+    if (fd >= 0) close(fd);
+    if (!ok) { free(d); return NULL; }
+    *n = (size_t)g_mf[k].size;
+    return d;
+}
+static void *restbl_read(const char *rel, int mod, size_t *n, void *ctx) {
+    (void)ctx;
+    if (mod) { size_t k = mod_lower(rel); return k < g_nmf && !strcmp(g_mf[k].rel, rel) ? mod_file(k, n, 256u << 20) : NULL; }
+    uint64_t i = base_index(rel);
+    return i == UINT64_MAX ? NULL : base_file(i, n, 256u << 20);
+}
+#define RESTBL "System/Resource/ResourceSizeTable.Product.143.Nin_NX_NVN.rsizetable.zs"
+static void ovr_add(const char *path, void *data, size_t n);
+static void mods_romfs_init(void) {
+    g_nmf = 0;
+    const ModFile *mf = NULL;
+    size_t n = mods_romfs_files(&mf, rom_has, NULL);
+    if (!n) return;
+    g_mf = mf, g_nmf = n;
+    uint64_t gi = base_index(RESTBL);
+    if (gi == UINT64_MAX) return;
+    RestblFile *files = calloc(n, sizeof *files);
+    uint8_t (*heads)[2][32] = calloc(n, sizeof *heads);
+    const uint8_t **shipped = calloc(n, sizeof *shipped);
+    size_t *shipped_n = calloc(n, sizeof *shipped_n), nf = 0, gn = 0, dn = 0;
+    int nshipped = 0;
+    need(files && heads && shipped && shipped_n, "mods: resource size table memory");
+    for (size_t k = 0; k < n; k++) {
+        if (!strncmp(mf[k].rel, "System/Resource/ResourceSizeTable.", 34)) {
+            size_t sn = 0;
+            void *d = mod_file(k, &sn, 64u << 20);
+            if (d) shipped[nshipped] = d, shipped_n[nshipped++] = sn;
+            continue;
+        }
+        RestblFile *f = &files[nf++];
+        f->rel = mf[k].rel, f->size = mf[k].size, f->head = heads[k][0], f->orig_head = heads[k][1];
+        // the zstd frame header (the decompressed size): only when the size alone does not do (.mc grows by size)
+        int fd = mods_open_file(mf[k].full);
+        ssize_t r = fd >= 0 ? pread(fd, heads[k][0], 32, 0) : -1;
+        if (fd >= 0) close(fd);
+        f->head_n = r > 0 ? (size_t)r : 0;
+        uint64_t bi = base_index(mf[k].rel);
+        if (bi != UINT64_MAX) {
+            Entry e = entry(bi);
+            f->orig_size = e.size;
+            if (rom_folder) {
+                char full[8192];
+                snprintf(full, sizeof full, "%s/%s", rom_dir, mf[k].rel);
+                int bfd = open(full, O_RDONLY | O_BINARY);
+                r = bfd >= 0 ? pread(bfd, heads[k][1], 32, 0) : -1;
+                if (bfd >= 0) close(bfd);
+            } else
+                r = pread(image_fd, heads[k][1], e.size < 32 ? (size_t)e.size : 32, (off_t)e.offset);
+            f->orig_head_n = r > 0 ? (size_t)r : 0;
+        }
+    }
+    void *game = base_file(gi, &gn, 64u << 20);
+    uint64_t di = base_index(ZS_DICTS);
+    void *dicts = di != UINT64_MAX ? base_file(di, &dn, 16u << 20) : NULL;
+    size_t out_n = 0;
+    uint8_t *out = game ? totk_restbl_build(game, gn, shipped, shipped_n, nshipped, files, nf, restbl_read, NULL, dicts, dn, &out_n) : NULL;
+    if (out) ovr_add(RESTBL, out, out_n);
+    for (int k = 0; k < nshipped; k++) free((void *)shipped[k]);
+    free(game); free(dicts); free(files); free(heads); free(shipped); free(shipped_n);
+}
+
 static void heapdef_overlay(void) {
+    mods_romfs_init();
     uint64_t totk_heap_extra_kib(void);
     int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
     void totk_resolution_log(void);
     int totk_ui_build(const void *in, size_t n, const void *dicts_z, size_t dn, int capture, unsigned w, unsigned h,
-                      void **out, size_t *out_n);
+                      int prompts, void **out, size_t *out_n);
     int totk_aspect_output(unsigned *w, unsigned *h);
     int totk_fr_fps60(void);
     size_t n = 0, dn = 0, out_n = 0;
@@ -240,15 +379,19 @@ static void heapdef_overlay(void) {
     // output of another shape than 16:9 the layouts are laid out for it (host/ui_aspect.c)
     unsigned aw = 0, ah = 0;
     int capture = totk_fr_fps60(), aspect = totk_aspect_output(&aw, &ah);
-    if (!capture && !aspect) return;
+    // the button prompts after the player's controls: the Xbox layout, buttons bound elsewhere (host/ui_prompts.c)
+    int totk_ui_prompts_wanted(void);
+    int prompts = totk_ui_prompts_wanted();
+    if (!capture && !aspect && !prompts) return;
     in = rom_file(UI_COMMON, 64u << 20, &n);
     void *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL;
     uint64_t t0 = runtime_now_ns();
-    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, &out, &out_n)) {
+    if (in && dicts && totk_ui_build(in, n, dicts, dn, capture, aw, ah, prompts, &out, &out_n)) {
         ovr_add(UI_COMMON, out, out_n);
-        fprintf(stderr, "[totk] RomFS: %s served%s%s (%.0f ms)\n", UI_COMMON,
+        fprintf(stderr, "[totk] RomFS: %s served%s%s%s (%.0f ms)\n", UI_COMMON,
                 capture ? ", the quick menus' background captured at once" : "",
-                aspect ? ", the layouts for the output's shape" : "", (runtime_now_ns() - t0) / 1e6);
+                aspect ? ", the layouts for the output's shape" : "", prompts ? ", the button prompts after the controls" : "",
+                (runtime_now_ns() - t0) / 1e6);
     } else if (!in || !dicts)
         fprintf(stderr, "[totk] RomFS: %s or %s missing: the game's own layouts\n", UI_COMMON, ZS_DICTS);
     free(in); free(dicts);
@@ -256,6 +399,8 @@ static void heapdef_overlay(void) {
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
     uint64_t i = lower(folder);
+    size_t k = g_nmf ? mod_lower(folder) : 0;
+    if (k < g_nmf && !strncmp(g_mf[k].rel, folder, n)) return 1;   // a folder only a mod has
     return i < file_count && !strncmp(entry_name(entry(i)), folder, n);
 }
 /* "mount:/a/b" (or "mount://a" from audio stream paths) -> "a/b"; NULL on traversal or a foreign mount */
@@ -285,6 +430,31 @@ static int romfs_owns(const char *path) {
     return n && path && !strncmp(path, mount_name, n) && path[n] == ':';
 }
 static int romfs_handle(uint64_t h) { return h > ROM_BASE && h < ROM_BASE + NROM; }
+/* Built the first time the game opens them, served from memory like the layouts (host/ui_prompts.c):
+   - the language's message archive (Mals/<lang>.Product.<n>.sarc.zs): the letters of the action prompt's diamond that
+     moved to another place say that place's letter (a button bound away from its place);
+   - the font archives (Font/Font*.Nin_NX_NVN.bfarc.zs): the button symbols in the game's texts after the controls. */
+typedef int (*zs_builder)(const void *in, size_t n, const void *dicts_z, size_t dn, void **out, size_t *out_n);
+static void lazy_overlay(const char *p, uint64_t i, zs_builder build, const char *what) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t tried[32];
+    static int ntried;
+    pthread_mutex_lock(&lock);
+    int seen = 0;
+    for (int k = 0; k < ntried; k++) seen |= tried[k] == i;
+    if (!seen && ntried < 32 && novr < NOVR) {
+        tried[ntried++] = i;
+        size_t n = 0, dn = 0, out_n = 0;
+        uint64_t t0 = runtime_now_ns();
+        void *in = rom_file(p, 64u << 20, &n), *dicts = in ? rom_file(ZS_DICTS, 16u << 20, &dn) : NULL, *out = NULL;
+        if (in && dicts && build(in, n, dicts, dn, &out, &out_n)) {
+            ovr_add(p, out, out_n);
+            fprintf(stderr, "[totk] RomFS: %s served with %s (%.0f ms)\n", p, what, (runtime_now_ns() - t0) / 1e6);
+        }
+        free(in); free(dicts);
+    }
+    pthread_mutex_unlock(&lock);
+}
 static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     runtime_fs_log("rom", path ? path : "(null)");
     if (!out || mode != OPEN_READ) return R_ROM_UNSUPPORTED;
@@ -292,8 +462,14 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!p) return R_PATH_NOT_FOUND;
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return R_PATH_NOT_FOUND;
+    int totk_ui_prompts_mals(const void *, size_t, const void *, size_t, void **, size_t *);
+    int totk_ui_prompts_font(const void *, size_t, const void *, size_t, void **, size_t *);
+    if (!strncmp(p, "Mals/", 5)) lazy_overlay(p, i, totk_ui_prompts_mals, "the diamond's letters after the controls");
+    else if (!strncmp(p, "Font/Font", 9) && strstr(p, ".bfarc.zs")) lazy_overlay(p, i, totk_ui_prompts_font, "the button symbols after the controls");
     int fd = -1;
-    if (rom_folder) {
+    if (i >= file_count) {   // a mod's file
+        if ((fd = mods_open_file(g_mf[i - file_count].full)) < 0) return R_PATH_NOT_FOUND;
+    } else if (rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, p);
         if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) return R_PATH_NOT_FOUND;
@@ -303,6 +479,13 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
         if (!rom_handles[h]) { rom_handles[h] = i + 1; rom_fds[h] = fd; *out = ROM_BASE + h; pthread_mutex_unlock(&rom_lock); return 0; }
     pthread_mutex_unlock(&rom_lock);
     runtime_fail("RomFS handle table full");
+}
+// The game's RomFS reads: their time (all threads) and bytes, for the long-frame line (gfx/nvn/hle_nvn.c)
+static _Atomic uint64_t g_fs_ns, g_fs_bytes;
+void runtime_zstd_cost(uint64_t *ns);   // host/zstd_host.c
+void runtime_io_cost(uint64_t *fs_ns, uint64_t *fs_bytes, uint64_t *zstd_ns) {
+    *fs_ns = atomic_load(&g_fs_ns); *fs_bytes = atomic_load(&g_fs_bytes);
+    runtime_zstd_cost(zstd_ns);
 }
 static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     if (!out || offset < 0 || (!buffer && size)) return R_ROM_INVALID;
@@ -321,11 +504,18 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
     guest_prepare_write(buffer, n);
+    int tries = 0;
+    uint64_t t0 = runtime_now_ns();
     while (done < n) {
-        ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
+        ssize_t r = pread(rom_folder || i - 1 >= file_count ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
+        // EFAULT: a region of the write watch was being frozen read-only as the read began (Linux, platform/linux.c);
+        // writable again, the read goes on
+        if (r < 0 && errno == EFAULT && tries++ < 8) { guest_prepare_write((uint8_t *)buffer + done, n - done); continue; }
         need(r > 0, "RomFS image read");
         done += (uint64_t)r;
     }
+    atomic_fetch_add(&g_fs_ns, runtime_now_ns() - t0);
+    atomic_fetch_add(&g_fs_bytes, n);
     *out = n;
     return 0;
 }
@@ -340,7 +530,8 @@ static void romfs_close(uint64_t h) {
     pthread_mutex_lock(&rom_lock);
     need(rom_handles[h - ROM_BASE] != 0, "close of a closed RomFS handle");
     rom_handles[h - ROM_BASE] = 0;
-    if (rom_folder) close(rom_fds[h - ROM_BASE]);
+    if (rom_fds[h - ROM_BASE] >= 0) close(rom_fds[h - ROM_BASE]);
+    rom_fds[h - ROM_BASE] = -1;
     pthread_mutex_unlock(&rom_lock);
 }
 static unsigned romfs_entry_type(int *out, const char *path) {
@@ -545,7 +736,7 @@ static void unmount(const char *name) {
     if (!romfs_owns(name) && strcmp(name, mount_name)) runtime_fail("unmount of unknown fs mount");
 }
 /* Commit writes the files to the disk on a thread of its own: fsync of every open file on the game's thread stopped it
-   for ~100 ms at each save (totk-pc-recomp measured 95-135 ms; its 6fca957 does it in the background, MIT). Each file
+   for ~100 ms at each save. Each file
    goes as a duplicate of its descriptor, so the game may close or reuse it meanwhile; until they are written the save
    counts as busy (runtime_fs_save_busy), so leaving the game waits for them. */
 static pthread_mutex_t sync_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -632,8 +823,10 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
     guest_prepare_write(buffer, size);
     uint64_t done = 0;
+    int tries = 0;
     while (done < size) {
         ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done);
+        if (n < 0 && errno == EFAULT && tries++ < 8) { guest_prepare_write((uint8_t *)buffer + done, size - done); continue; }   // as above
         if (n < 0) runtime_fail("host save read failure");
         if (!n) break;
         done += (uint64_t)n;
@@ -659,7 +852,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (fstat(fd, &st)) runtime_fail("host save stat");
     if ((uint64_t)offset + size > (uint64_t)st.st_size && !(mode & OPEN_APPEND)) return R_APPEND_REQUIRED;
     if (f->save) save_touched();
-    uint64_t done = 0;
+    uint64_t done = 0, t0 = runtime_now_ns();
     while (done < size) {
         ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done);
         if (n <= 0) {
@@ -670,7 +863,12 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         }
         done += (uint64_t)n;
     }
-    if (option && (*option & 1)) fsync(fd);
+    // The write is in the system's cache (later reads see it); a flush goes to the disk on the sync thread, as Commit
+    // does: on the game's thread it stopped the game for 0.5-0.8 s at each autosave on the Steam Deck (2026-11-05:
+    // pairs of long frames with no file read, decompression or GPU wait in them).
+    if (option && (*option & 1)) sync_later(fd);
+    atomic_fetch_add(&g_fs_ns, runtime_now_ns() - t0);
+    atomic_fetch_add(&g_fs_bytes, size);
     return 0;
 }
 static unsigned file_size(int64_t *out, uint64_t h) {
@@ -688,7 +886,7 @@ static unsigned set_file_size(uint64_t h, int64_t size) {
     if (files[h - FILE_BASE].save) save_touched();
     return _chsize_s(fd, size) ? errno_result() : 0;
 }
-static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fsync(fd); return 0; }
+static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; sync_later(fd); return 0; }   // (as above)
 static void close_file(uint64_t h) {
     if (romfs_handle(h)) { romfs_close(h); return; }
     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");
@@ -805,37 +1003,37 @@ static void close_directory(uint64_t h) {
 static void set_priority(int priority) { (void)priority; }   /* fs priority orders I/O inside the system fs process */
 static void fs_initialize(void) { runtime_fs_init(); }
 
-HLE_NATIVE("_ZN2nn2fs24InitializeForApplicationEv", fs_initialize, 'v')
-HLE_NATIVE("_ZN2nn2fs8MountRomEPKcPvm", mount_rom, 'w')
-HLE_NATIVE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", rom_cache_size, 'w')
-HLE_NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", open_file, 'w')
-HLE_NATIVE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", file_size, 'w')
-HLE_NATIVE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", close_file, 'v')
-HLE_NATIVE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", entry_type, 'w')
-HLE_NATIVE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", read_file, 'w')
-HLE_NATIVE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", read_options, 'w')
-HLE_NATIVE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", read_exact, 'w')
-HLE_NATIVE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", write_file, 'w')
-HLE_NATIVE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", set_file_size, 'w')
-HLE_NATIVE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", flush_file, 'w')
-HLE_NATIVE("_ZN2nn2fs10CreateFileEPKcl", create_file, 'w')
-HLE_NATIVE("_ZN2nn2fs10DeleteFileEPKc", delete_file, 'w')
-HLE_NATIVE("_ZN2nn2fs10RenameFileEPKcS2_", rename_file, 'w')
-HLE_NATIVE("_ZN2nn2fs15CreateDirectoryEPKc", create_directory, 'w')
-HLE_NATIVE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", delete_recursive, 'w')
-HLE_NATIVE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", open_directory, 'w')
-HLE_NATIVE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", read_directory, 'w')
-HLE_NATIVE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", close_directory, 'v')
-HLE_NATIVE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save, 'w')
-HLE_NATIVE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro, 'w')
-HLE_NATIVE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists, 'b')
-HLE_NATIVE("_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp, 'w')
-HLE_NATIVE("_ZN2nn2fs7UnmountEPKc", unmount, 'v')
-HLE_NATIVE("_ZN2nn2fs6CommitEPKc", commit, 'w')
-HLE_NATIVE("_ZN2nn2fs18CreateCacheStorageEill", create_cache, 'w')
-HLE_NATIVE("_ZN2nn2fs18DeleteCacheStorageEi", delete_cache, 'w')
-HLE_NATIVE("_ZN2nn2fs17MountCacheStorageEPKci", mount_cache, 'w')
-HLE_NATIVE("_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", open_cache_list, 'w')
-HLE_NATIVE("_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi", read_cache_list, 'w')
-HLE_NATIVE("_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", close_cache_list, 'v')
-HLE_NATIVE("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", set_priority, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs24InitializeForApplicationEv", fs_initialize, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs8MountRomEPKcPvm", mount_rom, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs22QueryMountRomCacheSizeEPm", rom_cache_size, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", open_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", file_size, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs9CloseFileENS0_10FileHandleE", close_file, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", entry_type, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", read_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", read_options, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", read_exact, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", write_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", set_file_size, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs9FlushFileENS0_10FileHandleE", flush_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs10CreateFileEPKcl", create_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs10DeleteFileEPKc", delete_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs10RenameFileEPKcS2_", rename_file, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs15CreateDirectoryEPKc", create_directory, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", delete_recursive, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", open_directory, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", read_directory, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", close_directory, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists, 'b')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs7UnmountEPKc", unmount, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs6CommitEPKc", commit, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs18CreateCacheStorageEill", create_cache, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs18DeleteCacheStorageEi", delete_cache, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs17MountCacheStorageEPKci", mount_cache, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs20OpenCacheStorageListEPNS0_22CacheStorageListHandleE", open_cache_list, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi", read_cache_list, 'w')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", close_cache_list, 'v')
+HLE_NATIVE_BLOCKING("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", set_priority, 'v')

@@ -359,3 +359,89 @@ size_t vkb_spv_drop_interlock(uint32_t *w, size_t nw) {
     }
     return o;
 }
+
+// TOTK_VK_NO_INVARIANT (vkb_shader.c): the translator marks the vertex position Invariant (third_party/shader_translator
+// patch 0009), which keeps drivers from reordering its arithmetic. Taken out here for an A/B of its GPU cost.
+size_t vkb_spv_drop_invariant(uint32_t *w, size_t n, int *found) {
+    *found = 0;
+    size_t o = 5;
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) return n;   // malformed: leave the module as it was (nothing moved before i)
+        if ((op == 71 && wc == 3 && w[i + 2] == 18) || (op == 72 && wc == 4 && w[i + 3] == 18)) {
+            (*found)++;
+        } else {
+            if (o != i) memmove(&w[o], &w[i], wc * 4);
+            o += wc;
+        }
+        i += wc;
+    }
+    return o;
+}
+
+// TOTK_VK_DEPTH_CLIP_NEG1 (vkb_shader.c): the translator's z = fma(z, 0.5, w * 0.5) before the divide taken out of a vertex
+// shader (the Fma becomes a copy of z), in place; the draw maps -1..1 to the depth range in the fixed function instead
+// (VK_EXT_depth_clip_control negativeOneToOne), as Maxwell does: the window depth then comes from the
+// interpolated z / w and not from a z rounded once more in the shader. *found: conversions taken out.
+size_t vkb_spv_drop_depth_convert(uint32_t *w, size_t n, int *found) {
+    *found = 0;
+    uint32_t bound = n > 5 ? w[3] : 0;
+    if (!bound || bound > (1u << 22)) return n;
+    uint32_t *cval = calloc(bound, 4);    // constant values (raw bits)
+    uint8_t *flag = calloc(bound, 1);     // 1 constant, 4 half w (FMul by 0.5), 8 pointer to Position.z, 16 marked Fma
+    uint32_t *fmaz = calloc(bound, 4);    // Fma result id -> its z operand + 1
+    uint32_t *stored = calloc(bound, 4);  // local variable -> the value last stored into it
+    uint32_t *val = calloc(bound, 4);     // a load -> the value it reads (through a local), else 0
+    uint32_t *ptrtype = calloc(bound, 4), *vartype = calloc(bound, 4), posvar = 0, blocktype = 0, member = 0;
+    if (!cval || !flag || !fmaz || !stored || !val || !ptrtype || !vartype) goto out;
+    const uint32_t HALF = 0x3f000000u;
+#define R(id) ((id) < bound && val[id] ? val[id] : (id))   // a value seen through loads of locals
+#define CV(id) ((id) < bound && (flag[id] & 1) ? (long long)cval[id] : -1)
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) break;
+        if (op == 43 && wc == 4 && w[i + 2] < bound) { flag[w[i + 2]] |= 1; cval[w[i + 2]] = w[i + 3]; }
+        else if (op == 71 && wc == 4 && w[i + 2] == 11 && w[i + 3] == 0) posvar = w[i + 1];   // BuiltIn Position
+        else if (op == 72 && wc == 5 && w[i + 3] == 11 && w[i + 4] == 0) { blocktype = w[i + 1]; member = w[i + 2]; }
+        else if (op == 32 && wc == 4 && w[i + 1] < bound) ptrtype[w[i + 1]] = w[i + 3];
+        else if (op == 59 && wc >= 4 && w[i + 2] < bound && w[i + 1] < bound) vartype[w[i + 2]] = ptrtype[w[i + 1]];
+        else if (op == 62 && wc >= 3 && w[i + 1] < bound) {   // OpStore
+            uint32_t v = R(w[i + 2]);
+            stored[w[i + 1]] = v;
+            if ((flag[w[i + 1]] & 8) && v < bound && fmaz[v]) flag[v] |= 16;
+        } else if (op == 61 && wc >= 4 && w[i + 2] < bound && w[i + 3] < bound) val[w[i + 2]] = stored[w[i + 3]];   // OpLoad
+        else if (op == 133 && wc == 5 && w[i + 2] < bound) {   // OpFMul
+            uint32_t a = R(w[i + 3]), b = R(w[i + 4]);
+            if (CV(a) == HALF || CV(b) == HALF) flag[w[i + 2]] |= 4;
+        } else if (op == 12 && wc == 8 && w[i + 4] == 50 && w[i + 2] < bound) {   // OpExtInst GLSL.std.450 Fma
+            uint32_t b = R(w[i + 6]), c = R(w[i + 7]);
+            if (CV(b) == HALF && c < bound && (flag[c] & 4)) fmaz[w[i + 2]] = w[i + 5] + 1;
+        } else if (op == 65 && wc >= 5 && w[i + 2] < bound) {   // OpAccessChain into Position .z
+            uint32_t base = w[i + 3], *ix = &w[i + 4];
+            int nix = (int)wc - 4;
+            if ((base == posvar && nix == 1 && CV(ix[0]) == 2) ||
+                (blocktype && base < bound && vartype[base] == blocktype && nix == 2 && CV(ix[0]) == member && CV(ix[1]) == 2))
+                flag[w[i + 2]] |= 8;
+        }
+        i += wc;
+    }
+#undef R
+#undef CV
+    for (size_t i = 5, o = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) { n = o; break; }
+        if (op == 12 && wc == 8 && w[i + 2] < bound && (flag[w[i + 2]] & 16)) {   // -> OpCopyObject %type %id %z
+            uint32_t t = w[i + 1], id = w[i + 2], z = fmaz[id] - 1;
+            w[o] = (4u << 16) | 83; w[o + 1] = t; w[o + 2] = id; w[o + 3] = z;
+            o += 4; (*found)++;
+        } else {
+            memmove(&w[o], &w[i], wc * 4);
+            o += wc;
+        }
+        i += wc;
+        if (i >= n) n = o;
+    }
+out:
+    free(cval); free(flag); free(fmaz); free(stored); free(val); free(ptrtype); free(vartype);
+    return n;
+}

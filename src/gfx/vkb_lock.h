@@ -11,7 +11,9 @@ uint64_t runtime_now_ns(void);
 // Time spent in some replay steps (development measurement, the per-frame log line)
 // new images (vkCreateImage + memory), uploads from game memory, queue submits; memory for the upload rings, descriptors
 // and uniform copies; the uniform snapshot at a submission's start; pool copies brought up to date before a submit
-enum { PK_CREATE, PK_UPLOAD, PK_SUBMIT, PK_ALLOC, PK_UCAP, PK_SYNC, PK_COUNT };
+// PK_UPWAIT: uploads waiting for one another (g_up_mu, vkb_tex.c); PK_SLOWDRAW: draws after a shader change that took
+// over 1 ms from the bind to the draw (a driver finishing a shader on first use?), the long-submission line
+enum { PK_CREATE, PK_UPLOAD, PK_SUBMIT, PK_ALLOC, PK_UCAP, PK_SYNC, PK_UPWAIT, PK_SLOWDRAW, PK_COUNT };
 extern _Atomic uint64_t vkb_step_ns[PK_COUNT], vkb_step_n[PK_COUNT];
 static inline void vkb_step_add(int kind, uint64_t t0) {
     atomic_fetch_add_explicit(&vkb_step_ns[kind], runtime_now_ns() - t0, memory_order_relaxed);

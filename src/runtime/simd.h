@@ -52,6 +52,7 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define FPCR_FZ (1u << 24)
 #define FPCR_RM (3u << 22)
 #define FPCR_SLOW (FPCR_FZ | FPCR_RM)
+extern int g_simd_nanvec;   // [TOTK] simd_fp.h vslow: NaN lanes fixed across the vector (dispatch.c, TOTK_FP_NANVEC)
 
 // MSR FPCR (the lifter emits this): FPCR.FZ also sets the host thread's MXCSR flush-to-zero and denormals-are-zero
 // (FTZ bit 15, DAZ bit 6), so FP arithmetic under FZ runs natively instead of through the flushing slow path. TOTK sets

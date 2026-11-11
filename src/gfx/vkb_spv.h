@@ -27,3 +27,9 @@ int vkb_spv_clamp_dref(const uint32_t *in, size_t nwords, uint32_t **out, size_t
 // end, execution modes, capability and extension - in place. The section it guarded then runs unordered between
 // overlapping fragments (a rare blending artefact) instead of the module being refused. Returns the new word count.
 size_t vkb_spv_drop_interlock(uint32_t *w, size_t nwords);
+// The translator's depth conversion z = (z + w) / 2 taken out of a vertex shader, in place (TOTK_VK_DEPTH_CLIP_NEG1):
+// the new word count; *found: how many were taken out.
+size_t vkb_spv_drop_depth_convert(uint32_t *w, size_t nwords, int *found);
+// Every Invariant decoration (OpDecorate / OpMemberDecorate, decoration 18) taken out, in place (TOTK_VK_NO_INVARIANT):
+// the new word count; *found: how many were taken out.
+size_t vkb_spv_drop_invariant(uint32_t *w, size_t nwords, int *found);

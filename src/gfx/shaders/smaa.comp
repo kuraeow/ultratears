@@ -1,0 +1,53 @@
+#version 450
+// UltraTears: SMAA 1x in place of the game's FXAA (src/gfx/vkb_smaa.c). SPDX-License-Identifier: GPL-3.0-or-later
+// The three passes of Jimenez et al.'s SMAA (third_party/smaa/SMAA.hlsl, MIT, unchanged) as compute shaders, one per
+// PASS: 0 luma edge detection, 1 blending weights, 2 neighbourhood blending. Each thread is one pixel: the "vertex
+// shader" functions of SMAA.hlsl give the offsets a full-screen triangle would have interpolated (they are linear in the
+// texture coordinate), the "pixel shader" functions the result. Coordinates as SMAA's D3D convention, which Vulkan's
+// shares (origin top-left): AreaTex and SearchTex go up as they are, unflipped.
+// The input is the game's tonemapped picture (0..1, the values its own FXAA takes luma from), sampled linearly.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform Metrics { vec4 rt; } pc;   // 1 / width, 1 / height, width, height
+
+#define SMAA_RT_METRICS pc.rt
+#define SMAA_GLSL_4 1
+#define SMAA_PRESET_HIGH 1
+// SMAA's edge detection discards a pixel without edges (its stencil); here the pixel is written with no edges instead
+#define discard return float2(0.0, 0.0)
+#include "../../../third_party/smaa/SMAA.hlsl"
+#undef discard
+
+#if PASS == 0
+layout(binding = 0) uniform sampler2D colorTex;
+layout(binding = 1, rg8) uniform writeonly image2D edgesOut;
+#elif PASS == 1
+layout(binding = 0) uniform sampler2D edgesTex;
+layout(binding = 1) uniform sampler2D areaTex;
+layout(binding = 2) uniform sampler2D searchTex;
+layout(binding = 3, rgba8) uniform writeonly image2D blendOut;
+#else
+layout(binding = 0) uniform sampler2D colorTex;
+layout(binding = 1) uniform sampler2D blendTex;
+layout(binding = 2, rgba16f) uniform writeonly image2D colorOut;
+#endif
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.rt.z) || p.y >= int(pc.rt.w)) return;
+    vec2 uv = (vec2(p) + 0.5) * pc.rt.xy;
+#if PASS == 0
+    vec4 off[3];
+    SMAAEdgeDetectionVS(uv, off);
+    imageStore(edgesOut, p, vec4(SMAALumaEdgeDetectionPS(uv, off, colorTex), 0.0, 0.0));
+#elif PASS == 1
+    vec2 pix;
+    vec4 off[3];
+    SMAABlendingWeightCalculationVS(uv, pix, off);
+    imageStore(blendOut, p, SMAABlendingWeightCalculationPS(uv, pix, off, edgesTex, areaTex, searchTex, vec4(0.0)));
+#else
+    vec4 off;
+    SMAANeighborhoodBlendingVS(uv, off);
+    imageStore(colorOut, p, SMAANeighborhoodBlendingPS(uv, off, colorTex, blendTex));
+#endif
+}

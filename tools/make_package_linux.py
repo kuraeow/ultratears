@@ -11,11 +11,11 @@ the clang resource headers for x86, ninja) from the pins of tools/deps.json "lin
 (tools/deps_install.py installs them here as on a source build; their debug symbols stripped), deps/linux (the Linux
 kit: the sysroot every Linux build compiles against), deps/shaders/ultrs-shaders (tools/build_xlate.py --rid
 linux-x64), ultratears-launcher with libSDL3.so.0 beside it. Every ELF file is checked against glibc 2.34, the floor the
-official LLVM binaries set (as totk-pc-recomp's make_release_linux.py check_glibc). The Windows builder puts the
+official LLVM binaries set. The Windows builder puts the
 AppImage into a Steam Deck's tar, the Linux launcher downloads it for its updates.
 
-The AppImage: the same folder with AppRun (the launcher) and a desktop entry, packed by appimagetool (pinned by hash as
-totk-pc-recomp pins it) with the static type-2 runtime (no libfuse2 on the host) built with this project's patch
+The AppImage: the same folder with AppRun (the launcher) and a desktop entry, packed by appimagetool (pinned by hash)
+with the static type-2 runtime (no libfuse2 on the host) built with this project's patch
 (tools/appimage_runtime: started from Steam, the released runtime finds no fusermount and the AppImage does not start).
 Started, the launcher copies the builder into the folder the player picks (tools/install_to.py) and builds the game there.
 """
@@ -41,7 +41,7 @@ import version  # noqa: E402
 from make_package import NOT_IN_PACKAGE, LICENSE_COPIES, git  # noqa: E402
 
 GLIBC_FLOOR = (2, 34)
-APPIMAGETOOL = {   # from release tags, pinned by hash: "continuous" uploads change under the same name (totk-pc-recomp's pins)
+APPIMAGETOOL = {   # from release tags, pinned by hash: "continuous" uploads change under the same name
     'tool': {'url': 'https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage',
              'sha256': 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'},
 }

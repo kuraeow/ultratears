@@ -219,7 +219,7 @@
   "size": 300755826
  },
  "linux_host": {
-  "comment": "The build's tools on Linux (tools/deps_install.py; a Linux builder package carries them, tools/make_package.py --linux): the same pins as totk-pc-recomp's tools/make_release_linux.py where it has them",
+  "comment": "The build's tools on Linux (tools/deps_install.py; a Linux builder package carries them, tools/make_package.py --linux)",
   "python": {
    "version": "3.14.10",
    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.14.10%2B20261026-x86_64-unknown-linux-gnu-install_only.tar.gz",

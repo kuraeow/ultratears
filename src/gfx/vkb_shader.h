@@ -20,7 +20,7 @@ typedef struct { uint8_t slot, separate; uint16_t type; } vkb_tex_ref;   // NVN 
 enum { VKB_VARIANTS = 16 };
 typedef struct { uint32_t intmask, sintmask, outmask, out_umask, out_imask; VkShaderEXT obj; } vkb_variant;
 
-typedef struct {
+typedef struct vkb_shader {
     VkShaderEXT obj;
     VkShaderStageFlagBits vk_stage;
     int stage;                           // NVN: 0 vertex, 1 fragment, 5 compute
@@ -44,12 +44,24 @@ typedef struct {
     uint32_t in_mask, out_mask;          // input / output locations
     uint32_t in_umask, in_imask;         // inputs of unsigned / signed integer type (fragment shaders)
     vkb_variant variants[VKB_VARIANTS]; int nvariants;   // vertex variants (integer attributes, added outputs) made so far
+    // the last-frame position variant of a vertex shader (vkb_shader_prevpos; the translator's PreviousPosition): its
+    // output location, the user banks the position reads, and for each cbuf slot the bank whose last-frame block is
+    // bound there (0: none; the translator's slots 18..31 are moved into slots the shader does not use)
+    int prev_loc; uint32_t prev_banks; uint8_t prev_of[VKB_NCBUF];
+    const struct vkb_shader *prev; int prev_state;   // the variant of this shader: 0 not looked up, 1 ready, -1 none
+    int neg1;                            // TOTK_VK_DEPTH_CLIP_NEG1: its z = (z + w) / 2 taken out (drawn with -1..1 clip)
 } vkb_shader;
+int vkb_depth_clip_neg1(void);   // TOTK_VK_DEPTH_CLIP_NEG1 (vkb_shader.c)
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd);   // NULL: no translation (logged)
 // The vertex shader object for integer attributes at intmask (signed: sintmask) and drawn with the fragment shader fs
 // (NULL: none): outputs added for the inputs of fs it does not write. See vkb_spv.c.
 VkShaderEXT vkb_shader_variant(const vkb_shader *vs, uint32_t intmask, uint32_t sintmask, const vkb_shader *fs);
+// The last-frame position variant of a vertex shader (per-object motion vectors, vkb_tsr.c): NULL while it is being
+// made (by a creator thread) or when the pack has none.
+const vkb_shader *vkb_shader_prevpos(const vkb_shader *vs);
+// A shader object for a fragment shader made by the port (stage fragment, the universal layout): NULL on failure.
+VkShaderEXT vkb_shader_own_fragment(const uint32_t *spv, size_t bytes);
 enum { VKB_LAYOUT_GRAPHICS, VKB_LAYOUT_COMPUTE, VKB_LAYOUT_BUFFERS, VKB_LAYOUTS };   // vkb_set_layout ids
 VkDescriptorSetLayout vkb_set_layout(int id);   // with split sets VKB_LAYOUT_GRAPHICS holds the textures and images only
 uint32_t vkb_set_layouts(int compute, VkDescriptorSetLayout out[2]);   // a pipeline's set layouts: their count

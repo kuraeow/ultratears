@@ -69,7 +69,8 @@ int main(int argc, char **argv) {
     if (!(dev_shot && *dev_shot) && !single_instance(TITLE))
         return 0;
     SDL_SetHint(SDL_HINT_APP_NAME, "UltraTears Launcher");
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    // the gamepad too: ImGui's SDL backend opens controllers only with it (the Steam Deck's own controls, any pad)
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
         return start_failed(log, "SDL_Init");
     SDL_Log("video driver %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
     float scale = window_scale(nullptr);
@@ -114,8 +115,13 @@ int main(int argc, char **argv) {
     bool running = true;
     while (running) {
         SDL_Event e;
-        bool got = SDL_WaitEventTimeout(&e, 50);   // idle: a few frames a second (the build's progress), no busy loop
+        // idle: a few frames a second (the build's progress), no busy loop; scrolling: every frame (vsync paces it)
+        bool got = SDL_WaitEventTimeout(&e, ui_busy() ? 1 : 50);
         while (got) {
+            if (ui_event(&e)) {   // a key or button being bound (the Controls tab): not for ImGui
+                got = SDL_PollEvent(&e);
+                continue;
+            }
             ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && e.window.windowID == SDL_GetWindowID(win))) {
                 if (ui_close_request())
@@ -153,6 +159,25 @@ int main(int argc, char **argv) {
         SDL_SetRenderDrawColor(ren, 12, 12, 12, 255);
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
+        // development: ULTRS_LAUNCHER_SHOT_KEYS=down,down,... pressed one every 4 frames before the screenshot (the
+        // keyboard's navigation, the same as the gamepad's)
+        if (shot && *shot) {
+            static const char *keys = SDL_getenv("ULTRS_LAUNCHER_SHOT_KEYS");
+            if (keys && *keys && frame >= 4 && frame % 4 == 0) {
+                const char *end = SDL_strchr(keys, ',');
+                std::string name(keys, end ? (size_t)(end - keys) : SDL_strlen(keys));
+                keys = end ? end + 1 : keys + SDL_strlen(keys);
+                SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
+                for (Uint32 t : {SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP}) {
+                    SDL_Event k;
+                    SDL_zero(k);
+                    k.type = t, k.key.scancode = sc, k.key.key = SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, false);
+                    k.key.down = t == SDL_EVENT_KEY_DOWN, k.key.windowID = SDL_GetWindowID(win);
+                    SDL_PushEvent(&k);
+                }
+                shot_at = SDL_GetTicks() + 400;
+            }
+        }
         if (shot && *shot && ++frame >= 8 && SDL_GetTicks() >= shot_at) {
             SDL_Surface *s = SDL_RenderReadPixels(ren, nullptr);
             if (s) {

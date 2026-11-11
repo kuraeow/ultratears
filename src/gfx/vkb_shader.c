@@ -445,6 +445,31 @@ static int dref_clamp(void) {
     if (v < 0) { const char *e = getenv("TOTK_VK_DREF_CLAMP"); v = !(e && *e == '0'); }
     return v;
 }
+// TOTK_VK_DEPTH_CLIP_NEG1=1: the vertex shaders' z = (z + w) / 2 taken out at load (vkb_spv_drop_depth_convert) and the
+// draws clip and map -1..1 themselves (vkb_draw.c, VK_EXT_depth_clip_control), as Maxwell does. L27: the distant
+// water and island edges re-decided on camera steps of 1e-5 rad with a 27 % smaller jump (fixed-step tower test,
+// 2026-11-10). Off by default until checked in play.
+int vkb_depth_clip_neg1(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_VK_DEPTH_CLIP_NEG1");
+        v = e && *e == '1' && vkc.has_depth_clip_control;
+        if (e && *e == '1') LOG("depth clip -1..1 in the draws: %s", v ? "on (TOTK_VK_DEPTH_CLIP_NEG1)" : "off: the GPU lacks VK_EXT_depth_clip_control");
+    }
+    return v;
+}
+
+// TOTK_VK_NO_INVARIANT=1: the vertex position's Invariant decoration taken out at load (vkb_spv_drop_invariant), an A/B
+// of its GPU cost (2026-10-30: ~10 % of the GPU time in the world on a PC; it came back with patch 0009 on 2026-11-02).
+// FSR 3.1's object motion draws a moving object again with its last-frame variant and LEQUAL against the scene depth,
+// which relies on both computing the same position: check it with the switch on. Use with TOTK_SHADER_BIN=<another
+// file>: the binaries of the other setting are dropped from the file in use (vkb_shbin_compact).
+static int no_invariant(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_NO_INVARIANT"); v = e && *e == '1'; if (v) LOG("vertex position not invariant (TOTK_VK_NO_INVARIANT)"); }
+    return v;
+}
+
 // Which translation of a shader, as the compiled binaries are keyed (vkb_shbin_variant.stamp), and the rewrites
 // load_module makes. From the pack: the hash of its .res.json and .spv (tools/pack_shaders.py). From a folder: the
 // .res.json's last write (seconds) and size, taken from _stat64 here and from FindFirstFile in ahead_thread.
@@ -452,6 +477,8 @@ static uint32_t stamp_fold(uint64_t h) {
     if (dref_clamp()) h ^= 0x5BD1E995ull << 32;   // binaries made before the clamp are not used (the halves fold below)
     if (!vkc.has_interlock) h ^= 0x27D4EB2Full << 32;   // nor those of modules with the interlock (vkb_spv_drop_interlock)
     if (vkb_split_sets()) h ^= 0x2F0B3C51ull << 32;   // nor those made with one descriptor set (buffers in set 1 now)
+    if (vkb_depth_clip_neg1()) h ^= 0x4E454731ull << 32;   // nor those with the vertex depth conversion (load_module)
+    if (no_invariant()) h ^= 0x494E5630ull << 32;   // nor those with the Invariant position (and back)
     return (uint32_t)(h ^ h >> 32) | 1;   // never 0
 }
 static uint32_t stamp_of(uint64_t mtime_s, uint64_t size) {
@@ -495,6 +522,22 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
             if (b < 0 || b > 255 || slot < 0 || slot >= VKB_NCBUF) continue;
             remap[b] = base + VKB_B_CBUF + (uint32_t)slot;
             s->cbuf_mask |= 1u << slot;
+        }
+    // a last-frame position variant (the translator's PreviousPosition): bank n's last-frame block was asked for at slot
+    // n + 15; it goes into a slot of c3..c16 the shader does not use, and prev_of says which bank's block is bound there
+    s->prev_loc = (int)json_top_int(j, "prev_location", -1);
+    s->prev_banks = (uint32_t)json_top_int(j, "prev_banks", 0);
+    if (s->prev_loc >= 0 && (p = json_array(j, "cbufs")))
+        for (; (p = json_next(p, &e)); p = e) {
+            long b = json_int(p, e, "binding", -1), slot = json_int(p, e, "slot", -1);
+            if (b < 0 || b > 255 || slot < 18 || slot > 31) continue;
+            int free_slot = -1;
+            for (int k = 16; k >= 3 && free_slot < 0; k--)
+                if (!(s->cbuf_mask & (1u << k))) free_slot = k;
+            if (free_slot < 0) { s->unsupported = 1; continue; }   // no room: the variant is not used
+            remap[b] = base + VKB_B_CBUF + (uint32_t)free_slot;
+            s->cbuf_mask |= 1u << free_slot;
+            s->prev_of[free_slot] = (uint8_t)(slot - 15);
         }
     // storage buffers: the address comes from the NVN driver bank c0, 16 bytes per slot: the stage's storage buffer
     // table (vertex 0x110, fragment 0x510, compute 0x310) or, for compute, its uniform buffer table (0x210): TOTK's
@@ -549,6 +592,7 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
     size_t ncl = 0;
     if (dref_clamp() && vkb_spv_clamp_dref(spv, nw, &clamped, &ncl)) { free(spv); spv = clamped; nw = ncl; }
     if (!vkc.has_interlock) nw = vkb_spv_drop_interlock(spv, nw);   // a device without it refused these modules (RX 570)
+    if (no_invariant()) { int found; nw = vkb_spv_drop_invariant(spv, nw, &found); }
     nspv = nw * 4;
     int split = nvn_stage <= 1 && vkb_split_sets();   // vertex and fragment shaders (compute keeps one set)
     uint32_t bound = spv[3], *in_set1 = split ? calloc((bound + 31) / 32, 4) : NULL;   // ids of buffer variables
@@ -574,6 +618,14 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
         i += wc;
     }
     free(in_set1);
+    if (nvn_stage == 0 && vkb_depth_clip_neg1()) {   // TOTK_VK_DEPTH_CLIP_NEG1: z = (z + w) / 2 out, the draw maps -1..1
+        int found = 0;
+        nw = vkb_spv_drop_depth_convert(spv, nw, &found);
+        nspv = nw * 4;
+        s->neg1 = found > 0;
+        static _Atomic int said;
+        if (!found && atomic_fetch_add(&said, 1) < 8) VLOG("vertex shader %.12s: no depth conversion found (drawn with 0..1 clip)", key);
+    }
     // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
     s->in_mask = vkb_spv_input_mask(spv, nw);
     s->out_mask = vkb_spv_output_mask(spv, nw);
@@ -916,7 +968,7 @@ static void ahead_start(void) {
 // the game starts (tools/setup.py step graphics, the launcher before Play), on every core, so the first play has no
 // compile stalls. Shaders already in the file cost a lookup each: with nothing to do it prints "ready" in about the
 // time Vulkan takes to start. Progress on stdout: "prepare-shaders: <done> of <total>", then a "done" line.
-// It outlives a driver crash (as totk-pc-recomp dbe8daf, MIT): while a worker hands a shader to the driver, its slot of
+// It outlives a driver crash: while a worker hands a shader to the driver, its slot of
 // prepare-journal.bin (beside the binary file) holds the shader's key, cleared when the call returns. A run that finds
 // a journal moves the keys in it into prepare-skip.txt with the GPU and driver version, and preparation skips what
 // that file lists for them (they compile at their first draw, where the driver may crash again); another driver
@@ -1121,6 +1173,43 @@ const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {
     }
     pthread_mutex_unlock(&g_mu);
     return &e->sh;
+}
+
+// The last-frame position variant: the shader's key with each byte XOR 0x6d (the translator's PrevPosKey, Program.cs),
+// made like any shader (from its binary when compiled ahead) by a creator thread; until then, and for a shader without
+// one, NULL. Its entry is held for good (variants are few: the scene's vertex shaders).
+const vkb_shader *vkb_shader_prevpos(const vkb_shader *cvs) {
+    vkb_shader *vs = (vkb_shader *)cvs;
+    if (!vs || !vs->key || vs->stage != 0 || vs->prev_loc >= 0) return NULL;
+    int st = __atomic_load_n(&vs->prev_state, __ATOMIC_ACQUIRE);
+    if (st) return st > 0 ? vs->prev : NULL;
+    char key[65];
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        sscanf(vs->key + 2 * i, "%2x", &v);
+        snprintf(key + 2 * i, 3, "%02x", v ^ 0x6d);
+    }
+    pthread_mutex_lock(&g_mu);
+    shentry *e = entry(key, 0);
+    if (e->loaded < 0 || (e->sh.obj && (e->sh.unsupported || e->sh.prev_loc < 0))) {
+        __atomic_store_n(&vs->prev_state, -1, __ATOMIC_RELEASE);
+    } else if (e->sh.obj) {
+        if (!e->sh.c1) e->sh.c1 = vs->c1, e->sh.c1_size = vs->c1_size;   // the same code's constants
+        vs->prev = &e->sh;
+        __atomic_store_n(&vs->prev_state, 1, __ATOMIC_RELEASE);
+    } else if (!e->busy && !e->queued && g_cq_in - g_cq_out < CQ) {
+        if (!e->refs) e->refs = 1;   // held for good
+        e->queued = 1;
+        g_cq[g_cq_in++ % CQ] = e;
+        pthread_cond_signal(&g_cq_cv);
+    }
+    pthread_mutex_unlock(&g_mu);
+    return NULL;
+}
+
+VkShaderEXT vkb_shader_own_fragment(const uint32_t *spv, size_t bytes) {
+    VkShaderEXT obj = VK_NULL_HANDLE;
+    return make_object(NULL, NULL, VK_SHADER_STAGE_FRAGMENT_BIT, spv, bytes, &obj) == VK_SUCCESS ? obj : VK_NULL_HANDLE;
 }
 
 void vkb_shader_stats(uint64_t *loaded, uint64_t *missing) { *loaded = g_loaded; *missing = g_missing; }

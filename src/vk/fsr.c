@@ -168,7 +168,9 @@ int vk_fsr_record(VkCommandBuffer cb, VkImage src, uint32_t sw, uint32_t sh, con
                   uint32_t dw, uint32_t dh) {
     if (!F.tried) init();
     int up = dw > (uint32_t)crop[2] || dh > (uint32_t)crop[3];
-    int sharpen_only = !up && dw == (uint32_t)crop[2] && dh == (uint32_t)crop[3] && !crop[0] && !crop[1] && F.sharp > 0;
+    // with FSR 3.1 in the game (src/gfx/vkb_tsr.c) the picture is sharpened there already
+    int vkb_tsr_on(void);
+    int sharpen_only = !up && dw == (uint32_t)crop[2] && dh == (uint32_t)crop[3] && !crop[0] && !crop[1] && F.sharp > 0 && !vkb_tsr_on();
     if (!F.ok || (!up && !sharpen_only) || !ensure_images(dw, dh)) return 0;
     if (F.src != src) {   // an output image of another size (the game changed it): a view of the new one
         if (F.src_view) vk.vkDestroyImageView(vkc.device, F.src_view, NULL);

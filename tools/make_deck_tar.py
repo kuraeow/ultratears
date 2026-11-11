@@ -91,7 +91,8 @@ def main():
     tmp = out.with_suffix('.tar.part')
     bar = progress.Bar('packing for the Steam Deck', total, 'GiB', 2**30, rate=True)
     with tarfile.open(tmp, 'w', format=tarfile.GNU_FORMAT) as t:
-        texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines()) + '\n').encode(), 0o644),
+        # a new game folder on the Deck: its first settings too (setup.first_settings: the frame limit 40)
+        texts = [('ultratears.cfg', ('\n'.join(setup.cfg_lines() + setup.first_settings(deck=True)) + '\n').encode(), 0o644),
                  ('data/setup.json', deck_state(version_line), 0o644)]
         for name, data, mode in texts:
             info = tarfile.TarInfo(f'{TOP}/{name}')

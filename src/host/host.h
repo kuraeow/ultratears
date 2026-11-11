@@ -54,6 +54,21 @@ typedef struct { uint64_t buttons; int32_t lx, ly, rx, ry; int connected; } Runt
 void runtime_gamepad_set(const RuntimeGamepadState *s);
 void runtime_input_key(unsigned code, int down);   // Mac virtual key codes (MacNativeGames' key layout)
 void runtime_input_clear(void);
+// The mouse (window_sdl.c -> overrides_input.c -> mouse_direct.c): raw relative motion in counts (+y down) and wheel
+// notches (+ away from the player) while the window holds the mouse
+void runtime_mouse_motion(float dx, float dy);
+void runtime_mouse_wheel(float notches);
+void runtime_mouse_take(int32_t *dx, int32_t *dy);   // the counts since the last take
+uint64_t runtime_input_buttons_last(void);           // the Switch buttons of the last controller read
+int runtime_mouse_selector_active(void);            // the ability wheel or a D-pad strip takes the mouse
+// mouse_direct.c
+int totk_mouse_enabled(void);                        // the mouse camera is on (TOTK_MOUSE_SENS > 0, TOTK_MOUSE_DIRECT)
+float totk_mouse_sens(void);
+int totk_mouse_camera_active(void);                  // a camera update took mouse input in the last 150 ms
+int totk_mouse_shake(void);                          // -1 / +1: the right stick follows a mouse shake (Ultrahand)
+void totk_mouse_radial(int32_t dx, int32_t dy, float cursor[2], int32_t out[2]);
+typedef struct { float distance; int direction; uint64_t pulse_until, neutral_until; } TotkMouseRow;
+void totk_mouse_row(int32_t dx, uint64_t now, TotkMouseRow *row, int32_t out[2]);
 
 // ---- window (window_sdl.c): SDL3 on the main thread
 int window_init(void);              // 1 = window up (presentation may still be missing: logged)
@@ -76,5 +91,6 @@ void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads);
 
 // ---- profiler.c: sampling CPU profiler for development (TOTK_PROF=<start s>:<seconds>[:<report path>])
 void runtime_profiler_start(void);
+void runtime_profiler_stop(void);   // the game is closing: a profile still sampling writes its report now
 uint64_t runtime_symbolize(uint64_t rip, char *out, size_t n);   // host address -> function (f_<guest> + guest symbol)
 void runtime_watch_tick(uint64_t present);   // TOTK_WATCH: arms / reports the memory write watch (watch.c)

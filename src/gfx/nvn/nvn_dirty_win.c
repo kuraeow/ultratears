@@ -35,19 +35,34 @@ static range_t *find(uintptr_t a) {
 // look at a range scans all of it, later looks in the epoch use the generations gathered then. The game writes what a
 // submission uses before submitting it, so one look per submission sees those writes; per-texture and per-pool scans
 // were hundreds of GetWriteWatch calls a submission (~9% of the recording thread, Great Sky Island, 2026-10-24).
-// Other threads (the retire thread's copy back of GPU writes) scan every time.
+// The recording threads (nvn_dirty_epoch_reader) share those scans: they record the same submission, and scanned on
+// every look before - a write watch call per texture check, ~7 % of each recording thread on the Steam Deck
+// (2026-11-04). The range's scan runs under a lock of its stripe and its epoch is set after it, so no thread reads the
+// generations of a scan still running. Other threads (the retire thread's copy back of GPU writes) scan every time.
 static _Atomic uint64_t g_epoch;
 static _Thread_local int t_epoch_thread;
 void nvn_dirty_epoch_begin(void) { t_epoch_thread = 1; atomic_fetch_add(&g_epoch, 1); }
+void nvn_dirty_epoch_reader(void) { t_epoch_thread = 1; }
+enum { SCAN_STRIPES = 64 };
+static pthread_mutex_t g_scan_mu[SCAN_STRIPES];
+static pthread_once_t g_scan_once = PTHREAD_ONCE_INIT;
+static void scan_init(void) { for (int i = 0; i < SCAN_STRIPES; i++) pthread_mutex_init(&g_scan_mu[i], NULL); }
 
 // Pages of [a, a+len) written since the last scan get a new generation; their watch bits are reset.
 static void scan_pages(range_t *r, uintptr_t a, size_t len, int count);
 static void scan(range_t *r, uintptr_t a, size_t len, int count) {
     if (count && t_epoch_thread) {
         uint64_t e = atomic_load(&g_epoch);
-        if (atomic_load(&r->epoch) == e) return;
-        atomic_store(&r->epoch, e);
-        a = r->base; len = r->end - r->base;
+        if (atomic_load_explicit(&r->epoch, memory_order_acquire) == e) return;
+        pthread_once(&g_scan_once, scan_init);
+        pthread_mutex_t *m = &g_scan_mu[(size_t)(r - g_r) % SCAN_STRIPES];
+        pthread_mutex_lock(m);
+        if (atomic_load_explicit(&r->epoch, memory_order_acquire) != e) {
+            scan_pages(r, r->base, r->end - r->base, count);
+            atomic_store_explicit(&r->epoch, e, memory_order_release);
+        }
+        pthread_mutex_unlock(m);
+        return;
     }
     scan_pages(r, a, len, count);
 }

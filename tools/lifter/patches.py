@@ -57,8 +57,7 @@ def get_s(reg):
 # sizes) from these, and its own FSR 1 (EASU) draws the scene onto its canvas. Here the two stores take the size
 # src/host/render_res.c chose instead, when there is one. The output (canvas, UI, swapchain): the swapchain size nnMain
 # writes (main+0xbdb584) and, as the display configuration publishes its active output (main+0x3dcb28), its canvas
-# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res), as
-# totk-pc-recomp's patches-v143.txt carries them.
+# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res).
 def scene_size(axis):   # str s0, [x19, #0xcc4 / #0xcc8]
     orig = {0: 0xbd0cc660, 1: 0xbd0cca60}[axis]
 
@@ -80,8 +79,7 @@ def aspect(orig):
     leave the ratio sead's perspective projection takes in s0. Two camera sites (update: ldr s0, [x19, #0x140]; setup:
     ldr s0, [x22, #0x68]) load the camera's copy of DefaultAspect 1.777778, two viewport routines divide width by height
     (fdiv s0, s0, s1). After the original instruction s0 takes the output's ratio, so a 21:9 output shows more of the
-    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from totk-pc-recomp's
-    recomp/patches-v143.txt (set aspect; MIT, Copyright (c) 2026 Valiantsin Dzerakh), from MacNativeGames'
+    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from MacNativeGames'
     game_patches_v143.c / aspect_patch.h (MIT, Copyright (c) 2026 MacNativeGames contributors)."""
     def f(gen, addr):
         expect(gen, addr, orig, 'aspect')
@@ -179,8 +177,7 @@ def fade(reg):
     return f
 
 
-# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). Site from totk-pc-recomp 1a07a8d
-# (recomp/patches-v143.txt, MIT): 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
+# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
 # main+0x683604 (add w11, w11, #7); the rounded value is the width (+0x3d8) and, through the packed store at +0xf4, the
 # height (+0x3f8). The fixed size goes into w11 just before the rounding.
 def shadow_size(gen, addr):
@@ -188,7 +185,7 @@ def shadow_size(gen, addr):
     return '{ extern int totk_shadow_size(uint32_t *n); uint32_t n_; if (totk_shadow_size(&n_)) c->x[11] = n_; }'
 
 
-# Equipment-switch cooldown (from totk-pc-recomp recomp/patches-v143.txt, MIT; their issue #18, found by JieML1100):
+# Equipment-switch cooldown:
 # the player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is above FLT_EPSILON, but
 # the equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0. Whole 30 Hz steps reach
 # exactly 0; a measured step leaves a rounding remainder, and one in (0, FLT_EPSILON] is never stepped again and keeps
@@ -197,8 +194,7 @@ def cooldown(gen, addr):   # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON) -> movi v1
     return word_or(gen, addr, 0x0f016681, 0x0f000401, fr('totk_fr_realtime'), 'equipment cooldown')
 
 
-# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c; sites from totk-pc-recomp
-# recomp/patches-v143.txt, MIT): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
+# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
 # (main+0x3a1e0) below goes to a host function, which hands what it does not take to the same guest function. Not
 # main+0x547a04: that caller (main+0x547964) resets a static DCtx of its own with which the game's zstd rejects some
 # valid frames, and the game relies on that result. TOTK_ZSTD_NATIVE=0: the guest decoder.
@@ -232,7 +228,76 @@ ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MU
               0x1852314: (0x979f9fb3, ZSTD_DDICT)}
 
 
+# ability_target_guard: Recall and Ultrahand crashed (c0000005 "accessing 0xffffffffffffffff", four times in 9 to 23
+# minutes of play) in main+0x1bd0138, which, once the owner's request at +0x678 says ready (status +0x6a0 == 2), takes
+# the target actor from the request's result record (x8 = [x19+0x6b0], x21 = [x8]), links it (main+0x155ec), reads
+# [[x21+0x228]+0xb0] (main+0x9a89d4) and takes a reference on that (main+0x2b8464, +0x90). The record had been reused:
+# x21 pointed into .rodata, outside the address space, or at heap memory that held other data. Before x21 is used it
+# must pass the game's own test of a live actor, the one main+0x155ec relies on: its link record [x21+0x1a8] points back
+# to it (+0x40) and carries its id (+0x48 == [x21+0x10]). Else the target is skipped for this frame, as a null or
+# tagged one is, and the skip is logged (totk_ability_target_ok, src/gfx/nvn/hle_nvn.c).
+def ability_target_guard(gen, addr):   # cbz x21, #0x801bd01f0
+    expect(gen, addr - 4, 0xf9400115, 'ability target guard')   # ldr x21, [x8]
+    expect(gen, addr, 0xb4000155, 'ability target guard')       # cbz x21, #0x801bd01f0
+    return ('{ extern int totk_ability_target_ok(uint64_t owner, uint64_t result, uint64_t actor); '
+            'if (c->x[21] == 0 || !totk_ability_target_ok(c->x[19], c->x[8], c->x[21])) { goto L_801bd01f0; } }')
+
+
+# The mouse camera (src/host/mouse_direct.c, which says what each site holds). Sites and words from totk-pc-recomp
+# recomp/patches-v143.txt @ d8a1d14 (MIT, Copyright (c) 2026 Valiantsin Dzerakh and contributors), each word checked
+# against the 1.4.3 main; there each is a branch to a host page that performs the instruction, here C that calls the
+# runtime before the original instruction (MOUSE_BEFORE) or after it (MOUSE_LOADS: the loaded register gets the value
+# for the mouse). The functions with these sites are lifted without locals, so the runtime may change any register.
+MOUSE_BEFORE = {
+    0x874cb4: (0xbd042289, 'totk_mouse_camera_input'),    # str s9, [x20, #0x420]: the processed camera stick
+    0x874d7c: (0x6d40a3e9, 'totk_mouse_camera_activity'), # ldp d9, d8, [sp, #8]: before the input flags' store
+    0x18e444: (0xf9400408, 'totk_mouse_orbit_begin'),     # ldr x8, [x0, #8]: the free orbit's update begins
+    0x18ea34: (0xb9418a88, 'totk_mouse_orbit_state'),     # ldr w8, [x20, #0x188]: its state decision
+    0x18f108: (0xbd4047ec, 'totk_mouse_orbit_angles'),    # ldr s12, [sp, #0x44]: its final pitch and yaw
+    0x1d59460: (0xb9004be8, 'totk_mouse_hand_input'),     # str w8, [sp, #0x48]: Ultrahand's input after its curves
+}
+MOUSE_LOADS = {   # the other cameras' stick and angle loads (mouse_direct.c load_sites)
+    0x23beb94: 0xbd4426c1, 0x23bebc8: 0xbd415e61, 0x23bee2c: 0xbd4422c1, 0x23beeec: 0xbc5b83a1,   # Aiming
+    0x23c0a10: 0xbd4422e0, 0x23c0a1c: 0xbd4426eb, 0x23c0b00: 0xbd416260, 0x23c0e80: 0xbd405be1,   # AimingTelescope
+    0x23d2eec: 0xbd4422e8, 0x23d2ef4: 0xbd4426ee, 0x23d3158: 0xbd416260, 0x23d34cc: 0xbc5b03a1,   # SpecialPower
+    0x23cb274: 0xbd442288, 0x23cb2a0: 0xbd406a61, 0x23cb3f8: 0xbd4426a8, 0x23cb424: 0xbd406661,   # Horse
+    0x23d2f30: 0xbd4422e8, 0x23d2f5c: 0xbd41da62, 0x23d2f6c: 0xbd4426e8, 0x23d2f98: 0xbd41de62,   # Recall's cursor
+    0x23d3210: 0xbd400400,                                                                         # its scale
+    0x23c2890: 0xbd4426ad, 0x23c28b4: 0xbd405261, 0x23c2934: 0xbd4422ad, 0x23c2964: 0xbd404be1,   # CameraFinder
+    0x23c3dd0: 0xbd442301, 0x23c3dd8: 0xbd409261, 0x23c3d64: 0xbd442701, 0x23c3d70: 0xbc488ec1,   # ClimbObj
+    0x23da694: 0xbd4422c1, 0x23da698: 0xbd4426c0, 0x23da840: 0xbd40da60, 0x23da894: 0xbd4017e0,   # Wakeboard
+    0x23daed8: 0xbd403fe9,
+    0x23d0100: 0xbd4422c1, 0x23d0104: 0xbd4426c0, 0x23d02ac: 0xbd40de60, 0x23d0a34: 0xbd4013e0,   # ShieldSurfing
+    0x23d087c: 0xbd403fe9,
+    0x23dced8: 0xbd4422cd, 0x23dd070: 0xb85cc3a8, 0x23dd008: 0xbd4426c9,                          # WaterfallClimb
+    0x23d4b14: 0xbd44228c, 0x23d4b1c: 0xbd44268d, 0x23d4f34: 0xbd40c260, 0x23d5028: 0xbd40b661,   # Tail (climbing)
+    0x23d756c: 0xbd442300, 0x23d7594: 0xbd442301, 0x23d75b4: 0xbd4023e0, 0x23d75c4: 0xbd4023e9,   # LockOn / Target
+    0x23d7998: 0xbd442701, 0x23d79b8: 0xbd4023e0, 0x23d79c8: 0xbd4023ea,
+    0x23cecb4: 0xbd4426a9, 0x23cecf8: 0xbd419a61, 0x23ced0c: 0xbd4422a9, 0x23ced4c: 0xbd419e61,   # LockOnAimingAt
+    0x23cc4b4: 0xbd44232b,                                                                         # HorseLockOnEmpty
+    0x23c542c: 0xbd4426eb, 0x23c546c: 0xbd405e61, 0x23c54d4: 0xbd4422eb, 0x23c5554: 0xbd406661,   # EventMultiTalk
+    0x23c90ac: 0xbd442709, 0x23c90d8: 0xbd407661, 0x23c9140: 0xbd442309, 0x23c9170: 0xbd407e61,   # EventTalkManual
+}
+
+
+def mouse_before(word, host):
+    def f(gen, addr):
+        expect(gen, addr, word, 'mouse')
+        return f'{{ extern void {host}(Cpu *c); {host}(c); }} {gen.c_of(word, addr)}'
+    return f
+
+
+def mouse_load(word):
+    def f(gen, addr):
+        expect(gen, addr, word, 'mouse')
+        return (f'{gen.c_of(word, addr)} {{ extern void totk_mouse_load(Cpu *c, uint32_t site); '
+                f'totk_mouse_load(c, {addr - MAIN:#x}u); }}')
+    return f
+
+
 PATCHES = {
+    **{MAIN + a: mouse_before(w, h) for a, (w, h) in MOUSE_BEFORE.items()},
+    **{MAIN + a: mouse_load(w) for a, w in MOUSE_LOADS.items()},
     MAIN + 0x2b036c: cooldown,
     **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
        for a, (w, t) in ZSTD_SITES.items()},
@@ -250,6 +315,7 @@ PATCHES = {
     MAIN + 0x246eac: cloth_inline(0x1e200940, 0, 10, 0x364),   # fmul s0, s10, s0 (factor s10, ratio slot sp+0x364)
     MAIN + 0x345904: cloth_inline(0x1e210801, 1, 0, 0x114),    # fmul s1, s0, s1 (factor s0, ratio slot sp+0x114)
     MAIN + 0xa7ac4: fade(8), MAIN + 0x95dd24: fade(8), MAIN + 0x6155e4: fade(10), MAIN + 0x615660: fade(10),
+    MAIN + 0x1bd01c8: ability_target_guard,
 }
 PRE_PATCHES = {
     MAIN + 0x3e5658: rt_step_ticks,

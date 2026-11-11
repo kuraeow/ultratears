@@ -113,7 +113,7 @@ static class SwshXlate
         // UltraTears: sub-texel precision bits of a GPU whose gathers round a coordinate between two texels the other way
         // from Maxwell (AMD, Intel): Ryujinx then biases gather coordinates (TexturePass.InsertCoordGatherBias), so
         // shadow-map filtering picks the same texels and draws no dashed lines along edges. TOTK_GATHER_BIAS, set by
-        // tools/setup.py from the GPU the game uses (8 off NVIDIA); 0 or unset: no bias. As totk-pc-recomp 119884c.
+        // tools/setup.py from the GPU the game uses (8 off NVIDIA); 0 or unset: no bias.
         static readonly int GatherBias = int.TryParse(Environment.GetEnvironmentVariable("TOTK_GATHER_BIAS"), out int gb) ? gb : 0;
         public int QueryHostGatherBiasPrecision() => GatherBias;
         // UltraTears: the SPIR-V generator writes texture offsets as ConstOffset / ConstOffsets, which must be constants.
@@ -124,6 +124,19 @@ static class SwshXlate
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
+        // UltraTears: the vertex shader's last-frame position variant (Transforms/PreviousPosition.cs), asked by Translate
+        public bool PrevPos;
+        public int PrevLocation = -1, PrevBanks;
+        public bool QueryPreviousPosition() => PrevPos;
+        public void ReportPreviousPosition(int location, int banks) { PrevLocation = location; PrevBanks = banks; }
+    }
+    // UltraTears: the key of a vertex shader's last-frame position variant: the key's bytes XOR 0x6d (src/gfx/vkb_shader.c
+    // computes the same).
+    internal static string PrevPosKey(string key)
+    {
+        byte[] b = Convert.FromHexString(key);
+        for (int i = 0; i < b.Length; i++) b[i] ^= 0x6d;
+        return Convert.ToHexString(b).ToLowerInvariant();
     }
 
 
@@ -133,12 +146,28 @@ static class SwshXlate
             try
             {
                 byte[] code = File.ReadAllBytes((string)job["code"]);
-                var acc = new Accessor(code, job);
+                // UltraTears: a vertex shader also gets its last-frame position variant, under its own key, when the
+                // position depends on the game's uniform banks (per-object motion vectors, src/gfx/vkb_tsr.c)
+                if ((string)job["stage"] == "vs" && key.Length == 64 && Environment.GetEnvironmentVariable("ULTRS_NO_PREVPOS") == null)
+                {
+                    string err = TranslateOne(job, outDir, code, PrevPosKey(key), true);
+                    if (err != null && err != "no position") Console.Error.WriteLine($"prevpos {key}: {err}");
+                }
+                return TranslateOne(job, outDir, code, key, false);
+            }
+            catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
+    }
+    static string TranslateOne(JsonObject job, string outDir, byte[] code, string key, bool prevPos)
+    {
+            try
+            {
+                var acc = new Accessor(code, job) { PrevPos = prevPos };
                 // 作业 debug = false：关 DebugMode（DebugMode 会跳过 AST 优化器，产物满是临时变量；不改语义）
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
+                if (prevPos && acc.PrevLocation < 0) return "no position";
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"),
                     VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
                 var res = new JsonObject
@@ -148,6 +177,7 @@ static class SwshXlate
                     ["uses_frag_coord"] = p.Info.UsesFragCoord, ["frag_out_map"] = p.Info.FragmentOutputMap,
                     ["tex_queried"] = new JsonArray(acc.TexQueried.Select(x => (JsonNode)x).ToArray()), ["img_queried"] = new JsonArray(acc.ImgQueried.Select(x => (JsonNode)x).ToArray()),
                 };
+                if (prevPos) { res["prev_location"] = acc.PrevLocation; res["prev_banks"] = acc.PrevBanks; }
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })

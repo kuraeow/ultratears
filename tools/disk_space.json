@@ -1,0 +1,6 @@
+{
+ "_": "Free space a build needs, in GB: the one place for it. tools/hw_check.py stops a build below it (less what the folder already holds: an update); the launcher (src/launcher/ui.cpp need_gb) shows it for a new folder. Measured 2026-11-04 (0.3.1 + FSR 3.1): a finished folder is ~33.5 (RomFS 16, BC7 textures 7.4, shader pack 3.4, compiled shaders 1.6, translated code 0.9, objects 2.1-2.7, the game 0.3-1.4, tools ~1), and the build peaks ~4.5 above that (the shader export and translation beside the pack being written): build_gb, the same on Windows and on Linux. copy_gb: the builder copied into the folder first (the launcher only: the check runs after the copy). deck_gb: a build on Windows for the Steam Deck on top (its tar 29.1, the Linux game 1.4, its objects 2.1, the Deck's shader pack 3.4). A build on Linux (a Linux PC or the Deck itself) makes no tar: build_gb alone.",
+ "build_gb": 39,
+ "copy_gb": 1,
+ "deck_gb": 37
+}

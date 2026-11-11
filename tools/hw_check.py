@@ -29,8 +29,10 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gpu_check  # noqa: E402
 
-INSTALL_GB = 36            # a build from nothing at its peak (data 27 GB, objects 2.7, tools 0.8, the shader export)
-LINUX_GB = 36              # a build for Linux / Steam Deck on top: the tar 28.7, its objects 2.7, the game 1.4, shaders 1.7, the Linux builder 0.6
+# The free space a build needs, from tools/disk_space.json (the launcher shows the same numbers): the game built from
+# nothing (build_gb), and what a build on Windows for the Steam Deck adds (deck_gb: its tar above all)
+_DISK = json.loads((pathlib.Path(__file__).resolve().parent / 'disk_space.json').read_text(encoding='utf-8'))
+INSTALL_GB, LINUX_GB = _DISK['build_gb'], _DISK['deck_gb']
 VRAM_GB, RAM_GB = 4, 16
 DECK_TAR = 'UltraTears-SteamDeck.tar'
 AMD = 0x1002
@@ -116,7 +118,9 @@ def disk_case(folder, linux=False):
     have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps', 'build-linux', 'linux') if (folder / d).is_dir())
     if (folder / DECK_TAR).is_file():
         have += (folder / DECK_TAR).stat().st_size
-    need = max(0, (INSTALL_GB + (LINUX_GB if linux else 0)) * 2**30 - have)
+    # built on Linux - a Linux PC or the Deck itself - the game is built in place, with no tar: INSTALL_GB alone (0.3.1
+    # added LINUX_GB there too and asked 71 GB)
+    need = max(0, (INSTALL_GB + (LINUX_GB if linux and os.name == 'nt' else 0)) * 2**30 - have)
     probe = folder
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
@@ -148,8 +152,8 @@ KERNEL_WRITE_WATCH = (6, 7)   # userfaultfd write protection without faults (WP_
 
 def kernel_version():
     """Linux's version as numbers ((0, 0): unknown, as when not Linux). Below 6.7 the game has no write watch
-    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow (as
-    totk-pc-recomp warns, installer/steps.py). SteamOS 3.8 and later have 6.11+."""
+    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow.
+    SteamOS 3.8 and later have 6.11+."""
     try:
         parts = os.uname().release.split('-')[0].split('.')
         return tuple(int(p) for p in parts[:2])

@@ -52,11 +52,33 @@ HostFn hle_lookup_impl(const char *name) {
 // HLE_NATIVE: the slot being called (set by dispatch_slow, which every host call passes through: host stubs are not
 // cached in the dispatch cache).
 static __thread const HleSlot *t_native;
+// The virtual cores (host/threads.c); these defaults where there are none (unit tests, probes)
+__attribute__((weak)) int runtime_core_away(void) { return 0; }
+__attribute__((weak)) void runtime_core_back(int *away) { (void)away; }
+
+/* Host calls in progress on this thread: HLE functions, overrides of game functions and SVCs. Game code a host call
+   runs (a callback) runs inside it. Asynchronous preemption (host/threads.c) moves a thread off its virtual core only
+   at 0: deeper, the host frames below may hold a host lock. */
+__thread int rt_host_depth;
+static __thread GuestFn t_hostfn;
+static void hle_fn_thunk(Cpu *c) {   // an HLE_FUNC or an override, counted in rt_host_depth
+    GuestFn f = t_hostfn;
+    rt_host_depth++;
+    f(c);
+    rt_host_depth--;
+}
+
 void hle_native_thunk(Cpu *c) {
     const HleSlot *s = t_native;
     uint64_t (*f)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = s->native;
+    char kind = s->ret;
+    int away = 0;
+    rt_host_depth++;
+    if (kind >= 'A' && kind <= 'Z') kind += 32, away = runtime_core_away();   // HLE_NATIVE_BLOCKING
     uint64_t r = f(c->x[0], c->x[1], c->x[2], c->x[3], c->x[4], c->x[5], c->x[6], c->x[7]);
-    switch (s->ret) {
+    rt_host_depth--;
+    if (away) runtime_core_back(&away);
+    switch (kind) {
     case 'v': break;
     case 'b': c->x[0] = (uint8_t)r; break;
     case 'w': c->x[0] = (uint32_t)r; break;
@@ -110,7 +132,28 @@ void *hle_alloc(uint64_t size) {
     return (void *)a;
 }
 
+/* The host code of the lifted modules: the first and the last function's address (host/threads.c, asynchronous
+   preemption: an interrupted thread is moved only when it runs there). 0 before dispatch_init. */
+int rt_lifted_range(uintptr_t *lo, uintptr_t *hi) {
+    uintptr_t l = UINTPTR_MAX, h = 0;
+    for (int t = 0; t < MAX_MODULES; t++)
+        for (uint64_t k = 0; k < tables[t].count; k++) {
+            uintptr_t f = (uintptr_t)tables[t].fns[k];
+            if (f < l) l = f;
+            if (f > h) h = f;
+        }
+    if (!h || l >= h) return 0;
+    *lo = l, *hi = h;
+    return 1;
+}
+
+// [TOTK] simd_fp.h vslow: a vector FP result with a NaN lane fixed across the vector, not lane by lane through the
+// scalar path (on by default since 2026-11-06; TOTK_FP_NANVEC=0: lane by lane, as before)
+int g_simd_nanvec = 1;
+
 void dispatch_init(void) {
+    const char *nv = getenv("TOTK_FP_NANVEC");
+    g_simd_nanvec = !(nv && *nv == '0');
     const uint64_t *addrs[] = {main_fn_addrs, subsdk0_fn_addrs, sdk_fn_addrs};
     const GuestFn *fns[] = {main_fn_ptrs, subsdk0_fn_ptrs, sdk_fn_ptrs};
     uint64_t counts[] = {main_fn_count, subsdk0_fn_count, sdk_fn_count};
@@ -143,13 +186,13 @@ static GuestFn dispatch_slow(Cpu *c) {
         int i = (int)((pc - HLE_BASE) / 16);
         if (i < hle_count) {
             if (hle_slots[i].native) { t_native = &hle_slots[i]; return hle_native_thunk; }
-            if (hle_slots[i].fn) return hle_slots[i].fn;
+            if (hle_slots[i].fn) { t_hostfn = hle_slots[i].fn; return hle_fn_thunk; }
             unimpl_pc = pc;
             return hle_unimplemented;
         }
     }
     for (int i = 0; i < override_count; i++)
-        if (overrides[i].addr == pc) return overrides[i].fn;
+        if (overrides[i].addr == pc) { t_hostfn = overrides[i].fn; return hle_fn_thunk; }
     GuestFn f = dispatch_lookup(pc);
     if (!f) {
         uint64_t off = 0;
@@ -165,8 +208,7 @@ static GuestFn dispatch_slow(Cpu *c) {
 
 // Preemption point (host/threads.c runtime_core_checkpoint): a guest thread whose core a better thread waits for gives
 // it up at its next indirect call or SVC, as Horizon would run the better thread at once. Without it the waiter got
-// the core only when the holder blocked or slept (totk-pc-recomp measured waits up to 26 ms; its rt_dispatch checks
-// the same way). rt_preempt_flag: the running thread's request flag, set by threads.c; one load and branch here.
+// the core only when the holder blocked or slept (waits up to 26 ms). rt_preempt_flag: the running thread's request flag, set by threads.c; one load and branch here.
 __thread volatile int *rt_preempt_flag;
 void (*rt_preempt_fn)(void);
 
@@ -257,7 +299,8 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
 
 // ---- function-entry profiler hook (cpu.h FN_ENTER): off unless a profiler sets g_fnprof
 volatile int g_fnprof;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr; (void)lr; (void)x0; }
+void (*volatile g_fnprof_cb)(uint64_t addr, uint64_t lr, uint64_t x0);   // development hooks (host/watch.c TOTK_BONES_BIRTH)
+void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { if (g_fnprof_cb) g_fnprof_cb(addr, lr, x0); }
 
 // ---- CNTPCT_EL0: the Switch's 19.2 MHz system counter
 // The Switch's 19.2 MHz counter: ns * 12 / 625, as a multiply by that ratio in 16.48 fixed point (a 128-bit division

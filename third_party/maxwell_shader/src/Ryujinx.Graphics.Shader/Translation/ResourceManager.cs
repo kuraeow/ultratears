@@ -65,7 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             _stage = stage;
             _stagePrefix = GetShaderStagePrefix(stage);
 
-            _cbSlotToBindingMap = new SetBindingPair[18];
+            _cbSlotToBindingMap = new SetBindingPair[32];   // UltraTears: 18..31 last frame's banks (Transforms/PreviousPosition.cs)
             _sbSlotToBindingMap = new SetBindingPair[16];
             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));

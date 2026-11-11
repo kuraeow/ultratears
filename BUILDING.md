@@ -65,8 +65,8 @@ was.
 | `romfs` | `data\romfs\romfs.bin`: the RomFS's 304,000 files in one image, its content checked against 1.4.3 | ~4 min |
 | `lift` | `data\generated`: the game's code translated to C (~0.9 GB) | ~1 min |
 | `compile` | `UltraTears.exe` (and `linux\ultratears`): x86-64-v3, or v2 on a CPU without AVX2 | ~15 min, seconds after small changes |
-| `shaders` | `data\shaders\translated.pack`: the game's ~28,700 shaders as SPIR-V | ~4 min |
-| `graphics` | `data\shaders\compiled.bin`: those shaders compiled by your graphics driver, so the game has no compile stalls | ~1–3 min |
+| `shaders` | `data\shaders\translated.pack`: the game's ~28,700 shaders as SPIR-V, with the vertex shaders' last-frame variants for FSR 3.1 (~43,000 in all, each zstd-compressed, ~0.9 GB) | ~5 min |
+| `graphics` | `data\shaders\compiled.bin`: those shaders compiled by your graphics driver, so the game has no compile stalls | ~2–5 min |
 | `textures` | `data\textures`: every ASTC texture as BC7 / BC1 (~7.5 GB) | ~8 min |
 | `finish` | `ultratears.cfg` (your own settings in it are kept) | seconds |
 | `deck` | `UltraTears-SteamDeck.tar`, with `--platform linux` or `both` | ~3 min |
@@ -125,9 +125,12 @@ And back on Windows:
 
 ```powershell
 python tools/make_package.py --home <game folder>    # release/UltraTears-<x.y.z>-windows-x86_64.zip
-git push origin dev:main
+git push origin dev
 git push origin v<x.y.z>
 ```
+
+`main` takes the release through a pull request from `dev`, merged with a merge commit (direct pushes to `main` are
+refused); then `dev` is fast-forwarded to `main` again.
 
 The packages carry only what a build reads: the compiler and the Linux kit are trimmed to the files the game's,
 the texture encoder's and the launcher's builds open (measured from ninja's records, `clang -M` and the linker's trace),

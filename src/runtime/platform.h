@@ -27,6 +27,9 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // MEM_WRITE_WATCH), their addresses into pages[] (at most max), and the tracking reset for the range. Returns the
 // count (max: maybe more), or -1 where there is no tracking (macOS, Linux). Page size: *page.
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page);
+// Linux: the write watch's frozen regions (not scanned, read-only until written): MiB frozen now, thaws by a write so
+// far, MiB of scans skipped so far. Zeros elsewhere.
+void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *skipped_mib);
 // Development (TOTK_MEMMAP=1): the process's committed memory by kind (guest window, heaps, other private, mapped,
 // images) and its largest private regions, to stderr. Slow (walks the address space and the heaps).
 void plat_memory_map(void);
@@ -39,6 +42,10 @@ uint64_t plat_now_ns(void);                // monotonic
 void plat_sleep_until_ns(uint64_t t);      // precise wait for plat_now_ns() >= t
 void plat_thread_realtime(uint64_t period_ns);
 void plat_thread_start(void);   // first thing on a new thread (Linux: its own signal stack for the fault handler)
+void plat_thread_background(void);   // work nothing waits for: below the game's threads (it takes idle CPU only)
+void plat_thread_nice(int n);        // n > 0: this thread below the game's threads by n (Linux nice; Windows below normal)
+// n bytes of guest memory that may have been released meanwhile into dst: 0 (and no fault) where any is not readable
+int plat_safe_read(void *dst, const void *src, size_t n);
 void plat_thread_boost(void);   // a thread the frame waits for (the replay thread): above the game's workers  // periodic timing thread (vsync): don't coalesce its timers
 
 // ---- process

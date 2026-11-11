@@ -1,0 +1,36 @@
+#version 450
+// UltraTears: motion vectors for the temporal upscaler (src/gfx/vkb_tsr.c). SPDX-License-Identifier: GPL-3.0-or-later
+// The camera's motion: each pixel's depth is taken through one matrix, last frame's view-projection times the inverse of
+// this frame's (made in double precision on the CPU: in float, TotK's world coordinates in the thousands left distant
+// surfaces shimmering), from this frame's clip space to last frame's. Objects that moved on their own were drawn again
+// into the object motion target (tsr_obj.frag: their last-frame position in normalized device coordinates, their depth,
+// 1); where that surface is still the one in the scene depth, its own last-frame position is taken instead.
+// The vector is last frame's window position minus this frame's, in render pixels, without the jitter (FSR's
+// convention). Clip space as the translated shaders write it: y up, depth -w..w; the replay's viewports have negative
+// heights, so window y grows downwards from ndc y = +1 and depth is ndc z * 0.5 + 0.5.
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform texture2D depth_tex;
+layout(binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(binding = 2) uniform texture2D obj_tex;   // RGBA32F: last-frame ndc xy, depth, 1 (0: none)
+layout(push_constant) uniform P {
+    mat4 m;        // this frame's clip space to last frame's
+    vec2 size;     // render size in pixels
+    vec2 jitter;   // this frame's jitter in pixels, as the scene was drawn (window x right, y down)
+} pc;
+vec2 window(vec2 ndc) { return vec2((ndc.x * 0.5 + 0.5) * pc.size.x, (0.5 - ndc.y * 0.5) * pc.size.y); }
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.size.x) || p.y >= int(pc.size.y)) return;
+    float d = texelFetch(depth_tex, p, 0).r;
+    vec2 win = vec2(p) + 0.5 - pc.jitter;   // where this pixel's surface sits without the jitter
+    vec4 obj = texelFetch(obj_tex, p, 0);
+    vec2 mv = vec2(0.0);
+    if (obj.w > 0.5 && abs(obj.z - d) <= 1e-6 + 1e-4 * (1.0 - d)) {
+        mv = window(obj.xy) - win;
+    } else {
+        vec4 c = pc.m * vec4(win.x / pc.size.x * 2.0 - 1.0, 1.0 - win.y / pc.size.y * 2.0, d * 2.0 - 1.0, 1.0);
+        if (c.w > 1e-6) mv = window(c.xy / c.w) - win;
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+}

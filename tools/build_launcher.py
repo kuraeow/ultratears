@@ -106,33 +106,37 @@ def main():
     assets_c(build)
     print(f'UltraTears Launcher {resources(build)}', flush=True)
     opt = '-O0' if a.debug else '-O2'
-    b = build.as_posix()
+    # relative to the folder ninja runs in where it can be: ninja puts $in and $out into commands unquoted
+    b = pathlib.Path(os.path.relpath(build, ROOT)).as_posix() if build.is_relative_to(ROOT) else build.as_posix()
     libs = LIBS.replace('-mwindows', '-mconsole') if a.debug else LIBS
     target, cxxlib = '-gcodeview -DUNICODE -D_UNICODE', ''
+    import build_game   # ninja_arg: a path in a command, quoted (the folder may have spaces in its name, issue #55)
     if linux:   # the Linux kit, as the game's (tools/build_game.py)
-        import build_game
         if not (build_game.LINUX_KIT / 'sysroot').is_dir():
             sys.exit(f'the Linux kit is missing ({build_game.LINUX_KIT})')
         target, cxxlib = build_game.linux_flags(), ' -stdlib=libstdc++'
         libs = (f'{build_game.linux_flags()} --rtlib=libgcc --unwindlib=libgcc -no-pie '
-                f'-L{build_game.LINUX_KIT.as_posix()}/lib {LINUX_LIBS}')
+                f'{build_game.ninja_arg("-L" + build_game.LINUX_KIT.as_posix() + "/lib")} {LINUX_LIBS}')
     lines = [
+        # the compilers by their full path, not through PATH (a ':' in the folder name splits PATH on Linux, #66)
+        f'cc = {build_game.ninja_arg(str(build_game.CLANG64 / build_game.exe("clang")))}',
+        f'cxx = {build_game.ninja_arg(str(build_game.CLANG64 / build_game.exe("clang++")))}',
         f'builddir = {b}',
         f'flags = {opt} -g -march=x86-64-v2 -Ideps/launcher/imgui -Ideps/launcher/imgui/backends -Ideps/launcher/nanosvg '
-        f'-Ideps/launcher/stb -I{b} -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS {target}',
+        f'-Ideps/launcher/stb {build_game.ninja_arg("-I" + b)} -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS {target}',
         'rule cxx',
-        f'  command = clang++ -MD -MF $out.d $flags{cxxlib} -std=c++17 -fno-exceptions -fno-rtti -Wall -Wno-unused-function -c $in -o $out',
+        f'  command = $cxx -MD -MF $out.d $flags{cxxlib} -std=c++17 -fno-exceptions -fno-rtti -Wall -Wno-unused-function -c $in -o $out',
         '  depfile = $out.d',
         '  deps = gcc',
         'rule cc',
-        '  command = clang -MD -MF $out.d $flags -c $in -o $out',
+        '  command = $cc -MD -MF $out.d $flags -c $in -o $out',
         '  depfile = $out.d',
         '  deps = gcc',
         'rule rc',
         '  command = llvm-windres --target=pe-x86-64 -I . $in -o $out',
         'rule link',
-        f'  command = clang++ -fuse-ld=lld -g -Wl,--pdb=$pdb -o $out $in {libs}' if not linux else
-        f'  command = clang++ -fuse-ld=lld -g -o $out $in {libs}',
+        f'  command = $cxx -fuse-ld=lld -g "-Wl,--pdb=$pdb" -o $out $in {libs}' if not linux else
+        f'  command = $cxx -fuse-ld=lld -g -o $out $in {libs}',
         '',
     ]
     objs = []

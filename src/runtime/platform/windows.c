@@ -10,6 +10,7 @@
 #include <malloc.h>
 
 #include "../platform.h"
+#include "../bufcat.h"
 
 // ---- guest address space
 // The window is reserved up front and committed per region (plat_commit from the loader / kernel). Anything
@@ -67,6 +68,8 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
     // once kept its old contents in the GPU's copy - the "giant planes", L13 in dev-local/docs/issues.md.)
     return (int)n;
 }
+
+void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *skipped_mib) { *frozen_mib = *thaws = *skipped_mib = 0; }
 
 // Decommit everything: the range stays reserved, and pages come back zeroed when committed again (lazily).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
@@ -157,7 +160,7 @@ void plat_memory_map(void) {
     char line[512];
     int at = 0;
     for (int c = 0; c < NB; c++)
-        if (bn[c]) at += snprintf(line + at, sizeof line - (size_t)at, " %s: %llu = %.0f MiB;", cls[c], (unsigned long long)bn[c], bb[c] / M);
+        if (bn[c]) at = bufcat(line, sizeof line, at, " %s: %llu = %.0f MiB;", cls[c], (unsigned long long)bn[c], bb[c] / M);
     fprintf(stderr, "[mem]   other private by region size:%s\n", at ? line : " -");
     for (int k = 0; k < TOP && top[k].size; k++)
         fprintf(stderr, "[mem]   private %016llx +%.1f MiB\n", (unsigned long long)top[k].base, top[k].size / M);
@@ -211,6 +214,13 @@ void plat_sleep_until_ns(uint64_t t) {
 void plat_thread_boost(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 
 void plat_thread_start(void) {}   // the vectored exception handler needs no stack of its own
+void plat_thread_background(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+void plat_thread_nice(int n) { if (n > 0) SetThreadPriority(GetCurrentThread(), n >= 10 ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_BELOW_NORMAL); }
+// (decommitted pages of the guest window: the copy fails instead of raising an access violation)
+int plat_safe_read(void *dst, const void *src, size_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), src, dst, n, &got) && got == n;
+}
 
 void plat_thread_realtime(uint64_t period_ns) {
     (void)period_ns;

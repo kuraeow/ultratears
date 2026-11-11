@@ -1,7 +1,7 @@
 """What a build for Linux reads of the Linux kit (deps/linux) and of clang's own headers, measured on a game folder that
 built the game for Linux (tools/setup.py --platform linux or both: build-linux/): the packages carry only these
 (tools/make_package.py trims the kit of the Windows package, tools/make_package_linux.py the kit and LLVM of the Linux
-one and of the AppImage), as totk-pc-recomp's make_release_linux.py keeps only the sysroot files its build read.
+one and of the AppImage).
 
 Measured, not guessed: the headers ninja recorded for every compiled file of the game, the headers of the texture
 encoder's sources (tools/bc7_build.py builds it on Linux too; clang -M with the same flags), and what lld reads when it
@@ -14,6 +14,7 @@ import argparse
 import pathlib
 import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,12 @@ RESOURCE = re.compile(r'[/\\]lib[/\\]clang[/\\]\d+[/\\](include[/\\].+)$', re.I)
 # kept whatever the measurement says: the licenses, the kit's own record of what it is, and the SDL3 the game's build
 # copies beside the game (tools/build_game.py: not read by the compiler or lld)
 ALWAYS = ('linux/licenses/', 'linux/README', 'linux/kit.json', 'linux/sysroot/usr/lib/x86_64-linux-gnu/libSDL3.so.0')
+
+
+def cmd_split(s):
+    """A ninja command's arguments: '$$' is '$', and an argument quoted for its shell (tools/build_game.py ninja_arg,
+    a path with spaces) stays one."""
+    return shlex.split(s.replace('$$', '$'), posix=True)
 
 
 def classify(path, used):
@@ -56,7 +63,9 @@ def measure(home):
     for line in deps.splitlines():
         classify(line, used)
     text = ninja.read_text(encoding='utf-8')
-    kit = re.search(r'--sysroot=(\S+)/sysroot', text).group(1)   # the kit this build used
+    # the kit this build used (its path quoted where it has spaces, tools/build_game.py ninja_arg)
+    kit = next(t for t in cmd_split(re.search(r'^cflags = (.*)$', text, re.M).group(1)) if t.startswith('--sysroot='))
+    kit = kit[len('--sysroot='):-len('/sysroot')]
     flags = ['--target=x86_64-linux-gnu', f'--sysroot={kit}/sysroot', f'-I{kit}/include']
     tmp = ROOT / 'dev-local/build/linux-used-probe'
     tmp.mkdir(parents=True, exist_ok=True)
@@ -93,20 +102,19 @@ def measure(home):
             for p in re.split(r'\s+', out.stdout.replace('\\\n', ' ')):
                 classify(p, used)
         # what lld reads linking the game (its link line, the objects of build-linux), the encoder and the launcher
-        link = re.search(r'^rule link\n  command = clang (.*) -o \$out @\$out\.rsp (.*)$', text, re.M)
+        link = re.search(r'^rule link\n  command = (?:clang|\$cc) (.*) -o \$out @\$out\.rsp (.*)$', text, re.M)
         objs = re.search(r'^build linux/ultratears: link (.*)$', text, re.M).group(1).split()
         probe = tmp / 'probe.cpp'
         probe.write_text('int main() { return 0; }\n')
         rsp = tmp / 'objs.rsp'   # ~1500 objects: past Windows' command-line limit
         rsp.write_text('\n'.join((home / o).as_posix() for o in objs if not o.startswith('|')))
-        runs = [[tool('clang'), *link.group(1).replace('$$ORIGIN', '$ORIGIN').split(), '-o', str(tmp / 'game'),
-                 '@' + str(rsp), *link.group(2).split()],
+        runs = [[tool('clang'), *cmd_split(link.group(1)), '-o', str(tmp / 'game'), '@' + str(rsp), *cmd_split(link.group(2))],
                 [tool('clang++'), *flags, '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
                  '-static-libstdc++', '-o', str(tmp / 'bc7build'), str(probe), f'-L{kit}/lib', '-l:libzstd.a', '-pthread',
                  '-lm'],
                 [tool('clang++'), *flags, '--rtlib=libgcc', '--unwindlib=libgcc', '-no-pie', f'-L{kit}/lib', '-fuse-ld=lld',
                  '-o', str(tmp / 'launcher'), str(probe),
-                 *build_launcher.LINUX_LIBS.replace("'$$ORIGIN'", '$ORIGIN').replace('$$ORIGIN', '$ORIGIN').split()]]
+                 *cmd_split(build_launcher.LINUX_LIBS)]]
         for cmd in runs:
             cmd = [c for c in cmd if c != '-g'] + ['-Wl,--verbose']
             r = subprocess.run(cmd, capture_output=True, text=True, env=tool_env(), cwd=home)
