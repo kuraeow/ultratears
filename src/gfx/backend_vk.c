@@ -2304,7 +2304,20 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
         // The draw covers one part, the CPU may have filled the rest: TOTK writes level 0 of a 32x32x32 noise volume and
         // draws its mips from it (then compresses them into BC4, L21); the image counted as GPU-written from that first
         // draw on, level 0 was never uploaded and every level stayed zero.
-        if (im && !im->gpu_written && !im->upload_stamp && (im->levels > 1 || im->layers > 1 || im->depth > 1)) vkb_tex_upload(cb, im);
+        // Single-level colour targets too (#64, L29): a new image starts with whatever the device memory held; the
+        // console's texture is its memory. TOTK re-creates the desert's 512x512 R16 height map after a fast travel and
+        // only stamps small rectangles into it, relying on the rest - our image kept another image's bytes there and
+        // the sand rose into walls up to the sky. Once per new image. TOTK_VK_RT_INIT=0: as before (only the above).
+        static int rt_init = -1;
+        if (rt_init < 0) { const char *e = getenv("TOTK_VK_RT_INIT"); rt_init = !(e && *e == '0'); }
+        if (im && !im->gpu_written && !im->upload_stamp &&
+            (im->levels > 1 || im->layers > 1 || im->depth > 1 || (rt_init && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT))) {
+            static _Atomic int said;
+            if (im->levels == 1 && im->layers == 1 && im->depth == 1 && atomic_fetch_add(&said, 1) < 16)
+                VLOG("new render target %llu (format %#x %ux%u) filled from game memory before its first draw, present %llu",
+                     (unsigned long long)im->serial, im->d.format, im->width, im->height, (unsigned long long)vkb_frame());
+            vkb_tex_upload(cb, im);
+        }
         uint32_t bw, bh;
         VkImageView bview = im && im->compressed && !vkb_view(im, v, 1, -1) ? vkb_tex_block_target(cb, im, v, &bw, &bh) : VK_NULL_HANDLE;
         if (bview) {   // GPU compression: drawn into an image of blocks, copied into the texture at the pass end (L21)
@@ -2584,9 +2597,11 @@ void mtl_tex_release(tex_t *t) { vkb_tex_release(t); }
 // TOTK_SHOT=<present number>[+<count>]:<file.bmp>: saves that presented frame (development check of the picture); with a
 // count, that many presents in a row to <file>_<present>.bmp, copied into one buffer without waiting on the GPU in between
 // (written once the last one is done), so the frames keep their usual timing (flicker between frames).
+// TOTK_SHOT_STEP=<presents>: after that, again every so many presents (a scripted walk through menus), each to
+// <file>_<present>.bmp.
 static VkBuffer g_shot_buf;
 static VkDeviceMemory g_shot_mem;
-static long long g_shot_at = -1, g_shot_count = 1;
+static long long g_shot_at = -1, g_shot_count = 1, g_shot_step;
 static uint64_t g_shot_n[256];
 static int g_shot_got;
 static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_t w, uint32_t h) {
@@ -2595,6 +2610,8 @@ static VkBuffer shot_record(VkCommandBuffer cb, uint64_t n, VkImage out, uint32_
         g_shot_at = e ? atoll(e) : 0;
         if (c) g_shot_count = atoll(c + 1);
         if (g_shot_count < 1 || g_shot_count > 256) g_shot_count = 1;
+        const char *st = getenv("TOTK_SHOT_STEP");
+        g_shot_step = st ? atoll(st) : 0;
     }
     // the buffer is made 30 presents ahead: a large allocation at the first frame shot would upset that frame's timing
     if (g_shot_at <= 0 || n + 30 < (uint64_t)g_shot_at || g_shot_got >= g_shot_count) return VK_NULL_HANDLE;
@@ -2628,7 +2645,7 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
         for (int k = 0; k < g_shot_got; k++) {
             char name[1024];
             const char *dot = strrchr(path + 1, '.');
-            if (g_shot_count == 1 || !dot) snprintf(name, sizeof name, "%s", path + 1);
+            if ((g_shot_count == 1 && g_shot_step <= 0) || !dot) snprintf(name, sizeof name, "%s", path + 1);
             else snprintf(name, sizeof name, "%.*s_%llu%s", (int)(dot - path - 1), path + 1, (unsigned long long)g_shot_n[k], dot);
             FILE *f = fopen(name, "wb");
             if (!f) continue;
@@ -2651,6 +2668,7 @@ static void shot_write(uint64_t fence, uint32_t w, uint32_t h) {
     vk.vkDestroyBuffer(vkc.device, g_shot_buf, NULL);
     vk.vkFreeMemory(vkc.device, g_shot_mem, NULL);
     g_shot_buf = VK_NULL_HANDLE;
+    if (g_shot_step > 0) { g_shot_at = (long long)g_shot_n[0] + g_shot_step; g_shot_got = 0; }   // TOTK_SHOT_STEP: the next one
 }
 static _Atomic long long g_dump_key_at;   // vkb_dump_request (F9)
 
