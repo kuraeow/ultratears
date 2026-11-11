@@ -110,7 +110,7 @@ def profile_rt(clang):
 # addresses), their control-flow hashes and the counts: no bytes of the game. The game's code is the same for every
 # player (TOTK 1.4.3, tools/setup.py checks it), so one profile serves all. clang lays out and inlines by it; it
 # changes no result. On the Steam Deck the game's work a frame 23-24.6 -> 21-22.6 ms in the dense places
-# (dev-local/docs/frame-compare.md 0). Code the training never reached keeps the optimization it has without a
+# (dev-local/docs/perf/frame-compare.md 0). Code the training never reached keeps the optimization it has without a
 # profile (-pgo-cold-func-opt=default), not the size-first one clang gives cold code. A function whose C changed since
 # (another lifter) does not match its hash and is compiled as without. TOTK_PGO=0: without the profile (A/B).
 # No .text.hot / .text.unlikely sections (-profile-guided-section-prefix=false): ld.lld groups them across all the

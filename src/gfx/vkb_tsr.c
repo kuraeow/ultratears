@@ -25,7 +25,7 @@
 // change, FSR at a draw. A chunk starts with the walk's jitter state at its start. On one recording thread
 // (TOTK_VK_RECORD_THREADS=1) the walk calls come in the same order, just before the recording.
 //
-// [temporary] Stage 1 (dev-local/docs/upscaler-eval.md): only the camera's motion (objects that move on their own get
+// [temporary] Stage 1 (dev-local/docs/perf/upscaler-eval.md): only the camera's motion (objects that move on their own get
 // none yet); FSR reads the picture after the game's FXAA; no texture LOD bias for the lower render size; fp32 shaders
 // only (no fp16 permutation for the Steam Deck yet). Each is listed in dev-local/docs/plan.md.
 #include <math.h>
