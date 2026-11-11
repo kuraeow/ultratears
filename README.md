@@ -55,7 +55,8 @@ also put a newer `UltraTears.AppImage` into the game folder in place of the old 
 <details>
 <summary>Controls</summary>
 
-The controller's button layout follows the Switch (A is the right button).
+The controller's button layout follows the Switch (A is the right button); on the Steam Deck it follows the Deck's own
+labels (A is the bottom button).
 
 Keyboard and mouse: WASD move, the mouse (or the arrow keys) turns the camera and aims, E = A, Left Shift = B,
 Space = X, left click / T = Y, Q = L, R = R, right click / Z = ZL, F / X = ZR, Esc = + (menu), Tab / M = − (map),
@@ -64,8 +65,38 @@ F11 or Alt+Enter full screen. Holding L, the mouse picks an ability; holding a d
 sideways steps through weapons, shields and materials. Mouse sensitivity, the bow's and inverted up and down are on the
 **Keyboard** page of the launcher's **Controls** tab.
 
-Both can be changed in the launcher's **Controls** tab: every button and key, and the controller's layout (Nintendo:
-A is the right button; Xbox / Steam Deck: A is the bottom one).
+Both can be changed in the launcher's **Controls** tab: every button and key (mouse buttons too), and the controller's
+layout (Nintendo: A is the right button; Xbox / Steam Deck: A is the bottom one). The game's button prompts follow
+your layout and bindings. The **Sticks and gyro** page sets each stick's and the gyro's dead zone, for a stick that
+drifts.
+</details>
+
+<details>
+<summary>Upscaling and anti-aliasing</summary>
+
+On the launcher's **General** tab:
+
+- **Scene scale:** the scene can be drawn below the screen's resolution and upscaled with **FSR 1** (the game's own) or
+  **FSR 3.1** (temporal, sharper and steadier in motion), or drawn at full size (**None**).
+- **Anti-aliasing** (without FSR 3.1, which anti-aliases by itself): the game's **FXAA**, **SMAA** (smoother edges for
+  little GPU time) or **Off**.
+</details>
+
+<details>
+<summary>Mods and cheats</summary>
+
+Mods made for the Switch emulators work as they are. In the launcher's **Mods** tab click **Open mods folder** and
+unpack each mod into a folder of its own there, so that its `romfs`, `exefs` or `cheats` folder sits directly in it
+(`atmosphere/contents/0100F2C0115B6000/...` works too). The same tab turns each mod and each cheat on or off and sets
+the mods' order: when two mods change the same file, the one higher in the list wins. Mods and cheats need no rebuild
+of the game.
+
+- RomFS mods (textures, models, text, ...), ExeFS patches (`.ips`, `.pchtxt`) and Atmosphere cheats (`.txt` named by
+  the game's build ID) for game version 1.4.3.
+- Patches and cheats that change the game's code are prepared when you press **Play**, a few seconds when they
+  changed. On Linux and the Steam Deck this needs the game folder set up by the AppImage; in a folder made on Windows
+  for the Deck, only RomFS mods and cheats that change data work.
+- A texture from a mod causes a short hitch the first time it is seen.
 </details>
 
 <details>
