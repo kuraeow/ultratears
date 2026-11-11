@@ -770,14 +770,14 @@ def lift(sites, image):
 
 def compile_lib(c_text, fns, nsw):
     from toolchain import CLANG64, exe, env as tool_env
-    from build_game import cpu_arch
+    from build_game import cpu_arch, linux_flag_args
     work = ROOT / 'data/mods/build'
     work.mkdir(parents=True, exist_ok=True)
     arch = cpu_arch()
     cc = str(CLANG64 / exe('clang'))
     flags = ['-O2', f'-march={arch}', '-fno-strict-aliasing', '-w', '-I', str(ROOT / 'src/runtime')]
-    if LINUX:
-        flags += ['-fPIC']
+    if LINUX:   # the game folder's Linux kit, as the game's own build: a Steam Deck has no system headers or libraries
+        flags += ['-fPIC', *linux_flag_args()]
     e = tool_env()
     # below the game and the desktop, as the game's own build (tools/build_game.py)
     nice = {} if LINUX else {'creationflags': 0x4000}   # BELOW_NORMAL_PRIORITY_CLASS
@@ -854,9 +854,13 @@ def compile_lib(c_text, fns, nsw):
             return False
         objs.append(str(work / 'fma.o'))
     tmp = ROOT / (LIB + '.new')
-    link = [cc, '-shared', '-fuse-ld=lld', '-o', str(tmp), *objs]
-    # Windows: no CRT start-up of its own (the game's toolchain has none for libraries, and nothing here needs one)
-    link += [] if LINUX else ['-nostartfiles', '-Wl,--entry,ultrs_dll_entry', '-static-libgcc']
+    link = [cc, '-shared', '-fuse-ld=lld', '-nostartfiles', '-o', str(tmp), *objs]
+    # no C runtime start-up of its own, nothing here needs one: the game's toolchain has none for libraries on Windows,
+    # and the players' trimmed Linux kit has only the start files of a program (crt1.o, crtbegin.o), not a library's
+    # Linux: -Bsymbolic, the glue's jumps through ultrs_ext_ptr / ultrs_imp_ptr (exported for the game's dlsym) are
+    # %rip-relative, which lld takes only against a symbol bound inside the library
+    link += ([*linux_flag_args(), '--rtlib=libgcc', '--unwindlib=libgcc', '-Wl,-Bsymbolic', '-lm'] if LINUX else
+             ['-Wl,--entry,ultrs_dll_entry', '-static-libgcc'])
     if not run(link):
         return False
     try:
