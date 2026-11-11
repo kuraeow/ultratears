@@ -729,6 +729,15 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
     sw_last = now_ns();
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
+// The host thread ids of the running guest threads (development: host/watch.c TOTK_BONES breakpoints).
+int runtime_guest_tids(unsigned long *out, int max) {
+    int n = 0;
+    g_lock();
+    for (thr_t *t = g_all; t && n < max; t = t->all)
+        if (t->started && !t->exited && t->os_tid) out[n++] = t->os_tid;
+    g_unlock();
+    return n;
+}
 
 // UltraTears (TOTK_STATS, with the frame interval line): the guest threads that waited most over the last `frames`
 // frames: blocked in a wait by kind, waiting for a virtual core, and the host's latency from a wake to running again.

@@ -719,6 +719,7 @@ static void fb_copies(void) {   // outside a pass: the sampled targets copied (n
 static VkBuffer g_zero;   // 64 KiB of zeros for unbound buffers
 static __thread const char *g_akey;   // the shader whose bindings are written (audit)
 static VkBuffer g_support;
+enum { ATTR_CONST_OFF = 65536 - 16 };   // in g_support: the value of a disabled vertex attribute
 static void fixed_buffers(void) {
     if (g_zero) return;
     // Ryujinx SupportBuffer: alpha test off, no BGRA swaps, render scale 1 (73 entries from byte 192), 1392 bytes
@@ -740,6 +741,8 @@ static void fixed_buffers(void) {
         vk.vkMapMemory(vkc.device, m, 0, VK_WHOLE_SIZE, 0, (void **)&p);
         memset(p, 0, 65536);
         if (k) for (int i = 0; i < 73; i++) { float one = 1.0f; memcpy(p + 192 + 16 * i, &one, 4); }
+        if (k) { float one = 1.0f; memcpy(p + ATTR_CONST_OFF + 12, &one, 4); }
+        if (k) { uint32_t probe[4] = {3, 0, 0, 0x3f800000}; memcpy(p + ATTR_CONST_OFF - 16, probe, 16); }   // TOTK_VK_ATTR_CONST=2: x = bits 3 (a bone past a one-bone palette)   // (0, 0, 0, 1): disabled vertex attributes
     }
 }
 
@@ -1793,6 +1796,28 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
                                                              .binding = a.stream, .format = f, .offset = a.offset};
         used |= 1u << a.stream;
     }
+    // An input the vertex shader reads that the game left disabled: the Switch's GPU gives (0, 0, 0, 1), as Eden does
+    // (EmitGetAttribute). Without an attribute Vulkan leaves it undefined; NVIDIA gave leftovers, so a disabled bone
+    // index of TOTK's rigid skinning (vs da777def3340, in_attr6) picked random bones and the mesh tore into a flapping
+    // sheet in some loads (L28). The constant: 16 bytes of g_support, stride 0, on a free binding.
+    static int attr_const = -1;
+    if (attr_const < 0) { const char *e = getenv("TOTK_VK_ATTR_CONST"); attr_const = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    uint32_t have = 0;
+    for (uint32_t i = 0; i < na; i++) have |= 1u << attr[i].location;
+    uint32_t miss = attr_const && S.sh[0] ? S.sh[0]->in_mask & ~have & 0xFFFFu : 0;
+    int cslot = -1;
+    for (int s = 15; miss && s >= 0 && cslot < 0; s--)
+        if (!(used >> s & 1)) cslot = s;
+    if (cslot >= 0) {
+        for (uint32_t l = 0; l < 16; l++)
+            if (miss >> l & 1)
+                attr[na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, .location = l,
+                                                                     .binding = (uint32_t)cslot, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0};
+        bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = (uint32_t)cslot,
+            .stride = 0, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX, .divisor = 1};
+        VkDeviceSize off = attr_const == 2 ? ATTR_CONST_OFF - 16 : ATTR_CONST_OFF, size = 16, stride = 0, key[4] = {(VkDeviceSize)(uintptr_t)g_support, off, 16, 0};
+        if (dyn(D_VB0 + cslot, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, (uint32_t)cslot, 1, &g_support, &off, &size, &stride);
+    }
     for (uint32_t s = 0; s < 16; s++) {
         if (!(used & (1u << s))) continue;
         bind[nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, .binding = s,
@@ -2069,6 +2094,159 @@ static void trace_resources(const vkb_shader *sh, int stage) {
             }
         }
     }
+}
+
+// TOTK_BONES=<vertex shader key prefix>:<cbuf slot>:<bytes>:<bone>:<present> (development, L28): at the first draw with
+// that vertex shader and a uniform buffer of that size in that slot from that present on, that bone (a 3x4 matrix at
+// vec4 3*bone) goes to host/watch.c: where it lives in game memory, and which code writes it.
+void runtime_bones_probe(const float *m12, uint64_t skip_lo, uint64_t skip_hi, uint64_t copy);
+// TOTK_BONES_SPREAD=<vs key prefix>:<present> (development, L28): every draw of that vertex shader in that present logs
+// its first two bones (c5, 3x4 each, in view space) in world space and their distance (a mesh stretched between bones).
+static void bones_spread(void) {
+    static const char *e;
+    static int init;
+    static long long at;
+    static size_t kl;
+    if (!init) {
+        init = 1;
+        e = getenv("TOTK_BONES_SPREAD");
+        const char *c = e ? strchr(e, ':') : NULL;
+        if (c) { kl = (size_t)(c - e); at = atoll(c + 1); }
+    }
+    if (!kl || vkb_frame() < (uint64_t)at || vkb_frame() > (uint64_t)at + 2 || !S.sh[0] || !S.sh[0]->key || strncmp(S.sh[0]->key, e, kl)) return;
+    const p_bind_buf *u = &S.ubo[0][5 - 3], *c7 = &S.ubo[0][7 - 3];
+    if (!u->addr || u->size < 96) return;
+    float w[2][3];
+    for (int k = 0; k < 2; k++) {
+        float b[12];
+        memcpy(b, (const void *)(uintptr_t)(u->addr + 48 * (uint64_t)k), 48);
+        for (int r = 0; r < 3; r++) w[k][r] = b[4 * r + 3] + (c7->addr && c7->size >= 128 ? ((const float *)(uintptr_t)(c7->addr + 112))[r] : 0);   // the shader: bone * position + c7[7]
+    }
+    float d = sqrtf((w[0][0] - w[1][0]) * (w[0][0] - w[1][0]) + (w[0][1] - w[1][1]) * (w[0][1] - w[1][1]) + (w[0][2] - w[1][2]) * (w[0][2] - w[1][2]));
+    uint64_t h[2] = {0, 0};   // FNV-1a of streams 0 and 1 in game memory; bone index histogram (byte 6 of stream 0)
+    unsigned nb[4] = {0, 0, 0, 0};
+    for (int st = 0; st < 2; st++) {
+        uint64_t a = S.vbuf[st].address, n = S.vbuf[st].size, x = 1469598103934665603ull;
+        if (!a || n > (64u << 20)) continue;
+        for (uint64_t i = 0; i < n; i++) x = (x ^ ((const uint8_t *)(uintptr_t)a)[i]) * 1099511628211ull;
+        h[st] = x;
+        if (st == 0 && S.vstream[0].stride == 8)
+            for (uint64_t i = 6; i < n; i += 8) nb[((const uint8_t *)(uintptr_t)a)[i] > 2 ? 3 : ((const uint8_t *)(uintptr_t)a)[i]]++;
+    }
+    VLOG("[spread]   s0=%#llx+%llu hash %016llx, s1=%#llx+%llu hash %016llx; bone index 0/1/2/other: %u %u %u %u",
+         (unsigned long long)S.vbuf[0].address, (unsigned long long)S.vbuf[0].size, (unsigned long long)h[0],
+         (unsigned long long)S.vbuf[1].address, (unsigned long long)S.vbuf[1].size, (unsigned long long)h[1], nb[0], nb[1], nb[2], nb[3]);
+    VLOG("[spread] frame %llu vs %.12s c5=%#llx+%llu c7=%#llx: bone 0 %g %g %g, bone 1 %g %g %g: %g m", (unsigned long long)vkb_frame(),
+         S.sh[0]->key, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)c7->addr, w[0][0], w[0][1], w[0][2],
+         w[1][0], w[1][1], w[1][2], d);
+}
+
+static void bones_check(void) {
+    bones_spread();
+    static const char *e;
+    static int init, slot, bone, done;
+    static long long at, bytes;
+    static size_t kl;
+    if (!init) {
+        init = 1;
+        e = getenv("TOTK_BONES");
+        const char *c = e ? strchr(e, ':') : NULL;
+        if (c && sscanf(c, ":%d:%lld:%d:%lld", &slot, &bytes, &bone, &at) == 4 && slot >= 3 && slot < VKB_NCBUF) kl = (size_t)(c - e);
+    }
+    if (!kl || done || vkb_frame() < (uint64_t)at || !S.sh[0] || !S.sh[0]->key || strncmp(S.sh[0]->key, e, kl)) return;
+    const p_bind_buf *u = &S.ubo[0][slot - 3];
+    static uint64_t sizes[32];
+    static int nsizes;
+    int known = 0;
+    for (int i = 0; i < nsizes; i++) known |= sizes[i] == u->size;
+    if (!known && nsizes < 32) {
+        sizes[nsizes++] = u->size;
+        VLOG("[bones] frame %llu candidate: vs %.12s c%d=%#llx+%llu", (unsigned long long)vkb_frame(), S.sh[0]->key, slot,
+             (unsigned long long)u->addr, (unsigned long long)u->size);
+    }
+    if (!u->addr || (bytes && (long long)u->size != bytes) || (uint64_t)(bone + 1) * 48 > u->size) return;
+    done = 1;
+    float b[12], v[12], m[12];
+    memcpy(b, (const void *)(uintptr_t)(u->addr + (uint64_t)bone * 48), 48);
+    // the bone is in view space: world = inverse(view) * bone, the view being c4[0..2] (a rigid 3x4)
+    const p_bind_buf *cv = &S.ubo[0][4 - 3];
+    if (cv->addr && cv->size >= 48) {
+        memcpy(v, (const void *)(uintptr_t)cv->addr, 48);
+        for (int r = 0; r < 3; r++)
+            for (int k = 0; k < 4; k++) {
+                float s = 0;
+                for (int j = 0; j < 3; j++) s += v[4 * j + r] * (k < 3 ? b[4 * j + k] : b[4 * j + 3] - v[4 * j + 3]);
+                m[4 * r + k] = s;
+            }
+        VLOG("[bones] view %g %g %g %g | %g %g %g %g | %g %g %g %g", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+    } else memcpy(m, b, 48);
+    VLOG("[bones] frame %llu, vs %.12s c%d=%#llx+%llu bone %d: %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)vkb_frame(),
+         S.sh[0]->key, slot, (unsigned long long)u->addr, (unsigned long long)u->size, bone, m[0], m[1], m[2], m[3], m[4], m[5], m[6],
+         m[7], m[8], m[9], m[10], m[11]);
+    runtime_bones_probe(m, u->addr & ~((64ull << 20) - 1), (u->addr & ~((64ull << 20) - 1)) + (64ull << 20), u->addr + (uint64_t)bone * 48);
+}
+
+// TOTK_VK_SKIPSCAN=<frame>:<frames per slot> (development, L28: which draw is a broken object on screen): over the 30
+// frames before <frame> the vertex shaders of draws with a bone palette (c5, a multiple of 48 bytes, 2+ bones) are
+// collected in order; from <frame> on, slot i (<frames per slot> frames each) does not draw shader i. With TOTK_SHOT
+// over the same frames, the shot where the object is gone names its shader (the slots are logged).
+static int skipscan(void) {
+    static const char *keys[1024];
+    static int nkeys, init, per, minb = 96, nbits;
+    static long long at;
+    static volatile int lk;
+    if (!init) {
+        const char *e = getenv("TOTK_VK_SKIPSCAN");
+        if (!e || sscanf(e, "%lld:%d:%d", &at, &per, &minb) < 2 || per < 1) at = -1;   // [:<min palette bytes>]
+        init = 1;
+    }
+    if (at < 0 || !S.sh[0] || !S.sh[0]->key) return 0;
+    long long f = (long long)vkb_frame();
+    if (f < at - 30) return 0;
+    // <min palette bytes> 0: every vertex shader, by bit planes: slot 2j skips the shaders whose index has bit j set,
+    // slot 2j+1 those with it clear (a shader is named by which slots remove the object)
+    const char *key = S.sh[0]->key;
+    int k = 0;
+    if (f < at) {
+        const p_bind_buf *u = &S.ubo[0][5 - 3];
+        static const char *only;   // TOTK_VK_SKIPSCAN_KEYS=<key prefix>,...: only these shaders
+        if (!only) { only = getenv("TOTK_VK_SKIPSCAN_KEYS"); if (!only) only = ""; }
+        if (*only) {
+            int hit = 0;
+            for (const char *q = only; *q;) {
+                size_t n = strcspn(q, ",");
+                if (n && !strncmp(key, q, n)) hit = 1;
+                q += n + (q[n] == ',');
+            }
+            if (!hit) return 0;
+        } else
+        if (minb > 0 && (!u->addr || u->size < (uint64_t)minb || u->size % 48)) return 0;
+        if (minb < 0) {   // -1: vertex shaders that read a storage buffer (the world's bone palette)
+            int rd = 0;
+            for (int i = 0; i < S.sh[0]->nsbuf; i++) rd |= S.sh[0]->sbuf[i].read;
+            if (!rd) return 0;
+        }
+        while (__atomic_exchange_n(&lk, 1, __ATOMIC_ACQUIRE)) {}
+        while (k < nkeys && keys[k] != key) k++;
+        if (k == nkeys && nkeys < 1024) {
+            keys[nkeys++] = key;
+            if (minb > 0)
+                VLOG("[skipscan] slot %d = frames %lld-%lld: vs %.12s (c5 %llu bytes)", k, at + (long long)k * per,
+                     at + (long long)(k + 1) * per - 1, key, (unsigned long long)u->size);
+            else
+                VLOG("[skipscan] vs %d: %.12s", k, key);
+            nbits = 0;
+            while ((1 << nbits) < nkeys) nbits++;
+        }
+        __atomic_store_n(&lk, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    long long slot = (f - at) / per;
+    if (minb > 0) return slot < nkeys && keys[slot] == key;
+    if (slot >= 2 * nbits) return 0;
+    while (k < nkeys && keys[k] != key) k++;
+    if (k == nkeys) return 0;   // a shader first seen during the scan: drawn
+    return ((k >> (slot / 2)) & 1) == !(slot & 1);
 }
 
 // TOTK_VK_SKIP=<key prefix>,...: draws with these vertex / fragment shaders are not drawn (development: bisecting)
@@ -2373,13 +2551,14 @@ void vkb_draw(const uint8_t *a, int indexed) {
         if (S.sh[0]) trace_resources(S.sh[0], 0);
         if (S.sh[1]) trace_resources(S.sh[1], 1);
     }
+    bones_check();
     if (!resolve_program() || !S.sh[0]) {
         vkb_cnt_add(g_skipped[0], 1);
         vkb_audit(S.bad_key ? A_SHADER_UNSUPPORTED : A_DRAW_NO_PROGRAM, S.bad_key);
         if (trace) VLOG("[draw]   skipped: no program / translation");
         return;
     }
-    if (skip_listed()) return;
+    if (skip_listed() || skipscan()) return;
     int ok;
     VkPrimitiveTopology topo = topology(indexed ? di->prim : dr->prim, &ok);
     if (!ok) {

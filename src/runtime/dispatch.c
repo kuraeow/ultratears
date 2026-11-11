@@ -299,7 +299,8 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
 
 // ---- function-entry profiler hook (cpu.h FN_ENTER): off unless a profiler sets g_fnprof
 volatile int g_fnprof;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { (void)addr; (void)lr; (void)x0; }
+void (*volatile g_fnprof_cb)(uint64_t addr, uint64_t lr, uint64_t x0);   // development hooks (host/watch.c TOTK_BONES_BIRTH)
+void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0) { if (g_fnprof_cb) g_fnprof_cb(addr, lr, x0); }
 
 // ---- CNTPCT_EL0: the Switch's 19.2 MHz system counter
 // The Switch's 19.2 MHz counter: ns * 12 / 625, as a multiply by that ratio in 16.48 fixed point (a 128-bit division
