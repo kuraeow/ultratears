@@ -2299,7 +2299,8 @@ static uint32_t dump_bpp(const vkb_image *im, int *depth) {
     if (im->astc || im->depth > 1 || (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT && !*depth)) return 0;
     return f == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB ||
            f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
-           f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R16G16_UNORM || *depth) ? 4 : f == VK_FORMAT_R16_SFLOAT ? 2 : 0;
+           f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R16G16_UNORM || *depth) ? 4
+         : f == VK_FORMAT_R16_SFLOAT || f == VK_FORMAT_R16_UNORM || f == VK_FORMAT_R8G8_UNORM ? 2 : 0;
 }
 // Records the copy of level 0, layer `layer` into upload memory (valid until the submission's slot is reused).
 static uint8_t *dump_copy(VkCommandBuffer cb, vkb_image *im, uint32_t layer, uint32_t *bpp) {
@@ -2339,6 +2340,8 @@ static void dump_save(const char *dir, const char *prefix, const vkb_image *im, 
         case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT:
             { float v; memcpy(&v, s, 4); o[0] = o[1] = o[2] = tone(v < 0 ? -v : v); o[3] = 255; break; }
         case VK_FORMAT_R16_SFLOAT: { uint16_t v; memcpy(&v, s, 2); float fv = half_to_float(v); o[0] = o[1] = o[2] = tone(fv < 0 ? -fv : fv); o[3] = 255; break; }
+        case VK_FORMAT_R16_UNORM: o[0] = o[1] = o[2] = s[1]; o[3] = 255; break;   // the high byte (terrain height maps)
+        case VK_FORMAT_R8G8_UNORM: o[2] = s[0]; o[1] = s[1]; o[0] = 0; o[3] = 255; break;
         default: o[0] = s[2]; o[1] = s[1]; o[2] = s[0]; o[3] = 255; break;
         }
     }
@@ -2349,6 +2352,13 @@ static void dump_save(const char *dir, const char *prefix, const vkb_image *im, 
         for (uint32_t x = 0; x < w && rn < 480; x += w / 16 ? w / 16 : 1) rn += snprintf(row + rn, sizeof row - rn, " %.4g", half_to_float(h16[(size_t)(h / 2) * w + x]));
         VLOG("[dump] %stexture %llu R16F %ux%u: row %u:%s; corners %g %g %g %g", prefix, (unsigned long long)im->serial, w, h, h / 2, row,
              half_to_float(h16[0]), half_to_float(h16[w - 1]), half_to_float(h16[(size_t)(h - 1) * w]), half_to_float(h16[(size_t)h * w - 1]));
+    }
+    if (im->format == VK_FORMAT_R16_UNORM) {   // a height map: its values and how much of it is not zero
+        const uint16_t *v16 = (const uint16_t *)px;
+        double sum = 0; uint32_t lo = 65535, hi = 0, nz = 0;
+        for (uint32_t p = 0; p < w * h; p++) { uint32_t v = v16[p]; sum += v; lo = v < lo ? v : lo; hi = v > hi ? v : hi; nz += v != 0; }
+        VLOG("[dump] %stexture %llu R16 %ux%u: min %u mean %.1f max %u, %u of %u texels not zero, centre %u", prefix,
+             (unsigned long long)im->serial, w, h, lo, sum / (w * h), hi, nz, w * h, v16[(size_t)(h / 2) * w + w / 2]);
     }
     if (im->format == VK_FORMAT_R32_SFLOAT || im->format == VK_FORMAT_D32_SFLOAT || im->format == VK_FORMAT_D32_SFLOAT_S8_UINT) {   // single channel: the values
         double sum = 0; float lo = 3e38f, hi = -3e38f;
