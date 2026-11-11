@@ -1857,17 +1857,18 @@ static void screen_play() {
 // ---------------------------------------------------------------- Controls (the game reads them: src/host/window_sdl.c
 // binds_load). pad_layout= nintendo (unset: A the right button) or xbox (A the bottom one); pad_<action>= SDL gamepad
 // names (a = the bottom button, as SDL names them by position), key_<action>= SDL scancode names, comma separated, none:
-// unbound; unset: the default below, which is the game's. A key or button bound to one action leaves the others.
+// unbound; unset: the default below, which is the game's (window_sdl.c ACTIONS). A key or button bound to one action
+// leaves the others. Keys may also be the mouse's buttons: Mouse Left, Mouse Right, Mouse Middle, Mouse 4, Mouse 5.
 struct Ctl { const char *id, *label, *pad_nin, *pad_xbox, *keys; };
 static const Ctl CTL_BUTTONS[] = {
-    {"a", "act_a", "b", "a", "J"}, {"b", "act_b", "a", "b", "K,Space"}, {"x", "act_x", "y", "x", "I"},
-    {"y", "act_y", "x", "y", "U"}, {"l", "act_l", "leftshoulder", "leftshoulder", "Q"},
-    {"r", "act_r", "rightshoulder", "rightshoulder", "E"}, {"zl", "act_zl", "lefttrigger", "lefttrigger", "Left Alt"},
-    {"zr", "act_zr", "righttrigger", "righttrigger", "Left Shift"}, {"plus", "act_plus", "start", "start", "Return"},
-    {"minus", "act_minus", "back", "back", "Tab,Escape"}, {"lstick", "act_lstick", "leftstick", "leftstick", "Z"},
-    {"rstick", "act_rstick", "rightstick", "rightstick", "C"}, {"up", "act_up", "dpup", "dpup", "T"},
-    {"down", "act_down", "dpdown", "dpdown", "G"}, {"left", "act_left", "dpleft", "dpleft", "F"},
-    {"right", "act_right", "dpright", "dpright", "H"}};
+    {"a", "act_a", "b", "a", "E"}, {"b", "act_b", "a", "b", "Left Shift"}, {"x", "act_x", "y", "x", "Space"},
+    {"y", "act_y", "x", "y", "Mouse Left,T"}, {"l", "act_l", "leftshoulder", "leftshoulder", "Q"},
+    {"r", "act_r", "rightshoulder", "rightshoulder", "R"}, {"zl", "act_zl", "lefttrigger", "lefttrigger", "Mouse Right,Z"},
+    {"zr", "act_zr", "righttrigger", "righttrigger", "F,X"}, {"plus", "act_plus", "start", "start", "Escape"},
+    {"minus", "act_minus", "back", "back", "Tab,M"}, {"lstick", "act_lstick", "leftstick", "leftstick", "Left Ctrl"},
+    {"rstick", "act_rstick", "rightstick", "rightstick", "C"}, {"up", "act_up", "dpup", "dpup", "2"},
+    {"down", "act_down", "dpdown", "dpdown", "4"}, {"left", "act_left", "dpleft", "dpleft", "1"},
+    {"right", "act_right", "dpright", "dpright", "3"}};
 static const Ctl CTL_MOVE[] = {
     {"move_up", "act_move_up", nullptr, nullptr, "W"}, {"move_down", "act_move_down", nullptr, nullptr, "S"},
     {"move_left", "act_move_left", nullptr, nullptr, "A"}, {"move_right", "act_move_right", nullptr, nullptr, "D"},
@@ -1961,6 +1962,13 @@ static std::string pad_label(const std::string &n) {
     if (n == "misc1") return "Share";
     return n;
 }
+// A key as shown: its SDL name, the mouse's buttons in words
+static std::string key_label(const std::string &n) {
+    if (n == "Mouse Left") return T("mouse_left");
+    if (n == "Mouse Right") return T("mouse_right");
+    if (n == "Mouse Middle") return T("mouse_middle");
+    return n;
+}
 static std::string ctl_default(bool pad, const Ctl &c) { return pad ? (layout_xbox() ? c.pad_xbox : c.pad_nin) : c.keys; }
 static bool same_input(const std::string &a, const std::string &b) { return !SDL_strcasecmp(a.c_str(), b.c_str()); }
 static bool has_input(const std::vector<std::string> &l, const std::string &s) {
@@ -2042,9 +2050,9 @@ bool ui_event(const SDL_Event *e) {
             cap_done();
             return true;
         }
-        // the game's own keys (window_sdl.c: F9 snapshots, F10 the frame counter, F11 full screen, Ctrl the mouse)
-        bool reserved = sc == SDL_SCANCODE_F9 || sc == SDL_SCANCODE_F10 || sc == SDL_SCANCODE_F11 ||
-                        sc == SDL_SCANCODE_LCTRL || sc == SDL_SCANCODE_RCTRL;
+        // the game's own keys (window_sdl.c: F9 snapshots, F10 the frame counter, F11 full screen; Esc, which lets the
+        // mouse go, cancels the wait above)
+        bool reserved = sc == SDL_SCANCODE_F9 || sc == SDL_SCANCODE_F10 || sc == SDL_SCANCODE_F11;
         const char *name = SDL_GetScancodeName(sc);
         if (!g_cap.pad && !reserved && name && *name && !e->key.repeat) {
             ctl_assign(false, g_cap.id, name);
@@ -2069,8 +2077,14 @@ bool ui_event(const SDL_Event *e) {
             cap_done();
         }
         return true;
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:   // a click elsewhere: no longer waiting (the click itself goes on)
-        g_cap.on = false;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (!g_cap.pad && e->button.button >= 1 && e->button.button <= 5) {   // a key awaited: a mouse button does too
+            static const char *const names[] = {"", "Mouse Left", "Mouse Middle", "Mouse Right", "Mouse 4", "Mouse 5"};
+            ctl_assign(false, g_cap.id, names[e->button.button]);
+            cap_done();   // the click itself clicks nothing
+            return true;
+        }
+        g_cap.on = false;   // a button awaited: a click elsewhere, no longer waiting (the click itself goes on)
         return false;
     default: return false;
     }
@@ -2103,7 +2117,7 @@ static void ctl_row(float cy, bool pad, const Ctl &c) {
     std::vector<std::string> cur = ctl_current(pad, c);
     std::string shown;
     for (const std::string &s : cur)
-        shown += (shown.empty() ? "" : ", ") + (pad ? pad_label(s) : s);
+        shown += (shown.empty() ? "" : ", ") + (pad ? pad_label(s) : key_label(s));
     bool waiting = g_cap.on && g_cap.pad == pad && g_cap.id == c.id;
     if (waiting)
         shown = T(pad ? "press_button" : "press_key");

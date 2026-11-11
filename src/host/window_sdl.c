@@ -5,7 +5,7 @@
 //  - game controllers: buttons by position as on a Switch controller (the right face button is A), sticks with Y up;
 //  - rumble: the game's vibration values (hid_feedback.c) drive the controller's low / high frequency motors.
 //  - motion: the controller's gyro and accelerometer feed motion_fusion.c (gyro aiming); F11 / Alt+Enter: fullscreen.
-//  - the mouse: kept in the window, the cursor hidden (mouse_capture); Ctrl lets it go.
+//  - the mouse: kept in the window, the cursor hidden (mouse_capture); Esc lets it go.
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is boot.c's; SDL only gets SDL_SetMainReady
 #include <SDL3/SDL_main.h>
@@ -25,26 +25,6 @@ static SDL_Window *window;
 static SDL_Gamepad *pad;
 static SDL_Mutex *pad_lock;
 
-static int mac_key(SDL_Scancode s) {
-    switch (s) {
-    case SDL_SCANCODE_A: return 0; case SDL_SCANCODE_S: return 1; case SDL_SCANCODE_D: return 2;
-    case SDL_SCANCODE_F: return 3; case SDL_SCANCODE_H: return 4; case SDL_SCANCODE_G: return 5;
-    case SDL_SCANCODE_Z: return 6; case SDL_SCANCODE_X: return 7; case SDL_SCANCODE_C: return 8;
-    case SDL_SCANCODE_V: return 9; case SDL_SCANCODE_B: return 11; case SDL_SCANCODE_Q: return 12;
-    case SDL_SCANCODE_W: return 13; case SDL_SCANCODE_E: return 14; case SDL_SCANCODE_R: return 15;
-    case SDL_SCANCODE_Y: return 16; case SDL_SCANCODE_T: return 17; case SDL_SCANCODE_O: return 31;
-    case SDL_SCANCODE_U: return 32; case SDL_SCANCODE_I: return 34; case SDL_SCANCODE_P: return 35;
-    case SDL_SCANCODE_L: return 37; case SDL_SCANCODE_J: return 38; case SDL_SCANCODE_K: return 40;
-    case SDL_SCANCODE_N: return 45; case SDL_SCANCODE_M: return 46; case SDL_SCANCODE_RETURN: return 36;
-    case SDL_SCANCODE_TAB: return 48; case SDL_SCANCODE_SPACE: return 49; case SDL_SCANCODE_ESCAPE: return 53;
-    case SDL_SCANCODE_LSHIFT: return 56; case SDL_SCANCODE_RSHIFT: return 60; case SDL_SCANCODE_LALT: return 58;
-    case SDL_SCANCODE_RALT: return 61; case SDL_SCANCODE_LCTRL: return 59; case SDL_SCANCODE_RCTRL: return 62;
-    case SDL_SCANCODE_LEFT: return 123; case SDL_SCANCODE_RIGHT: return 124; case SDL_SCANCODE_DOWN: return 125;
-    case SDL_SCANCODE_UP: return 126;
-    default: return -1;
-    }
-}
-
 /* ---- bindings (the launcher's Controls tab writes them into ultratears.cfg; boot.c passes pad_* / key_* lines on as
    TOTK_BIND_pad_* / TOTK_BIND_key_*). Unset: the layouts below, as before.
    - pad_layout=xbox: the face buttons as an Xbox pad (and the Steam Deck) labels them, A the bottom one; default
@@ -54,15 +34,30 @@ static int mac_key(SDL_Scancode s) {
      none: unbound. Actions: a b x y l r zl zr plus minus lstick rstick up down left right.
    - key_<action>=<SDL scancode names, comma separated> (SDL_GetScancodeName: "W", "Space", "Left Shift"); none:
      unbound. The same actions and move_up / move_down / move_left / move_right, cam_up / cam_down / cam_left /
-     cam_right (the sticks the keys drive). A key bound here no longer does what it did by default. */
-typedef struct { const char *id; uint64_t bit; int mac, mac_alt; } bind_action;
+     cam_right (the sticks the keys drive); the mouse's buttons too: Mouse Left, Mouse Right, Mouse Middle, Mouse 4,
+     Mouse 5. Unset: the PC layout of the keys column below (the launcher's CTL_BUTTONS / CTL_MOVE hold the same); a key
+     may do two actions. Escape lets the mouse go (mouse_capture) only when it is bound to none of them. */
+typedef struct { const char *id; uint64_t bit; int mac; const char *keys; } bind_action;
 static const bind_action ACTIONS[] = {
-    {"a", 1, 38, -1}, {"b", 2, 40, 49}, {"x", 4, 34, -1}, {"y", 8, 32, -1}, {"lstick", 16, 6, -1}, {"rstick", 32, 8, -1},
-    {"l", 64, 12, -1}, {"r", 128, 14, -1}, {"zl", 256, 58, -1}, {"zr", 512, 56, -1}, {"plus", 1024, 36, -1},
-    {"minus", 2048, 48, 53}, {"left", 4096, 3, -1}, {"up", 8192, 17, -1}, {"right", 16384, 4, -1}, {"down", 32768, 5, -1},
-    {"move_up", 0, 13, -1}, {"move_down", 0, 1, -1}, {"move_left", 0, 0, -1}, {"move_right", 0, 2, -1},
-    {"cam_up", 0, 126, -1}, {"cam_down", 0, 125, -1}, {"cam_left", 0, 123, -1}, {"cam_right", 0, 124, -1}};
-static int8_t g_keymap[SDL_SCANCODE_COUNT];        // scancode -> the Mac key code overrides_input.c reads, -1 none
+    {"a", 1, 38, "E"}, {"b", 2, 40, "Left Shift"}, {"x", 4, 34, "Space"}, {"y", 8, 32, "Mouse Left,T"},
+    {"lstick", 16, 6, "Left Ctrl"}, {"rstick", 32, 8, "C"}, {"l", 64, 12, "Q"}, {"r", 128, 14, "R"},
+    {"zl", 256, 58, "Mouse Right,Z"}, {"zr", 512, 56, "F,X"}, {"plus", 1024, 36, "Escape"}, {"minus", 2048, 48, "Tab,M"},
+    {"left", 4096, 3, "1"}, {"up", 8192, 17, "2"}, {"right", 16384, 4, "3"}, {"down", 32768, 5, "4"},
+    {"move_up", 0, 13, "W"}, {"move_down", 0, 1, "S"}, {"move_left", 0, 0, "A"}, {"move_right", 0, 2, "D"},
+    {"cam_up", 0, 126, "Up"}, {"cam_down", 0, 125, "Down"}, {"cam_left", 0, 123, "Left"}, {"cam_right", 0, 124, "Right"}};
+// scancode / mouse button -> the Mac key codes overrides_input.c reads (up to two actions), -1 none
+static int8_t g_keymap[SDL_SCANCODE_COUNT][2];
+static int8_t g_mousemap[6][2];   // SDL_BUTTON_LEFT (1) .. SDL_BUTTON_X2 (5)
+static int mouse_from_name(const char *t) {
+    static const char *const names[] = {NULL, "Mouse Left", "Mouse Middle", "Mouse Right", "Mouse 4", "Mouse 5"};
+    for (int b = 1; b < 6; b++) if (!SDL_strcasecmp(t, names[b])) return b;
+    return 0;
+}
+static void map_add(int8_t m[2], int code) {
+    if (m[0] == code || m[1] == code) return;
+    if (m[0] < 0) m[0] = (int8_t)code;
+    else if (m[1] < 0) m[1] = (int8_t)code;
+}
 static uint64_t g_padbits[SDL_GAMEPAD_BUTTON_COUNT];   // SDL button -> Switch buttons
 static uint64_t g_trigbits[2];                     // the left / right trigger -> Switch buttons
 static int g_xbox_layout;
@@ -74,7 +69,8 @@ static const char *bind_value(const char *kind, const char *id) {
     return v && *v ? v : NULL;
 }
 static void binds_load(void) {
-    for (int s = 0; s < SDL_SCANCODE_COUNT; s++) g_keymap[s] = (int8_t)mac_key((SDL_Scancode)s);
+    memset(g_keymap, -1, sizeof g_keymap);
+    memset(g_mousemap, -1, sizeof g_mousemap);
     const char *layout = getenv("TOTK_BIND_pad_layout");
     g_xbox_layout = layout && !SDL_strcasecmp(layout, "xbox");
     static const struct { SDL_GamepadButton b; uint64_t bit; } common[] = {
@@ -112,18 +108,17 @@ static void binds_load(void) {
             }
             changed++;
         }
-        if ((v = bind_value("key", A->id))) {   // its keys: these and no others
-            for (int s = 0; s < SDL_SCANCODE_COUNT; s++)
-                if (g_keymap[s] == A->mac || (A->mac_alt >= 0 && g_keymap[s] == A->mac_alt)) g_keymap[s] = -1;
-            char list[256];
-            snprintf(list, sizeof list, "%s", v);
-            for (char *t = strtok(list, ","); t; t = strtok(NULL, ",")) {
-                while (*t == ' ') t++;
-                SDL_Scancode s = SDL_GetScancodeFromName(t);
-                if (s != SDL_SCANCODE_UNKNOWN) g_keymap[s] = (int8_t)A->mac;
-                else if (SDL_strcasecmp(t, "none")) fprintf(stderr, "[totk] key_%s: no key \"%s\"\n", A->id, t);
-            }
-            changed++;
+        v = bind_value("key", A->id);   // its keys and mouse buttons: these, else the defaults
+        if (v) changed++;
+        char list[256];
+        snprintf(list, sizeof list, "%s", v ? v : A->keys);
+        for (char *t = strtok(list, ","); t; t = strtok(NULL, ",")) {
+            while (*t == ' ') t++;
+            int mb = mouse_from_name(t);
+            SDL_Scancode s = mb ? SDL_SCANCODE_UNKNOWN : SDL_GetScancodeFromName(t);
+            if (mb) map_add(g_mousemap[mb], A->mac);
+            else if (s != SDL_SCANCODE_UNKNOWN) map_add(g_keymap[s], A->mac);
+            else if (SDL_strcasecmp(t, "none")) fprintf(stderr, "[totk] key_%s: no key \"%s\"\n", A->id, t);
         }
     }
     fprintf(stderr, "[totk] controls: %s layout%s, %d action(s) bound in ultratears.cfg\n", g_xbox_layout ? "Xbox" : "Nintendo",
@@ -309,7 +304,7 @@ float window_refresh_hz(void) {
 }
 
 // The mouse is the window's while the game has the focus, as in other PC games: the cursor hidden and kept in the
-// window (SDL's relative mode), taken at the start and by a click into the window, let go by Ctrl and whenever another
+// window (SDL's relative mode), taken at the start and by a click into the window, let go by Esc and whenever another
 // window gets the focus (Alt+Tab, the Windows key; SDL gives it back with the focus). The game gets no mouse input
 // yet (overrides_input.c: a mouse that does not move): this is only that the cursor stays out of the way.
 static void mouse_capture(bool on) {
@@ -357,9 +352,9 @@ _Noreturn void window_loop(void) {
                         toggle_fullscreen();
                         break;
                     }
-                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat &&
-                        (e.key.scancode == SDL_SCANCODE_LCTRL || e.key.scancode == SDL_SCANCODE_RCTRL)) {
-                        mouse_capture(false);   // Ctrl lets the mouse go (no button of the game's layout)
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_ESCAPE &&
+                        g_keymap[SDL_SCANCODE_ESCAPE][0] < 0) {
+                        mouse_capture(false);   // Esc lets the mouse go, unless bound to one of the game's buttons
                         break;
                     }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) {
@@ -372,12 +367,19 @@ _Noreturn void window_loop(void) {
                         vkb_dump_request();
                         break;
                     }
-                    int k = e.key.scancode < SDL_SCANCODE_COUNT ? g_keymap[e.key.scancode] : -1;   // (binds_load)
-                    if (k >= 0 && !e.key.repeat) runtime_input_key((unsigned)k, e.type == SDL_EVENT_KEY_DOWN);
+                    if (e.key.scancode < SDL_SCANCODE_COUNT && !e.key.repeat)   // (binds_load)
+                        for (int i = 0; i < 2; i++)
+                            if (g_keymap[e.key.scancode][i] >= 0) runtime_input_key((unsigned)g_keymap[e.key.scancode][i], e.type == SDL_EVENT_KEY_DOWN);
                     break;
                 }
-                case SDL_EVENT_MOUSE_BUTTON_DOWN:   // a click into the window takes the mouse again
-                    if (!SDL_GetWindowRelativeMouseMode(window)) mouse_capture(true);
+                case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
+                    if (!SDL_GetWindowRelativeMouseMode(window)) {   // a click into the window takes the mouse again (and does nothing else)
+                        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) mouse_capture(true);
+                        break;
+                    }
+                    if (e.button.button < 6 && !(e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && text_entry_blocks_input()))
+                        for (int i = 0; i < 2; i++)
+                            if (g_mousemap[e.button.button][i] >= 0) runtime_input_key((unsigned)g_mousemap[e.button.button][i], e.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
                     break;
                 case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); break;
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
