@@ -3032,6 +3032,14 @@ void ui_init(SDL_Window *w) {
     // updates: one question to GitHub at every start, in the background (no answer: nothing shown); a release found
     // stays offered until it is installed
     U.upd.version = U.set.get("update_version");
+    // only a release newer than this package: one found while an older build was here (a test build before that release,
+    // or the folder updated by hand since) is forgotten instead of offered as an "update" to an older version
+    if (!U.upd.version.empty() && !U.version.empty() && !version_newer(U.upd.version, U.version)) {
+        for (const char *k : {"update_version", "update_name", "update_url", "update_sha256", "update_size", "update_page"})
+            U.set.set(k, "");
+        save();
+        U.upd.version.clear();
+    }
     if (!U.upd.version.empty() && U.upd.version != U.version && !U.version.empty()) {
         U.upd.name = U.set.get("update_name"), U.upd.url = U.set.get("update_url");
         U.upd.sha256 = U.set.get("update_sha256"), U.upd.page = U.set.get("update_page");
