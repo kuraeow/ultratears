@@ -34,7 +34,8 @@ TARGETS = {'probe_cpu': ['src/probe/probe_cpu.c'],
                     'src/host/window_sdl.c', 'src/vk/vk.c', 'src/vk/present.c', 'src/vk/fsr.c', 'src/vk/overlay.c', 'src/host/motion_fusion.c',
                     'src/host/deck_imu.c',
                     'src/host/profiler.c', 'src/host/watch.c', 'src/host/frame_rate.c', 'src/host/render_res.c', 'src/host/ui_capture.c',
-                    'src/host/ui_aspect.c', 'src/host/ui_prompts.c', 'src/host/zstd_host.c', 'src/host/pgo.c']}
+                    'src/host/ui_aspect.c', 'src/host/ui_prompts.c', 'src/host/zstd_host.c', 'src/host/pgo.c',
+                    'src/host/mods.c', 'src/host/restbl.c']}
 # The graphics front end (MacNativeGames' NVN layer) with its macOS stand-ins: own include paths, own rule
 GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_ext.c', 'src/gfx/nvn/nvn_registry.c',
        'src/gfx/nvn/nvn_thunks.gen.c', 'src/gfx/nvn/nvn_dirty_win.c', 'src/gfx/nvn/totk_timeline_win.c',

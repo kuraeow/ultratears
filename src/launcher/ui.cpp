@@ -1596,8 +1596,8 @@ static bool toggle(const char *id, float x_right, float cy, bool on) {   // the 
     return clicked;
 }
 
-static int g_tab = 0;   // 0 general, 1 the game's language, 2 controls, 3 debug
-enum { TAB_COUNT = 4, TAB_CONTROLS = 2, TAB_DEBUG = 3 };
+static int g_tab = 0;   // 0 general, 1 the game's language, 2 controls, 3 mods, 4 debug
+enum { TAB_COUNT = 5, TAB_CONTROLS = 2, TAB_MODS = 3, TAB_DEBUG = 4 };
 static bool g_full_q = false;   // "Rebuild completely" pressed: asking whether to
 static std::string g_full_platform = "windows";   // for which platform (its list)
 
@@ -1627,7 +1627,7 @@ static float badge_w(const char *name) { return SDL_max(22.0f, text_w(g_media.sm
 static bool capturing();   // the Controls tab waits for a key or button (below)
 
 static void play_tabs() {   // instead of the header on the Play screen (the design)
-    static const char *const TABS[] = {"tab_main", "tab_lang", "tab_controls", "tab_debug"};
+    static const char *const TABS[] = {"tab_main", "tab_lang", "tab_controls", "tab_mods", "tab_debug"};
     // with a controller: L1 / R1 (LB / RB) go through the tabs, their badges at both ends (the design 7.1)
     bool pad = SDL_HasGamepad();
     if (pad && !capturing() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
@@ -1739,10 +1739,15 @@ static void screen_debug() {
 }
 
 static void screen_controls();
+static void screen_mods();
 
 static void screen_play() {
     if (g_tab == TAB_DEBUG) {
         screen_debug();
+        return;
+    }
+    if (g_tab == TAB_MODS) {
+        screen_mods();
         return;
     }
     if (g_tab == TAB_CONTROLS) {
@@ -2491,6 +2496,254 @@ static void screen_controls() {
     ImGui::Dummy(ImVec2(1, 1));
 }
 
+// ---------------------------------------------------------------- Mods
+// The mods folder (src/host/mods.c): what tools/mods_code.py list finds there, each mod switched on or off and moved up
+// or down, its cheats switched one by one. Written to ultratears.cfg (mods_order, mods_off, cheats_on): the game reads
+// them when it starts. The list is read again after every change (the counts depend on the order).
+static struct {
+    SetupProc *p = nullptr;
+    bool loaded = false, failed = false, again = false;
+    Json data;
+    std::vector<int> order;            // indices into data["mods"], top first
+    std::vector<std::string> open;     // mods whose cheats are shown
+} M;
+
+static std::string mods_dir() {
+    std::string d = cfg_get("mods_dir");
+    return d.empty() ? path_join(U.install, "mods") : (d.size() > 1 && (d[0] == '/' || d[1] == ':') ? d : path_join(U.install, d));
+}
+static void mods_list() {
+    if (M.p) {
+        M.again = true;   // a change while the list is read: read it once more after
+        return;
+    }
+    std::string py = python_path(U.install);
+    if (py.empty()) {
+        M.failed = true;
+        return;
+    }
+    M.p = setup_start({py, path_join(U.install, "tools/mods_code.py"), "list"}, U.install, path_join(U.install, "ultratears-mods.log"));
+}
+static void mods_poll() {
+    if (!M.p)
+        return;
+    std::string line, last;
+    while (setup_line(M.p, line))
+        if (!line.empty() && line[0] == '{')
+            last = line;
+    if (!last.empty()) {
+        Json j;
+        if (json_parse(last, j)) {
+            M.data = j, M.loaded = true, M.failed = false;
+            M.order.clear();
+            for (size_t i = 0; i < M.data["mods"].size(); i++)
+                M.order.push_back((int)i);
+        }
+    }
+    int code = 0;
+    if (!setup_finished(M.p, &code))
+        return;
+    setup_free(M.p);
+    M.p = nullptr;
+    if (code != 0 && !M.loaded)
+        M.failed = true;
+    if (M.again) {
+        M.again = false;
+        mods_list();
+    }
+}
+static void mods_save() {   // the order, the switched-off mods and the cheats that are on, from what the page shows
+    std::string order, off;
+    for (int i : M.order) {
+        const Json &m = M.data["mods"][(size_t)i];
+        order += (order.empty() ? "" : "|") + m["name"].str();
+        if (!m["enabled"].truth())
+            off += (off.empty() ? "" : "|") + m["name"].str();
+    }
+    std::string on;
+    for (size_t i = 0; i < M.data["cheats_on"].size(); i++)
+        on += (on.empty() ? "" : ",") + M.data["cheats_on"][i].str();
+    cfg_set("mods_order", order);
+    cfg_set("mods_off", off);
+    cfg_set("cheats_on", on);
+    mods_list();
+}
+static bool cheat_on(const std::string &id) {
+    const Json &l = M.data["cheats_on"];
+    for (size_t i = 0; i < l.size(); i++)
+        if (l[i].str() == id)
+            return true;
+    return false;
+}
+static void cheat_set(const std::string &id, bool on) {
+    Json &l = const_cast<Json &>(M.data["cheats_on"]);
+    if (l.kind != Json::Arr) {   // none listed yet: a list of its own in the object
+        M.data.keys.push_back("cheats_on");
+        M.data.items.push_back(Json());
+        M.data.items.back().kind = Json::Arr;
+        return cheat_set(id, on);
+    }
+    for (size_t i = 0; i < l.items.size(); i++)
+        if (l.items[i].str() == id) {
+            if (!on)
+                l.items.erase(l.items.begin() + (long)i);
+            return;
+        }
+    if (on) {
+        Json v;
+        v.kind = Json::Str, v.s = id;
+        l.items.push_back(v);
+    }
+}
+static std::string fit(ImFont *f, const std::string &s, float w) {   // cut with an ellipsis to w design pixels
+    if (text_w(f, s.c_str()) <= w)
+        return s;
+    std::string t = s;
+    while (!t.empty() && text_w(f, (t + "...").c_str()) > w) {
+        t.pop_back();
+        while (!t.empty() && ((unsigned char)t.back() & 0xC0) == 0x80)   // a whole UTF-8 character
+            t.pop_back();
+    }
+    return t + "...";
+}
+static std::string mod_summary(const Json &m) {
+    std::vector<std::string> parts;
+    if (m["romfs"].truth()) {
+        parts.push_back(Tf("mod_files", {{"r", m["replaced"].str()}, {"a", m["added"].str()}}));
+        if (m["other_version"].num() > 0)
+            parts.push_back(Tf("mod_other_version", {{"n", m["other_version"].str()}}));
+        if (m["overridden"].num() > 0)
+            parts.push_back(Tf("mod_overridden", {{"n", m["overridden"].str()}, {"m", m["overridden_by"].str()}}));
+    }
+    if (m["patch_files"].num() > 0)
+        parts.push_back(T("mod_code"));
+    else if (m["other_build"].num() > 0)
+        parts.push_back(T("mod_code_other"));
+    if (m["cheats"].size())
+        parts.push_back(Tf("mod_cheats", {{"n", std::to_string(m["cheats"].size())}}));
+    std::string p = m["problem"].str();
+    if (p == "empty")
+        parts = {T("mod_empty")};
+    else if (p == "bad_name")
+        parts = {T("mod_bad_name")};
+    std::string out;
+    for (const std::string &s : parts)
+        out += (out.empty() ? "" : " · ") + s;
+    return out;
+}
+
+static void screen_mods() {
+    if (!M.loaded && !M.p && !M.failed)
+        mods_list();
+    mods_poll();
+    float top = 80;
+    // the folder: open it (made when missing), read it again
+    float bw = text_w(g_media.medium, T("mods_folder")) + 34, rw = text_w(g_media.medium, T("mods_refresh")) + 34;
+    rich(g_media.small, 52, top + 4, 748 - bw - rw - 24 - 52, {{T("mods_note"), C_SUB}}, 17);
+    if (button("mods_refresh", T("mods_refresh"), 748 - bw - 8 - rw, top, rw, 38, DARK, !M.p))
+        mods_list();
+    if (button("mods_folder", T("mods_folder"), 748 - bw, top, bw, 38, DARK)) {
+        std::string d = mods_dir();
+        SDL_CreateDirectory(d.c_str());
+        SDL_OpenURL(("file:///" + d).c_str());
+    }
+    top += 56;
+    if (!M.loaded) {
+        text(g_media.label, 52, top + 10, M.failed ? C_ERR : C_SUB, T(M.failed ? "mods_failed" : "mods_loading"));
+        return;
+    }
+    const Json &mods = M.data["mods"];
+    if (!mods.size()) {
+        float h = rich(g_media.small, 52, top + 16, 696, {{T("mods_none"), C_SUB}}, 17);
+        card(top, top + 32 + h);
+        return;
+    }
+    if (M.data["code"].str() == "stale") {
+        float h = rich(g_media.small, 52, top, 696, {{T("mods_code_stale"), C_SUB}}, 17);
+        top += h + 12;
+    }
+    for (size_t k = 0; k < M.order.size(); k++) {
+        int i = M.order[k];
+        const Json &m = mods[(size_t)i];
+        std::string name = m["name"].str(), id = "mod" + std::to_string(i);
+        bool on = m["enabled"].truth();
+        float cy = top + 26;
+        // the switch at the right, Up and Down left of it, the cheats' button left of those
+        float uw = text_w(g_media.medium, T("mod_up")) + 24, dw = text_w(g_media.medium, T("mod_down")) + 24;
+        float x = 748 - 38 - 16 - dw;
+        if (button((id + "_dn").c_str(), T("mod_down"), x, cy - 15, dw, 30, DARK, k + 1 < M.order.size())) {
+            std::swap(M.order[k], M.order[k + 1]);
+            mods_save();
+        }
+        x -= uw + 6;
+        if (button((id + "_up").c_str(), T("mod_up"), x, cy - 15, uw, 30, DARK, k > 0)) {
+            std::swap(M.order[k], M.order[k - 1]);
+            mods_save();
+        }
+        size_t nch = m["cheats"].size();
+        bool shown = std::find(M.open.begin(), M.open.end(), name) != M.open.end();
+        if (nch) {
+            std::string l = shown ? T("mod_cheats_hide") : Tf("mod_cheats_show", {{"n", std::to_string(nch)}});
+            float cw = text_w(g_media.medium, l.c_str()) + 24;
+            x -= cw + 6;
+            if (button((id + "_ch").c_str(), l.c_str(), x, cy - 15, cw, 30, DARK)) {
+                if (shown)
+                    M.open.erase(std::find(M.open.begin(), M.open.end(), name));
+                else
+                    M.open.push_back(name);
+            }
+        }
+        if (toggle((id + "_on").c_str(), 748, cy, on)) {
+            const_cast<Json &>(m["enabled"]).kind = Json::Bool;
+            const_cast<Json &>(m["enabled"]).b = !on;
+            mods_save();
+        }
+        text(g_media.label, 52, cy - g_media.label->FontSize / S / 2, on ? C_TEXT : C_DIM, fit(g_media.label, name, x - 16 - 52).c_str());
+        std::string sum = mod_summary(m);
+        float h = rich(g_media.small, 52, cy + 20, 696, {{sum.c_str(), m["problem"].str().empty() ? C_SUB : C_ERR}}, 17);
+        float bottom = cy + 20 + h + 10;
+        if (shown) {   // its cheats: a switch each; headings, the always-on and the ones the port cannot run without one
+            for (size_t c = 0; c < nch; c++) {
+                const Json &ch = m["cheats"][c];
+                std::string kind = ch["kind"].str(), cid = ch["id"].str();
+                float ccy = bottom + 16;
+                ImU32 col = kind == "unsupported" || kind == "restore" || !on ? C_DIM : C_TEXT;
+                if (kind == "heading") {
+                    text(g_media.small, 68, ccy - g_media.small->FontSize / S / 2, C_SUB, fit(g_media.small, ch["name"].str(), 680).c_str());
+                    bottom = ccy + 12;
+                    continue;
+                }
+                std::string why;
+                if (ch["master"].truth())
+                    why = T("cheat_always");
+                else if (kind == "restore")
+                    why = T("cheat_restore");
+                else if (kind == "unsupported")
+                    why = T(("cheat_why_" + ch["why"].str()).c_str());
+                else if (ch["keys"].num() > 0)
+                    why = T("cheat_keys");
+                float nw = why.empty() ? 600 : 360;
+                text(g_media.regular, 68, ccy - g_media.regular->FontSize / S / 2, col, fit(g_media.regular, ch["name"].str(), nw).c_str());
+                if (!why.empty())
+                    text(g_media.small, 68 + nw + 12, ccy - g_media.small->FontSize / S / 2, C_SUB, fit(g_media.small, why, 748 - 50 - 68 - nw - 12).c_str());
+                if ((kind == "data" || kind == "code") && !ch["master"].truth()) {
+                    bool con = cheat_on(cid);
+                    if (toggle((id + "_c" + cid).c_str(), 748, ccy, con)) {
+                        cheat_set(cid, !con);
+                        mods_save();
+                    }
+                }
+                bottom = ccy + 16;
+            }
+            bottom += 8;
+        }
+        card(top, bottom);
+        top = bottom + 8;
+    }
+    ImGui::SetCursorScreenPos(P(0, top + 56));   // the body scrolls down to here
+    ImGui::Dummy(ImVec2(1, 1));
+}
+
 static void screen_update() {
     float y = title(82, Tf("upd_title", {{"v", U.upd.version}}).c_str(), nullptr) + 6;
     std::string from = Tf("upd_from", {{"old", U.version}, {"v", U.upd.version}});
@@ -2568,6 +2821,7 @@ static bool g_play_failed = false;
 // AppRun): the window stays hidden unless there is something to compile, and the game then takes the launcher's place.
 static struct {
     SetupProc *p = nullptr;
+    SetupProc *mods = nullptr;    // tools/mods_code.py build, before the graphics are prepared
     int tries = 0;
     double done = 0, total = 0;   // total 0: checking
     bool play_mode = false, show = false, quit = false;
@@ -2579,6 +2833,18 @@ static void gfx_start() {
     G.p = setup_start({exe, "--prepare-shaders"}, U.install, path_join(U.install, "ultratears-prepare.log"));
 }
 
+// Play: first the code the mods' patches and code cheats change, built when their files changed since the last time (a few
+// seconds; nothing when they did not), then the graphics. A failed build starts the game without them (it says so in its log).
+static void play_start() {
+    std::string py = python_path(U.install);
+    if (path_is_dir(mods_dir()) && !py.empty() && path_is_file(path_join(U.install, "tools/mods_code.py"))) {
+        G.mods = setup_start({py, path_join(U.install, "tools/mods_code.py"), "build"}, U.install,
+                             path_join(U.install, "ultratears-mods.log"));
+        return;
+    }
+    gfx_start();
+}
+
 static void play_now() {
     if (G.play_mode)   // main.cpp closes the window, then ui_play_finish starts the game
         G.quit = true;
@@ -2587,6 +2853,22 @@ static void play_now() {
 }
 
 static void gfx_poll() {
+    if (G.mods) {
+        std::string line;
+        while (setup_line(G.mods, line))
+            if (!line.empty())
+                SDL_Log("mods: %s", line.c_str());
+        int code = 0;
+        if (!setup_finished(G.mods, &code))
+            return;
+        setup_free(G.mods);
+        G.mods = nullptr;
+        if (code != 0)
+            SDL_Log("mods: the code of the mods' patches and cheats was not built (exit code %d): the game starts without it", code);
+        M.loaded = false;   // the Mods page reads the folder again (the code is built now)
+        gfx_start();
+        return;
+    }
     if (!G.p)
         return;
     std::string line;
@@ -2618,7 +2900,7 @@ void ui_play_mode() {   // main.cpp: --play
         return;   // nothing to play yet, or an update to finish: the launcher as usual
     G.play_mode = true;
     U.screen = SCR_PLAY;
-    gfx_start();
+    play_start();
 }
 bool ui_window_wanted() { return !G.play_mode || G.show; }
 bool ui_quit_wanted() { return G.quit; }
@@ -2631,6 +2913,11 @@ bool ui_play_finish() {
 }
 
 static void screen_play_footer() {
+    if (G.mods) {
+        text(g_media.regular, 36, 404, C_TEXT, T("mods_building"));
+        text(g_media.small, 36, 448, C_SUB, T("mods_building_note"));
+        return;
+    }
     if (G.p) {   // the graphics prepared, before the game starts
         std::string t = G.total > 0 ? Tf("gfx_prep", {{"done", std::to_string((long long)G.done)}, {"total", std::to_string((long long)G.total)}})
                                     : std::string(T("gfx_check"));
@@ -2650,7 +2937,7 @@ static void screen_play_footer() {
     if (button("play", T("play"), 36, 408, 116, 48, U.has_upd ? DARK : PRIMARY)) {
         g_play_failed = false;
         G.tries = 0;
-        gfx_start();
+        play_start();
     }
     float x = 168;
     if (U.has_upd) {
@@ -2947,10 +3234,12 @@ void ui_demo(const char *name) {
         U.dump_st = D_OK;
         start_build();
     } else if (n == "play" || n == "play_upd" || n == "play_lang" || n == "play_debug" || n == "play_full" ||
-               n == "play_pad" || n == "play_keys" || n == "play_sticks") {
+               n == "play_pad" || n == "play_keys" || n == "play_sticks" || n == "play_mods") {
         U.screen = SCR_PLAY;
         g_tab = n == "play_lang" ? 1 : n == "play_pad" || n == "play_keys" || n == "play_sticks" ? TAB_CONTROLS
-              : n == "play_debug" || n == "play_full" ? TAB_DEBUG : 0;
+              : n == "play_debug" || n == "play_full" ? TAB_DEBUG : n == "play_mods" ? TAB_MODS : 0;
+        if (n == "play_mods" && SDL_getenv("ULTRS_LAUNCHER_DEMO_OPEN"))   // the cheats of this mod shown
+            M.open.push_back(SDL_getenv("ULTRS_LAUNCHER_DEMO_OPEN"));
         g_ctl_tab = n == "play_keys" ? CTL_KEYS : n == "play_sticks" ? CTL_STICKS : CTL_PAD;
         g_demo_sticks = n == "play_sticks";
         if (const char *w = SDL_getenv("ULTRS_LAUNCHER_DEMO_WAIT"))   // an action waiting for its key or button

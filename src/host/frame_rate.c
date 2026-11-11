@@ -231,6 +231,7 @@ static void camera_near(void) {
 // slot): the step follows the frames as shown, pacing waits included.
 void runtime_frame_step_update(uint64_t now_ns) {
     config();
+    { void mods_cheats_frame(void); mods_cheats_frame(); }   // player mods' data cheats (mods.c)
     camera_near();
     speed_probe(now_ns);
     speed_trace(now_ns);

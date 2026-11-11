@@ -64,10 +64,18 @@ static uint64_t gnu_hash_count(uint64_t table) {
     return last + 1;
 }
 
+static uint8_t g_build_id[MAX_MODULES][32];   // each module's build id (NSO header +0x40)
+// Player mods' ExeFS patches (host/mods.c), stored into a module's image before it is relocated; none in the probes.
+__attribute__((weak)) void mods_patch_module(const char *name, uint8_t *image, uint64_t size, uint64_t text_off,
+                                             uint64_t text_size, const uint8_t bid[32]) {
+    (void)name, (void)image, (void)size, (void)text_off, (void)text_size, (void)bid;
+}
+
 static void load_nso(Module *m, const char *path, uint64_t base) {
     size_t len;
     uint8_t *raw = read_file(path, &len);
     if (!raw || len < 0x100 || memcmp(raw, "NSO0", 4)) FATAL("cannot load %s\n", path);
+    memcpy(g_build_id[m - g_modules], raw + 0x40, 32);
     uint32_t flags = *(uint32_t *)(raw + 0xC);
     uint32_t seg[3][3];  // file_off, mem_off, size
     for (int i = 0; i < 3; i++) memcpy(seg[i], raw + 0x10 + i * 0x10, 12);
@@ -222,6 +230,10 @@ void loader_load(const char *exefs) {
         m->name = mods[i].name;
         snprintf(path, sizeof path, "%s/%s", exefs, m->name);
         load_nso(m, path, mods[i].base);
+    }
+    for (int i = 0; i < g_nmodules; i++) {
+        Module *m = &g_modules[i];
+        mods_patch_module(m->name, (uint8_t *)(uintptr_t)m->base, m->size, m->text_off, m->text_size, g_build_id[i]);
     }
     for (int i = 0; i < g_nmodules; i++) relocate(&g_modules[i]);
 }

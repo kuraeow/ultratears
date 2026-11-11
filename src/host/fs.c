@@ -4,7 +4,7 @@
  *  - Windows file calls (mkdir, directory types via stat, rename that refuses to replace, _commit);
  *  - RomFS: the runtime index (tools/make_romfs_index.py, MacNativeGames' TOTKRFS1 layout) and the extracted
  *    romfs.bin, both already verified at extraction, or (the player's dump) a folder of plain files, indexed by
- *    walking it at start (tools/setup.py checks it against the expected version); overlays (mods, data patches), split images and the startup
+ *    walking it at start (tools/setup.py checks it against the expected version); player mods are served from their own folders (mods.c), split images and the startup
  *    re-hash are not ported yet. RomFS directory listing stays unsupported, as in MacNativeGames.
  * Save, temporary and cache storage are host directories under the profile directory (TOTK_PROFILE_DIR, default
  * userdata); application save data is created on first start, as the system launcher does. */
@@ -22,6 +22,7 @@
 #endif
 
 #include "host.h"
+#include "mods.h"
 #include "../runtime/hle.h"
 
 #define R_PATH_NOT_FOUND 0x202u
@@ -59,7 +60,15 @@ static uint64_t rom_handles[NROM];   /* file index + 1; 0 is free */
 static pthread_mutex_t rom_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t offset, size; uint32_t name, len; } Entry;
 _Static_assert(sizeof(Entry) == 24, "index entry layout");
-static Entry entry(uint64_t i) { Entry e; memcpy(&e, index_bytes + 24 + i * 24, 24); return e; }
+/* Player mods' files (mods.c) are numbered after the RomFS's own: file_count + k is g_mf[k], read from its own file. */
+static const ModFile *g_mf;
+static size_t g_nmf;
+static Entry entry(uint64_t i) {
+    Entry e;
+    if (i >= file_count) return (Entry){0, g_mf[i - file_count].size, 0, 0};
+    memcpy(&e, index_bytes + 24 + i * 24, 24);
+    return e;
+}
 static const char *entry_name(Entry e) { return (const char *)index_bytes + strings_offset + e.name; }
 
 /* A RomFS folder (the player's extraction: plain files): the index is built by walking it, in the same layout as the
@@ -182,9 +191,22 @@ static uint64_t lower(const char *p) {
     while (lo < hi) { uint64_t m = lo + (hi - lo) / 2; if (strcmp(entry_name(entry(m)), p) < 0) lo = m + 1; else hi = m; }
     return lo;
 }
-static uint64_t file_index(const char *p) {
+static uint64_t base_index(const char *p) {
     uint64_t i = lower(p);
     return i < file_count && !strcmp(p, entry_name(entry(i))) ? i : UINT64_MAX;
+}
+static size_t mod_lower(const char *p) {   // first mod file whose path is >= p
+    size_t lo = 0, hi = g_nmf;
+    while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (strcmp(g_mf[m].rel, p) < 0) lo = m + 1; else hi = m; }
+    return lo;
+}
+// The file the game gets for RomFS path p: a mod's (file_count + k) before the RomFS's own.
+static uint64_t file_index(const char *p) {
+    if (g_nmf) {
+        size_t k = mod_lower(p);
+        if (k < g_nmf && !strcmp(g_mf[k].rel, p)) return file_count + k;
+    }
+    return base_index(p);
 }
 /* RomFS files served from memory in place of the game's: the HeapDef table
    a bigger game resolution needs (render_res.c: its render-target heap and that heap's parent grown) and, above 30 fps,
@@ -203,7 +225,11 @@ static void *rom_file(const char *path, size_t max, size_t *n) {
     Entry e = entry(i);
     void *in = e.size && e.size < max ? malloc((size_t)e.size) : NULL;
     int ok = in != NULL;
-    if (ok && rom_folder) {
+    if (ok && i >= file_count) {
+        int fd = mods_open_file(g_mf[i - file_count].full);
+        ok = fd >= 0 && pread(fd, in, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok && rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, path);
         int fd = open(full, O_RDONLY | O_BINARY);
@@ -220,7 +246,120 @@ static void ovr_add(const char *path, void *data, size_t n) {
     ovr[novr].index = file_index(path), ovr[novr].data = data, ovr[novr].size = n;
     novr++;
 }
+/* ---- player mods (mods.c): their files numbered after the RomFS's own, and the resource size table rebuilt for them */
+// RomFS indices + 1 by the hash of the path without case, for a mod path spelled otherwise (built at the first such path)
+static uint32_t *ci_table;
+static size_t ci_mask;
+static uint64_t ci_hash(const char *s) {
+    uint64_t h = 14695981039346656037ull;
+    for (; *s; s++) h = (h ^ (uint8_t)(*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) * 1099511628211ull;
+    return h;
+}
+static int rom_has(const char *rel, const char **spelling, void *ctx) {
+    (void)ctx;
+    if (base_index(rel) != UINT64_MAX) return 1;
+    if (!ci_table) {
+        for (ci_mask = 1; ci_mask < file_count * 2; ci_mask <<= 1) {}
+        ci_table = calloc(ci_mask, sizeof *ci_table);
+        need(ci_table != NULL, "RomFS case index memory");
+        ci_mask--;
+        for (uint64_t i = 0; i < file_count; i++)
+            for (size_t k = ci_hash(entry_name(entry(i))) & ci_mask;; k = (k + 1) & ci_mask)
+                if (!ci_table[k]) { ci_table[k] = (uint32_t)i + 1; break; }
+    }
+    for (size_t k = ci_hash(rel) & ci_mask; ci_table[k]; k = (k + 1) & ci_mask)
+        if (!strcasecmp(entry_name(entry(ci_table[k] - 1)), rel)) { *spelling = entry_name(entry(ci_table[k] - 1)); break; }
+    return 0;
+}
+static void *base_file(uint64_t i, size_t *n, size_t max) {   // the RomFS's own copy of file i
+    Entry e = entry(i);
+    void *d = e.size < max ? malloc(e.size ? (size_t)e.size : 1) : NULL;
+    int ok = d != NULL;
+    if (ok && rom_folder) {
+        char full[8192];
+        snprintf(full, sizeof full, "%s/%s", rom_dir, entry_name(e));
+        int fd = open(full, O_RDONLY | O_BINARY);
+        ok = fd >= 0 && pread(fd, d, (size_t)e.size, 0) == (ssize_t)e.size;
+        if (fd >= 0) close(fd);
+    } else if (ok)
+        ok = pread(image_fd, d, (size_t)e.size, (off_t)e.offset) == (ssize_t)e.size;
+    if (!ok) { free(d); return NULL; }
+    *n = (size_t)e.size;
+    return d;
+}
+static void *mod_file(size_t k, size_t *n, size_t max) {
+    if (g_mf[k].size >= max) return NULL;
+    void *d = malloc(g_mf[k].size ? (size_t)g_mf[k].size : 1);
+    int fd = d ? mods_open_file(g_mf[k].full) : -1;
+    int ok = fd >= 0 && pread(fd, d, (size_t)g_mf[k].size, 0) == (ssize_t)g_mf[k].size;
+    if (fd >= 0) close(fd);
+    if (!ok) { free(d); return NULL; }
+    *n = (size_t)g_mf[k].size;
+    return d;
+}
+static void *restbl_read(const char *rel, int mod, size_t *n, void *ctx) {
+    (void)ctx;
+    if (mod) { size_t k = mod_lower(rel); return k < g_nmf && !strcmp(g_mf[k].rel, rel) ? mod_file(k, n, 256u << 20) : NULL; }
+    uint64_t i = base_index(rel);
+    return i == UINT64_MAX ? NULL : base_file(i, n, 256u << 20);
+}
+#define RESTBL "System/Resource/ResourceSizeTable.Product.143.Nin_NX_NVN.rsizetable.zs"
+static void ovr_add(const char *path, void *data, size_t n);
+static void mods_romfs_init(void) {
+    g_nmf = 0;
+    const ModFile *mf = NULL;
+    size_t n = mods_romfs_files(&mf, rom_has, NULL);
+    if (!n) return;
+    g_mf = mf, g_nmf = n;
+    uint64_t gi = base_index(RESTBL);
+    if (gi == UINT64_MAX) return;
+    RestblFile *files = calloc(n, sizeof *files);
+    uint8_t (*heads)[2][32] = calloc(n, sizeof *heads);
+    const uint8_t **shipped = calloc(n, sizeof *shipped);
+    size_t *shipped_n = calloc(n, sizeof *shipped_n), nf = 0, gn = 0, dn = 0;
+    int nshipped = 0;
+    need(files && heads && shipped && shipped_n, "mods: resource size table memory");
+    for (size_t k = 0; k < n; k++) {
+        if (!strncmp(mf[k].rel, "System/Resource/ResourceSizeTable.", 34)) {
+            size_t sn = 0;
+            void *d = mod_file(k, &sn, 64u << 20);
+            if (d) shipped[nshipped] = d, shipped_n[nshipped++] = sn;
+            continue;
+        }
+        RestblFile *f = &files[nf++];
+        f->rel = mf[k].rel, f->size = mf[k].size, f->head = heads[k][0], f->orig_head = heads[k][1];
+        // the zstd frame header (the decompressed size): only when the size alone does not do (.mc grows by size)
+        int fd = mods_open_file(mf[k].full);
+        ssize_t r = fd >= 0 ? pread(fd, heads[k][0], 32, 0) : -1;
+        if (fd >= 0) close(fd);
+        f->head_n = r > 0 ? (size_t)r : 0;
+        uint64_t bi = base_index(mf[k].rel);
+        if (bi != UINT64_MAX) {
+            Entry e = entry(bi);
+            f->orig_size = e.size;
+            if (rom_folder) {
+                char full[8192];
+                snprintf(full, sizeof full, "%s/%s", rom_dir, mf[k].rel);
+                int bfd = open(full, O_RDONLY | O_BINARY);
+                r = bfd >= 0 ? pread(bfd, heads[k][1], 32, 0) : -1;
+                if (bfd >= 0) close(bfd);
+            } else
+                r = pread(image_fd, heads[k][1], e.size < 32 ? (size_t)e.size : 32, (off_t)e.offset);
+            f->orig_head_n = r > 0 ? (size_t)r : 0;
+        }
+    }
+    void *game = base_file(gi, &gn, 64u << 20);
+    uint64_t di = base_index(ZS_DICTS);
+    void *dicts = di != UINT64_MAX ? base_file(di, &dn, 16u << 20) : NULL;
+    size_t out_n = 0;
+    uint8_t *out = game ? totk_restbl_build(game, gn, shipped, shipped_n, nshipped, files, nf, restbl_read, NULL, dicts, dn, &out_n) : NULL;
+    if (out) ovr_add(RESTBL, out, out_n);
+    for (int k = 0; k < nshipped; k++) free((void *)shipped[k]);
+    free(game); free(dicts); free(files); free(heads); free(shipped); free(shipped_n);
+}
+
 static void heapdef_overlay(void) {
+    mods_romfs_init();
     uint64_t totk_heap_extra_kib(void);
     int totk_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);
     void totk_resolution_log(void);
@@ -260,6 +399,8 @@ static void heapdef_overlay(void) {
 static int folder_exists(const char *folder) {
     size_t n = strlen(folder);
     uint64_t i = lower(folder);
+    size_t k = g_nmf ? mod_lower(folder) : 0;
+    if (k < g_nmf && !strncmp(g_mf[k].rel, folder, n)) return 1;   // a folder only a mod has
     return i < file_count && !strncmp(entry_name(entry(i)), folder, n);
 }
 /* "mount:/a/b" (or "mount://a" from audio stream paths) -> "a/b"; NULL on traversal or a foreign mount */
@@ -326,7 +467,9 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     if (!strncmp(p, "Mals/", 5)) lazy_overlay(p, i, totk_ui_prompts_mals, "the diamond's letters after the controls");
     else if (!strncmp(p, "Font/Font", 9) && strstr(p, ".bfarc.zs")) lazy_overlay(p, i, totk_ui_prompts_font, "the button symbols after the controls");
     int fd = -1;
-    if (rom_folder) {
+    if (i >= file_count) {   // a mod's file
+        if ((fd = mods_open_file(g_mf[i - file_count].full)) < 0) return R_PATH_NOT_FOUND;
+    } else if (rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, p);
         if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) return R_PATH_NOT_FOUND;
@@ -364,7 +507,7 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     int tries = 0;
     uint64_t t0 = runtime_now_ns();
     while (done < n) {
-        ssize_t r = pread(rom_folder ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
+        ssize_t r = pread(rom_folder || i - 1 >= file_count ? rom_fds[h - ROM_BASE] : image_fd, (uint8_t *)buffer + done, (size_t)(n - done), (off_t)(e.offset + (uint64_t)offset + done));
         // EFAULT: a region of the write watch was being frozen read-only as the read began (Linux, platform/linux.c);
         // writable again, the read goes on
         if (r < 0 && errno == EFAULT && tries++ < 8) { guest_prepare_write((uint8_t *)buffer + done, n - done); continue; }
@@ -387,7 +530,8 @@ static void romfs_close(uint64_t h) {
     pthread_mutex_lock(&rom_lock);
     need(rom_handles[h - ROM_BASE] != 0, "close of a closed RomFS handle");
     rom_handles[h - ROM_BASE] = 0;
-    if (rom_folder) close(rom_fds[h - ROM_BASE]);
+    if (rom_fds[h - ROM_BASE] >= 0) close(rom_fds[h - ROM_BASE]);
+    rom_fds[h - ROM_BASE] = -1;
     pthread_mutex_unlock(&rom_lock);
 }
 static unsigned romfs_entry_type(int *out, const char *path) {

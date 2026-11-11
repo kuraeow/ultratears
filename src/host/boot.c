@@ -143,7 +143,10 @@ static const char *default_exefs(void) {
                 {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
                 {"gyro_deadzone", "TOTK_GYRO_DEADZONE"},
                 // the launcher's Keyboard page (mouse_direct.c)
-                {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"}};
+                {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"},
+                // the launcher's Mods page (mods.c)
+                {"mods_dir", "TOTK_MODS_DIR"}, {"mods_order", "TOTK_MODS_ORDER"}, {"mods_off", "TOTK_MODS_OFF"},
+                {"cheats_on", "TOTK_CHEATS_ON"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
@@ -235,6 +238,7 @@ int main(int argc, char **argv) {
     uint64_t t0 = runtime_now_ns();
     loader_load(exefs);
     dispatch_init();
+    { void mods_code_load(void); mods_code_load(); }   // player mods' code patches and code cheats (mods.c)
     fprintf(stderr, "[totk] modules loaded and linked in %.0f ms\n", (runtime_now_ns() - t0) / 1e6);
 
     runtime_profiler_start();
