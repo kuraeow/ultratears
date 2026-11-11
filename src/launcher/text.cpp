@@ -57,7 +57,7 @@ static const Text TEXTS[] = {
                   "Your game data and saves stay; then only what changed is rebuilt.",
                   "Лаунчер скачает новую версию с GitHub, проверит её и поставит вместо старой. Данные игры и сохранения "
                   "останутся, затем пересоберётся только изменённое."}},
-    {"upd_go", {"Update", "Обновить"}},
+    {"upd_go", {"Download the update", "Скачать обновление"}},
     {"upd_retry", {"Try again", "Повторить"}},
     {"upd_later", {"Not now", "Не сейчас"}},
     {"upd_download", {"Downloading", "Загрузка"}},

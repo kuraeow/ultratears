@@ -305,7 +305,10 @@ static bool package_replaces(const std::string &from, const std::string &to) {
     std::string a = package_version_line(from), b = package_version_line(to);
     return !a.empty() && a != b && !version_newer(package_version(to), package_version(from));
 }
+static bool g_demo_stale;   // ULTRS_LAUNCHER_DEMO=rebuild (development): an update waiting for its rebuild
 static bool stale() {
+    if (g_demo_stale)
+        return true;
     std::string line = package_version_line(U.root);
 #ifdef _WIN32
     bool newer = false;   // the PC's launcher is in its package: an update replaces it with the package (apply_update.py)
@@ -1066,6 +1069,7 @@ static void version_label() {   // the port's version (the launcher's is the sam
 
 static float platform_choice(float x_right, bool note);
 
+static void play_from_rebuild();
 static void screen_dump_footer() {
     if (U.dump_st != D_OK && U.dump_st != D_DATA) {
         version_label();
@@ -1077,8 +1081,16 @@ static void screen_dump_footer() {
     double free = disk_free_gb(U.install);
     bool space = free < 0 || free >= need_gb() || installed() || resume;
     float left = platform_choice(764 - w - 8, !(resume || rebuild));   // the design: for which platform, beside the button
-    if (resume || rebuild)
+    // an update waiting for its rebuild: the game built before can still be played until then
+    bool play_old = rebuild && !game_exe(U.install).empty();
+    if (play_old) {   // Play on the left; the hint on its own line above the buttons
+        float pw = SDL_max(116.0f, text_w(g_media.medium, T("play")) + 48);
+        if (button("play_old", T("play"), 36, 408, pw, 48, DARK))
+            play_from_rebuild();   // its progress (mods, graphics) is drawn on the Play screen; back here when it is done
+        rich(g_media.small, 36, 376, 728, {{T("rebuild_hint"), C_SUB}}, 17);
+    } else if (resume || rebuild) {
         rich(g_media.small, 36, 418, left - 36 - 24, {{T(rebuild ? "rebuild_hint" : "resume_hint"), C_SUB}}, 17);
+    }
     if (button("prepare", label, 764 - w, 408, w, 48, PRIMARY, space && !linux_kit_gone()))
         start_build();
 }
@@ -2802,7 +2814,9 @@ static void screen_update_footer() {
 
 // "Version X is out — Update" next to the language button, while nothing is being built
 static void update_banner(float right) {
-    if (!U.has_upd || U.screen != SCR_DUMP)   // the Play screen offers it at the bottom
+    // the Play screen offers it at the bottom; an installed game here waits for its rebuild ("Update the game"), and on
+    // Linux the folder's older version would offer the release already downloaded and running once more
+    if (!U.has_upd || U.screen != SCR_DUMP || installed())
         return;
     std::string t = Tf("upd_banner", {{"v", U.upd.version}});
     const char *go = T("upd_open");
@@ -2835,6 +2849,13 @@ static void gfx_start() {
 
 // Play: first the code the mods' patches and code cheats change, built when their files changed since the last time (a few
 // seconds; nothing when they did not), then the graphics. A failed build starts the game without them (it says so in its log).
+static void play_start();
+static void play_from_rebuild() {   // screen_dump_footer: the game built before, while an update waits for its rebuild
+    g_play_failed = false;
+    G.tries = 0;
+    U.screen = SCR_PLAY;
+    play_start();
+}
 static void play_start() {
     std::string py = python_path(U.install);
     if (path_is_dir(mods_dir()) && !py.empty() && path_is_file(path_join(U.install, "tools/mods_code.py"))) {
@@ -2926,6 +2947,10 @@ static void screen_play_footer() {
         if (G.total > 0)
             DL->AddRectFilled(P(36, 432), P(36 + 728 * (float)SDL_min(1.0, G.done / G.total), 440), C_BAR_FILL, 4 * S);
         text(g_media.small, 36, 448, C_SUB, T("gfx_note"));
+        return;
+    }
+    if (stale()) {   // the game was started from the rebuild screen (screen_dump_footer): back to it
+        U.screen = SCR_DUMP;
         return;
     }
     // Play; with a newer release found also Update, and what is new (the design: Play grey beside a green Update)
@@ -3204,6 +3229,13 @@ void ui_demo(const char *name) {
         U.upd.version = "0.3.0", U.upd.page = ULTRS_REPO "/releases";
         U.version = U.version.empty() ? "0.2.0" : U.version;
         U.has_upd = true, U.upd_st = 0, U.screen = SCR_UPDATE;
+        return;
+    }
+    if (n == "rebuild") {   // the game installed, an update waiting for its rebuild, a newer release found too
+        g_demo_stale = true;
+        U.dump_st = D_DATA, U.screen = SCR_DUMP;
+        U.upd.version = "0.4.1", U.upd.page = ULTRS_REPO "/releases";
+        U.has_upd = true;
         return;
     }
     if (n == "dump_bad") {
