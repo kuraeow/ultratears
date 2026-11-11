@@ -13,7 +13,9 @@ GPL-3.0-or-later.
 | `shader_translator/` | MacNativeGames' `totk_xlate`: the service around that translator that turns the game's NVN shaders into SPIR-V; built as `ultrs-shaders.exe` by `tools/build_xlate.py` | MacNativeGames `games/totk/tools/totk_xlate` @b75be8c, without its macOS build script | MIT (`shader_translator/LICENSE`) |
 
 Elsewhere in the tree: `src/gfx/tex/bc7enc/` (bc7enc and rgbcx, Rich Geldreich, MIT) and the files ported from
-MacNativeGames (MIT), LASRecomp (MIT) and B2recomp (GPL-3.0), each named in its header comment;
+MacNativeGames (MIT), LASRecomp (MIT), B2recomp (GPL-3.0) and totk-pc-recomp (MIT, its license text
+`fsr1/LICENSE-totk-pc-recomp.txt`; the mouse camera `src/host/mouse_direct.c` and its sites in `tools/lifter/patches.py`),
+each named in its header comment;
 `tools/shaders/inventory.py` (MacNativeGames, MIT). The launcher's fonts in `assets/launcher/fonts/` (compiled into
 the launcher by `tools/build_launcher.py`): Inter (The Inter Project Authors) and Montserrat Alternates (The Montserrat
 Project Authors), both SIL Open Font License 1.1, their license texts next to them (`OFL-*.txt`). The game's own copy

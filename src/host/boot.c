@@ -141,7 +141,9 @@ static const char *default_exefs(void) {
                 {"fps_overlay", "TOTK_FPS_OVERLAY"},   // the frame counter (F10 in the game)
                 // the launcher's Sticks and gyro page (window_sdl.c dead_zone, motion_fusion.c)
                 {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
-                {"gyro_deadzone", "TOTK_GYRO_DEADZONE"}};
+                {"gyro_deadzone", "TOTK_GYRO_DEADZONE"},
+                // the launcher's Keyboard page (mouse_direct.c)
+                {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);

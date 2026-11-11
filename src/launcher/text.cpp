@@ -143,6 +143,14 @@ static const Text TEXTS[] = {
                      "Steam Deck."}},
     {"sec_buttons", {"Buttons", "Кнопки"}},
     {"sec_move", {"Movement and camera", "Движение и камера"}},
+    {"sec_mouse", {"Mouse", "Мышь"}},
+    {"row_mouse_sens", {"Camera sensitivity", "Чувствительность камеры"}},
+    {"row_mouse_aim", {"Sensitivity while aiming a bow", "Чувствительность при натянутом луке"}},
+    {"row_mouse_invert", {"Invert up and down", "Инверсия по вертикали"}},
+    {"mouse_note", {"The mouse turns the camera and aims. Holding L, it picks an ability; holding a d-pad key, the "
+                    "wheel or moving the mouse sideways steps through weapons, shields and materials.",
+                    "Мышь поворачивает камеру и целится. С зажатой L она выбирает способность, с зажатой клавишей "
+                    "d-pad колесо или движение мыши вбок листают оружие, щиты и материалы."}},
     {"press_button", {"Press a button…", "Нажмите кнопку…"}},
     {"press_key", {"Press a key…", "Нажмите клавишу…"}},
     {"ctl_reset", {"Back to default", "Вернуть по умолчанию"}},

@@ -57,9 +57,12 @@ also put a newer `UltraTears.AppImage` into the game folder in place of the old 
 
 The controller's button layout follows the Switch (A is the right button).
 
-Keyboard: WASD move, arrow keys camera, J = A, K / Space = B, I = X, U = Y, Q / E = L / R, Alt / Shift = ZL / ZR,
-Enter = +, Tab / Esc = − (map), T F G H = d-pad, Z / C = stick buttons, F11 or Alt+Enter full screen. Mouse support is
-planned.
+Keyboard and mouse: WASD move, the mouse (or the arrow keys) turns the camera and aims, E = A, Left Shift = B,
+Space = X, left click / T = Y, Q = L, R = R, right click / Z = ZL, F / X = ZR, Esc = + (menu), Tab / M = − (map),
+Left Ctrl / C = stick buttons, 1 2 3 4 = d-pad (left, up, right, down; the mouse's side buttons are left and right),
+F11 or Alt+Enter full screen. Holding L, the mouse picks an ability; holding a d-pad key, the wheel or moving the mouse
+sideways steps through weapons, shields and materials. Mouse sensitivity, the bow's and inverted up and down are on the
+**Keyboard** page of the launcher's **Controls** tab.
 
 Both can be changed in the launcher's **Controls** tab: every button and key, and the controller's layout (Nintendo:
 A is the right button; Xbox / Steam Deck: A is the bottom one).

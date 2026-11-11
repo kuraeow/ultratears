@@ -1867,8 +1867,8 @@ static const Ctl CTL_BUTTONS[] = {
     {"zr", "act_zr", "righttrigger", "righttrigger", "F,X"}, {"plus", "act_plus", "start", "start", "Escape"},
     {"minus", "act_minus", "back", "back", "Tab,M"}, {"lstick", "act_lstick", "leftstick", "leftstick", "Left Ctrl"},
     {"rstick", "act_rstick", "rightstick", "rightstick", "C"}, {"up", "act_up", "dpup", "dpup", "2"},
-    {"down", "act_down", "dpdown", "dpdown", "4"}, {"left", "act_left", "dpleft", "dpleft", "1"},
-    {"right", "act_right", "dpright", "dpright", "3"}};
+    {"down", "act_down", "dpdown", "dpdown", "4"}, {"left", "act_left", "dpleft", "dpleft", "1,Mouse 4"},
+    {"right", "act_right", "dpright", "dpright", "3,Mouse 5"}};
 static const Ctl CTL_MOVE[] = {
     {"move_up", "act_move_up", nullptr, nullptr, "W"}, {"move_down", "act_move_down", nullptr, nullptr, "S"},
     {"move_left", "act_move_left", nullptr, nullptr, "A"}, {"move_right", "act_move_right", nullptr, nullptr, "D"},
@@ -2398,6 +2398,41 @@ static void screen_sticks() {
     ImGui::Dummy(ImVec2(1, 1));
 }
 
+// The mouse (src/host/mouse_direct.c): mouse_sens= the camera's turn per count (unset: 1, 0.08 degrees a count),
+// mouse_aim= its factor while the bow is drawn (unset: 1), mouse_invert=1 up and down swapped. Each row writes nothing
+// at its default.
+static void mouse_row_slider(float cy, const char *label, const char *key, float lo, float hi, float step) {
+    row_label(cy, label);
+    std::string set = cfg_get(key);
+    float v = set.empty() ? 1.0f : SDL_clamp((float)SDL_atof(set.c_str()), lo, hi);
+    std::string val = num_text(v, 1);
+    text(g_media.control, 748 - text_w(g_media.control, val.c_str()), cy - g_media.control->FontSize / S / 2, C_TEXT, val.c_str());
+    float x = 340;
+    if (slider((std::string("sl_") + key).c_str(), x, cy, 748 - 52 - x, &v, lo, hi, step)) {
+        char b[16];   // the game reads it with a dot, whatever the language
+        SDL_snprintf(b, sizeof b, "%.1f", v);
+        cfg_set(key, SDL_fabsf(v - 1.0f) < 0.01f ? "" : b);
+    }
+}
+
+static void mouse_section(float &top) {
+    const float ROW = 38;
+    text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T("sec_mouse"));
+    float cy = top + 52;
+    mouse_row_slider(cy, "row_mouse_sens", "mouse_sens", 0.1f, 5.0f, 0.1f);
+    cy += ROW;
+    mouse_row_slider(cy, "row_mouse_aim", "mouse_aim", 0.1f, 3.0f, 0.1f);
+    cy += ROW;
+    row_label(cy, "row_mouse_invert");
+    bool inv = cfg_get("mouse_invert") == "1";
+    if (toggle("mouse_invert", 748, cy, inv))
+        cfg_set("mouse_invert", inv ? "" : "1");
+    float h = rich(g_media.small, 52, cy + 24, 696, {{T("mouse_note"), C_SUB}}, 17);
+    float bottom = cy + 24 + h + 12;
+    card(top, bottom);
+    top = bottom + 8;
+}
+
 static void screen_controls() {
     if (g_cap.on && SDL_GetTicks() - g_cap.t0 > 8000)   // nothing pressed for a while: no longer waiting
         g_cap.on = false;
@@ -2437,8 +2472,10 @@ static void screen_controls() {
         top = bottom + 8;
     };
     section("sec_buttons", CTL_BUTTONS, sizeof CTL_BUTTONS / sizeof *CTL_BUTTONS);
-    if (!pad)
+    if (!pad) {
         section("sec_move", CTL_MOVE, sizeof CTL_MOVE / sizeof *CTL_MOVE);
+        mouse_section(top);
+    }
     // when they apply, and everything of this device back to the defaults (the layout stays)
     float bw = text_w(g_media.medium, T("ctl_reset_all")) + 34;
     rich(g_media.small, 52, top + 12, 748 - bw - 16 - 52, {{T("ctl_applies"), C_SUB}}, 17);

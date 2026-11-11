@@ -243,7 +243,61 @@ def ability_target_guard(gen, addr):   # cbz x21, #0x801bd01f0
             'if (c->x[21] == 0 || !totk_ability_target_ok(c->x[19], c->x[8], c->x[21])) { goto L_801bd01f0; } }')
 
 
+# The mouse camera (src/host/mouse_direct.c, which says what each site holds). Sites and words from totk-pc-recomp
+# recomp/patches-v143.txt @ d8a1d14 (MIT, Copyright (c) 2026 Valiantsin Dzerakh and contributors), each word checked
+# against the 1.4.3 main; there each is a branch to a host page that performs the instruction, here C that calls the
+# runtime before the original instruction (MOUSE_BEFORE) or after it (MOUSE_LOADS: the loaded register gets the value
+# for the mouse). The functions with these sites are lifted without locals, so the runtime may change any register.
+MOUSE_BEFORE = {
+    0x874cb4: (0xbd042289, 'totk_mouse_camera_input'),    # str s9, [x20, #0x420]: the processed camera stick
+    0x874d7c: (0x6d40a3e9, 'totk_mouse_camera_activity'), # ldp d9, d8, [sp, #8]: before the input flags' store
+    0x18e444: (0xf9400408, 'totk_mouse_orbit_begin'),     # ldr x8, [x0, #8]: the free orbit's update begins
+    0x18ea34: (0xb9418a88, 'totk_mouse_orbit_state'),     # ldr w8, [x20, #0x188]: its state decision
+    0x18f108: (0xbd4047ec, 'totk_mouse_orbit_angles'),    # ldr s12, [sp, #0x44]: its final pitch and yaw
+    0x1d59460: (0xb9004be8, 'totk_mouse_hand_input'),     # str w8, [sp, #0x48]: Ultrahand's input after its curves
+}
+MOUSE_LOADS = {   # the other cameras' stick and angle loads (mouse_direct.c load_sites)
+    0x23beb94: 0xbd4426c1, 0x23bebc8: 0xbd415e61, 0x23bee2c: 0xbd4422c1, 0x23beeec: 0xbc5b83a1,   # Aiming
+    0x23c0a10: 0xbd4422e0, 0x23c0a1c: 0xbd4426eb, 0x23c0b00: 0xbd416260, 0x23c0e80: 0xbd405be1,   # AimingTelescope
+    0x23d2eec: 0xbd4422e8, 0x23d2ef4: 0xbd4426ee, 0x23d3158: 0xbd416260, 0x23d34cc: 0xbc5b03a1,   # SpecialPower
+    0x23cb274: 0xbd442288, 0x23cb2a0: 0xbd406a61, 0x23cb3f8: 0xbd4426a8, 0x23cb424: 0xbd406661,   # Horse
+    0x23d2f30: 0xbd4422e8, 0x23d2f5c: 0xbd41da62, 0x23d2f6c: 0xbd4426e8, 0x23d2f98: 0xbd41de62,   # Recall's cursor
+    0x23d3210: 0xbd400400,                                                                         # its scale
+    0x23c2890: 0xbd4426ad, 0x23c28b4: 0xbd405261, 0x23c2934: 0xbd4422ad, 0x23c2964: 0xbd404be1,   # CameraFinder
+    0x23c3dd0: 0xbd442301, 0x23c3dd8: 0xbd409261, 0x23c3d64: 0xbd442701, 0x23c3d70: 0xbc488ec1,   # ClimbObj
+    0x23da694: 0xbd4422c1, 0x23da698: 0xbd4426c0, 0x23da840: 0xbd40da60, 0x23da894: 0xbd4017e0,   # Wakeboard
+    0x23daed8: 0xbd403fe9,
+    0x23d0100: 0xbd4422c1, 0x23d0104: 0xbd4426c0, 0x23d02ac: 0xbd40de60, 0x23d0a34: 0xbd4013e0,   # ShieldSurfing
+    0x23d087c: 0xbd403fe9,
+    0x23dced8: 0xbd4422cd, 0x23dd070: 0xb85cc3a8, 0x23dd008: 0xbd4426c9,                          # WaterfallClimb
+    0x23d4b14: 0xbd44228c, 0x23d4b1c: 0xbd44268d, 0x23d4f34: 0xbd40c260, 0x23d5028: 0xbd40b661,   # Tail (climbing)
+    0x23d756c: 0xbd442300, 0x23d7594: 0xbd442301, 0x23d75b4: 0xbd4023e0, 0x23d75c4: 0xbd4023e9,   # LockOn / Target
+    0x23d7998: 0xbd442701, 0x23d79b8: 0xbd4023e0, 0x23d79c8: 0xbd4023ea,
+    0x23cecb4: 0xbd4426a9, 0x23cecf8: 0xbd419a61, 0x23ced0c: 0xbd4422a9, 0x23ced4c: 0xbd419e61,   # LockOnAimingAt
+    0x23cc4b4: 0xbd44232b,                                                                         # HorseLockOnEmpty
+    0x23c542c: 0xbd4426eb, 0x23c546c: 0xbd405e61, 0x23c54d4: 0xbd4422eb, 0x23c5554: 0xbd406661,   # EventMultiTalk
+    0x23c90ac: 0xbd442709, 0x23c90d8: 0xbd407661, 0x23c9140: 0xbd442309, 0x23c9170: 0xbd407e61,   # EventTalkManual
+}
+
+
+def mouse_before(word, host):
+    def f(gen, addr):
+        expect(gen, addr, word, 'mouse')
+        return f'{{ extern void {host}(Cpu *c); {host}(c); }} {gen.c_of(word, addr)}'
+    return f
+
+
+def mouse_load(word):
+    def f(gen, addr):
+        expect(gen, addr, word, 'mouse')
+        return (f'{gen.c_of(word, addr)} {{ extern void totk_mouse_load(Cpu *c, uint32_t site); '
+                f'totk_mouse_load(c, {addr - MAIN:#x}u); }}')
+    return f
+
+
 PATCHES = {
+    **{MAIN + a: mouse_before(w, h) for a, (w, h) in MOUSE_BEFORE.items()},
+    **{MAIN + a: mouse_load(w) for a, w in MOUSE_LOADS.items()},
     MAIN + 0x2b036c: cooldown,
     **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
        for a, (w, t) in ZSTD_SITES.items()},

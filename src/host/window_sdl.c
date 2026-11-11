@@ -42,7 +42,7 @@ static const bind_action ACTIONS[] = {
     {"a", 1, 38, "E"}, {"b", 2, 40, "Left Shift"}, {"x", 4, 34, "Space"}, {"y", 8, 32, "Mouse Left,T"},
     {"lstick", 16, 6, "Left Ctrl"}, {"rstick", 32, 8, "C"}, {"l", 64, 12, "Q"}, {"r", 128, 14, "R"},
     {"zl", 256, 58, "Mouse Right,Z"}, {"zr", 512, 56, "F,X"}, {"plus", 1024, 36, "Escape"}, {"minus", 2048, 48, "Tab,M"},
-    {"left", 4096, 3, "1"}, {"up", 8192, 17, "2"}, {"right", 16384, 4, "3"}, {"down", 32768, 5, "4"},
+    {"left", 4096, 3, "1,Mouse 4"}, {"up", 8192, 17, "2"}, {"right", 16384, 4, "3,Mouse 5"}, {"down", 32768, 5, "4"},
     {"move_up", 0, 13, "W"}, {"move_down", 0, 1, "S"}, {"move_left", 0, 0, "A"}, {"move_right", 0, 2, "D"},
     {"cam_up", 0, 126, "Up"}, {"cam_down", 0, 125, "Down"}, {"cam_left", 0, 123, "Left"}, {"cam_right", 0, 124, "Right"}};
 // scancode / mouse button -> the Mac key codes overrides_input.c reads (up to two actions), -1 none
@@ -305,8 +305,8 @@ float window_refresh_hz(void) {
 
 // The mouse is the window's while the game has the focus, as in other PC games: the cursor hidden and kept in the
 // window (SDL's relative mode), taken at the start and by a click into the window, let go by Esc and whenever another
-// window gets the focus (Alt+Tab, the Windows key; SDL gives it back with the focus). The game gets no mouse input
-// yet (overrides_input.c: a mouse that does not move): this is only that the cursor stays out of the way.
+// window gets the focus (Alt+Tab, the Windows key; SDL gives it back with the focus). While it is held its raw motion and
+// wheel go to overrides_input.c (the camera: mouse_direct.c); the game's own HID mouse stays one that does not move.
 static void mouse_capture(bool on) {
     if (SDL_GetWindowRelativeMouseMode(window) == on) return;
     SDL_SetWindowRelativeMouseMode(window, on);
@@ -381,6 +381,15 @@ _Noreturn void window_loop(void) {
                         for (int i = 0; i < 2; i++)
                             if (g_mousemap[e.button.button][i] >= 0) runtime_input_key((unsigned)g_mousemap[e.button.button][i], e.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
                     break;
+                case SDL_EVENT_MOUSE_MOTION:   // relative mode: raw counts, +y down
+                    if (SDL_GetWindowRelativeMouseMode(window) && !text_entry_blocks_input())
+                        runtime_mouse_motion(e.motion.xrel, e.motion.yrel);
+                    break;
+                case SDL_EVENT_MOUSE_WHEEL: {   // + away from the player
+                    float y = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+                    if (SDL_GetWindowRelativeMouseMode(window) && !text_entry_blocks_input()) runtime_mouse_wheel(y);
+                    break;
+                }
                 case SDL_EVENT_WINDOW_FOCUS_LOST: runtime_input_clear(); break;
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
                 case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;

@@ -46,17 +46,20 @@ void runtime_input_key(unsigned code, int down) {
     keys[code] = (unsigned char)!!down;
     pthread_mutex_unlock(&input_lock);
 }
+static void mouse_clear(void);   /* the mouse's counts and notches dropped (below) */
 void runtime_input_clear(void) {
     pthread_mutex_lock(&input_lock);
     memset(keys, 0, sizeof keys);
     pending = 0;
     memset(&g_pad, 0, sizeof g_pad);
     pthread_mutex_unlock(&input_lock);
+    mouse_clear();
 }
 
 /* TOTK_INPUT_SCRIPT=<frame>:<key>[*<frames held>],... (development: drive the game without a person, e.g.
    "520:J,700:J*30,900:W*120"). Frames are the graphics frontend's frames; keys are named as on the keyboard
-   (A-Z, RETURN, SPACE, TAB, ESCAPE, UP, DOWN, LEFT, RIGHT, LSHIFT, LALT) and go through the same layout as typing. */
+   (A-Z, RETURN, SPACE, TAB, ESCAPE, UP, DOWN, LEFT, RIGHT, LSHIFT, LALT) and go through the same layout as typing;
+   MX=<counts> / MY=<counts> move the mouse that many counts a frame for the frames held (e.g. "1500:MX=20*60"). */
 static int script_code(const char *k, size_t n) {
     static const struct { const char *name; int code; } named[] = {
         {"RETURN", 36}, {"SPACE", 49}, {"TAB", 48}, {"ESCAPE", 53}, {"UP", 126}, {"DOWN", 125}, {"LEFT", 123},
@@ -80,8 +83,97 @@ void runtime_input_script_tick(uint64_t frame) {
         int code = script_code(k, n);
         if (code >= 0 && frame == at) { fprintf(stderr, "[totk] input script: frame %llu press %.*s\n", (unsigned long long)frame, (int)n, k); runtime_input_key((unsigned)code, 1); }
         if (code >= 0 && frame == at + hold) runtime_input_key((unsigned)code, 0);
+        /* MX=<counts> / MY=<counts>: mouse motion, that many counts each frame over the hold (default 6 frames) */
+        if (n > 3 && k[0] == 'M' && (k[1] == 'X' || k[1] == 'Y') && k[2] == '=' && frame >= at && frame < at + hold) {
+            float v = (float)strtod(k + 3, NULL);
+            if (frame == at) fprintf(stderr, "[totk] input script: frame %llu mouse %.*s\n", (unsigned long long)frame, (int)n, k);
+            runtime_mouse_motion(k[1] == 'X' ? v : 0, k[1] == 'Y' ? v : 0);
+        }
         p = strchr(k, ',');
         if (p) p++;
+    }
+}
+
+/* The mouse (window_sdl.c while it holds the mouse): counts and wheel notches gathered for the camera hooks
+   (mouse_direct.c takes the counts at each camera step, so a turn follows the mouse whatever the frame rate) and for the
+   ability wheel and the D-pad strips below. */
+static int64_t g_mouse[2];     /* counts not yet taken */
+static int32_t g_wheel;        /* wheel notches not yet taken, + away from the player */
+static float g_mouse_rest[3];  /* the window thread's fractions of a count / notch */
+static uint64_t g_buttons_last;
+static int g_selector;
+void runtime_mouse_motion(float dx, float dy) {
+    float x = g_mouse_rest[0] + dx, y = g_mouse_rest[1] + dy;
+    int64_t ix = (int64_t)x, iy = (int64_t)y;
+    g_mouse_rest[0] = x - (float)ix, g_mouse_rest[1] = y - (float)iy;
+    if (ix) __atomic_add_fetch(&g_mouse[0], ix, __ATOMIC_RELAXED);
+    if (iy) __atomic_add_fetch(&g_mouse[1], iy, __ATOMIC_RELAXED);
+}
+void runtime_mouse_wheel(float notches) {
+    float w = g_mouse_rest[2] + notches;
+    int32_t n = (int32_t)w;
+    g_mouse_rest[2] = w - (float)n;
+    if (n) __atomic_add_fetch(&g_wheel, n, __ATOMIC_RELAXED);
+}
+static int32_t clamp32(int64_t v) { return v < INT32_MIN ? INT32_MIN : v > INT32_MAX ? INT32_MAX : (int32_t)v; }
+void runtime_mouse_take(int32_t *dx, int32_t *dy) {
+    *dx = clamp32(__atomic_exchange_n(&g_mouse[0], 0, __ATOMIC_RELAXED));
+    *dy = clamp32(__atomic_exchange_n(&g_mouse[1], 0, __ATOMIC_RELAXED));
+}
+uint64_t runtime_input_buttons_last(void) { return __atomic_load_n(&g_buttons_last, __ATOMIC_RELAXED); }
+static void mouse_clear(void) {
+    int32_t dx, dy;
+    runtime_mouse_take(&dx, &dy);
+    __atomic_store_n(&g_wheel, 0, __ATOMIC_RELAXED);
+}
+int runtime_mouse_selector_active(void) { return __atomic_load_n(&g_selector, __ATOMIC_RELAXED) != 0; }
+
+/* The mouse at a controller read (input_lock held), after the keys and the pad:
+   - L held (the ability wheel): the mouse moves a virtual cursor on the right stick, which stays where it was put;
+   - D-pad up, left or right held (the strips of materials, shields, weapons and bows): horizontal motion steps the strip,
+     and so does the wheel, a notch a step (away from the player to the left);
+   - else the camera hooks take the counts (mouse_direct.c); counts no camera takes (a menu, a cutscene: no camera step
+     with input on) are dropped, so they do not turn the camera at once when it comes back;
+   - a mouse shake while Ultrahand holds an object swings the right stick with it (mouse_direct.c totk_mouse_shake).
+   The right stick takes the larger of the pad's and the mouse's deflection, as the keys do. */
+static void mouse_route(NpadState *s) {
+    static int was;
+    static float cursor[2];
+    static TotkMouseRow row;
+    static int32_t wheel_dir;
+    static uint64_t wheel_until;
+    uint64_t b = s->buttons, now = runtime_now_ns();
+    int on = totk_mouse_enabled();
+    int sel = !on ? 0 : (b & 64) ? 1 : (b & 8192) ? 2 : (b & 4096) ? 3 : (b & 16384) ? 4 : 0;
+    __atomic_store_n(&g_selector, sel, __ATOMIC_RELAXED);
+    int32_t dx, dy, out[2] = {0, 0};
+    int32_t notches = __atomic_exchange_n(&g_wheel, 0, __ATOMIC_RELAXED);
+    if (sel != was) cursor[0] = cursor[1] = 0, row = (TotkMouseRow){0}, wheel_dir = 0, wheel_until = 0;
+    if (sel) {
+        runtime_mouse_take(&dx, &dy);
+        if (sel == 1) totk_mouse_radial(dx, dy, cursor, out);
+        else {
+            totk_mouse_row(dx, now, &row, out);
+            /* the wheel: a 32 ms full-tilt pulse a notch with 32 ms of neutral after it, the mouse's step timing */
+            if (!out[0]) {
+                if (wheel_dir && now < wheel_until) out[0] = wheel_dir * 32767;
+                else if (wheel_dir) wheel_dir = 0, wheel_until = now + 32000000ull;
+                else if (notches && now >= wheel_until) {
+                    wheel_dir = notches > 0 ? -1 : 1;
+                    wheel_until = now + 32000000ull;
+                    out[0] = wheel_dir * 32767;
+                }
+            }
+        }
+    } else if (was || !totk_mouse_camera_active()) {
+        runtime_mouse_take(&dx, &dy);   /* a strip let go, or no camera takes the mouse now: dropped */
+    }
+    was = sel;
+    int shake = on ? totk_mouse_shake() : 0;
+    if (shake) out[0] = shake * 32767, out[1] = 0;
+    if (out[0] || out[1]) {
+        int64_t m2 = (int64_t)out[0] * out[0] + (int64_t)out[1] * out[1], p2 = (int64_t)s->rx * s->rx + (int64_t)s->ry * s->ry;
+        if (shake || m2 > p2) s->rx = out[0], s->ry = out[1];
     }
 }
 
@@ -129,6 +221,8 @@ static int pad_states(NpadState *out, int max, const uint32_t *id, uint32_t want
         if (abs(pad.ly) > abs(state.ly)) state.ly = pad.ly;
         if (abs(pad.rx) > abs(state.rx)) state.rx = pad.rx;
         if (abs(pad.ry) > abs(state.ry)) state.ry = pad.ry;
+        mouse_route(&state);
+        __atomic_store_n(&g_buttons_last, state.buttons, __ATOMIC_RELAXED);
     }
     *out = state;
     pthread_mutex_unlock(&input_lock);
