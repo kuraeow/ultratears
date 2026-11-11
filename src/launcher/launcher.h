@@ -113,8 +113,10 @@ void ui_drop(const char *path);            // a folder dropped onto the window
 bool ui_close_request();                   // the window's close button: true to close now (a build asks first)
 void ui_demo(const char *name);             // development: a screen with sample data
 void ui_play_mode();                       // --play: the graphics prepared, then the game, the window only if needed
-bool ui_window_wanted();                   // false while --play has nothing to show
-bool ui_quit_wanted();                     // --play: the graphics prepared, the game to start
+void ui_prepare_mode(const std::string &dump);   // --prepare --game <dump>: the build, no window, progress lines on stdout
+int ui_prepare_code();                     // --prepare, after closing: the exit code (0: the game is built)
+bool ui_window_wanted();                   // false while --play has nothing to show, and for --prepare
+bool ui_quit_wanted();                     // --play: the graphics prepared, the game to start; --prepare: the build over
 bool ui_play_finish();                     // --play, after closing: the game started
 void ui_quit();                            // closing: stop the build (it resumes next time)
 bool ui_event(const SDL_Event *e);         // every event first: true when the Controls tab took it (a key being bound)
