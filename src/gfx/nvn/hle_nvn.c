@@ -75,6 +75,7 @@ uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
 }
 
 #include "nvn_impl.h"
+#include "../../runtime/bufcat.h"
 
 static int g_log;
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
@@ -846,7 +847,7 @@ static void cs_dump(void) {   // 每帧调一次（出图处） | Called once pe
     if (!cs_on()) return; uint64_t f = dm_nvn_frame_count(); if (f - g_cs.frame0 < 300) return;
     pthread_mutex_lock(&g_cs_mu); double n = (double)(f - g_cs.frame0); char top[700]; int k = 0; uint8_t used[64] = {0};
     for (int r = 0; r < 8; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!used[i] && g_cs.op_b[i] && (bi < 0 || g_cs.op_b[i] > g_cs.op_b[bi])) bi = i; if (bi < 0) break; used[bi] = 1;
-        k += snprintf(top + k, sizeof top - k, " command %d: %.0f entries x %.0f bytes = %.1f KB;", bi, g_cs.op_n[bi] / n, (double)g_cs.op_b[bi] / (double)g_cs.op_n[bi], g_cs.op_b[bi] / n / 1024.0); }
+        k = bufcat(top, sizeof top, k, " command %d: %.0f entries x %.0f bytes = %.1f KB;", bi, g_cs.op_n[bi] / n, (double)g_cs.op_b[bi] / (double)g_cs.op_n[bi], g_cs.op_b[bi] / n / 1024.0); }
     LOG("[nvn] command memory through frame %llu: recorded %.1f KB / %.0f entries per frame; game segments %.2f/frame, mean %.1f KB (min %.1f / max %.1f); memory callbacks %.2f/frame; host segments %.3f/frame; discarded tails %.1f KB/frame | per frame:%s",
         (unsigned long long)f, g_cs.bytes / n / 1024.0, g_cs.recs / n, g_cs.grants / n, g_cs.grants ? g_cs.grant_bytes / (double)g_cs.grants / 1024.0 : 0, g_cs.grant_min / 1024.0, g_cs.grant_max / 1024.0, g_cs.cbs / n, g_cs.hostseg / n, g_cs.waste / n / 1024.0, top);
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
@@ -869,7 +870,7 @@ static void cmd_reserve(cmd_t *o, size_t need) {
 void runtime_describe_address(uint64_t a, char *out, size_t n);
 static void guest_chain(const char *what) {
     char line[1024]; size_t o = 0; uint64_t *fp = (uint64_t *)__builtin_frame_address(0);
-    for (int i = 0; i < 14 && fp && !((uintptr_t)fp & 7); i++) { char w[96]; runtime_describe_address(fp[1], w, sizeof w); if (o < sizeof line - 100) o += snprintf(line + o, sizeof line - o, " <- %s", w); if ((uint64_t *)fp[0] == fp) break; fp = (uint64_t *)fp[0]; }
+    for (int i = 0; i < 14 && fp && !((uintptr_t)fp & 7); i++) { char w[96]; runtime_describe_address(fp[1], w, sizeof w); if (o < sizeof line - 100) o = bufcat(line, sizeof line, o, " <- %s", w); if ((uint64_t *)fp[0] == fp) break; fp = (uint64_t *)fp[0]; }
     LOG("[chain] %s%s", what, line);
 }
 /* Offset in main of the first guest return address on the frame chain (0 = none): which game code issued the call. */
@@ -1086,7 +1087,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     size_t hw_before = o->hw_used; uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8); o->hw_used -= 8;
     o->recording = 0;
     if (reclog_limit() && (int)t_rec_n < reclog_limit()) { char line[1024]; size_t n = 0; t_rec_n++;
-        for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
+        for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n = bufcat(line, sizeof line, n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
     uint8_t *copy = flatten_recording(o->seg);
     if (call_stats_on()) call_stats_end(c, copy);
@@ -1747,7 +1748,7 @@ static void bindprog_log(const prog_t *o, int stages) {
     uint64_t gfp = sw ? sw[0] : 0, glr = sw ? sw[1] : 0;
     for (int d = 0; d < 8 && n < (int)sizeof b - 48; d++) {
         const char *nm; uint64_t off;
-        if (runtime_module_offset(glr, &nm, &off)) n += snprintf(b + n, sizeof b - n, " %s+%#llx", nm, (unsigned long long)off); else n += snprintf(b + n, sizeof b - n, " %#llx", (unsigned long long)glr);
+        if (runtime_module_offset(glr, &nm, &off)) n = bufcat(b, sizeof b, n, " %s+%#llx", nm, (unsigned long long)off); else n = bufcat(b, sizeof b, n, " %#llx", (unsigned long long)glr);
         if (!gfp || (gfp & 7)) break; uint64_t *f = (uint64_t *)(uintptr_t)gfp; glr = f[1]; gfp = f[0]; if (!glr) break;
     }
     LOG("%s", b);
@@ -2375,11 +2376,11 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
         }
         if (tot > 1000 && said++ % 150 == 0) {
             char line[700]; int ln = 0;
-            for (int i = 0; i < m && ln < 600; i++) ln += snprintf(line + ln, sizeof line - (size_t)ln, " %u", d[i]);
+            for (int i = 0; i < m && ln < 600; i++) ln = bufcat(line, sizeof line, ln, " %u", d[i]);
             LOG("[shape] submission: %d handles, draws+dispatches %u, largest %u, handles with 100+: %u; per handle:%s", n, tot, mx, big, line);
             unsigned inc = 0, cbig = 0, cmx = 0; ln = 0;
             for (unsigned i = 0; i < ncall && i < 256; i++) { inc += calld[i]; if (calld[i] > cmx) cmx = calld[i]; if (calld[i] >= 100) cbig++;
-                if (ln < 600) ln += snprintf(line + ln, sizeof line - (size_t)ln, " %u", calld[i]); }
+                if (ln < 600) ln = bufcat(line, sizeof line, ln, " %u", calld[i]); }
             LOG("[shape]   calls %u: draws in calls %u (outside %u), largest %u, calls with 100+: %u; per call:%s", ncall, inc, tot - inc, cmx, cbig, line);
         }
       } }
@@ -2721,7 +2722,7 @@ static void dump_frame(void) {
         if (!d) continue;
         total += d; nfn++;
         if (g_tsv && calls) fprintf(g_tsv, "%llu\t%s\t%llu\n", g_frame, nvn_names[i], d);
-        if (g_frame <= (uint64_t)nframes && o < sizeof line - 96) o += snprintf(line + o, sizeof line - o, " %s=%llu", nvn_names[i] + 3, d);
+        if (g_frame <= (uint64_t)nframes && o < sizeof line - 96) o = bufcat(line, sizeof line, o, " %s=%llu", nvn_names[i] + 3, d);
     }
     if (g_tsv) fflush(g_tsv);
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu: %u functions, %llu calls |%s", g_frame ? "frame" : "initialization", g_frame, nfn, total, line);
@@ -2777,7 +2778,7 @@ static void tsummary(uint64_t frame) {
     for (int k = 0; k < 6; k++) {
         unsigned n = g_tn[k] < TWIN ? g_tn[k] : TWIN; if (!n) continue;
         double v[TWIN]; memcpy(v, g_tw[k], n * sizeof *v); qsort(v, n, sizeof *v, dcmp);
-        o += snprintf(line + o, sizeof line - o, " %s p50 %.2f / p95 %.2f / max %.2f ms (%u frames);", g_tname[k], v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], n);
+        o = bufcat(line, sizeof line, o, " %s p50 %.2f / p95 %.2f / max %.2f ms (%u frames);", g_tname[k], v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], n);
     }
     LOG("[nvn] timing through frame %llu:%s", frame, line);
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
@@ -2804,7 +2805,7 @@ static void tsummary(uint64_t frame) {
       { extern uint64_t g_draw_skip[16]; static uint64_t prev[16]; char b[512]; size_t o = 0; b[0] = 0;
         static const char *why[] = {"no-program", "zero-source", "defer-take", "render-disabled", "raster-discard", "cull-both", "scissor-empty", "deferred", "no-encoder", "no-pipeline", "viewport-empty", "primitive",
                                     "clear-render-disabled", "cond-disabled", "cond-unknown", "shader-missing"};   // TOTK: 12-14 conditional rendering (see cond_eval); 15 a shader variant the iPhone does not have yet
-        for (int i = 0; i < 16; i++) { uint64_t d = g_draw_skip[i] - prev[i]; prev[i] = g_draw_skip[i]; if (d && o < sizeof b - 48) o += snprintf(b + o, sizeof b - o, " %s=%llu", why[i], (unsigned long long)d); }
+        for (int i = 0; i < 16; i++) { uint64_t d = g_draw_skip[i] - prev[i]; prev[i] = g_draw_skip[i]; if (d && o < sizeof b - 48) o = bufcat(b, sizeof b, o, " %s=%llu", why[i], (unsigned long long)d); }
         if (o) LOG("[nvn] TOTK draws discarded by replay through frame %llu:%s", frame, b); }
       { static uint64_t py, pk, pw; uint64_t cy = atomic_load(&g_cum_sub_cyc), ck = atomic_load(&g_cum_sub_sys_ns), cw = atomic_load(&g_cum_sub_wall_ns);
         if (pf && frame > pf && ci > pi && cy > py) { double nf = (double)(frame - pf), cyc = (double)(cy - py), cpu = (double)(cc - pc);
@@ -2884,7 +2885,7 @@ static void slow_emit(uint64_t f) {
         slow++;
         char b[4096]; size_t o = snprintf(b, sizeof b, "[slowframe]\t%llu", f);
         __typeof__(g_sr[0]) *r = &g_sr[f % SRN];
-        for (int i = 0; i < r->n && o < sizeof b - 64; i++) o += snprintf(b + o, sizeof b - o, "\t%s=%.3f", r->k[i], r->v[i]);
+        for (int i = 0; i < r->n && o < sizeof b - 64; i++) o = bufcat(b, sizeof b, o, "\t%s=%.3f", r->k[i], r->v[i]);
         double m = 0; for (uint64_t p = f >= 3 ? f - 3 : 0; p < f; p++) { double x = srow(p, "@frame_ms", 0); if (x > m) m = x; }
         snprintf(b + o, sizeof b - o, "\t@prev3_max_frame_ms=%.3f", m);
         fprintf(stderr, "%s\n", b);
@@ -3187,7 +3188,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if ((g_frame + 1) % TWIN == 0) {   // 每 300 帧列出耗时最多的 5 个函数 | every 300 frames list the 5 most time-consuming functions
             char line[1024]; size_t o = 0;
             for (int k = 0; k < 5; k++) { unsigned best = 0; for (unsigned i = 1; i < NVN_NFUNC; i++) if (acc[i] > acc[best]) best = i;
-                if (!acc[best]) break; o += snprintf(line + o, sizeof line - o, " %s %.2f ms；", nvn_names[best] + 3, acc[best] * tb.numer / tb.denom / 1e6); acc[best] = 0; }
+                if (!acc[best]) break; o = bufcat(line, sizeof line, o, " %s %.2f ms；", nvn_names[best] + 3, acc[best] * tb.numer / tb.denom / 1e6); acc[best] = 0; }
             LOG("[nvn] top 5 translation costs (total over the last 300 frames): %s", line); memset(acc, 0, sizeof acc);
         }
         trow(g_frame, "@rec_ms", rec * tb.numer / tb.denom / 1e6); trow(g_frame, "@submit_ms", sub * tb.numer / tb.denom / 1e6);

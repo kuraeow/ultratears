@@ -25,6 +25,7 @@
 #include "nvn/totk_vpool.h"
 #include "vkb_audit.h"
 #include "vkb_lock.h"
+#include "../runtime/bufcat.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -2349,7 +2350,7 @@ static void dump_save(const char *dir, const char *prefix, const vkb_image *im, 
         const uint16_t *h16 = (const uint16_t *)px;
         char row[512];
         int rn = 0;
-        for (uint32_t x = 0; x < w && rn < 480; x += w / 16 ? w / 16 : 1) rn += snprintf(row + rn, sizeof row - rn, " %.4g", half_to_float(h16[(size_t)(h / 2) * w + x]));
+        for (uint32_t x = 0; x < w && rn < 480; x += w / 16 ? w / 16 : 1) rn = bufcat(row, sizeof row, rn, " %.4g", half_to_float(h16[(size_t)(h / 2) * w + x]));
         VLOG("[dump] %stexture %llu R16F %ux%u: row %u:%s; corners %g %g %g %g", prefix, (unsigned long long)im->serial, w, h, h / 2, row,
              half_to_float(h16[0]), half_to_float(h16[w - 1]), half_to_float(h16[(size_t)(h - 1) * w]), half_to_float(h16[(size_t)h * w - 1]));
     }
@@ -2550,9 +2551,9 @@ static void texlog(uint64_t present) {
                     s += (half_to_float(h[0]) + half_to_float(h[1]) + half_to_float(h[2])) / 3.0;
                 }
             }
-            ln += snprintf(line + ln, sizeof line - (size_t)ln, " %.4g", np ? s / np : 0);
+            ln = bufcat(line, sizeof line, ln, " %.4g", np ? s / np : 0);
             if (bpp == 8 && np)
-                ln += snprintf(line + ln, sizeof line - (size_t)ln, " [rgba %.3g %.3g %.3g %.3g, below 1: %u %u %u %u]", ch[0] / np, ch[1] / np, ch[2] / np,
+                ln = bufcat(line, sizeof line, ln, " [rgba %.3g %.3g %.3g %.3g, below 1: %u %u %u %u]", ch[0] / np, ch[1] / np, ch[2] / np,
                                ch[3] / np, below1[0], below1[1], below1[2], below1[3]);
         }
         VLOG("%s", line);

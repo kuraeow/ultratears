@@ -14,6 +14,7 @@
 #include "compat/gfx_compat.h"
 #include "host/hle.h"
 #include "vkb_audit.h"
+#include "../runtime/bufcat.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -105,7 +106,7 @@ static void report(void) {
                 if (s->keys[j].n > s->keys[i].n) { keyc t = s->keys[i]; s->keys[i] = s->keys[j]; s->keys[j] = t; }
         char keys[256] = "";
         int n = 0;
-        for (int i = 0; i < s->nkeys && i < 6 && n < 200; i++) n += snprintf(keys + n, sizeof keys - n, "%s%s %llu", i ? ", " : "", s->keys[i].key, (unsigned long long)s->keys[i].n);
+        for (int i = 0; i < s->nkeys && i < 6 && n < 200; i++) n = bufcat(keys, sizeof keys, n, "%s%s %llu", i ? ", " : "", s->keys[i].key, (unsigned long long)s->keys[i].n);
         VLOG("  %-48s %8.1f draws/frame %8.1f events/frame %5llu frames  %s", g_name[order[k]], (double)s->draws / frames,
              (double)s->events / frames, (unsigned long long)s->frames, keys);
         if (f) fprintf(f, "| %s | %.1f | %.1f | %llu | %s |\n", g_name[order[k]], (double)s->draws / frames, (double)s->events / frames,

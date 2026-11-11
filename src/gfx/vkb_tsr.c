@@ -43,6 +43,7 @@
 #include "../../third_party/fsr3/fsr3_spv.h"
 #include "vkb_tsr_mv_spv.h"
 #include "vkb_shader.h"
+#include "../runtime/bufcat.h"
 
 void vkb_tsr_obj_log(void);
 
@@ -293,7 +294,7 @@ static int make_job(void) {
                     double v[4] = {pts[p][0], pts[p][1], 0.9, 1}, o[4] = {0};
                     for (int r = 0; r < 4; r++)
                         for (int k = 0; k < 4; k++) o[r] += m[r * 4 + k] * v[k];
-                    n += snprintf(line + n, sizeof line - n, " (%+.1f,%+.1f)", (o[0] / o[3] - v[0]) * 0.5 * W.sw,
+                    n = bufcat(line, sizeof line, n, " (%+.1f,%+.1f)", (o[0] / o[3] - v[0]) * 0.5 * W.sw,
                                   -(o[1] / o[3] - v[1]) * 0.5 * W.sh);
                 }
                 VLOG("antialiasing: motion at centre, top-left, top-right, bottom-left, bottom-right (px):%s; cam %.2f %.2f %.2f %.2f / %.2f %.2f %.2f %.2f",

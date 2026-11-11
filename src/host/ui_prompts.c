@@ -30,6 +30,7 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #define STBTT_STATIC
 #include "../../third_party/stb/stb_truetype.h"
+#include "../runtime/bufcat.h"
 
 extern const unsigned char te_inter_ttf[];   /* host/text_entry.c */
 
@@ -703,7 +704,7 @@ int totk_ui_prompts_font(const void *in, size_t n, const void *dicts_z, size_t d
         char line[512];
         int at = 0;
         for (int k = 0; k < NSYM && at < (int)sizeof line - 32; k++)
-            if (sym_from[k] != k) at += snprintf(line + at, sizeof line - at, " %s=%s", SYM[k].id, SYM[sym_from[k]].id);
+            if (sym_from[k] != k) at = bufcat(line, sizeof line, at, " %s=%s", SYM[k].id, SYM[sym_from[k]].id);
         fprintf(stderr, "[totk] button font: symbols after the controls:%s\n", line);
     }
     return ok;

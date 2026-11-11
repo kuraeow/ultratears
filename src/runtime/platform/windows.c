@@ -10,6 +10,7 @@
 #include <malloc.h>
 
 #include "../platform.h"
+#include "../bufcat.h"
 
 // ---- guest address space
 // The window is reserved up front and committed per region (plat_commit from the loader / kernel). Anything
@@ -159,7 +160,7 @@ void plat_memory_map(void) {
     char line[512];
     int at = 0;
     for (int c = 0; c < NB; c++)
-        if (bn[c]) at += snprintf(line + at, sizeof line - (size_t)at, " %s: %llu = %.0f MiB;", cls[c], (unsigned long long)bn[c], bb[c] / M);
+        if (bn[c]) at = bufcat(line, sizeof line, at, " %s: %llu = %.0f MiB;", cls[c], (unsigned long long)bn[c], bb[c] / M);
     fprintf(stderr, "[mem]   other private by region size:%s\n", at ? line : " -");
     for (int k = 0; k < TOP && top[k].size; k++)
         fprintf(stderr, "[mem]   private %016llx +%.1f MiB\n", (unsigned long long)top[k].base, top[k].size / M);

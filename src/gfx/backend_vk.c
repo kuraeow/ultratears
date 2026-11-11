@@ -28,6 +28,7 @@
 #include "nvn/nvn_obj.h"
 #include "../vk/present.h"
 #include "vkb.h"
+#include "../runtime/bufcat.h"
 #include "vkb_shader.h"
 #include "vkb_audit.h"
 #include "vkb_lock.h"
@@ -244,7 +245,7 @@ static void memory_log(void) {
         vk.vkGetPhysicalDeviceMemoryProperties2(vkc.gpu, &p);
         int n = 0;
         for (uint32_t h = 0; h < p.memoryProperties.memoryHeapCount && n < (int)sizeof drv - 64; h++)
-            n += snprintf(drv + n, sizeof drv - (size_t)n, " heap %u%s %.0f of %.0f MiB;", h,
+            n = bufcat(drv, sizeof drv, n, " heap %u%s %.0f of %.0f MiB;", h,
                           p.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (video)" : "",
                           b.heapUsage[h] / 1048576.0, b.heapBudget[h] / 1048576.0);
     }
@@ -257,7 +258,7 @@ static void memory_log(void) {
                                              "write-back", "copy back"};
         char line[512]; int n = 0;
         for (int t = 0; t < MT_N && n < (int)sizeof line - 48; t++)
-            n += snprintf(line + n, sizeof line - (size_t)n, " %s %.0f MiB;", nm[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
+            n = bufcat(line, sizeof line, n, " %s %.0f MiB;", nm[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
         VLOG("memory: ours by use:%s", line);
     }
     vkb_shader_report();
@@ -280,7 +281,7 @@ static void memory_log(void) {
         char tl[384];
         int at = 0;
         for (int t = 0; t < MT_N; t++)
-            at += snprintf(tl + at, sizeof tl - (size_t)at, " %s %.0f;", tn[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
+            at = bufcat(tl, sizeof tl, at, " %s %.0f;", tn[t], atomic_load(&g_tag_bytes[t]) / 1048576.0);
         VLOG("memory: ours by use (MiB):%s", tl);
     }
 }
@@ -2861,7 +2862,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             {
                 static uint64_t pct[32];
                 char cl[256]; int cn = 0;
-                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn += snprintf(cl + cn, sizeof cl - (size_t)cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
+                for (int k = 0; k < 32; k++) if (g_counter_types[k] > pct[k]) { cn = bufcat(cl, sizeof cl, cn, " type %d: %.1f", k, (double)(g_counter_types[k] - pct[k]) / f); pct[k] = g_counter_types[k]; }
                 if (cn) VLOG("per frame: counter reports by type:%s", cl);
                 static uint64_t pq[5];
                 if (g_oq_on > 0) {
@@ -2978,7 +2979,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             for (int k = 0; k < PE_COUNT; k++) {
                 uint64_t ended = vkb_cnt_sum(vkb_pass_end_n[k]);
                 if (ended > prev[k] && at < (int)sizeof line - 48)
-                    at += snprintf(line + at, sizeof line - (size_t)at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
+                    at = bufcat(line, sizeof line, at, " %s %.0f,", why[k], (double)(ended - prev[k]) / f);
                 prev[k] = ended;
             }
             if (at) VLOG("passes ended per frame by:%s", line);

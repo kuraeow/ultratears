@@ -18,6 +18,7 @@
 #include "vkb_audit.h"
 #include "vkb_lock.h"
 #include "nvn/nvn_dirty.h"
+#include "../runtime/bufcat.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
@@ -2055,13 +2056,13 @@ static void trace_resources(const vkb_shader *sh, int stage) {
         vkb_rw_read(&g_reg_mu, LK_TEXREG);
         if (sid < g_nsreg && g_sreg[sid].valid) {
             const samp_par *sp = &g_sreg[sid].p;
-            if (sp->cmp_mode) n += snprintf(line + n, sizeof line - n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
+            if (sp->cmp_mode) n = bufcat(line, sizeof line, n, "(cmp %u func %u)", sp->cmp_mode, sp->cmp_func);
             if (getenv("TOTK_VK_TRACE_SAMPLERS"))   // NVN values: wrap 0 clamp .. 7 clamp to edge, filters 0 nearest 1 linear
-                n += snprintf(line + n, sizeof line - n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
+                n = bufcat(line, sizeof line, n, "(s%d wrap %u %u %u min %u mag %u border %g %g %g %g)", sid, sp->ws, sp->wt,
                               sp->wr, sp->minf, sp->magf, sp->border[0], sp->border[1], sp->border[2], sp->border[3]);
         }
         vkb_rw_read_end(&g_reg_mu);
-        if (sh->tex[i].type & 0x400) n += snprintf(line + n, sizeof line - n, "(shadow)");   // Ryujinx SamplerType.Shadow
+        if (sh->tex[i].type & 0x400) n = bufcat(line, sizeof line, n, "(shadow)");   // Ryujinx SamplerType.Shadow
     }
     for (int i = 0; i < sh->nimg && n < 900; i++) {
         const view_t *v = NULL;
@@ -2071,12 +2072,12 @@ static void trace_resources(const vkb_shader *sh, int stage) {
     }
     for (int slot = 3; slot < VKB_NCBUF && n < 900; slot++)
         if (sh->cbuf_mask & (1u << slot))
-            n += snprintf(line + n, sizeof line - n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
+            n = bufcat(line, sizeof line, n, " c%d=%#llx+%llu", slot, (unsigned long long)S.ubo[stage][slot - 3].addr,
                           (unsigned long long)S.ubo[stage][slot - 3].size);
     for (int i = 0; i < sh->nsbuf && n < 900; i++) {
         uint8_t slot = sh->sbuf[i].slot;
         const p_bind_buf *b = slot == 0xFF ? NULL : sh->sbuf[i].kind == VKB_SB_TABLE ? &S.ssbo[stage][slot] : &S.ubo[stage][slot];
-        n += snprintf(line + n, sizeof line - n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
+        n = bufcat(line, sizeof line, n, " s%d(%c%d)=%#llx+%llu", i, "tup"[sh->sbuf[i].kind], slot,
                       b ? (unsigned long long)b->addr : 0ull, b ? (unsigned long long)b->size : 0ull);
     }
     VLOG("%s", line);
@@ -2470,12 +2471,12 @@ void vkb_draw(const uint8_t *a, int indexed) {
         for (int i = 0; i < rt->n && i < 8; i++)
             if (rt->color[i]) {
                 vkb_image *ti = vkb_image_of(rt->color[i]);
-                tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
+                tn = bufcat(tl, sizeof tl, tn, " c%d=%llu@%p#%04llx", i, (unsigned long long)rt->color[i]->serial, rt->color[i]->mem,
                                ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
             }
         if (rt->depth) {
             vkb_image *ti = vkb_image_of(rt->depth);
-            tn += snprintf(tl + tn, sizeof tl - (size_t)tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
+            tn = bufcat(tl, sizeof tl, tn, " d=%llu@%p#%04llx", (unsigned long long)rt->depth->serial, rt->depth->mem,
                            ti ? (unsigned long long)((uintptr_t)ti->img & 0xffff) : 0ull);
         }
         VLOG("[draw]   targets:%s", tn ? tl : " -");
@@ -2501,11 +2502,11 @@ void vkb_draw(const uint8_t *a, int indexed) {
                 memcpy(&a, &S.vattr[i], sizeof a);
                 if (!a.fmt) continue;
                 used |= 1u << a.stream;
-                vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " a%d=s%u+%u/%#x", i, (unsigned)a.stream, (unsigned)a.offset, (unsigned)a.fmt);
+                vn = bufcat(vl, sizeof vl, vn, " a%d=s%u+%u/%#x", i, (unsigned)a.stream, (unsigned)a.offset, (unsigned)a.fmt);
             }
             for (uint32_t s = 0; s < 16 && vn < (int)sizeof vl - 80; s++)
                 if (used >> s & 1)
-                    vn += snprintf(vl + vn, sizeof vl - (size_t)vn, " | s%u=%#llx+%llu stride %u%s", s, (unsigned long long)S.vbuf[s].address,
+                    vn = bufcat(vl, sizeof vl, vn, " | s%u=%#llx+%llu stride %u%s", s, (unsigned long long)S.vbuf[s].address,
                                    (unsigned long long)S.vbuf[s].size, (unsigned)S.vstream[s].stride, S.vstream[s].divisor ? " instanced" : "");
             if (indexed) snprintf(vl + vn, sizeof vl - (size_t)vn, " | index %#llx type %d base %d first inst %d", (unsigned long long)di->ibuf,
                                   di->itype, di->base_vertex, di->base_instance);
