@@ -379,6 +379,22 @@ size_t vkb_spv_drop_invariant(uint32_t *w, size_t n, int *found) {
     return o;
 }
 
+// TOTK_CS_GROUP1 (vkb_shader.c): the thread groups of 0.3.1 and before (LocalSize 1 1 1: one thread of each group ran),
+// to tell whether a problem comes with the whole groups tools/pack_fixups.py gives compute shaders since 476d8b1.
+int vkb_spv_local_size_one(uint32_t *w, size_t n) {
+    for (size_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) return 0;
+        if (op == 16 && wc == 6 && w[i + 2] == 17) {   // OpExecutionMode %entry LocalSize x y z
+            int changed = w[i + 3] != 1 || w[i + 4] != 1 || w[i + 5] != 1;
+            w[i + 3] = w[i + 4] = w[i + 5] = 1;
+            return changed;
+        }
+        i += wc;
+    }
+    return 0;
+}
+
 // TOTK_VK_DEPTH_CLIP_NEG1 (vkb_shader.c): the translator's z = fma(z, 0.5, w * 0.5) before the divide taken out of a vertex
 // shader (the Fma becomes a copy of z), in place; the draw maps -1..1 to the depth range in the fixed function instead
 // (VK_EXT_depth_clip_control negativeOneToOne), as Maxwell does: the window depth then comes from the

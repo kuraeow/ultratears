@@ -33,3 +33,5 @@ size_t vkb_spv_drop_depth_convert(uint32_t *w, size_t nwords, int *found);
 // Every Invariant decoration (OpDecorate / OpMemberDecorate, decoration 18) taken out, in place (TOTK_VK_NO_INVARIANT):
 // the new word count; *found: how many were taken out.
 size_t vkb_spv_drop_invariant(uint32_t *w, size_t nwords, int *found);
+// A compute shader's OpExecutionMode LocalSize set to 1 1 1, in place (TOTK_CS_GROUP1, development): 1 when it changed.
+int vkb_spv_local_size_one(uint32_t *w, size_t nwords);

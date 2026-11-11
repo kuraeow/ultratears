@@ -327,6 +327,7 @@ static size_t drop_cull_distance(uint32_t *w, size_t n) {
 // ---- shader objects: from the driver's binary on disk when there is one (vkb_shbin.c), else compiled from SPIR-V
 // and its binary kept
 static _Atomic uint64_t g_from_bin, g_from_spv, g_bin_refused, g_obj_live, g_obj_destroyed;
+static int cs_group1(void);
 static VkResult make_object(const char *key, const vkb_shbin_variant *v, VkShaderStageFlagBits stage, const uint32_t *spv,
                             size_t bytes, VkShaderEXT *obj) {
     VkDescriptorSetLayout layouts[2];
@@ -342,6 +343,7 @@ static VkResult make_object(const char *key, const vkb_shbin_variant *v, VkShade
     if (vkc.subgroup_pin && (vkc.subgroup_pin_stages & stage)) ci.pNext = &lanes;
     void *bin;
     size_t nbin;
+    if (stage == VK_SHADER_STAGE_COMPUTE_BIT && cs_group1()) key = NULL;   // compiled from SPIR-V each start, never kept
     if (key && vkb_shbin_get(key, v, &bin, &nbin)) {
         VkShaderCreateInfoEXT bi = ci;
         bi.codeType = VK_SHADER_CODE_TYPE_BINARY_EXT; bi.codeSize = nbin; bi.pCode = bin;
@@ -470,6 +472,15 @@ static int no_invariant(void) {
     return v;
 }
 
+// TOTK_CS_GROUP1=1 (development): compute shaders run LocalSize 1 1 1 as before 476d8b1 (one thread of each group:
+// particles stretch into needles again), to tell whether a problem comes with the whole groups. Those shaders are
+// compiled from SPIR-V at each start and not kept (make_object): the binaries on disk stay valid for both settings.
+static int cs_group1(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_CS_GROUP1"); v = e && *e == '1'; if (v) LOG("compute shaders: one thread a group (TOTK_CS_GROUP1)"); }
+    return v;
+}
+
 // Which translation of a shader, as the compiled binaries are keyed (vkb_shbin_variant.stamp), and the rewrites
 // load_module makes. From the pack: the hash of its .res.json and .spv (tools/pack_shaders.py). From a folder: the
 // .res.json's last write (seconds) and size, taken from _stat64 here and from FindFirstFile in ahead_thread.
@@ -593,6 +604,7 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
     if (dref_clamp() && vkb_spv_clamp_dref(spv, nw, &clamped, &ncl)) { free(spv); spv = clamped; nw = ncl; }
     if (!vkc.has_interlock) nw = vkb_spv_drop_interlock(spv, nw);   // a device without it refused these modules (RX 570)
     if (no_invariant()) { int found; nw = vkb_spv_drop_invariant(spv, nw, &found); }
+    if (nvn_stage == 5 && cs_group1()) vkb_spv_local_size_one(spv, nw);
     nspv = nw * 4;
     int split = nvn_stage <= 1 && vkb_split_sets();   // vertex and fragment shaders (compute keeps one set)
     uint32_t bound = spv[3], *in_set1 = split ? calloc((bound + 31) / 32, 4) : NULL;   // ids of buffer variables
