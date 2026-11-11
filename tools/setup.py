@@ -542,7 +542,8 @@ def step_compile(dump, state, cpus):
 # its neighbours) is packed as it is, without translating again.
 KEEP_SHADER_WORK = False
 # Fixes made in the pack after packing (tools/pack_fixups.py); a higher number makes them again in a pack made before.
-PACK_FIXUPS = 2
+# 3: the pack compressed (tools/pack_shaders.py, version 2) - pack_fixups.py writes an older pack again, 3.4 -> ~0.9 GiB.
+PACK_FIXUPS = 3
 SHADER_OLD = ['raw', 'ryujinx', 'ryujinx-code', 'jobs.jsonl', 'shaders.tsv', 'ryujinx-results.tsv', 'ryujinx-results-new.tsv']
 
 
@@ -593,7 +594,7 @@ def step_shaders(dump, state, cpus):
             xlate = xlate_id + ('' if bias == '0' else '-g' + bias)
             if state.get(f'{key}-pack') == f'{export}/{xlate}' and pack.is_file():
                 if state.get(f'{key}-fixups') != PACK_FIXUPS:
-                    run([sys.executable, 'tools/pack_fixups.py', pack, DATA], 'fixing the shaders')
+                    run([sys.executable, 'tools/pack_fixups.py', pack, DATA, '--jobs', cpus], 'fixing the shaders')
                     state[f'{key}-fixups'] = PACK_FIXUPS
                     save_state(state)
                     made.append(out.name + ' (fixes)')
@@ -601,7 +602,7 @@ def step_shaders(dump, state, cpus):
             os.environ['TOTK_GATHER_BIAS'] = bias
             old = out / 'ryujinx'
             if key == 'shaders' and old.is_dir() and state.get('shaders-xlate') == xlate and not work.exists():
-                run([sys.executable, 'tools/pack_shaders.py', old, pack], 'packing the shaders')
+                run([sys.executable, 'tools/pack_shaders.py', old, pack, '--jobs', cpus], 'packing the shaders')
             else:
                 if state.get('shaders-export') != export or not (work / 'jobs.jsonl').is_file():
                     run([sys.executable, 'tools/export_shaders.py', DATA / 'romfs', work, DATA / 'exefs'], 'finding the shaders')
@@ -617,8 +618,8 @@ def step_shaders(dump, state, cpus):
                     state['shaders-xlate'] = xlate
                 save_state(state)
                 out.mkdir(parents=True, exist_ok=True)
-                run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack], 'packing the shaders')
-            run([sys.executable, 'tools/pack_fixups.py', pack, DATA], 'fixing the shaders')
+                run([sys.executable, 'tools/pack_shaders.py', work / 'translated', pack, '--jobs', cpus], 'packing the shaders')
+            run([sys.executable, 'tools/pack_fixups.py', pack, DATA, '--jobs', cpus], 'fixing the shaders')
             state[f'{key}-fixups'] = PACK_FIXUPS
             state[f'{key}-pack'] = f'{export}/{xlate}'
             save_state(state)

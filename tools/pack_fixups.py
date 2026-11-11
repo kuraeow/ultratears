@@ -1,9 +1,10 @@
 """Fixes of the translated shaders, made in a shader pack in place (tools/setup.py, step "shaders", after packing).
 
-usage: python tools/pack_fixups.py <pack file> <data folder (romfs, exefs)>
+usage: python tools/pack_fixups.py <pack file> <data folder (romfs, exefs)> [--jobs N]
 
 A shader a fix changes gets the stamp of its new contents (as tools/pack_shaders.py makes it), so the driver's compiled
-binaries (data/shaders/compiled.bin) are made again for it alone. Running it again changes nothing.
+binaries (data/shaders/compiled.bin) are made again for it alone. Running it again changes nothing. A pack whose
+modules are stored as they are (version 1) is written again compressed on the way (pack_shaders.rewrite).
 
 Compute thread groups (2026-11-07): the translation jobs (tools/export_shaders.py) gave no thread-group size, so every
 compute shader was translated with LocalSize 1 1 1, while the game dispatches its groups for the size in the NVN
@@ -14,8 +15,8 @@ needles stretched along that velocity (2026-11-07, the user's Switch screenshots
 OpExecutionMode LocalSize gets the size of its control section. The game's code computes its indices from the group
 and thread ids with the size built in, and Maxwell has no other read of it, so the size is all that changes.
 """
-import hashlib
 import json
+import os
 import pathlib
 import struct
 import sys
@@ -55,36 +56,32 @@ def set_local_size(w, size):
 
 
 def main():
+    import pack_shaders
     path, data = sys.argv[1], pathlib.Path(sys.argv[2])
+    jobs = int(sys.argv[sys.argv.index('--jobs') + 1]) if '--jobs' in sys.argv else os.cpu_count() or 1
     sizes = local_sizes(data)
-    changed = unknown = 0
-    with open(path, 'r+b') as f:
-        hdr = f.read(32)
-        count, at = struct.unpack_from('<I', hdr, 12)[0], struct.unpack_from('<Q', hdr, 16)[0]
-        f.seek(at)
-        index = f.read(count * 64)
-        for i in range(count):   # the record: key, json offset, spv offset, json length, spv length, stamp
-            key, jo, so, jl, sl, stamp, _ = struct.unpack_from('<32sQQIIII', index, i * 64)
+    changed, unknown, raw = {}, 0, 0
+    with open(path, 'rb') as f:
+        recs = pack_shaders.read_index(f)
+        for i, (key, jo, so, jl, sl, stamp, stored) in enumerate(recs):
+            raw += not stored
             f.seek(jo)
-            jb = f.read(jl)
-            if json.loads(jb).get('stage') != 'cs':
+            if json.loads(f.read(jl)).get('stage') != 'cs':
                 continue
             size = sizes.get(key.hex())
             if not size or not all(size):
                 unknown += 1
                 continue
-            f.seek(so)
-            w = list(struct.unpack(f'<{sl // 4}I', f.read(sl)))
-            if not set_local_size(w, size):
-                continue
-            sb = struct.pack(f'<{sl // 4}I', *w)
-            f.seek(so)
-            f.write(sb)
-            f.seek(at + i * 64 + 56)
-            f.write(struct.pack('<I', struct.unpack('<I', hashlib.sha256(jb + sb).digest()[:4])[0] | 1))
-            changed += 1
-    print(f'{path}: {changed} compute shaders given their thread-group size'
-          + (f' ({unknown} without a size of their own)' if unknown else ''))
+            w = list(struct.unpack(f'<{sl // 4}I', pack_shaders.read_spv(f, recs[i])))
+            if set_local_size(w, size):
+                changed[i] = struct.pack(f'<{sl // 4}I', *w)
+    # The pack is written again when a module changed (its stamp follows its new contents) or when it still holds
+    # modules stored as they are (a pack of version 1: compressed here).
+    if changed or (raw and pack_shaders.zstd is not None):
+        pack_shaders.rewrite(path, changed, jobs)
+    print(f'{path}: {len(changed)} compute shaders given their thread-group size'
+          + (f' ({unknown} without a size of their own)' if unknown else '')
+          + f', {os.path.getsize(path) / 2**20:.0f} MiB')
 
 
 if __name__ == '__main__':
