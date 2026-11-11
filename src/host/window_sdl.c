@@ -140,15 +140,18 @@ static int32_t stick(Sint16 v, int invert) {
 /* The stick dead zone (GitHub #39: with an Xbox One pad Link walked right on his own): on the Switch the HID service
    takes a resting stick's offset off before the game sees it, SDL gives the raw position. A radial dead zone of
    TOTK_STICK_DEADZONE percent of the travel (default 10, 0..50) reads as centred, and the rest is scaled so the stick
-   still goes from 0 to full beyond it, without a jump at its edge. */
-static void dead_zone(int32_t *x, int32_t *y) {
-    static double dz = -1;
-    if (dz < 0) {
-        const char *e = getenv("TOTK_STICK_DEADZONE");
-        double v = e ? atof(e) : 10;
-        dz = (v >= 0 && v <= 50 ? v : 10) / 100 * 32767;
-        if (e) fprintf(stderr, "[totk] stick dead zone %.0f %% (TOTK_STICK_DEADZONE)\n", dz * 100 / 32767);
+   still goes from 0 to full beyond it, without a jump at its edge. Each stick its own (the launcher's Sticks and gyro
+   page: stick_deadzone_left= / _right= in ultratears.cfg): TOTK_STICK_DEADZONE_LEFT / _RIGHT over the shared one. */
+static void dead_zone(int32_t *x, int32_t *y, int side) {
+    static double dzs[2] = {-1, -1};
+    if (dzs[side] < 0) {
+        const char *name = side ? "TOTK_STICK_DEADZONE_RIGHT" : "TOTK_STICK_DEADZONE_LEFT", *e = getenv(name);
+        if (!e || !*e) name = "TOTK_STICK_DEADZONE", e = getenv(name);
+        double v = e && *e ? atof(e) : 10;
+        dzs[side] = (v >= 0 && v <= 50 ? v : 10) / 100 * 32767;
+        if (e && *e) fprintf(stderr, "[totk] %s stick dead zone %.0f %% (%s)\n", side ? "right" : "left", dzs[side] * 100 / 32767, name);
     }
+    double dz = dzs[side];
     double r = sqrt((double)*x * *x + (double)*y * *y);
     if (r <= dz) { *x = *y = 0; return; }
     double k = r >= 32767 ? 32767 / r : (r - dz) / (32767 - dz) * 32767 / r;
@@ -173,8 +176,8 @@ static void pad_update(void) {
         s.ly = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY), 1);
         s.rx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX), 0);
         s.ry = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY), 1);
-        dead_zone(&s.lx, &s.ly);
-        dead_zone(&s.rx, &s.ry);
+        dead_zone(&s.lx, &s.ly, 0);
+        dead_zone(&s.rx, &s.ry, 1);
         s.connected = 1;
     }
     runtime_gamepad_set(&s);

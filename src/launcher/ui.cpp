@@ -4,6 +4,7 @@
 #include "launcher.h"
 #include "imgui_internal.h"   // NavMoveRequestSubmit: the left stick moves the focus as the d-pad does
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #ifndef _WIN32
@@ -1874,7 +1875,8 @@ static const Ctl CTL_MOVE[] = {
     {"cam_left", "act_cam_left", nullptr, nullptr, "Left"}, {"cam_right", "act_cam_right", nullptr, nullptr, "Right"}};
 static const Opt LAYOUT_OPTS[] = {{"nintendo", "layout_nintendo"}, {"xbox", "layout_xbox"}};
 
-static int g_ctl_tab = 0;   // 0 the gamepad, 1 the keyboard
+static int g_ctl_tab = 0;   // 0 the gamepad's buttons, 1 its sticks and gyro, 2 the keyboard
+enum { CTL_PAD = 0, CTL_STICKS = 1, CTL_KEYS = 2 };
 static struct { bool on = false, pad = false; std::string id; Uint64 t0 = 0; } g_cap;   // waiting for a key or button
 static bool capturing() { return g_cap.on; }
 
@@ -2128,17 +2130,275 @@ static void card(float top, float bottom) {   // drawn under what is on it (the 
     DL->ChannelsSetCurrent(1);
 }
 
+// ---------------------------------------------------------------- Sticks and gyro (the game reads them:
+// src/host/window_sdl.c dead_zone, src/host/motion_fusion.c). stick_deadzone_left= / stick_deadzone_right= percent of the
+// stick's travel that reads as centred (unset: 10), gyro_deadzone= degrees a second that read as no rotation (unset: the
+// game's own, 1.2 with its HID reader of Switch controllers, 0 otherwise). GitHub #39: a stick that does not rest at its
+// centre walks Link on his own; the page shows each stick live in its circle, the dead zone as a grey disc in it.
+static const float STICK_DZ_DEFAULT = 10, GYRO_DZ_AUTO = 1.2f, GYRO_BAR_MAX = 5;   // percent; deg/s: Auto's knob, the bar's end
+
+struct PadNow { bool pad = false, gyro = false; float lx = 0, ly = 0, rx = 0, ry = 0, g[3] = {}; };   // sticks -1..1, gyro deg/s
+static bool g_demo_sticks;   // development: sample positions for the screenshots (ULTRS_LAUNCHER_DEMO=play_sticks)
+
+static PadNow pad_now() {   // the first controller, as the game takes it
+    PadNow p;
+    if (g_demo_sticks) {
+        p.pad = p.gyro = true;
+        p.lx = 0.13f, p.ly = -0.07f, p.rx = 0.55f, p.ry = 0.32f;
+        p.g[0] = 0.5f, p.g[1] = -0.6f, p.g[2] = 0.2f;
+        return p;
+    }
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    SDL_Gamepad *g = ids && n ? SDL_GetGamepadFromID(ids[0]) : nullptr;
+    SDL_free(ids);
+    if (!g)
+        return p;
+    p.pad = true;
+    auto ax = [&](SDL_GamepadAxis a) { return SDL_GetGamepadAxis(g, a) / 32767.0f; };
+    p.lx = ax(SDL_GAMEPAD_AXIS_LEFTX), p.ly = ax(SDL_GAMEPAD_AXIS_LEFTY);
+    p.rx = ax(SDL_GAMEPAD_AXIS_RIGHTX), p.ry = ax(SDL_GAMEPAD_AXIS_RIGHTY);
+    if (SDL_GamepadHasSensor(g, SDL_SENSOR_GYRO)) {
+        if (!SDL_GamepadSensorEnabled(g, SDL_SENSOR_GYRO))
+            SDL_SetGamepadSensorEnabled(g, SDL_SENSOR_GYRO, true);
+        float r[3] = {};
+        if (SDL_GetGamepadSensorData(g, SDL_SENSOR_GYRO, r, 3)) {   // rad/s
+            p.gyro = true;
+            for (int i = 0; i < 3; i++)
+                p.g[i] = r[i] * 180 / SDL_PI_F;
+        }
+    }
+    return p;
+}
+
+// The gyro's rate as the game sees it: its zero-rate bias (a still controller reads a little rotation) taken off, the
+// bias learnt as a slow mean while the controller is about still (as motion_fusion.c learns it, more simply)
+static float gyro_rate(const PadNow &p) {
+    static float bias[3];
+    static bool have;
+    if (!p.gyro) {
+        have = false;
+        return 0;
+    }
+    if (!have) {
+        for (int i = 0; i < 3; i++)
+            bias[i] = p.g[i];
+        have = true;
+    }
+    float d[3], r2 = 0;
+    for (int i = 0; i < 3; i++)
+        d[i] = p.g[i] - bias[i], r2 += d[i] * d[i];
+    float rate = SDL_sqrtf(r2), dt = SDL_min(ImGui::GetIO().DeltaTime, 0.1f);
+    if (rate < 10 && !g_demo_sticks)   // about still: the mean follows over ~2 s
+        for (int i = 0; i < 3; i++)
+            bias[i] += d[i] * dt / 2;
+    return g_demo_sticks ? 0.8f : rate;
+}
+
+static std::string num_text(float v, int decimals) {   // 1.5 in English, 1,5 in Russian
+    char b[32];
+    SDL_snprintf(b, sizeof b, "%.*f", decimals, v);
+    if (g_lang == LANG_RU)
+        for (char *c = b; *c; c++)
+            if (*c == '.')
+                *c = ',';
+    return b;
+}
+
+// A slider over [x, x + w] at cy: the mouse drags it, the d-pad and the arrow keys move it a step while it has the focus
+// (they move the focus elsewhere only by up and down there). Returns true when the value changed this frame.
+static bool slider(const char *id, float x, float cy, float w, float *v, float lo, float hi, float step) {
+    bool hov, down;
+    hit(id, x - 8, cy - 14, w + 16, 28, &hov, &down);
+    ImGuiID iid = ImGui::GetItemID();
+    float old = *v;
+    if (down && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        float f = SDL_clamp(((ImGui::GetIO().MousePos.x - O.x) / S - x) / w, 0.0f, 1.0f);
+        *v = lo + SDL_roundf(f * (hi - lo) / step) * step;
+    }
+    if (ImGui::IsItemFocused()) {
+        static const ImGuiKey LESS[] = {ImGuiKey_GamepadDpadLeft, ImGuiKey_LeftArrow}, MORE[] = {ImGuiKey_GamepadDpadRight, ImGuiKey_RightArrow};
+        for (ImGuiKey k : LESS) {
+            ImGui::SetKeyOwner(k, iid);   // not the navigation's while here
+            if (ImGui::IsKeyPressed(k, ImGuiInputFlags_Repeat, iid))
+                *v -= step;
+        }
+        for (ImGuiKey k : MORE) {
+            ImGui::SetKeyOwner(k, iid);
+            if (ImGui::IsKeyPressed(k, ImGuiInputFlags_Repeat, iid))
+                *v += step;
+        }
+        *v = SDL_clamp(*v, lo, hi);
+    }
+    float f = (*v - lo) / (hi - lo), kx = x + w * f;
+    DL->AddRectFilled(P(x, cy - 2), P(x + w, cy + 2), C_BAR, 2 * S);
+    DL->AddRectFilled(P(x, cy - 2), P(kx, cy + 2), C_DIM, 2 * S);
+    dot(kx, cy, hov || down ? 9 : 8, hov || down ? C_LIGHT_HOVER : C_TEXT);
+    return *v != old;
+}
+
+static struct {   // "Set up automatically": 3 s of the controller lying still, its sticks let go
+    bool on = false;
+    Uint64 t0 = 0;
+    float maxr[2] = {};
+    std::vector<std::array<float, 3>> gyro;
+    std::string msg;
+} g_calib;
+
+static void calib_frame(const PadNow &p) {
+    if (!g_calib.on)
+        return;
+    if (!p.pad) {
+        g_calib.on = false;
+        return;
+    }
+    float r[2] = {SDL_sqrtf(p.lx * p.lx + p.ly * p.ly), SDL_sqrtf(p.rx * p.rx + p.ry * p.ry)};
+    for (int i = 0; i < 2; i++)
+        g_calib.maxr[i] = SDL_max(g_calib.maxr[i], r[i]);
+    if (p.gyro)
+        g_calib.gyro.push_back({p.g[0], p.g[1], p.g[2]});
+    float dev = 0;   // the gyro's largest distance from its mean: its noise at rest
+    if (!g_calib.gyro.empty()) {
+        float m[3] = {};
+        for (auto &s : g_calib.gyro)
+            for (int i = 0; i < 3; i++)
+                m[i] += s[i] / g_calib.gyro.size();
+        for (auto &s : g_calib.gyro) {
+            float d2 = 0;
+            for (int i = 0; i < 3; i++)
+                d2 += (s[i] - m[i]) * (s[i] - m[i]);
+            dev = SDL_max(dev, SDL_sqrtf(d2));
+        }
+    }
+    if (g_calib.maxr[0] > 0.5f || g_calib.maxr[1] > 0.5f || dev > 20) {   // held or moved: not a resting reading
+        g_calib.on = false;
+        g_calib.msg = T("calib_moved");
+        return;
+    }
+    if (SDL_GetTicks() - g_calib.t0 < 3000)
+        return;
+    g_calib.on = false;
+    std::string shown[2];
+    const char *keys[2] = {"stick_deadzone_left", "stick_deadzone_right"};
+    for (int i = 0; i < 2; i++) {   // the rest's reach and a margin; the default when that is enough
+        float dz = SDL_min(50.0f, SDL_ceilf(g_calib.maxr[i] * 100 * 1.2f + 3));
+        cfg_set(keys[i], dz <= STICK_DZ_DEFAULT ? "" : std::to_string((int)dz));
+        shown[i] = num_text(SDL_max(dz, STICK_DZ_DEFAULT), 0) + "%";
+    }
+    std::string g = T("dz_auto");
+    if (p.gyro) {
+        float dz = SDL_min(GYRO_BAR_MAX, SDL_roundf((dev * 1.5f + 0.2f) * 10) / 10);
+        char b[16];   // the game reads it with a dot, whatever the language
+        SDL_snprintf(b, sizeof b, "%.1f", dz);
+        cfg_set("gyro_deadzone", dz <= GYRO_DZ_AUTO ? "" : b);
+        if (dz > GYRO_DZ_AUTO)
+            g = num_text(dz, 1) + T("deg_s");
+    }
+    g_calib.msg = Tf("calib_done", {{"l", shown[0]}, {"r", shown[1]}, {"g", g}});
+}
+
+static void stick_card(float x0, float top, const char *title, const char *key, float sx, float sy, bool pad) {
+    const float W = 360;
+    text(g_media.small, x0 + 16, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T(title));
+    std::string set = cfg_get(key);
+    float dz = set.empty() ? STICK_DZ_DEFAULT : SDL_clamp((float)SDL_atof(set.c_str()), 0.0f, 50.0f);
+    if (!set.empty() && reset_button((std::string("rs_") + key).c_str(), x0 + W - 16 - 28, top + 20))
+        cfg_set(key, ""), dz = STICK_DZ_DEFAULT;
+    const float R = 38, cx = x0 + W / 2, cy = top + 78;
+    DL->AddCircleFilled(P(cx, cy), R * S, C_FIELD, 48);
+    DL->AddLine(P(cx - R, cy), P(cx + R, cy), C_SEG_ON, S);
+    DL->AddLine(P(cx, cy - R), P(cx, cy + R), C_SEG_ON, S);
+    DL->AddCircleFilled(P(cx, cy), R * dz / 100 * S, IM_COL32(88, 88, 88, 255), 48);
+    ring(cx, cy, R, C_DIM);
+    if (pad) {   // where the stick is; green once the game sees it pushed
+        float r = SDL_sqrtf(sx * sx + sy * sy), k = r > 1 ? 1 / r : 1;
+        bool out = r * 100 > dz;
+        dot(cx + sx * k * R, cy + sy * k * R, 5, out ? C_BAR_FILL : C_TEXT);
+    }
+    float ry = top + 132;
+    text(g_media.label, x0 + 16, ry - g_media.label->FontSize / S / 2, C_TEXT, T("row_deadzone"));
+    std::string val = num_text(dz, 0) + "%";
+    text(g_media.control, x0 + W - 16 - text_w(g_media.control, val.c_str()), ry - g_media.control->FontSize / S / 2, C_TEXT, val.c_str());
+    float lx = x0 + 32 + text_w(g_media.label, T("row_deadzone"));
+    if (slider((std::string("sl_") + key).c_str(), lx, ry, x0 + W - 16 - 52 - lx, &dz, 0, 50, 1))
+        cfg_set(key, dz == STICK_DZ_DEFAULT ? "" : std::to_string((int)dz));
+}
+
+static void screen_sticks() {
+    PadNow p = pad_now();
+    calib_frame(p);
+    g_scrolling = true;   // live: frames at the display's rate while the page is shown
+    float bw = text_w(g_media.medium, T("calib")) + 34;
+    std::string calib_label = g_calib.on ? Tf("calib_wait", {{"n", std::to_string(3 - (int)((SDL_GetTicks() - g_calib.t0) / 1000))}})
+                                         : std::string(T("calib"));
+    bw = SDL_max(bw, text_w(g_media.medium, calib_label.c_str()) + 34);
+    if (button("calib", calib_label.c_str(), 764 - bw, 98 - 16, bw, 32, DARK, p.pad && !g_calib.on)) {
+        g_calib = {};
+        g_calib.on = true, g_calib.t0 = SDL_GetTicks();
+    }
+    float top = 124;
+    stick_card(36, top, "sec_lstick", "stick_deadzone_left", p.lx, p.ly, p.pad);
+    stick_card(404, top, "sec_rstick", "stick_deadzone_right", p.rx, p.ry, p.pad);
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(396, top + 152), C_CARD, 10 * S);
+    DL->AddRectFilled(P(404, top), P(764, top + 152), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
+    // the gyro: its rate on a bar, the dead zone the bar's grey start
+    top += 160;
+    text(g_media.small, 52, top + 20 - g_media.small->FontSize / S / 2, C_SUB, T("sec_gyro"));
+    std::string set = cfg_get("gyro_deadzone");
+    bool aut = set.empty();
+    float dz = aut ? GYRO_DZ_AUTO : SDL_clamp((float)SDL_atof(set.c_str()), 0.0f, GYRO_BAR_MAX);
+    if (!aut && reset_button("rs_gyro", 748 - 28, top + 20))
+        cfg_set("gyro_deadzone", ""), aut = true, dz = GYRO_DZ_AUTO;
+    float cy = top + 48, bx = 52, bwid = 300;
+    float rate = gyro_rate(p);
+    if (!p.pad || !p.gyro) {
+        text(g_media.small, bx, cy - g_media.small->FontSize / S / 2, C_DIM, T(p.pad ? "no_gyro" : "no_pad"));
+    } else {
+        DL->AddRectFilled(P(bx, cy - 4), P(bx + bwid, cy + 4), C_BAR, 4 * S);
+        DL->AddRectFilled(P(bx, cy - 4), P(bx + bwid * dz / GYRO_BAR_MAX, cy + 4), IM_COL32(88, 88, 88, 255), 4 * S);
+        float mx = bx + bwid * SDL_min(rate, GYRO_BAR_MAX) / GYRO_BAR_MAX;
+        DL->AddRectFilled(P(mx - 1.5f, cy - 9), P(mx + 1.5f, cy + 9), rate > dz ? C_BAR_FILL : C_TEXT, 1.5f * S);
+        std::string rt = num_text(rate, 1) + T("deg_s");
+        text(g_media.control, bx + bwid + 12, cy - g_media.control->FontSize / S / 2, C_SUB, rt.c_str());
+    }
+    float lx = 440;
+    text(g_media.label, lx, cy - g_media.label->FontSize / S / 2, C_TEXT, T("row_deadzone"));
+    std::string val = aut ? std::string(T("dz_auto")) : num_text(dz, 1) + T("deg_s");
+    float vw = 64;
+    text(g_media.control, 748 - text_w(g_media.control, val.c_str()), cy - g_media.control->FontSize / S / 2, C_TEXT, val.c_str());
+    float sx = lx + 16 + text_w(g_media.label, T("row_deadzone"));
+    if (slider("sl_gyro", sx, cy, 748 - vw - 12 - sx, &dz, 0, GYRO_BAR_MAX, 0.1f)) {
+        char b[16];
+        SDL_snprintf(b, sizeof b, "%.1f", dz);
+        cfg_set("gyro_deadzone", b);
+    }
+    float bottom = top + 72;
+    DL->ChannelsSetCurrent(0);
+    DL->AddRectFilled(P(36, top), P(764, bottom), C_CARD, 10 * S);
+    DL->ChannelsSetCurrent(1);
+    const char *note = g_calib.msg.empty() ? T("sticks_note") : g_calib.msg.c_str();
+    rich(g_media.small, 52, bottom + 5, 712, {{note, C_SUB}}, 17);
+    ImGui::SetCursorScreenPos(P(0, bottom + 24));
+    ImGui::Dummy(ImVec2(1, 1));
+}
+
 static void screen_controls() {
     if (g_cap.on && SDL_GetTicks() - g_cap.t0 > 8000)   // nothing pressed for a while: no longer waiting
         g_cap.on = false;
-    static const Opt DEV_OPTS[] = {{"pad", "ctl_gamepad"}, {"key", "ctl_keyboard"}};
+    static const Opt DEV_OPTS[] = {{"pad", "ctl_gamepad"}, {"sticks", "ctl_sticks"}, {"key", "ctl_keyboard"}};
     float sw = 4;
     for (const Opt &o : DEV_OPTS)
         sw += text_w(g_media.control, opt_label(o)) + 24;
-    int k = segmented("ctl_dev", 36 + sw, 98, DEV_OPTS, g_ctl_tab);   // the gamepad or the keyboard, left under the tabs
+    int k = segmented("ctl_dev", 36 + sw, 98, DEV_OPTS, g_ctl_tab);   // buttons, sticks or the keyboard, left under the tabs
     if (k >= 0)
         g_ctl_tab = k, g_cap.on = false;
-    bool pad = g_ctl_tab == 0;
+    if (g_ctl_tab == CTL_STICKS) {
+        screen_sticks();
+        return;
+    }
+    bool pad = g_ctl_tab == CTL_PAD;
     const float ROW = 38;
     float top = 124, cy;
     if (pad) {   // the layout: which face button is A
@@ -2480,7 +2740,9 @@ void ui_frame(float scale) {
     // The left stick moves the focus as the d-pad does (ImGui itself only scrolls with it): a push one step, held it
     // repeats after 0.35 s every 0.12 s. Not while a key is awaited or a list is open (its own items take the d-pad).
     g_scrolling = false;   // (set again below while the sticks are held or a drag goes on)
-    {
+    // the Sticks and gyro page shows the sticks themselves: there they neither move the focus nor scroll (the d-pad does)
+    bool sticks_page = U.screen == SCR_PLAY && g_tab == TAB_CONTROLS && g_ctl_tab == CTL_STICKS;
+    if (!sticks_page) {
         static ImGuiDir held = ImGuiDir_None;
         static double next_at;
         auto mag = [&](ImGuiKey k) { return io.KeysData[k - ImGuiKey_NamedKey_BEGIN].AnalogValue; };
@@ -2551,7 +2813,7 @@ void ui_frame(float scale) {
             ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
             g_drag_scrolled = true;
         }
-        float rs = io.KeysData[ImGuiKey_GamepadRStickDown - ImGuiKey_NamedKey_BEGIN].AnalogValue - io.KeysData[ImGuiKey_GamepadRStickUp - ImGuiKey_NamedKey_BEGIN].AnalogValue;
+        float rs = sticks_page ? 0 : io.KeysData[ImGuiKey_GamepadRStickDown - ImGuiKey_NamedKey_BEGIN].AnalogValue - io.KeysData[ImGuiKey_GamepadRStickUp - ImGuiKey_NamedKey_BEGIN].AnalogValue;
         g_scrolling = g_scrolling || SDL_fabsf(rs) > 0.2f || ImGui::IsMouseDragging(ImGuiMouseButton_Left);
         if (SDL_fabsf(rs) > 0.2f && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
             ImGui::SetScrollY(ImGui::GetScrollY() + rs * 700 * S * io.DeltaTime);
@@ -2634,13 +2896,14 @@ void ui_demo(const char *name) {
         U.dump_st = D_OK;
         start_build();
     } else if (n == "play" || n == "play_upd" || n == "play_lang" || n == "play_debug" || n == "play_full" ||
-               n == "play_pad" || n == "play_keys") {
+               n == "play_pad" || n == "play_keys" || n == "play_sticks") {
         U.screen = SCR_PLAY;
-        g_tab = n == "play_lang" ? 1 : n == "play_pad" || n == "play_keys" ? TAB_CONTROLS
+        g_tab = n == "play_lang" ? 1 : n == "play_pad" || n == "play_keys" || n == "play_sticks" ? TAB_CONTROLS
               : n == "play_debug" || n == "play_full" ? TAB_DEBUG : 0;
-        g_ctl_tab = n == "play_keys";
+        g_ctl_tab = n == "play_keys" ? CTL_KEYS : n == "play_sticks" ? CTL_STICKS : CTL_PAD;
+        g_demo_sticks = n == "play_sticks";
         if (const char *w = SDL_getenv("ULTRS_LAUNCHER_DEMO_WAIT"))   // an action waiting for its key or button
-            g_cap.on = true, g_cap.pad = !g_ctl_tab, g_cap.id = w, g_cap.t0 = SDL_GetTicks();
+            g_cap.on = true, g_cap.pad = g_ctl_tab == CTL_PAD, g_cap.id = w, g_cap.t0 = SDL_GetTicks();
         g_full_q = n == "play_full";
         if (n == "play_lang") g_demo_open = SDL_getenv("ULTRS_LAUNCHER_DEMO_OPEN");
         if (n == "play_upd" || n == "play_lang") {

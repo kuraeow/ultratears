@@ -138,7 +138,10 @@ static const char *default_exefs(void) {
                 {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
                 {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}, {"antialias", "TOTK_AA"},
                 {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
-                {"fps_overlay", "TOTK_FPS_OVERLAY"}};   // the frame counter (F10 in the game)
+                {"fps_overlay", "TOTK_FPS_OVERLAY"},   // the frame counter (F10 in the game)
+                // the launcher's Sticks and gyro page (window_sdl.c dead_zone, motion_fusion.c)
+                {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
+                {"gyro_deadzone", "TOTK_GYRO_DEADZONE"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
