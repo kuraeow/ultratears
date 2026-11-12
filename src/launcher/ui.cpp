@@ -449,7 +449,14 @@ static void check_dump(const std::string &path) {
         U.dump_st = D_BAD, U.dump_code = "no_python", U.dump_args = Json();
         return;
     }
-    U.check = setup_start({py, path_join(U.root, "tools/setup.py"), "--check-dump", path, "--json"}, U.root, "");
+    // its answer (which file did not match, and why) goes into ultratears-setup.log, the one log players send: a dump
+    // refused before any build left nothing to send (GitHub #91). The game folder is made for it if it is not there yet.
+    std::string log;
+    if (!U.install.empty()) {
+        SDL_CreateDirectory(U.install.c_str());
+        log = log_path();
+    }
+    U.check = setup_start({py, path_join(U.root, "tools/setup.py"), "--check-dump", path, "--json"}, U.root, log);
 }
 
 static void SDLCALL folder_picked(void *which, const char *const *files, int) {
