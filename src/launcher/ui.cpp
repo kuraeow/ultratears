@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -2923,8 +2924,74 @@ void ui_play_mode() {   // main.cpp: --play
     U.screen = SCR_PLAY;
     play_start();
 }
-bool ui_window_wanted() { return !G.play_mode || G.show; }
-bool ui_quit_wanted() { return G.quit; }
+
+// ---- --prepare --game <dump>: the Prepare the game button without a window, for another launcher's setup step (the
+// "prepare" of recomplauncher.json). Its progress goes to stdout as "progress 0.4 Text" lines, the exit code is 0 when
+// the game is built, 3 when the hardware check found a card the game cannot run on (nobody is there to say "build
+// anyway"; the launcher's own window can), 4 when another launcher is building, else 1. The details are in the log.
+static struct {
+    bool on = false, finished = false, declined = false;
+    double last = -1;
+    std::string last_text;
+} PREP;
+
+void ui_prepare_mode(const std::string &dump) {
+    // the folder the other launcher plays from, not one chosen earlier in this launcher's own window
+    use_install(default_install());
+    link_deps();
+#ifdef _WIN32
+    U.platform = "windows";   // no tar for the Steam Deck
+#endif
+    U.dump = dump;
+    U.dump_st = data_ready() ? D_DATA : D_OK;   // setup.py checks the dump itself
+    PREP.on = true;
+    start_build();
+}
+
+static void prepare_progress() {
+    const Row *running = nullptr;
+    for (int i = 0; i < n_rows() && !running; i++)
+        running = U.rows[i].st == R_RUN ? &U.rows[i] : nullptr;
+    std::string text = T(running ? running->name : "step_check");
+    double now = overall();
+    if (now - PREP.last < 0.01 && text == PREP.last_text)
+        return;
+    PREP.last = now;
+    PREP.last_text = text;
+    printf("progress %.3f %s\n", now, text.c_str());
+    fflush(stdout);
+}
+
+static void prepare_failed() {
+    SDL_Log("prepare: the build failed: %s", U.fail_text.c_str());
+    for (int i = 0; i < n_rows(); i++)
+        if (U.rows[i].st == R_ERROR)
+            SDL_Log("prepare: %s: %s", U.rows[i].id, U.rows[i].err.c_str());
+}
+
+static void prepare_poll() {   // every frame
+    if (!PREP.on || PREP.finished)
+        return;
+    if (U.hw_asked && U.build) {
+        for (size_t i = 0; i < U.hw.size(); i++)
+            SDL_Log("prepare: hardware check: %s (%s)", U.hw[i]["code"].str().c_str(), U.hw[i]["sev"].str().c_str());
+        SDL_Log("prepare: not building for this PC: the launcher's own window can build anyway");
+        PREP.declined = true;
+        U.hw_asked = false;
+        setup_answer(U.build, "no");
+    }
+    if (U.build || U.copy) {
+        prepare_progress();
+        return;
+    }
+    PREP.finished = true;   // the copy and the build are over: main.cpp ends the loop
+    if (!U.done)
+        prepare_failed();
+}
+
+int ui_prepare_code() { return U.done ? 0 : PREP.declined ? 3 : 1; }
+bool ui_window_wanted() { return !PREP.on && (!G.play_mode || G.show); }
+bool ui_quit_wanted() { return G.quit || PREP.finished; }
 // --play, the window closed: on Linux the launcher's process becomes the game (Steam follows it; with the window open its
 // display connection would pass to the game and keep the window up), elsewhere the game is started
 bool ui_play_finish() {
@@ -3078,6 +3145,7 @@ void ui_frame(float scale) {
     S = scale;
     poll();
     gfx_poll();
+    prepare_poll();
     {   // entering the Play screen (at start, after a build, back from an update): Play takes the focus
         static int last_screen = -1;
         if (U.screen == SCR_PLAY && last_screen != SCR_PLAY)

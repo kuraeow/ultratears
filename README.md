@@ -8,6 +8,8 @@
 and the Steam Deck from your own copy of the game. It is not an emulator: the game's code is translated to native code
 ahead of time, and its shaders and textures are prepared when the game is built, not while you play.
 
+<a href="https://recomplauncher.com/game/ultratears"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 > [!IMPORTANT]
 > **No game files are included.** You need your own copy of the game with update 1.4.3, dumped from your own console as
 > plain `exefs` and `romfs` folders. This project provides no game files, keys, firmware or dumping tools, and

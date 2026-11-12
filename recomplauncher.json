@@ -1,0 +1,168 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "UltraTears",
+  "repo": "kuraeow/ultratears",
+  "game": {
+    "kind": "folder",
+    "label": "Your own dump of The Legend of Zelda: Tears of the Kingdom with update 1.4.3, as plain folders: the folder that holds exefs and romfs. Encrypted packages (.nsp, .xci) are not accepted.",
+    "check": { "file": "exefs/main" }
+  },
+  "start": {
+    "program": ["UltraTears.exe", "UltraTears/linux/ultratears", "linux/ultratears"]
+  },
+  "prepare": {
+    "program": ["UltraTears Launcher.exe", "UltraTears.AppImage"],
+    "args": ["--prepare", "--game", "{game}"],
+    "label": "Building the game from your dump (about 30 minutes)",
+    "timeout": 21600
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        { "path": "{install}/UltraTears/ultratears.cfg", "if": "{install}/UltraTears/ultratears.cfg" },
+        { "path": "{install}/ultratears.cfg" }
+      ]
+    }
+  ],
+  "saves": ["{install}/userdata", "{install}/UltraTears/userdata"],
+  "folders": {
+    "saves": [
+      { "path": "{install}/UltraTears/userdata", "if": "{install}/UltraTears/userdata" },
+      { "path": "{install}/userdata" }
+    ],
+    "logs": [
+      { "path": "{install}/UltraTears", "if": "{install}/UltraTears/ultratears.cfg" },
+      { "path": "{install}" }
+    ]
+  },
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window",
+      "help": "Borderless fills the screen without changing its mode. Fullscreen takes the screen at its own size and refresh rate. F11 or Alt+Enter switch in the game.",
+      "choices": [
+        { "label": "Window", "set": { "window": "window" } },
+        { "label": "Borderless", "set": { "window": "borderless" } },
+        { "label": "Fullscreen", "set": { "window": "fullscreen" } }
+      ],
+      "defaults": { "window": "window" }
+    },
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "help": "The size of the picture. 1080p is the default; the larger sizes need a stronger graphics card. Wide screens can set a wider size in ultratears.cfg.",
+      "choices": [
+        { "label": "720p", "set": { "resolution": "1280x720" } },
+        { "label": "1080p", "set": { "resolution": "1920x1080" } },
+        { "label": "1440p", "set": { "resolution": "2560x1440" } },
+        { "label": "4K", "set": { "resolution": "3840x2160" } },
+        { "label": "Screen's own", "set": { "resolution": "display" } }
+      ],
+      "defaults": { "resolution": "1920x1080" }
+    },
+    {
+      "id": "scale",
+      "label": "Scene scale",
+      "help": "How large the 3D scene is drawn before it is scaled up to the picture. Lower is faster and softer. Full size draws it sharp with no upscaling.",
+      "choices": [
+        { "label": "50%", "set": { "scale": "50" } },
+        { "label": "59%", "set": { "scale": "59" } },
+        { "label": "67%", "set": { "scale": "67" } },
+        { "label": "77%", "set": { "scale": "77" } },
+        { "label": "Game's own", "set": { "scale": "" } },
+        { "label": "Full size", "set": { "scale": "100" } },
+        { "label": "150%", "set": { "scale": "150" } },
+        { "label": "200%", "set": { "scale": "200" } }
+      ],
+      "defaults": { "scale": "" }
+    },
+    {
+      "id": "antialias",
+      "label": "Anti-aliasing",
+      "help": "Smooths jagged edges. SMAA is smoother than the game's own FXAA for little extra cost.",
+      "choices": [
+        { "label": "FXAA", "set": { "antialias": "" } },
+        { "label": "SMAA", "set": { "antialias": "smaa" } },
+        { "label": "Off", "set": { "antialias": "off" } }
+      ],
+      "defaults": { "antialias": "" }
+    },
+    {
+      "id": "sharpness",
+      "label": "Sharpness",
+      "help": "How much the upscaler sharpens the picture.",
+      "choices": [
+        { "label": "Off", "set": { "sharpness": "0" } },
+        { "label": "25%", "set": { "sharpness": "25" } },
+        { "label": "50%", "set": { "sharpness": "50" } },
+        { "label": "75%", "set": { "sharpness": "75" } },
+        { "label": "100%", "set": { "sharpness": "100" } }
+      ],
+      "defaults": { "sharpness": "50" }
+    },
+    {
+      "id": "fps",
+      "label": "Frame rate",
+      "help": "The game's speed is tied to its frame rate: 30 and 60 are what it was made for. Anything above 60 is a beta and can break physics or sound.",
+      "choices": [
+        { "label": "30", "set": { "fps": "30" } },
+        { "label": "40", "set": { "fps": "40" } },
+        { "label": "45", "set": { "fps": "45" } },
+        { "label": "60", "set": { "fps": "60" } },
+        { "label": "120 (beta)", "set": { "fps": "120" } },
+        { "label": "144 (beta)", "set": { "fps": "144" } },
+        { "label": "Screen's rate (beta)", "set": { "fps": "display" } },
+        { "label": "Up to 240 (beta)", "set": { "fps": "unlimited" } }
+      ],
+      "defaults": { "fps": "60" }
+    },
+    {
+      "id": "vsync",
+      "label": "V-Sync",
+      "help": "On shows whole frames only. Off shows each frame at once, with the lowest delay, and may tear.",
+      "choices": [
+        { "label": "On", "set": { "vsync": "on" } },
+        { "label": "Off", "set": { "vsync": "off" } }
+      ],
+      "defaults": { "vsync": "on" }
+    },
+    {
+      "id": "counter",
+      "label": "Frame counter",
+      "help": "The frame rate in a corner of the game. F10 switches it in the game.",
+      "choices": [
+        { "label": "Off", "set": { "fps_overlay": "0" } },
+        { "label": "On", "set": { "fps_overlay": "1" } }
+      ],
+      "defaults": { "fps_overlay": "0" }
+    },
+    {
+      "id": "language",
+      "label": "Game language",
+      "help": "The language of the game's text. Chinese and Korean need the console's system fonts, see the README.",
+      "choices": [
+        { "label": "System's", "set": { "lang": "" } },
+        { "label": "English", "set": { "lang": "en-US" } },
+        { "label": "Deutsch", "set": { "lang": "de" } },
+        { "label": "Español", "set": { "lang": "es" } },
+        { "label": "Français", "set": { "lang": "fr" } },
+        { "label": "Italiano", "set": { "lang": "it" } },
+        { "label": "Nederlands", "set": { "lang": "nl" } },
+        { "label": "Português", "set": { "lang": "pt" } },
+        { "label": "Português (Brasil)", "set": { "lang": "pt-BR" } },
+        { "label": "Русский", "set": { "lang": "ru" } },
+        { "label": "日本語", "set": { "lang": "ja" } },
+        { "label": "한국어", "set": { "lang": "ko" } },
+        { "label": "简体中文", "set": { "lang": "zh-Hans" } }
+      ],
+      "defaults": { "lang": "" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your saves and profile.", "open": "saves" },
+    { "id": "logs", "label": "Log", "help": "ultratears.log: send it with a bug report.", "open": "logs" }
+  ]
+}
