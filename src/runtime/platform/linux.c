@@ -556,8 +556,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     if (sig == SIGSEGV) fz_report(fa, si->si_code, 0);
 #endif
     if (rt_fault_watch(fa, pc)) return;
-    char what[32];
-    snprintf(what, sizeof what, "signal %d", sig);
+    char what[80];
+    // a general protection fault (x86-64: a non-canonical pointer such as text read as one) comes with no address, so
+    // the 0 after "accessing" is not the address read: say so, or the log reads as a null pointer
+    if (sig == SIGSEGV && si->si_code == SI_KERNEL) snprintf(what, sizeof what, "signal %d, general protection (no address given)", sig);
+    else snprintf(what, sizeof what, "signal %d", sig);
     rt_fault_report(what, fa, pc, lr);
     const char *headless = getenv("TOTK_HEADLESS");
     if (headless && *headless && strcmp(headless, "0") != 0) {
