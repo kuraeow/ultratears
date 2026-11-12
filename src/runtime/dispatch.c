@@ -1,6 +1,7 @@
 // Guest address -> recompiled function lookup, and the host (HLE) function registry.
 // Based on LASRecomp runtime/dispatch.c (MIT); TOTK: three modules linked statically into the executable.
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -242,6 +243,7 @@ void rt_fatal_trace(void) {
     plat_print_backtrace();
     fflush(stderr);
     plat_fatal_notice();
+    signal(SIGABRT, SIG_DFL);   // already reported: the crash handler must not dump this abort as a second crash
     abort();
 }
 
