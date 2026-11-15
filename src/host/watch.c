@@ -195,6 +195,7 @@ static int hw_stage;
 // +0x50); up to four debug registers at once (hw_more: the extra addresses, DR1..DR3).
 static uint64_t hw_more[3];
 static int hw_nmore;
+static unsigned hw_rw = 0x9;   // DR7 R/W + LEN of each slot: 0x9 write, 8 bytes; 0xB read or write, 8 bytes (TOTK_NEARSCAN)
 static void hw_set_all(uint64_t addr, int on) {
     unsigned long tids[512];
     int n = runtime_guest_tids(tids, 512);
@@ -215,7 +216,7 @@ static void hw_set_all(uint64_t addr, int on) {
                 cx.Dr3 = on && hw_nmore > 2 ? (hw_more[2] & ~7ull) : 0;
                 uint64_t d7 = cx.Dr7 & ~0xFFFF00FFull;
                 if (on)
-                    for (int s = 0; s <= hw_nmore && s < 4; s++) d7 |= (1ull << (2 * s)) | (0x9ull << (16 + 4 * s));   // Ls, write, 8 bytes
+                    for (int s = 0; s <= hw_nmore && s < 4; s++) d7 |= (1ull << (2 * s)) | ((uint64_t)hw_rw << (16 + 4 * s));   // Ls, write (or read/write), 8 bytes
                 cx.Dr7 = d7;
                 cx.Dr6 = 0;
                 if (SetThreadContext(h, &cx)) ok++;
@@ -232,6 +233,9 @@ static LONG CALLBACK hw_handler(EXCEPTION_POINTERS *e) {
     int slot = (e->ContextRecord->Dr6 & 1) ? 0 : (e->ContextRecord->Dr6 & 2) ? 1 : (e->ContextRecord->Dr6 & 4) ? 2 : 3;
     uint64_t at = slot ? (hw_more[slot - 1] & ~7ull) : (hw_addr & ~7ull);
     e->ContextRecord->Dr6 = 0;
+    static __thread int inside;   // a read breakpoint (TOTK_NEARSCAN) must not fire again inside the handler
+    if (inside) return EXCEPTION_CONTINUE_EXECUTION;
+    inside = 1;
     InterlockedIncrement(&nwrites);
     uint64_t rip = e->ContextRecord->Rip;
     AcquireSRWLockExclusive(&lock);
@@ -240,13 +244,16 @@ static LONG CALLBACK hw_handler(EXCEPTION_POINTERS *e) {
     if (k == nhits && nhits < MAX_HITS) { hits[k].rip = rip; hits[k].addr = at; chain_of(e->ContextRecord, hits[k].chain, &hits[k].nchain); nhits++; }
     if (k < nhits) {
         hits[k].count++;
-        memcpy(&hits[k].last, (const void *)(uintptr_t)at, 4);
-        memcpy(&hits[k].last2, (const void *)(uintptr_t)(at + 4), 4);
-        if (hits[k].nseq < 8) memcpy(hits[k].seq[hits[k].nseq++], (const void *)(uintptr_t)at, 8);   // the first values written
+        if (hw_rw == 0x9) {   // a read of the watched place here would trap again (read breakpoints)
+            memcpy(&hits[k].last, (const void *)(uintptr_t)at, 4);
+            memcpy(&hits[k].last2, (const void *)(uintptr_t)(at + 4), 4);
+            if (hits[k].nseq < 8) memcpy(hits[k].seq[hits[k].nseq++], (const void *)(uintptr_t)at, 8);   // the first values written
+        }
         Cpu *c = guest_cpu();
         if (c) { memcpy(hits[k].x, c->x, sizeof hits[k].x); hits[k].lr = c->x[30]; memcpy(hits[k].xs, c->x + 19, sizeof hits[k].xs); if (hw_stage == 1 && !hw_x19) hw_x19 = c->x[19]; }
     }
     ReleaseSRWLockExclusive(&lock);
+    inside = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 static void dump_near(uint64_t p) {
@@ -531,6 +538,43 @@ void runtime_watch_tick(uint64_t present) {
         AddVectoredExceptionHandler(1, hw_handler);
         hw_on = 2;
         hw_set_all(hw_addr, 1);
+    }
+    // TOTK_NEARSCAN=<present> (development, L30 / GitHub #93): the camera's near and far planes (TOTK_CAMERA_NEAR and 25000,
+    // either order) searched for in game memory; the first four places get a hardware read/write breakpoint for
+    // TOTK_WATCH_FRAMES presents: which code reads the near plane.
+    static long long ns_at = -1;
+    if (ns_at == -1) { const char *e = getenv("TOTK_NEARSCAN"); ns_at = e ? atoll(e) : 0; }
+    if (ns_at > 0 && present >= (uint64_t)ns_at && !InterlockedExchange(&hw_used, 1)) {
+        ns_at = 0;
+        const char *e = getenv("TOTK_CAMERA_NEAR");
+        float nf[2] = {e && *e ? strtof(e, NULL) : 1.0f, 25000.0f}, fn[2] = {nf[1], nf[0]};
+        uint64_t at[16];
+        int n = 0;
+        for (uint64_t a = GUEST_LO; a < GUEST_HI && n < 16;) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) break;
+            uint64_t end = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+            if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                for (uint64_t p = (uint64_t)(uintptr_t)mi.BaseAddress + 32; p + 40 <= end && n < 16; p += 4) {
+                    int ord = !memcmp((const void *)(uintptr_t)p, nf, 8) ? 1 : !memcmp((const void *)(uintptr_t)p, fn, 8) ? 2 : 0;
+                    if (!ord || p == 0x800000000ull + 0x2d02970) continue;   // the default in main's data (frame_rate.c)
+                    at[n++] = ord == 1 ? p : p + 4;   // the near plane
+                    fprintf(stderr, "[nearscan] near %g at %#llx (%s)\n", nf[0], (unsigned long long)at[n - 1], ord == 1 ? "near, far" : "far, near");
+                    dump_near(at[n - 1]);
+                }
+            a = end;
+        }
+        if (n) {
+            hw_rw = 0xB;
+            hw_addr = at[0];
+            hw_nmore = n - 1 < 3 ? n - 1 : 3;
+            for (int i = 0; i < hw_nmore; i++) hw_more[i] = at[i + 1];
+            const char *r = getenv("TOTK_WATCH_FRAMES");
+            hw_report_at = present + (r ? (uint64_t)atoll(r) : 20);
+            AddVectoredExceptionHandler(1, hw_handler);
+            hw_on = 2;
+            hw_set_all(hw_addr, 1);
+        } else fprintf(stderr, "[nearscan] near %g, far 25000: not found\n", nf[0]);
     }
     if (hw_on == 1 && hw_report_at < 1000000) hw_report_at += present;   // the deadline, from the first tick after arming
     if (hw_on == 1) hw_on = 2;
