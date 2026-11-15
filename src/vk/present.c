@@ -112,9 +112,10 @@ static int create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = mode, .clipped = VK_TRUE};
 #ifdef _WIN32
-    /* Fullscreen through the desktop's compositor (the way DirectX games' fullscreen goes, its frames still flipped to the
-       screen directly), not the driver's exclusive mode: there the desktop kept the run's first frame, so a screenshot
-       tool (Win+Shift+S) showed it black with "-- FPS" (the user, 2026-11-15). TOTK_VK_NO_EXCLUSIVE=0: the driver's choice. */
+    /* TOTK_VK_NO_EXCLUSIVE=1 (development): fullscreen through the desktop's compositor, not the driver's exclusive mode.
+       In the exclusive mode the desktop keeps the run's first frame, so a screenshot tool (Win+Shift+S) shows it black
+       (the user, 2026-11-15); through the compositor the GPU had 100-220 ms frames in play at 120 fps (2026-11-16), so
+       the default is the driver's choice again. */
     // VkSurfaceFullScreenExclusiveInfoEXT of vulkan_win32.h (not in every builder's headers): DISALLOWED is 2
     struct { VkStructureType sType; void *pNext; int fullScreenExclusive; } fse = {
         VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT, NULL, 2};

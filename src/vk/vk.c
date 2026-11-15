@@ -302,15 +302,16 @@ static int create_device(void) {
         // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
         {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},
 #ifdef _WIN32
-        // the fullscreen window through the desktop's compositor rather than the driver's exclusive mode (present.c):
-        // screenshot tools and the desktop see the game's frames (they saw the first frame of the run, 2026-11-15)
+        // development (TOTK_VK_NO_EXCLUSIVE=1): the fullscreen window through the desktop's compositor rather than the
+        // driver's exclusive mode (present.c). Off by default since 2026-11-16: in play the GPU had 100-220 ms frames
+        // that the exclusive mode never showed (screenshot tools see the first frame of the run there)
         {"VK_EXT_full_screen_exclusive", NULL, &vkc.has_fse},
 #endif
     };
     const char *robust = getenv("TOTK_VK_ROBUST");
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
-        if (want[i].flag == &vkc.has_fse && (!vkc.surface || (getenv("TOTK_VK_NO_EXCLUSIVE") && !strcmp(getenv("TOTK_VK_NO_EXCLUSIVE"), "0")))) continue;
+        if (want[i].flag == &vkc.has_fse && (!vkc.surface || !(getenv("TOTK_VK_NO_EXCLUSIVE") && !strcmp(getenv("TOTK_VK_NO_EXCLUSIVE"), "1")))) continue;
         if (want[i].features == &frb2 && !(robust && !strcmp(robust, "2"))) continue;
         if ((want[i].flag == &vkc.has_checkpoints || want[i].flag == &vkc.has_buffer_marker) && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
