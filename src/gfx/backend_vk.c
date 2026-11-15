@@ -1747,6 +1747,8 @@ static struct { uint64_t f, ns, beg, end; double lag_ms; unsigned subs; } g_gf[G
 static _Atomic uint64_t g_gf_frame;
 static int g_tsq_ready(void);
 static VkQueryPool g_tsq_pool(void);
+static void hc_check(int slot, uint64_t fence, uint64_t frame, uint64_t s0, uint64_t dur_ns);   // TOTK_GPU_HITCH
+static void hc_slot_begin(int slot, VkCommandBuffer cb);
 void mtl_set_frame(uint64_t f) { atomic_store(&g_gf_frame, f); }
 static void gpu_frame(const job *j) {
     uint64_t t[2], end = runtime_now_ns();
@@ -1760,6 +1762,7 @@ static void gpu_frame(const job *j) {
     if (end > g->end) g->end = end;
     double lag = beg > j->t_sub ? (beg - j->t_sub) / 1e6 : 0;
     if (lag > g->lag_ms) g->lag_ms = lag;
+    hc_check(j->slot, j->fence, j->frame, t[0], dur);
 }
 double mtl_gpu_ms(uint64_t f) { return g_gf[f % GF_N].f == f ? g_gf[f % GF_N].ns / 1e6 : -1; }
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) {
@@ -1826,6 +1829,7 @@ static void gpu_time_begin(int slot) {   // into the slot's own command buffer (
         g_ts_used[slot] = 0;
     }
     vk.vkCmdResetQueryPool(g_slots[slot].cb, g_tsq, (uint32_t)(2 * slot), 2);
+    hc_slot_begin(slot, g_slots[slot].cb);
     vk.vkCmdWriteTimestamp2(g_slots[slot].cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_tsq, (uint32_t)(2 * slot));
 }
 // The GPU span of a completed command buffer on the host clock: it ended about when the retire thread saw its fence
@@ -2167,8 +2171,155 @@ static long long pp_frame(void) {
     return at;
 }
 static int pp_on(void) { return pp_frame() > 0 && !g_pp_done && vkb_frame() == (uint64_t)pp_frame(); }
-void vkb_passprof_note(const char *key) {   // vkb_draw.c: the first fragment shader of the open pass
+static void hc_note(const char *key);
+void vkb_passprof_note(const char *key) {   // vkb_draw.c: every draw, with the first fragment shader of the open pass
+    hc_note(key);
     if (g_pp_open >= 0 && !g_pp[g_pp_open].key[0] && key) snprintf(g_pp[g_pp_open].key, sizeof g_pp[0].key, "%.12s", key);
+}
+
+/* ---- TOTK_GPU_HITCH=<ms>: which render pass made a submission long on the GPU (2026-11-16). In play on the RTX 3060
+   single submissions took 80-380 ms on the GPU with nothing new in them (no images, uploads, shaders or pipelines) and
+   no wait of ours inside them: hard hitches at random moments, so TOTK_GPU_PASSPROF (one chosen frame) cannot catch
+   them. Here every pass of every submission gets a timestamp pair in its slot's range of a query pool (passes are
+   recorded on several threads: an index taken atomically per slot); the retire thread, when a submission's GPU time
+   is over the threshold, reads them and logs the longest passes and the longest stretch of the submission outside any
+   pass (copies, dispatches, barriers between them). On by default in Debug mode (TOTK_STATS) at 50 ms; 0: off. */
+enum { HC_PER = 1024 };   // queries per slot: 512 passes a submission (a frame has ~220 over ~4 submissions)
+typedef struct { uint32_t w, h, ncolor, fmt0, depth, draws, worker; char kind, key[16]; } hc_info;   // kind: P pass, D dispatch, F FSR 3.1
+static VkQueryPool g_hcq;
+static hc_info g_hc[SLOTS][HC_PER / 2];
+static _Atomic int g_hc_n[SLOTS];
+static __thread int t_hc_open = -1, t_hc_slot;
+static double hc_ms(void) {
+    static double v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_GPU_HITCH"), *st = getenv("TOTK_STATS");
+        v = e && *e ? atof(e) : st && *st && *st != '0' ? 50 : 0;
+        if (v < 0 || getenv("TOTK_GPU_PASSPROF")) v = 0;
+        if (v > 0) VLOG("GPU hitches: the passes of a submission over %.0f ms on the GPU are logged (TOTK_GPU_HITCH; 0 = off)", v);
+    }
+    return v;
+}
+static void hc_slot_begin(int slot, VkCommandBuffer cb) {   // gpu_time_begin: the slot's first command buffer
+    if (hc_ms() <= 0) return;
+    if (!g_hcq) {
+        VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SLOTS * HC_PER};
+        if (!vk_check(vk.vkCreateQueryPool(vkc.device, &ci, NULL, &g_hcq), "pass timestamp pool (GPU hitches)")) return;
+        vk.vkResetQueryPool(vkc.device, g_hcq, 0, SLOTS * HC_PER);
+    }
+    vk.vkCmdResetQueryPool(cb, g_hcq, (uint32_t)(slot * HC_PER), HC_PER);
+    atomic_store(&g_hc_n[slot], 0);
+}
+static int hc_open(VkCommandBuffer cb, char kind, uint32_t w, uint32_t h, const char *key, int *slot_out) {   // index, -1: none
+    if (!g_hcq || g_cur < 0) return -1;
+    int slot = g_cur, i = atomic_fetch_add(&g_hc_n[slot], 1);
+    if (i >= HC_PER / 2) return -1;
+    hc_info *p = &g_hc[slot][i];
+    memset(p, 0, sizeof *p);
+    p->kind = kind; p->w = w; p->h = h;
+    p->worker = (uint32_t)t_worker;
+    if (key) snprintf(p->key, sizeof p->key, "%.12s", key);
+    vk.vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_hcq, (uint32_t)(slot * HC_PER + 2 * i));
+    *slot_out = slot;
+    return i;
+}
+static void hc_begin(VkCommandBuffer cb, VkExtent2D ext) {
+    int slot = 0, i = hc_open(cb, 'P', ext.width, ext.height, NULL, &slot);
+    t_hc_open = i;
+    if (i < 0) return;
+    hc_info *p = &g_hc[slot][i];
+    p->ncolor = (uint32_t)(g_rt.n < 0 ? 0 : g_rt.n);
+    p->fmt0 = g_rt.n > 0 && g_rt.color[0] ? (uint32_t)g_rt.color[0]->d.format : 0;
+    p->depth = g_rt.depth ? (uint32_t)g_rt.depth->d.format : 0;
+    t_hc_slot = slot;
+}
+// Outside a pass (vkb.h): a dispatch of the game (kind D, its groups) or of FSR 3.1 (F); the handle goes to vkb_hc_end.
+int vkb_hc_begin(VkCommandBuffer cb, char kind, uint32_t x, uint32_t y, const char *key) {
+    int slot = 0, i = hc_open(cb, kind, x, y, key, &slot);
+    if (i < 0) return -1;
+    g_hc[slot][i].draws = 1;
+    return slot * HC_PER + 2 * i;
+}
+void vkb_hc_end(VkCommandBuffer cb, int h) {
+    if (h >= 0) vk.vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_hcq, (uint32_t)h + 1);
+}
+static void hc_note(const char *key) {
+    if (t_hc_open < 0) return;
+    hc_info *p = &g_hc[t_hc_slot][t_hc_open];
+    p->draws++;
+    if (!p->key[0] && key) snprintf(p->key, sizeof p->key, "%.12s", key);
+}
+static void hc_end(VkCommandBuffer cb) {
+    if (t_hc_open < 0) return;
+    vk.vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_hcq, (uint32_t)(t_hc_slot * HC_PER + 2 * t_hc_open + 1));
+    t_hc_open = -1;
+}
+static int hc_cmp_dur(const void *a, const void *b) {
+    double x = ((const double *)a)[0], y = ((const double *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static int hc_cmp_beg(const void *a, const void *b) {
+    double x = ((const double *)a)[1], y = ((const double *)b)[1];
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+// The retire thread, the submission complete: its passes over the threshold. s0: the submission's first timestamp.
+static void hc_check(int slot, uint64_t fence, uint64_t frame, uint64_t s0, uint64_t dur_ns) {
+    double lim = hc_ms();
+    if (lim <= 0 || !g_hcq || slot < 0 || dur_ns < lim * 1e6) return;
+    static int said;
+    if (said >= 40) return;
+    said++;
+    int n = atomic_load(&g_hc_n[slot]);
+    if (n > HC_PER / 2) n = HC_PER / 2;
+    double per = vkc.props.limits.timestampPeriod / 1e6;
+    if (!n) { VLOG("GPU hitch: submission %llu (frame %llu) %.1f ms on the GPU, no pass in it", (unsigned long long)fence, (unsigned long long)frame, dur_ns / 1e6); return; }
+    uint64_t (*q)[2] = malloc(sizeof *q * 2 * (size_t)n);   // value, availability
+    double (*r)[4] = malloc(sizeof *r * (size_t)n);         // duration, start, end (ms from s0), pass index
+    if (!q || !r) { free(q); free(r); return; }
+    VkResult res = vk.vkGetQueryPoolResults(vkc.device, g_hcq, (uint32_t)(slot * HC_PER), (uint32_t)(2 * n), sizeof *q * 2 * (size_t)n, q,
+                                            sizeof *q, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    int m = 0;
+    double inpass = 0;
+    if (res == VK_SUCCESS || res == VK_NOT_READY)
+        for (int i = 0; i < n; i++) {
+            const uint64_t *b = q[2 * i], *e = q[2 * i + 1];
+            if (!b[1] || !e[1] || e[0] < b[0]) continue;
+            r[m][0] = (double)(e[0] - b[0]) * per;
+            r[m][1] = b[0] > s0 ? (double)(b[0] - s0) * per : 0;
+            r[m][2] = e[0] > s0 ? (double)(e[0] - s0) * per : 0;
+            r[m][3] = i;
+            inpass += r[m][0];
+            m++;
+        }
+    // the longest stretch outside every pass: passes in start order, the furthest end so far against the next start
+    double gap = 0, gap_at = 0, reach = 0;
+    int gap_after = -1, gap_before = -1;
+    if (m) {
+        qsort(r, (size_t)m, sizeof *r, hc_cmp_beg);
+        if (r[0][1] > gap) gap = r[0][1], gap_at = 0, gap_before = (int)r[0][3];
+        reach = r[0][2];
+        int reach_i = (int)r[0][3];
+        for (int k = 1; k < m; k++) {
+            if (r[k][1] - reach > gap) gap = r[k][1] - reach, gap_at = reach, gap_after = reach_i, gap_before = (int)r[k][3];
+            if (r[k][2] > reach) reach = r[k][2], reach_i = (int)r[k][3];
+        }
+        double tail = dur_ns / 1e6 - reach;
+        if (tail > gap) gap = tail, gap_at = reach, gap_after = reach_i, gap_before = -1;
+    }
+    VLOG("GPU hitch: submission %llu (frame %llu) %.1f ms on the GPU: %d passes timed of %d, %.1f ms in passes; longest stretch "
+         "outside passes %.1f ms at +%.1f ms (after pass %d, before pass %d)", (unsigned long long)fence, (unsigned long long)frame,
+         dur_ns / 1e6, m, n, inpass, gap, gap_at, gap_after, gap_before);
+    qsort(r, (size_t)m, sizeof *r, hc_cmp_dur);
+    for (int k = 0; k < m && k < 8; k++) {
+        const hc_info *p = &g_hc[slot][(int)r[k][3]];
+        if (p->kind == 'P')
+            VLOG("  %8.2f ms at +%.1f  #%-3d pass %ux%u  %u colour (fmt %#x) depth %#x  %u draws  fs %s  (recording thread %u)", r[k][0],
+                 r[k][1], (int)r[k][3], p->w, p->h, p->ncolor, p->fmt0, p->depth, p->draws, p->key[0] ? p->key : "-", p->worker);
+        else
+            VLOG("  %8.2f ms at +%.1f  #%-3d %s %ux%u groups  cs %s  (recording thread %u)", r[k][0], r[k][1], (int)r[k][3],
+                 p->kind == 'F' ? "FSR 3.1 dispatch" : "dispatch", p->w, p->h, p->key[0] ? p->key : "-", p->worker);
+    }
+    free(q); free(r);
 }
 static void pp_begin(VkCommandBuffer cb, VkExtent2D ext) {
     if (!pp_on() || g_ppn >= PP_MAX / 2) return;
@@ -2233,6 +2384,7 @@ static void pass_end(void) {
     oq_close();   // an occlusion query begun in the pass ends in it
     vk.vkCmdEndRendering(vkb_cmd());
     pp_end(vkb_cmd());
+    hc_end(vkb_cmd());
     vkb_tex_block_flush(vkb_cmd());
     g_in_pass = 0;
     ub_flush(vkb_cmd());   // the pass's kept uniform updates reach memory
@@ -2419,6 +2571,7 @@ static int pass_begin(VkExtent2D bare, uint32_t fb) {
     }
     vkb_checkpoint("begin pass", NULL, NULL);
     pp_begin(cb, g_pass_extent);
+    hc_begin(cb, g_pass_extent);
     vk.vkCmdBeginRendering(cb, &ri);
     g_in_pass = 1;
     return 1;

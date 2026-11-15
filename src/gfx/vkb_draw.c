@@ -2768,7 +2768,9 @@ void vkb_dispatch(const uint8_t *a) {
     vk.vkCmdBindShadersEXT(cb, 1, &st, &cs->obj);
     int gq = gprof_begin();
     vkb_checkpoint("dispatch", cs->key, NULL);
+    int hc = vkb_hc_begin(cb, 'D', (uint32_t)d->x, (uint32_t)d->y * (uint32_t)d->z, cs->key);
     vk.vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    vkb_hc_end(cb, hc);
     gprof_end(gq, cs, 1, (uint32_t)(d->x * d->y * d->z), 1);
     vk.vkCmdPipelineBarrier2(cb, &dep);
     vkb_cnt_add(g_draws, 1);

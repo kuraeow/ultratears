@@ -701,7 +701,9 @@ static void dispatch(VkCommandBuffer cb, VkDescriptorSet set, int p, const bind_
     VkShaderStageFlagBits st = VK_SHADER_STAGE_COMPUTE_BIT;
     vk.vkCmdBindShadersEXT(cb, 1, &st, &F.sh[p]);
     vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, F.pl[p], 0, 1, &set, 0, NULL);
+    int hc = vkb_hc_begin(cb, 'F', gx, gy, pc->name);
     vk.vkCmdDispatch(cb, gx, gy, 1);
+    vkb_hc_end(cb, hc);
     barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 

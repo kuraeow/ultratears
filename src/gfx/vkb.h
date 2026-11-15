@@ -37,6 +37,8 @@ void vkb_destroy_later(VkImageView view, VkImage img, VkDeviceMemory mem);
 void vkb_destroy_image_later(VkImage img, VkDeviceMemory mem, uint32_t imem);   // imem != 0: back to its block (vkb_imem_free)
 void vkb_imem_free(uint32_t imem);   // vkb_tex.c: image memory in a shared block given back
 void vkb_passprof_note(const char *key);   // TOTK_GPU_PASSPROF: names the open pass by its first shader
+int vkb_hc_begin(VkCommandBuffer cb, char kind, uint32_t x, uint32_t y, const char *key);   // TOTK_GPU_HITCH: a dispatch timed
+void vkb_hc_end(VkCommandBuffer cb, int h);                                                   // (backend_vk.c; -1: not timed)
 void vkb_checkpoint(const char *what, const char *k1, const char *k2);   // TOTK_VK_CHECKPOINTS: names the next GPU command
 int vkb_in_pass(void);
 // Host-visible upload memory of the current submission (reused after its fence): n bytes aligned to `align`.
