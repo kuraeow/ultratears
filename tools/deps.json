@@ -381,6 +381,18 @@
      "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_sdlrenderer3.h",
      "size": 2781,
      "sha256": "3e356dd91a17f4210e2aab5d4e28aa55adb0c95c26dc87c5dd5a806d46bad52f"
+    },
+    {
+     "path": "backends/imgui_impl_vulkan.cpp",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_vulkan.cpp",
+     "size": 88758,
+     "sha256": "1af35121a8cc8ff4d16d4d9da89c5724bbc2cb930920247eeeac0faa6b1ff006"
+    },
+    {
+     "path": "backends/imgui_impl_vulkan.h",
+     "url": "https://raw.githubusercontent.com/ocornut/imgui/f5befd2d29e66809cd1110a152e375a7f1981f06/backends/imgui_impl_vulkan.h",
+     "size": 13284,
+     "sha256": "19e69a81474ee9e9348a54d619456c89810df634a0500ecccef145e7a488f1a2"
     }
    ]
   },

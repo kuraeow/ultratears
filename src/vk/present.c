@@ -28,6 +28,7 @@ static VkSwapchainKHR swapchain;
 static VkFormat format;
 static VkExtent2D extent;
 static VkImage images[MAX_IMAGES];
+static VkImageView views[MAX_IMAGES];   // the settings overlay draws into them (src/overlay: dynamic rendering)
 static uint32_t nimages;
 static VkSemaphore image_ready[FRAMES], render_done[MAX_IMAGES];
 static VkFence in_flight[FRAMES];
@@ -58,7 +59,11 @@ static int create_present_objects(void) {
 }
 
 static void destroy_swapchain(void) {
-    for (uint32_t i = 0; i < nimages; i++) vk.vkDestroySemaphore(vkc.device, render_done[i], NULL);
+    for (uint32_t i = 0; i < nimages; i++) {
+        vk.vkDestroySemaphore(vkc.device, render_done[i], NULL);
+        if (views[i]) vk.vkDestroyImageView(vkc.device, views[i], NULL);
+        views[i] = VK_NULL_HANDLE;
+    }
     if (swapchain) vk.vkDestroySwapchainKHR(vkc.device, swapchain, NULL);
     swapchain = VK_NULL_HANDLE;
     nimages = 0;
@@ -102,14 +107,33 @@ static int create_swapchain(void) {
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = vkc.surface,
         .minImageCount = count, .imageFormat = format, .imageColorSpace = pick.colorSpace, .imageExtent = extent,
-        .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageArrayLayers = 1, .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                             (getenv("TOTK_OVERLAY_DEMO") ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),   // (shot_record)
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = mode, .clipped = VK_TRUE};
+#ifdef _WIN32
+    /* Fullscreen through the desktop's compositor (the way DirectX games' fullscreen goes, its frames still flipped to the
+       screen directly), not the driver's exclusive mode: there the desktop kept the run's first frame, so a screenshot
+       tool (Win+Shift+S) showed it black with "-- FPS" (the user, 2026-11-15). TOTK_VK_NO_EXCLUSIVE=0: the driver's choice. */
+    // VkSurfaceFullScreenExclusiveInfoEXT of vulkan_win32.h (not in every builder's headers): DISALLOWED is 2
+    struct { VkStructureType sType; void *pNext; int fullScreenExclusive; } fse = {
+        VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT, NULL, 2};
+    if (vkc.has_fse) ci.pNext = &fse;
+    {
+        static int logged;
+        if (!logged++) LOG("fullscreen: %s", vkc.has_fse ? "through the compositor (exclusive mode disallowed)" : "the driver's choice");
+    }
+#endif
     if (!vk_check(vk.vkCreateSwapchainKHR(vkc.device, &ci, NULL, &swapchain), "vkCreateSwapchainKHR")) return 0;
     nimages = MAX_IMAGES;
     vk.vkGetSwapchainImagesKHR(vkc.device, swapchain, &nimages, images);
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    for (uint32_t i = 0; i < nimages; i++) vk.vkCreateSemaphore(vkc.device, &si, NULL, &render_done[i]);
+    for (uint32_t i = 0; i < nimages; i++) {
+        vk.vkCreateSemaphore(vkc.device, &si, NULL, &render_done[i]);
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = images[i], .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vk.vkCreateImageView(vkc.device, &vi, NULL, &views[i]) != VK_SUCCESS) views[i] = VK_NULL_HANDLE;
+    }
     LOG("swapchain %ux%u, %u images, %s", extent.width, extent.height, nimages,
         mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     return 1;
@@ -158,6 +182,9 @@ static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 int vkp_active(void) { return swapchain != VK_NULL_HANDLE || g_window != NULL; }
+// The swapchain's format and image count (the settings overlay's pipeline is made for them); 0 before the first
+VkFormat vkp_format(void) { return swapchain ? format : VK_FORMAT_UNDEFINED; }
+uint32_t vkp_image_count(void) { return nimages; }
 
 int vkp_out_acquire(uint32_t w, uint32_t h, VkImage *image) {
     pthread_mutex_lock(&mu);
@@ -213,6 +240,74 @@ void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int cro
     pthread_mutex_unlock(&mu);
 }
 
+/* Development: the window's picture as shown, overlays included, into a PPM file (vkp_shot_request, from the settings
+   overlay's TOTK_OVERLAY_DEMO): a copy of the swapchain image after everything is drawn on it. Screen captures of the
+   desktop see a stale picture of a flip-model Vulkan window. Needs TOTK_OVERLAY_DEMO at the start (the swapchain's
+   images can then be copied from). */
+static char g_shot_path[512];
+static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER;
+static VkBuffer g_shot_buf;
+static VkDeviceMemory g_shot_mem;
+static void *g_shot_map;
+static VkDeviceSize g_shot_size;
+void vkp_shot_request(const char *path) {
+    pthread_mutex_lock(&g_shot_mu);
+    snprintf(g_shot_path, sizeof g_shot_path, "%s", path);
+    pthread_mutex_unlock(&g_shot_mu);
+}
+static int shot_record(VkCommandBuffer cb, VkImage img, char *path, size_t n) {   // 1: a copy recorded (written after the fence)
+    pthread_mutex_lock(&g_shot_mu);
+    int want = g_shot_path[0] != 0;
+    if (want) snprintf(path, n, "%s", g_shot_path), g_shot_path[0] = 0;
+    pthread_mutex_unlock(&g_shot_mu);
+    if (!want) return 0;
+    VkDeviceSize need = (VkDeviceSize)extent.width * extent.height * 4;
+    if (g_shot_size < need) {
+        if (g_shot_buf) { vk.vkDestroyBuffer(vkc.device, g_shot_buf, NULL); vk.vkFreeMemory(vkc.device, g_shot_mem, NULL); }
+        g_shot_buf = VK_NULL_HANDLE, g_shot_size = 0;
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = need, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VkMemoryRequirements req;
+        if (vk.vkCreateBuffer(vkc.device, &bi, NULL, &g_shot_buf) != VK_SUCCESS) return 0;
+        vk.vkGetBufferMemoryRequirements(vkc.device, g_shot_buf, &req);
+        uint32_t type = UINT32_MAX;
+        VkMemoryPropertyFlags w = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t t = 0; t < vkc.memory.memoryTypeCount; t++)
+            if ((req.memoryTypeBits & (1u << t)) && (vkc.memory.memoryTypes[t].propertyFlags & w) == w) { type = t; break; }
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || vk.vkAllocateMemory(vkc.device, &ai, NULL, &g_shot_mem) != VK_SUCCESS) {
+            vk.vkDestroyBuffer(vkc.device, g_shot_buf, NULL);
+            g_shot_buf = VK_NULL_HANDLE;
+            return 0;
+        }
+        vk.vkBindBufferMemory(vkc.device, g_shot_buf, g_shot_mem, 0);
+        vk.vkMapMemory(vkc.device, g_shot_mem, 0, VK_WHOLE_SIZE, 0, &g_shot_map);
+        g_shot_size = need;
+    }
+    barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy r = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {extent.width, extent.height, 1}};
+    vk.vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot_buf, 1, &r);
+    barrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    return 1;
+}
+static void shot_write(const char *path) {   // after the frame's fence
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6 %u %u 255\n", extent.width, extent.height);
+    const uint8_t *p = g_shot_map;
+    int bgr = format == VK_FORMAT_B8G8R8A8_UNORM;
+    for (size_t i = 0; i < (size_t)extent.width * extent.height; i++) {
+        uint8_t c[3] = {p[i * 4 + (bgr ? 2 : 0)], p[i * 4 + 1], p[i * 4 + (bgr ? 0 : 2)]};
+        fwrite(c, 1, 3, f);
+    }
+    fclose(f);
+    LOG("shot %s", path);
+}
+
+static int g_again;            // the frame shown is the last one again (the text field, the settings overlay)
+static uint64_t g_ovl_drawn;   // the settings overlay's frame drawn last (ovl_record)
+
 // One window frame: the newest game frame (out, may be NULL: the cycling colour) fitted with its aspect ratio.
 static int present_one(uint64_t n, unsigned slot, out_t *out) {
     if (atomic_exchange(&resized, 0) || !swapchain) {
@@ -256,11 +351,17 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
         }
         void vk_overlay_frame(void);
         void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
-        vk_overlay_frame();   // the frame counter (overlay.c, F10)
-        vk_overlay_record(cb, images[idx], extent, format, slot);
+        if (!g_again) vk_overlay_frame();   // the frame counter (overlay.c, F10): game frames only
+        int ovl_visible(void);
+        if (!ovl_visible()) vk_overlay_record(cb, images[idx], extent, format, slot);   // not under the settings overlay
         void vk_text_panel_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
         vk_text_panel_record(cb, images[idx], extent, format, slot);   // the software keyboard's field (host/text_entry.c)
     }
+    // the settings overlay over everything (src/overlay; nothing while it is closed)
+    uint64_t ovl_record(VkCommandBuffer cb, VkImage img, VkImageView view, VkExtent2D ext);
+    g_ovl_drawn = ovl_record(cb, images[idx], views[idx], extent);
+    char shot[512];
+    int shooting = getenv("TOTK_OVERLAY_DEMO") && shot_record(cb, images[idx], shot, sizeof shot);
     barrier(cb, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     vk.vkEndCommandBuffer(cb);
@@ -282,10 +383,13 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
     VkResult s = vk.vkQueueSubmit2(vkc.queue, 1, &si, in_flight[slot]);
     r = s == VK_SUCCESS ? vk.vkQueuePresentKHR(vkc.queue, &pi) : s;
     vk_queue_unlock();
+    void ovl_record_done(void);
+    ovl_record_done();   // the settings overlay's font texture may change again (src/overlay)
     if (!vk_check(s, "vkQueueSubmit2")) return 0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&resized, 1);
     else if (r != VK_SUCCESS) { vk_check(r, "vkQueuePresentKHR"); return 0; }
-    if (out) vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);   // the output image is free again after this
+    if (out || shooting) vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);   // the output image is free again after this
+    if (shooting) shot_write(shot);
     atomic_fetch_add(&presented, 1);
     return 1;
 }
@@ -300,6 +404,11 @@ static void *present_thread(void *unused) {
         pthread_mutex_lock(&mu);
         int again = 0;
         while (frames_in == shown && !again) {
+            /* The settings overlay (src/overlay) pauses the game: the last game frame is shown again under each of its
+               new frames (the main thread draws them and wakes this thread, vkp_wake), the cycling colour before the first. */
+            int ovl_visible(void);
+            uint64_t ovl_seq(void);
+            if (ovl_visible() && ovl_seq() != g_ovl_drawn && (last < 0 || g_out[last].state == 0)) { again = 1; break; }
             /* While the software keyboard's field is open the game may draw nothing (the thread that asked for it waits):
                the last frame is shown again with the field over it every 33 ms, so typing shows. */
             if (!text_entry_visible() || last < 0) { pthread_cond_wait(&cv, &mu); continue; }
@@ -319,10 +428,11 @@ static void *present_thread(void *unused) {
                 if (i != pick && g_out[i].state == 1) shown = frames_in - 1;
         }
         if (pick >= 0) g_out[pick].state = 2, last = pick;
+        g_again = again;
         pthread_mutex_unlock(&mu);
         /* The steady rate (host/frame_rate.c): a frame drawn before its slot waits for it here, so frames reach the
            screen one period apart whatever their work; a frame more than half a second away is a clock change. */
-        if (pick >= 0 && g_out[pick].not_before) {
+        if (pick >= 0 && g_out[pick].not_before && !again) {
             uint64_t at = g_out[pick].not_before, now = runtime_now_ns();
             if (at > now && at - now < 500000000ull) plat_sleep_until_ns(at);
         }

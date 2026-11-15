@@ -25,6 +25,9 @@
 
 // ---------------------------------------------------------------- settings
 static int g_mode = -1;   // 0 the game's FXAA (or FSR 3.1, vkb_tsr.c), 1 SMAA, 2 none
+// antialias= changed in the settings overlay between the game's FXAA, SMAA and none: from the next FXAA draw (SMAA's
+// objects are made the first time it runs)
+void vkb_aa_reload(void) { g_mode = -1; }
 int vkb_aa_mode(void) {
     if (g_mode < 0) {
         const char *e = getenv("TOTK_AA");

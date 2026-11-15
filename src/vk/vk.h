@@ -71,6 +71,7 @@ typedef struct {
     int has_buffer_marker;   // TOTK_VK_CHECKPOINTS=1: VK_AMD_buffer_marker (the same, written by the GPU to host memory)
     int has_device_fault;    // VK_EXT_device_fault: the driver's report of a lost device (vk_device_fault_report)
     int has_custom_border;   // VK_EXT_custom_border_color without a format: any sampler border colour, as on NVN
+    int has_fse;             // Windows: VK_EXT_full_screen_exclusive (present.c: fullscreen without the exclusive mode)
     uint32_t max_custom_border;   // ...at most this many such samplers at once (maxCustomBorderColorSamplers)
     uint32_t subgroup_pin;   // 32 where the driver may run shaders in other subgroup sizes (AMD: 32 or 64), else 0
     VkShaderStageFlags subgroup_pin_stages;   // ...the stages it can pin (requiredSubgroupSizeStages)

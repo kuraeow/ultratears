@@ -95,14 +95,16 @@ void setup_free(SetupProc *p);
 std::string python_path(const std::string &root);         // deps/python/python.exe, else the one on PATH
 
 // ---- media.cpp
-struct Icon { SDL_Texture *tex = nullptr; float w = 0, h = 0; };   // w, h: logical size (design pixels)
+// w, h: logical size (design pixels). tex: the launcher's SDL_Texture; atlas: packed into ImGui's font atlas instead, at
+// uv0..uv1 (the game's overlay: one texture for everything, media_load without a renderer)
+struct Icon { ImTextureID tex = 0; float w = 0, h = 0; bool atlas = false; ImVec2 uv0 = ImVec2(0, 0), uv1 = ImVec2(1, 1); };
 struct Media {
     ImFont *regular = nullptr, *medium = nullptr, *small = nullptr, *title = nullptr, *brand = nullptr;
     ImFont *label = nullptr, *control = nullptr;   // the Play screen: setting names; tabs, choices, lists
     Icon emblem, pattern, check, error, folder, warn, chevron;
 };
 extern Media g_media;
-void media_load(SDL_Renderer *r, float scale);   // fonts and icons at this scale (again when it changes)
+void media_load(SDL_Renderer *r, float scale);   // fonts and icons at this scale (again when it changes); r null: the atlas
 float font_line(ImFont *f);                       // the line height of a font's text style, design pixels
 void window_icon(SDL_Window *w);                  // the port's icon on the window (Linux; Windows: the exe's resource)
 

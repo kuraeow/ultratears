@@ -72,6 +72,14 @@ static int mode(void) {
     return g_mode;
 }
 int vkb_tsr_on(void) { return mode() == 1 && vkb_ready(); }
+int vkb_tsr_configured(void) { return mode() == 1; }   // FSR 3.1 chosen at the start (the overlay: on or off needs a restart)
+// sharpness= changed in the settings overlay: FSR 3.1's RCAS from the next frame (its passes all exist). FSR 3.1 itself
+// on or off waits for a restart (the jitter, the samplers' LOD bias, the scale come with it).
+void vkb_tsr_sharp_reload(void) {
+    const char *s = getenv("TOTK_SHARPNESS");
+    int v = s && *s ? atoi(s) : 50;
+    g_sharp = (v < 0 ? 0 : v > 100 ? 100 : v) / 100.0f;
+}
 
 // The texture LOD bias for a scene drawn smaller than the output (AMD's advice for FSR: log2(render / display) - 1),
 // from the scale setting at the start (render_res.c: unset is the game's 5/6). TOTK_AA_LODBIAS=<value> overrides.

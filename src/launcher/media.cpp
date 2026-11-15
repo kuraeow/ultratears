@@ -41,6 +41,20 @@ void window_icon(SDL_Window *w) {
 #endif
 }
 
+// Without a renderer (the game's overlay, src/overlay): the images go into ImGui's font atlas, one texture for all.
+// Their pixels wait here until the fonts are added and the atlas is built (media_load's end).
+struct Pending { Icon *icon; std::vector<unsigned char> rgba; int w, h, rect; };
+static std::vector<Pending> g_pending;
+
+static Icon atlas_icon(Icon *dst, const unsigned char *rgba, int w, int h, float logical_w, float logical_h) {
+    Pending p{dst, std::vector<unsigned char>(rgba, rgba + (size_t)w * h * 4), w, h, -1};
+    p.rect = ImGui::GetIO().Fonts->AddCustomRectRegular(w + 2, h + 2);   // a pixel of its own edge around it: no seams
+    g_pending.push_back(std::move(p));
+    Icon icon;
+    icon.atlas = true, icon.w = logical_w, icon.h = logical_h;
+    return icon;
+}
+
 static SDL_Texture *texture(SDL_Renderer *r, const unsigned char *rgba, int w, int h) {
     SDL_Texture *t = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);   // RGBA bytes
     if (!t)
@@ -53,11 +67,11 @@ static SDL_Texture *texture(SDL_Renderer *r, const unsigned char *rgba, int w, i
 
 static void drop(Icon &i) {
     if (i.tex)
-        SDL_DestroyTexture(i.tex);
+        SDL_DestroyTexture((SDL_Texture *)(intptr_t)i.tex);
     i = Icon();
 }
 
-static Icon png(SDL_Renderer *r, const char *name, float logical_w, float logical_h) {
+static Icon png(SDL_Renderer *r, const char *name, float logical_w, float logical_h, Icon *dst) {
     Icon icon;
     const launcher_asset *a = asset(name);
     if (!a)
@@ -66,13 +80,16 @@ static Icon png(SDL_Renderer *r, const char *name, float logical_w, float logica
     unsigned char *px = stbi_load_from_memory(a->data, (int)a->size, &w, &h, &n, 4);
     if (!px)
         return icon;
-    icon.tex = texture(r, px, w, h);
+    if (r)
+        icon.tex = (ImTextureID)(intptr_t)texture(r, px, w, h);
+    else
+        icon = atlas_icon(dst, px, w, h, logical_w, logical_h);
     icon.w = logical_w, icon.h = logical_h;
     stbi_image_free(px);
     return icon;
 }
 
-static Icon svg(SDL_Renderer *r, const char *name, float logical, float scale) {
+static Icon svg(SDL_Renderer *r, const char *name, float logical, float scale, Icon *dst) {
     Icon icon;
     const launcher_asset *a = asset(name);
     if (!a)
@@ -87,7 +104,10 @@ static Icon svg(SDL_Renderer *r, const char *name, float logical, float scale) {
     nsvgRasterize(rast, img, 0, 0, px / img->width, rgba.data(), px, px, px * 4);
     nsvgDeleteRasterizer(rast);
     nsvgDelete(img);
-    icon.tex = texture(r, rgba.data(), px, px);
+    if (r)
+        icon.tex = (ImTextureID)(intptr_t)texture(r, rgba.data(), px, px);
+    else
+        icon = atlas_icon(dst, rgba.data(), px, px, logical, logical);
     icon.w = icon.h = logical;
     return icon;
 }
@@ -169,11 +189,32 @@ void media_load(SDL_Renderer *r, float scale) {
     io.FontDefault = g_media.regular;
     for (Icon *i : {&g_media.emblem, &g_media.pattern, &g_media.check, &g_media.error, &g_media.folder, &g_media.warn, &g_media.chevron})
         drop(*i);
-    g_media.emblem = png(r, "l_emblem.png", 40, 40);
-    g_media.pattern = png(r, "l_pattern.png", 256, 256);
-    g_media.check = svg(r, "l_ic_check.svg", 16, scale);
-    g_media.error = svg(r, "l_ic_error.svg", 16, scale);
-    g_media.warn = svg(r, "l_ic_warn.svg", 16, scale);
-    g_media.chevron = svg(r, "l_ic_chevron.svg", 16, scale);
-    g_media.folder = svg(r, "l_ic_folder.svg", 24, scale);
+    g_pending.clear();
+    g_media.emblem = png(r, "l_emblem.png", 40, 40, &g_media.emblem);
+    g_media.pattern = png(r, "l_pattern.png", 256, 256, &g_media.pattern);
+    g_media.check = svg(r, "l_ic_check.svg", 16, scale, &g_media.check);
+    g_media.error = svg(r, "l_ic_error.svg", 16, scale, &g_media.error);
+    g_media.warn = svg(r, "l_ic_warn.svg", 16, scale, &g_media.warn);
+    g_media.chevron = svg(r, "l_ic_chevron.svg", 16, scale, &g_media.chevron);
+    g_media.folder = svg(r, "l_ic_folder.svg", 24, scale, &g_media.folder);
+    if (r)
+        return;
+    // the atlas: built now, the images copied into their places (the backend uploads it as RGBA from here on)
+    io.Fonts->Build();
+    unsigned char *tex;
+    int tw, th;
+    io.Fonts->GetTexDataAsRGBA32(&tex, &tw, &th);
+    for (Pending &p : g_pending) {
+        ImFontAtlasCustomRect *rc = io.Fonts->GetCustomRectByIndex(p.rect);
+        if (!rc->IsPacked())
+            continue;
+        for (int y = 0; y < p.h + 2; y++)
+            for (int x = 0; x < p.w + 2; x++) {
+                int sx = SDL_clamp(x - 1, 0, p.w - 1), sy = SDL_clamp(y - 1, 0, p.h - 1);
+                std::memcpy(tex + ((size_t)(rc->Y + y) * tw + rc->X + x) * 4, &p.rgba[((size_t)sy * p.w + sx) * 4], 4);
+            }
+        p.icon->uv0 = ImVec2((rc->X + 1) / (float)tw, (rc->Y + 1) / (float)th);
+        p.icon->uv1 = ImVec2((rc->X + 1 + p.w) / (float)tw, (rc->Y + 1 + p.h) / (float)th);
+    }
+    g_pending.clear();
 }

@@ -44,10 +44,19 @@ GFX = ['src/gfx/nvn/hle_nvn.c', 'src/gfx/nvn/nvn_tex.c', 'src/gfx/nvn/totk_nvn_e
        'src/gfx/vkb_draw.c', 'src/gfx/tex/nvn_deswizzle.c', 'src/gfx/tex/astc.c', 'src/gfx/vkb_bc7.c',
        'src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/tex/bc7enc/rgbcx.cpp', 'src/gfx/tex/bc7key.c']
 GFX_INCLUDES = '-Isrc/gfx -Isrc/gfx/nvn -Isrc/gfx/nvn/include -Isrc/gfx/compat'
+# The settings overlay in the game (src/overlay): the launcher's pages and look (src/ui), its words, fonts and images
+# (src/launcher, assets/launcher: build/assets.c), Dear ImGui with its SDL3 and Vulkan backends (deps/launcher, pinned in
+# tools/deps.json), C++ without exceptions or RTTI
+OVERLAY = ['src/overlay/overlay.cpp', 'src/launcher/text.cpp', 'src/launcher/json.cpp', 'src/launcher/platform.cpp',
+           'src/launcher/setup_proc.cpp', 'src/launcher/media.cpp', 'deps/launcher/imgui/imgui.cpp',
+           'deps/launcher/imgui/imgui_draw.cpp', 'deps/launcher/imgui/imgui_tables.cpp', 'deps/launcher/imgui/imgui_widgets.cpp',
+           'deps/launcher/imgui/backends/imgui_impl_sdl3.cpp', 'deps/launcher/imgui/backends/imgui_impl_vulkan.cpp']
+OVERLAY_INCLUDES = ('-Ideps/launcher/imgui -Ideps/launcher/imgui/backends -Ideps/launcher/nanosvg -Ideps/launcher/stb -Isrc/launcher '
+                    '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DIMGUI_IMPL_VULKAN_NO_PROTOTYPES')
 # --wrap: the log's writes go through src/runtime/logcost.c, which times them for the long-frame line; getenv
 # answers from src/runtime/envcache.c's table
 LIBS = '-static -Wl,--error-limit=0 -Wl,--disable-high-entropy-va -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc,--wrap=getenv -pthread -ldbghelp -lwinmm -lsynchronization -lshell32 -lopus -lvpx -lSDL3 -lzstd -liconv' \
-       ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -lc++'
+       ' -luser32 -lgdi32 -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32 -lsetupapi -ldinput8 -lbcrypt -ldwmapi -lc++'
 CFLAGS = '-O2 -march=x86-64-v3 -g -gcodeview -fno-strict-aliasing -D_FILE_OFFSET_BITS=64'
 GAME_CFLAGS = CFLAGS + ' -w -Isrc/runtime'
 # Linux (--platform linux): the kit is deps/linux in a builder, else dev-local/linux-cross (ULTRS_LINUX_KIT overrides).
@@ -281,6 +290,12 @@ def main():
         + (' -stdlib=libstdc++' if linux else '') + ' -c $in -o $out',   # Linux: the sysroot's libstdc++, linked static
         '  depfile = $out.d',
         '  deps = gcc',
+        f'uiflags = {cflags} -w -I{bd} {OVERLAY_INCLUDES}' + ('' if linux else ' -DUNICODE -D_UNICODE'),
+        'rule uicxx',   # the settings overlay (OVERLAY)
+        '  command = $cxx -MD -MF $out.d $uiflags -std=c++17 -fno-exceptions -fno-rtti'
+        + (' -stdlib=libstdc++' if linux else '') + ' -c $in -o $out',
+        '  depfile = $out.d',
+        '  deps = gcc',
         'rule gamecc',
         '  command = $cc -MD -MF $out.d $gameflags -c $in -o $out',   # runtime headers (cpu.h, simd*.h) are inlined
         '  depfile = $out.d',
@@ -309,6 +324,17 @@ def main():
             obj = f'{bd}/obj/{src.rsplit(".", 1)[0].replace("/", "_")}.o'
             lines.append(f'build {obj}: {"gfxcxx" if cxx else "gfxcc"} {src}')
             objs.append(obj)
+        # the settings overlay: ImGui's files (downloaded when missing), the launcher's fonts and images as C arrays
+        import deps_install
+        import build_launcher
+        deps_install.launcher_libs(ROOT)
+        build_launcher.assets_c(build)
+        for src in OVERLAY:
+            obj = f'{bd}/obj/{src.rsplit(".", 1)[0].replace("/", "_")}.o'
+            lines.append(f'build {obj}: uicxx {src}')
+            objs.append(obj)
+        lines.append(f'build {bd}/obj/overlay_assets.o: cc {bd}/assets.c')
+        objs.append(f'{bd}/obj/overlay_assets.o')
     game_objs = []
     for module in ('main', 'subsdk0', 'sdk'):
         for c in sorted((gen / module).glob('*.c')):

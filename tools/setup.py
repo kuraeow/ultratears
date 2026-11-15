@@ -244,7 +244,7 @@ def choose_dump(home, requested):
 
 
 # Files only the source has (tools/make_package.py NOT_IN_PACKAGE): without them this is no full checkout
-SOURCE_ONLY = ('tools/build_xlate.py', 'tools/make_package.py', 'src/launcher')
+SOURCE_ONLY = ('tools/build_xlate.py', 'tools/make_package.py', 'src/launcher/main.cpp')
 
 
 def build_from_checkout(a):

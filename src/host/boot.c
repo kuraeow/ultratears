@@ -6,6 +6,8 @@
 #include <string.h>
 
 #include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
 #include "host.h"
 #include "version.h"   // build/version.h (tools/build_game.py, tools/version.py)
 #ifdef _WIN32
@@ -108,6 +110,24 @@ static void deck_defaults(void) {
 #endif
 }
 
+static const char *const CFG_KEYS[][2] = {   // ultratears.cfg's names -> the runtime's variables
+    {"romfs", "TOTK_ROMFS"}, {"shaders", "TOTK_SHADER_DIR"}, {"compiled", "TOTK_SHADER_BIN"}, {"shaderpack", "TOTK_SHADER_PACK"}, {"textures", "TOTK_BC7_DIR"},
+    {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
+    // the player's settings (the launcher's Play screen and the game's overlay write them)
+    {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
+    {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
+    {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}, {"antialias", "TOTK_AA"},
+    {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
+    {"fps_overlay", "TOTK_FPS_OVERLAY"},   // the frame counter (F10 in the game)
+    // the launcher's Sticks and gyro page (window_sdl.c dead_zone, motion_fusion.c)
+    {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
+    {"gyro_deadzone", "TOTK_GYRO_DEADZONE"},
+    // the launcher's Keyboard page (mouse_direct.c)
+    {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"},
+    // the launcher's Mods page (mods.c)
+    {"mods_dir", "TOTK_MODS_DIR"}, {"mods_order", "TOTK_MODS_ORDER"}, {"mods_off", "TOTK_MODS_OFF"},
+    {"cheats_on", "TOTK_CHEATS_ON"}};
+
 static const char *default_exefs(void) {
     const char *exefs = "data/exefs";
     char path[4096];
@@ -130,23 +150,6 @@ static const char *default_exefs(void) {
             char *eq = strchr(line, '=');
             if (!eq || line[0] == '#') continue;
             *eq = 0;
-            static const char *const keys[][2] = {   // the file's names -> the runtime's variables
-                {"romfs", "TOTK_ROMFS"}, {"shaders", "TOTK_SHADER_DIR"}, {"compiled", "TOTK_SHADER_BIN"}, {"shaderpack", "TOTK_SHADER_PACK"}, {"textures", "TOTK_BC7_DIR"},
-                {"saves", "TOTK_PROFILE_DIR"}, {"fonts", "TOTK_SHARED_FONTS"}, {"fps", "TOTK_FPS_LIMIT"},
-                // the player's settings (the launcher's Play screen writes them)
-                {"window", "TOTK_WINDOW"}, {"vsync", "TOTK_VSYNC"}, {"lang", "TOTK_LANG"}, {"debug", "TOTK_STATS"},
-                {"resolution", "TOTK_OUTPUT_RES"}, {"scale", "TOTK_RENDER_SCALE"}, {"shadow_map", "TOTK_SHADOW_RES"},
-                {"sharpness", "TOTK_SHARPNESS"}, {"upscale", "TOTK_UPSCALER"}, {"antialias", "TOTK_AA"},
-                {"gpu_marks", "TOTK_VK_CHECKPOINTS"},   // the launcher's GPU markers (Debug tab)
-                {"fps_overlay", "TOTK_FPS_OVERLAY"},   // the frame counter (F10 in the game)
-                // the launcher's Sticks and gyro page (window_sdl.c dead_zone, motion_fusion.c)
-                {"stick_deadzone_left", "TOTK_STICK_DEADZONE_LEFT"}, {"stick_deadzone_right", "TOTK_STICK_DEADZONE_RIGHT"},
-                {"gyro_deadzone", "TOTK_GYRO_DEADZONE"},
-                // the launcher's Keyboard page (mouse_direct.c)
-                {"mouse_sens", "TOTK_MOUSE_SENS"}, {"mouse_aim", "TOTK_MOUSE_AIM_SCALE"}, {"mouse_invert", "TOTK_MOUSE_INVERT_Y"},
-                // the launcher's Mods page (mods.c)
-                {"mods_dir", "TOTK_MODS_DIR"}, {"mods_order", "TOTK_MODS_ORDER"}, {"mods_off", "TOTK_MODS_OFF"},
-                {"cheats_on", "TOTK_CHEATS_ON"}};
             if (!strcmp(line, "exefs")) snprintf(g_exefs, sizeof g_exefs, "%s", eq + 1), exefs = g_exefs;
             else if (!strcmp(line, "snapshots")) {   // the launcher's "Extended debugging with snapshots": F9 saves the frame into diag\f<frame>
                 if (!strcmp(eq + 1, "1")) setenv("TOTK_DUMP_KEY", "diag", 0);
@@ -157,8 +160,8 @@ static const char *default_exefs(void) {
                 if (snprintf(var, sizeof var, "TOTK_BIND_%s", line) < (int)sizeof var) setenv(var, eq + 1, 0);
             }
             else
-                for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++)
-                    if (!strcmp(line, keys[i][0])) setenv(keys[i][1], eq + 1, 0);
+                for (unsigned i = 0; i < sizeof CFG_KEYS / sizeof *CFG_KEYS; i++)
+                    if (!strcmp(line, CFG_KEYS[i][0])) setenv(CFG_KEYS[i][1], eq + 1, 0);
         }
         fclose(f);
         fprintf(stderr, "[totk] game folder %s (%s)\n", path, cfg);
@@ -205,7 +208,87 @@ void totk_cfg_set(const char *key, const char *value) {
     remove("ultratears.cfg.new");
 }
 
+/* The game's settings overlay (src/overlay) changed a key of ultratears.cfg: the variable it stands for now has the new
+   value (an empty one: unset, the default), so what reads it again follows. The Steam Deck's defaults come back for
+   what is unset. Main thread. */
+void totk_cfg_env(const char *key, const char *value) {
+    char var[96];
+    const char *name = NULL;
+    if (!strncmp(key, "pad_", 4) || !strncmp(key, "key_", 4)) {
+        if (snprintf(var, sizeof var, "TOTK_BIND_%s", key) < (int)sizeof var) name = var;
+    } else
+        for (unsigned i = 0; i < sizeof CFG_KEYS / sizeof *CFG_KEYS; i++)
+            if (!strcmp(key, CFG_KEYS[i][0])) name = CFG_KEYS[i][1];
+    if (!name) return;
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
+    deck_defaults();
+}
+
+/* The overlay's "Restart now": the game started again as it was started (its arguments, its folder and the environment
+   it got, so that ultratears.cfg's new values are read rather than the ones this run set), and this one ends.
+   Windows: a new process (it goes on writing ultratears.log, as processes this one starts do: TOTK_LOG_APPEND,
+   platform/windows.c). Linux: execve in this
+   process's place, so that Steam, the Steam Deck's Game Mode and the AppImage's runtime keep the same game process. */
+#ifdef _WIN32
+static wchar_t *g_env0, g_cwd0[4096];   // (the command line: GetCommandLineW)
+#else
+static char **g_argv, **g_env0, g_cwd0[4096];
+#endif
+static void start_kept(char **argv) {
+#ifdef _WIN32
+    (void)argv;
+    wchar_t *e = GetEnvironmentStringsW();
+    if (e) {
+        size_t n = 0;
+        while (e[n] || e[n + 1]) n++;
+        g_env0 = malloc((n + 2) * sizeof *g_env0);
+        if (g_env0) memcpy(g_env0, e, (n + 2) * sizeof *g_env0);
+        FreeEnvironmentStringsW(e);
+    }
+    if (!GetCurrentDirectoryW(sizeof g_cwd0 / sizeof *g_cwd0, g_cwd0)) g_cwd0[0] = 0;
+#else
+    g_argv = argv;
+    extern char **environ;
+    size_t n = 0;
+    while (environ[n]) n++;
+    g_env0 = calloc(n + 1, sizeof *g_env0);
+    for (size_t i = 0; g_env0 && i < n; i++) g_env0[i] = strdup(environ[i]);
+    if (!getcwd(g_cwd0, sizeof g_cwd0)) g_cwd0[0] = 0;
+#endif
+}
+void totk_restart(void) {
+    fprintf(stderr, "[totk] restarting: settings changed in the overlay need a new start\n");
+    runtime_profiler_stop();
+    { void pgo_flush(void); pgo_flush(); }
+#ifdef _WIN32
+    wchar_t exe[4096];
+    DWORD k = GetModuleFileNameW(NULL, exe, sizeof exe / sizeof *exe);
+    const wchar_t *cl = GetCommandLineW();
+    size_t n = wcslen(cl);
+    wchar_t *line = malloc((n + 1) * sizeof *line);
+    if (k && k < sizeof exe / sizeof *exe && line) {
+        memcpy(line, cl, (n + 1) * sizeof *line);
+        STARTUPINFOW si = {sizeof si};
+        PROCESS_INFORMATION pi;
+        if (CreateProcessW(exe, line, NULL, NULL, FALSE, g_env0 ? CREATE_UNICODE_ENVIRONMENT : 0, g_env0,
+                           g_cwd0[0] ? g_cwd0 : NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            _Exit(0);
+        }
+    }
+    fprintf(stderr, "[totk] restart failed (error %lu)\n", (unsigned long)GetLastError());
+#else
+    static char *none[] = {NULL};
+    if (g_cwd0[0] && chdir(g_cwd0) != 0) fprintf(stderr, "[totk] restart: cannot enter %s\n", g_cwd0);
+    execve("/proc/self/exe", g_argv, g_env0 ? g_env0 : none);
+    fprintf(stderr, "[totk] restart failed: %s\n", strerror(errno));
+#endif
+}
+
 int main(int argc, char **argv) {
+    start_kept(argv);
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "UltraTears %s (commit %s)\n", ULTRS_VERSION, ULTRS_COMMIT);   // first line of every log
     // --debug: the statistics lines in the log (TOTK_STATS=1; the launcher's Debug mode writes debug=1 instead)

@@ -38,7 +38,7 @@ import deps_install  # noqa: E402
 import linux_used  # noqa: E402
 import public_tree  # noqa: E402
 import version  # noqa: E402
-from make_package import NOT_IN_PACKAGE, LICENSE_COPIES, git  # noqa: E402
+from make_package import NOT_IN_PACKAGE, LICENSE_COPIES, git, launcher_deps  # noqa: E402
 
 GLIBC_FLOOR = (2, 34)
 APPIMAGETOOL = {   # from release tags, pinned by hash: "continuous" uploads change under the same name
@@ -57,6 +57,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | deps/linux | The Linux kit: files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
 | ultratears-launcher, libSDL3.so.0 | The launcher (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt, licenses/linux-kit/ |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
+| deps/launcher | Dear ImGui with its SDL3 and Vulkan backends (MIT), nanosvg (zlib), stb_image (MIT): compiled into the game on your machine for its settings overlay, with the fonts of assets/launcher (SIL OFL 1.1) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 
 Source code. The launcher and the shader translator come built; their source, like all of this project's, is at
 https://github.com/kuraeow/ultratears/tree/{commit}. Others: LLVM https://github.com/llvm/llvm-project, ninja
@@ -195,6 +196,7 @@ def main():
             shutil.rmtree(p)
         elif p.is_file():
             p.unlink()
+    launcher_deps(out)   # Dear ImGui for the game's settings overlay (built on the player's machine)
     # the tools, from the same pins a source build installs, without what a player's build does not use
     deps_install.install_python_linux(out)
     deps_install.install_llvm(out)

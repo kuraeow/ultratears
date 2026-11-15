@@ -113,6 +113,25 @@ static int create_instance(SDL_Window *window) {
         with_debug[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         exts = with_debug;
     }
+#ifdef _WIN32
+    /* VK_EXT_full_screen_exclusive needs VK_KHR_get_surface_capabilities2 on the instance (present.c: the fullscreen
+       window shown through the desktop's compositor, not in the driver's exclusive mode) */
+    static const char *with_caps2[64];
+    if (exts && next < 63) {
+        uint32_t n = 0;
+        vk.vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        VkExtensionProperties *p = calloc(n ? n : 1, sizeof *p);
+        vk.vkEnumerateInstanceExtensionProperties(NULL, &n, p);
+        int have = 0;
+        for (uint32_t i = 0; i < n; i++) have |= !strcmp(p[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        free(p);
+        if (have) {
+            for (Uint32 i = 0; i < next; i++) with_caps2[i] = exts[i];
+            with_caps2[next++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+            exts = with_caps2;
+        }
+    }
+#endif
     const char *layers[2];
     uint32_t nlayers = 0;
     if (validate) layers[nlayers++] = layer;
@@ -282,10 +301,16 @@ static int create_device(void) {
         {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
         // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
         {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},
+#ifdef _WIN32
+        // the fullscreen window through the desktop's compositor rather than the driver's exclusive mode (present.c):
+        // screenshot tools and the desktop see the game's frames (they saw the first frame of the run, 2026-11-15)
+        {"VK_EXT_full_screen_exclusive", NULL, &vkc.has_fse},
+#endif
     };
     const char *robust = getenv("TOTK_VK_ROBUST");
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
+        if (want[i].flag == &vkc.has_fse && (!vkc.surface || (getenv("TOTK_VK_NO_EXCLUSIVE") && !strcmp(getenv("TOTK_VK_NO_EXCLUSIVE"), "0")))) continue;
         if (want[i].features == &frb2 && !(robust && !strcmp(robust, "2"))) continue;
         if ((want[i].flag == &vkc.has_checkpoints || want[i].flag == &vkc.has_buffer_marker) && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }

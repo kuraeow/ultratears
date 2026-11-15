@@ -352,6 +352,85 @@ static const Text TEXTS[] = {
                       "Игра не сможет отслеживать записи в свою память и будет работать очень медленно. Обновите систему."}},
     {"amd_untested", {"{gpu}: AMD cards are not tested yet", "{gpu}: видеокарты AMD ещё не проверены"}},
     {"amd_untested.d", {"Please tell how the game runs: it helps.", "Расскажите, как идёт игра, — это поможет."}},
+    // ---- the game's settings overlay (src/overlay): its own words, and each row's description (<row>.desc)
+    {"ovl_select", {"Select", "Выбрать"}},
+    {"ovl_back", {"Back", "Назад"}},
+    {"ovl_quit", {"Quit game", "Выйти из игры"}},
+    {"ovl_restart_title", {"Restart the game?", "Перезапустить игру?"}},
+    {"ovl_restart_text", {"Some of the changes take effect only after a restart. Unsaved progress will be lost.",
+                          "Часть изменений вступит в силу только после перезапуска. Несохранённый прогресс будет потерян."}},
+    {"ovl_restart_now", {"Restart now", "Перезапустить"}},
+    {"ovl_later", {"Later", "Позже"}},
+    {"ovl_quit_title", {"Quit the game?", "Выйти из игры?"}},
+    {"ovl_quit_text", {"Unsaved progress will be lost.", "Несохранённый прогресс будет потерян."}},
+    {"ovl_quit_go", {"Quit", "Выйти"}},
+    {"ovl_applies_now", {"Applies at once.", "Применяется сразу."}},
+    {"ovl_after_restart", {"after a restart", "после перезапуска"}},
+    {"ovl_applies_restart", {"Applies after a restart of the game.", "Применяется после перезапуска игры."}},
+    {"ctl_applies_now", {"Changes apply at once. A mouse button can be pressed in place of a key; Esc cancels waiting.",
+                         "Изменения применяются сразу. Вместо клавиши можно нажать кнопку мыши; Esc отменяет ожидание."}},
+    {"sticks_note_now", {"A stick let go and a gamepad lying still stay in the grey. Changes apply at once.",
+                         "Отпущенный стик и лежащий геймпад остаются в сером круге. Изменения применяются сразу."}},
+    {"mods_note_game", {"The higher mod wins a file two mods change. Changes apply after a restart of the game.",
+                        "Если два мода меняют один файл, побеждает тот, что выше. Изменения — после перезапуска игры."}},
+    {"tab_main.desc", {"How the game is shown: window, resolution, image quality and frame rate. Point at a setting to read what it does.",
+                       "Как показывается игра: окно, разрешение, качество картинки и частота кадров. Наведите на настройку, чтобы прочитать, что она делает."}},
+    {"tab_controls.desc", {"Which buttons and keys do what, the sticks' dead zones, the gyro and the mouse. The bindings also drive this menu.",
+                           "Какие кнопки и клавиши что делают, мёртвые зоны стиков, гироскоп и мышь. Это меню тоже управляется этими назначениями."}},
+    {"tab_mods.desc", {"Mods from the mods folder: switch them on or off, change their order, switch cheats. The game reads them when it starts.",
+                       "Моды из папки mods: включение, порядок, читы. Игра читает их при запуске."}},
+    {"tab_debug.desc", {"For reports of problems: more lines in the log and snapshots of frames. Not needed for playing.",
+                        "Для отчётов о проблемах: больше строк в логе и снимки кадров. Для игры не нужно."}},
+    {"row_window.desc", {"Fullscreen takes the screen over and may change its mode; Borderless is a window the size of the screen, quick to "
+                         "switch away from; Window can be moved and resized. F11 switches too.",
+                         "Полный экран занимает экран целиком; Без рамки — окно размером с экран, из него быстрее переключаться в "
+                         "другие программы; Окно можно двигать и менять его размер. F11 тоже переключает."}},
+    {"row_res.desc", {"The size of the picture the game composes, its menus included. More is sharper and costs the graphics card "
+                      "more; the screen's own size looks best. Another shape than 16:9 widens the view.",
+                      "Размер картинки, которую собирает игра, вместе с меню. Больше — чётче, но тяжелее для видеокарты; лучше "
+                      "всего смотрится родное разрешение экрана. Форма шире 16:9 расширяет обзор."}},
+    {"row_scale.desc", {"The 3D scene drawn smaller and scaled up to the resolution: the biggest effect on the frame rate. FSR 3.1 "
+                        "also smooths edges over several frames and keeps more detail at the same scale; FSR 1 is the game's own.",
+                        "3D-сцена рисуется меньше и растягивается до разрешения — сильнее всего влияет на частоту кадров. FSR 3.1 "
+                        "ещё и сглаживает края по нескольким кадрам и при том же масштабе сохраняет больше деталей; FSR 1 — как в "
+                        "самой игре."}},
+    {"row_aa.desc", {"Smooths jagged edges. FXAA is the game's own, cheap and slightly soft; SMAA is sharper for a little more work.",
+                     "Сглаживает ступеньки на краях. FXAA — как в игре, дешёвое и немного мылит; SMAA чётче и чуть тяжелее."}},
+    {"row_sharp.desc", {"Sharpening of the final picture (AMD's RCAS). Higher brings out detail after scaling; too high shows halos "
+                        "around edges.",
+                        "Повышение резкости итоговой картинки (RCAS от AMD). Больше — заметнее детали после масштабирования; "
+                        "слишком много даёт ореолы вокруг краёв."}},
+    {"row_fps.desc", {"The most frames a second the game shows. Above 60 is a beta: the game itself was not made for it, and the "
+                      "camera or climbing may behave oddly in places. Switching to or from 30 applies after a restart.",
+                      "Сколько кадров в секунду игра показывает самое большее. Выше 60 — бета: сама игра на это не рассчитана, "
+                      "местами странно ведут себя камера или лазание. Переход на 30 и обратно — после перезапуска."}},
+    {"row_vsync.desc", {"On: whole frames only, no tearing. Off: frames are shown at once, a little less input delay, but the "
+                        "picture may tear.",
+                        "Вкл: только целые кадры, без разрывов. Выкл: кадры показываются сразу, чуть меньше задержка ввода, но "
+                        "картинка может рваться."}},
+    {"row_counter.desc", {"Frames per second and their time in the top right corner. F10 switches it in the game.",
+                          "Кадры в секунду и их время в правом верхнем углу. В игре переключается клавишей F10."}},
+    {"row_layout.desc", {"Which face button is A: on the right as on a Switch controller, or at the bottom as on Xbox pads and the "
+                         "Steam Deck.",
+                         "Какая из правых кнопок — A: справа, как на контроллере Switch, или снизу, как на геймпадах Xbox и Steam Deck."}},
+    {"act.desc", {"Select the field, then press the button or key for this action; the action that had it gets this one's in "
+                  "exchange. The arrow at the left puts the default back.",
+                  "Выберите поле и нажмите кнопку или клавишу для этого действия; действие, у которого она была, получит "
+                  "взамен прежнюю. Стрелка слева возвращает значение по умолчанию."}},
+    {"row_deadzone.desc", {"How far a stick may lean, or the gyro turn, before the game takes it as moved. Raise it if Link walks "
+                           "or the aim drifts on its own.",
+                           "Насколько стик может отклониться или гироскоп повернуться, прежде чем игра сочтёт это движением. "
+                           "Увеличьте, если Линк идёт сам или прицел уплывает."}},
+    {"row_mouse_sens.desc", {"How fast the mouse turns the camera.", "Как быстро мышь поворачивает камеру."}},
+    {"row_mouse_aim.desc", {"The mouse's speed while a bow is drawn, as a share of the camera's.",
+                            "Скорость мыши при натянутом луке — как доля от скорости камеры."}},
+    {"row_mouse_invert.desc", {"Moving the mouse up looks down.", "Мышь вверх — взгляд вниз."}},
+    {"row_debug.desc", {"Statistics lines in the log and a console window beside the game: for reports of problems.",
+                        "Строки статистики в логе и окно консоли рядом с игрой — для отчётов о проблемах."}},
+    {"row_snapshots.desc", {"F9 saves the frame's draws and textures into the diag folder: for picture bugs. Takes disk space.",
+                            "F9 сохраняет отрисовки и текстуры кадра в папку diag — для ошибок картинки. Занимает место на диске."}},
+    {"row_gpu_marks.desc", {"If the graphics card fails, the log says what it was doing last. May slow the game a little.",
+                            "Если видеокарта сбоит, лог покажет, чем она занималась последней. Может немного замедлить игру."}},
 };
 
 static const Text *find(const char *key) {

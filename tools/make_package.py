@@ -70,6 +70,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | bin-linux/ultratears-launcher | The launcher for Linux / Steam Deck, put into the Deck's tar (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) beside it in the tar | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 | deps/linux | The Linux kit for builds for the Steam Deck (tools/make_linux_kit.py): files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
+| deps/launcher | Dear ImGui with its SDL3 and Vulkan backends (MIT), nanosvg (zlib), stb_image (MIT): compiled into the game on your PC for its settings overlay, with the fonts of assets/launcher (SIL OFL 1.1) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 
 Source code. The launcher and the shader translator come built; their source, like all of this project's, is at
 https://github.com/kuraeow/ultratears/tree/{commit} (src/launcher, third_party/shader_translator,
@@ -80,8 +81,10 @@ capstone https://github.com/capstone-engine/capstone, Ryujinx https://github.com
 '''
 
 # The source tree in the package is what the build on the player's PC uses: what only builds the parts that come built
-# (the launcher, the shader translator), the developers' tools and GitHub's files stay in the repository.
-NOT_IN_PACKAGE = ['src/launcher', 'assets/launcher',
+# (the launcher, the shader translator), the developers' tools and GitHub's files stay in the repository. The game's
+# settings overlay (src/overlay) is built there with the launcher's words, fonts, images and helpers (the rest of
+# src/launcher, assets/launcher) and Dear ImGui (deps/launcher, LAUNCHER_DEPS).
+NOT_IN_PACKAGE = ['src/launcher/main.cpp', 'src/launcher/ui.cpp', 'src/launcher/update.cpp',
                   'assets/cover.png', 'third_party/maxwell_shader', 'third_party/shader_translator', 'tools/build_xlate.py',
                   'tools/build_launcher.py', 'tools/make_package.py', 'tools/eden_xlate', 'tools/run_eden_xlate.py',
                   'tools/compare_spirv_opt.py', 'tools/validate_spirv.py', 'tools/gen_nvn_thunks.py', 'tools/recon_code.py',
@@ -92,6 +95,13 @@ LICENSE_COPIES = {'deps/launcher/imgui/LICENSE.txt': 'imgui.txt', 'deps/launcher
                   'deps/launcher/stb/LICENSE': 'stb.txt', 'assets/launcher/fonts/OFL-Inter.txt': 'OFL-Inter.txt',
                   'assets/launcher/fonts/OFL-MontserratAlternates.txt': 'OFL-MontserratAlternates.txt',
                   'third_party/shader_translator/LICENSE': 'totk_xlate.txt'}
+
+
+def launcher_deps(out):
+    """deps/launcher: Dear ImGui, nanosvg and stb_image as tools/deps.json pins them (checked again by
+    deps_install.launcher_libs on the player's PC, so the build downloads nothing)."""
+    src = deps_install.launcher_libs(ROOT)
+    shutil.copytree(src, out / 'deps/launcher', ignore=shutil.ignore_patterns('downloads'), dirs_exist_ok=True)
 
 
 def git(*args):
@@ -250,6 +260,7 @@ def main():
             shutil.rmtree(p)
         elif p.is_file():
             p.unlink()
+    launcher_deps(out)
     # deps/clang64
     used = clang64_files_used(home) | dll_closure(PROGRAMS)
     for f in sorted(used):

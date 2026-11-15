@@ -210,4 +210,5 @@ void runtime_motion_start(void) {
 void runtime_motion_stop(void) {}
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
+void runtime_motion_reload(void) { pthread_mutex_lock(&lock); deadzone = -1; pthread_mutex_unlock(&lock); }   /* gyro_deadzone= from the overlay */
 void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }

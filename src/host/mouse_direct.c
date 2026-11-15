@@ -76,6 +76,7 @@ static void settings(void) {
     LOGM("sensitivity %.2f, aiming x%.2f%s%s", g_sens, g_aim, g_invert ? ", inverted y" : "", g_direct ? "" : ", off (TOTK_MOUSE_DIRECT=0)");
 }
 float totk_mouse_sens(void) { settings(); return g_sens; }
+void totk_mouse_reload(void) { g_sens = -1; }   // the settings overlay changed mouse_*: read again
 int totk_mouse_enabled(void) { settings(); return g_direct && g_sens > 0; }
 static int direct_mode(void) { return totk_mouse_enabled(); }
 

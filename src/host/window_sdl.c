@@ -6,6 +6,8 @@
 //  - rumble: the game's vibration values (hid_feedback.c) drive the controller's low / high frequency motors.
 //  - motion: the controller's gyro and accelerometer feed motion_fusion.c (gyro aiming); F11 / Alt+Enter: fullscreen.
 //  - the mouse: kept in the window, the cursor hidden (mouse_capture); Esc lets it go.
+//  - the settings overlay (src/overlay): F1 (unless bound) or the controller's Back + Start together; while it is open
+//    it takes the input and the game waits (ovl_game_gate).
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED   // main() is boot.c's; SDL only gets SDL_SetMainReady
 #include <SDL3/SDL_main.h>
@@ -22,6 +24,12 @@
 #endif
 
 static SDL_Window *window;
+// src/overlay/overlay.cpp (main thread)
+int ovl_is_open(void);
+void ovl_toggle(void);
+int ovl_event(const SDL_Event *e);
+void ovl_frame(void);
+int ovl_wait_ms(void);
 static SDL_Gamepad *pad;
 static SDL_Mutex *pad_lock;
 
@@ -137,8 +145,8 @@ static int32_t stick(Sint16 v, int invert) {
    TOTK_STICK_DEADZONE percent of the travel (default 10, 0..50) reads as centred, and the rest is scaled so the stick
    still goes from 0 to full beyond it, without a jump at its edge. Each stick its own (the launcher's Sticks and gyro
    page: stick_deadzone_left= / _right= in ultratears.cfg): TOTK_STICK_DEADZONE_LEFT / _RIGHT over the shared one. */
+static double dzs[2] = {-1, -1};
 static void dead_zone(int32_t *x, int32_t *y, int side) {
-    static double dzs[2] = {-1, -1};
     if (dzs[side] < 0) {
         const char *name = side ? "TOTK_STICK_DEADZONE_RIGHT" : "TOTK_STICK_DEADZONE_LEFT", *e = getenv(name);
         if (!e || !*e) name = "TOTK_STICK_DEADZONE", e = getenv(name);
@@ -159,12 +167,54 @@ static int pad_down(void) {   // any button or trigger of the controller pressed
     for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) return 1;
     return SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384 || SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384;
 }
+/* The overlay's chord: the controller's Back and Start (View and Menu, - and +, Share and Options: SDL's names by
+   position) pressed together open or close it. So that the first of the two does not reach the game (the map, the
+   menu), each goes to the game only once it has been held CHORD_NS alone; a press let go sooner is given to the game
+   then, for TAP_NS. Both held together: neither reaches the game until both are up. */
+enum { CHORD_MS = 80, TAP_MS = 60 };
+static const SDL_GamepadButton CHORD[2] = {SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_START};
+static uint64_t g_chord_down[2], g_chord_tap[2];   // runtime_now_ns when it went down (0: up); a tap given until
+static int g_chord;                                 // both went down together
+static int chord_timing(void) {   // a timer runs: the window loop wakes every few ms (pad_update again)
+    uint64_t now = runtime_now_ns();
+    for (int i = 0; i < 2; i++)
+        if ((g_chord_down[i] && now - g_chord_down[i] < CHORD_MS * 1000000ull) || now < g_chord_tap[i]) return 1;
+    return 0;
+}
+static uint64_t chord_buttons(uint64_t now) {   // the Switch buttons Back and Start give the game now
+    int down[2];
+    for (int i = 0; i < 2; i++) {
+        down[i] = pad && SDL_GetGamepadButton(pad, CHORD[i]);
+        if (down[i] && !g_chord_down[i]) g_chord_down[i] = now;
+        if (!down[i] && g_chord_down[i]) {
+            if (!g_chord && now - g_chord_down[i] < CHORD_MS * 1000000ull) g_chord_tap[i] = now + TAP_MS * 1000000ull;
+            g_chord_down[i] = 0;
+        }
+    }
+    if (down[0] && down[1] && !g_chord) {
+        g_chord = 1;
+        g_chord_tap[0] = g_chord_tap[1] = 0;
+        ovl_toggle();
+    }
+    if (g_chord && !down[0] && !down[1]) g_chord = 0;
+    uint64_t bits = 0;
+    for (int i = 0; i < 2; i++)
+        if (!g_chord && ((down[i] && now - g_chord_down[i] >= CHORD_MS * 1000000ull) || now < g_chord_tap[i]))
+            bits |= g_padbits[CHORD[i]];
+    return bits;
+}
+/* The overlay just closed: the controller's buttons held then (A on "Later", B for Back) stay the overlay's until let go,
+   or the game took them as pressed the moment it went on (the user, 2026-11-15) */
+static int g_after_overlay;
 static void pad_update(void) {
     RuntimeGamepadState s = {0};
-    if (pad && text_entry_blocks_input()) s.connected = 1;   // held: connected, nothing pressed
+    uint64_t chord = chord_buttons(runtime_now_ns());
+    if (g_after_overlay && !pad_down()) g_after_overlay = 0;
+    if (pad && (text_entry_blocks_input() || ovl_is_open() || g_after_overlay)) s.connected = 1;   // held: connected, nothing pressed
     else if (pad) {
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)   // through the bindings (binds_load)
-            if (g_padbits[b] && SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) s.buttons |= g_padbits[b];
+            if (g_padbits[b] && b != CHORD[0] && b != CHORD[1] && SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) s.buttons |= g_padbits[b];
+        s.buttons |= chord;
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) s.buttons |= g_trigbits[0];
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) s.buttons |= g_trigbits[1];
         s.lx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), 0);
@@ -198,6 +248,9 @@ int window_init(void) {
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");   // 10 ms device buffer at 48 kHz
     SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON, "1");        // the exe's icon resource (assets/icon.ico via build/ultratears.rc) for the window
     SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON_SMALL, "1");
+    // Exclusive fullscreen stays up when another window takes the focus (SDL minimizes it by default): a screenshot tool
+    // (Win+Shift+S) minimized the game (the user, 2026-11-15)
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "[totk] SDL: %s\n", SDL_GetError());
         return 0;
@@ -312,6 +365,111 @@ static void mouse_capture(bool on) {
     SDL_SetWindowRelativeMouseMode(window, on);
 }
 
+/* ---- the settings overlay's side (src/overlay, main thread) */
+// window= changed in the overlay: the mode it names now, as window_init sets it
+void window_apply_mode(void) {
+    const char *mode = getenv("TOTK_WINDOW");
+    int full = mode && (!SDL_strcmp(mode, "borderless") || !SDL_strcmp(mode, "fullscreen"));
+    const SDL_DisplayMode *desk = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window));
+    SDL_SetWindowFullscreenMode(window, full && !SDL_strcmp(mode, "fullscreen") ? desk : NULL);
+    SDL_SetWindowFullscreen(window, full);
+    fprintf(stderr, "[totk] window: %s (overlay)\n", mode && *mode ? mode : "window");
+}
+// pad_* / key_*, the dead zones changed in the overlay: read again
+void window_reload_input(void) {
+    binds_load();
+    dzs[0] = dzs[1] = -1;
+    pad_update();
+}
+static int g_last_keyboard = -1;   // the input used last: 1 the keyboard or the mouse, 0 a controller; -1 none yet
+int window_last_keyboard(void) { return g_last_keyboard >= 0 ? g_last_keyboard : !pad; }
+// The Switch buttons a key stands for in the overlay: its bindings, the movement keys as the d-pad
+static uint64_t key_bits(int k) {
+    uint64_t bits = 0;
+    for (int i = 0; i < 2; i++) {
+        int mac = g_keymap[k][i];
+        if (mac < 0) continue;
+        for (unsigned a = 0; a < sizeof ACTIONS / sizeof *ACTIONS; a++)
+            if (ACTIONS[a].mac == mac)
+                bits |= ACTIONS[a].bit ? ACTIONS[a].bit : !SDL_strcmp(ACTIONS[a].id, "move_up") ? 8192u
+                      : !SDL_strcmp(ACTIONS[a].id, "move_down") ? 32768u : !SDL_strcmp(ACTIONS[a].id, "move_left") ? 4096u
+                      : !SDL_strcmp(ACTIONS[a].id, "move_right") ? 16384u : 0;
+    }
+    return bits;
+}
+/* Shift, Ctrl, Alt and Win bound to a button (B is Left Shift by default) act in the overlay only pressed alone and let
+   go: Win+Shift+S, Shift+Alt+S (screenshots) and the like closed it (the user, 2026-11-15). Pressed alone, the button is
+   given for one poll at the release (g_mod_pulse). */
+static uint8_t g_mod_alone[8];   // SDL_SCANCODE_LCTRL .. SDL_SCANCODE_RGUI: down, and nothing else pressed since
+static uint64_t g_mod_pulse;
+static int is_mod(int sc) { return sc >= SDL_SCANCODE_LCTRL && sc <= SDL_SCANCODE_RGUI; }
+static void note_mods(const SDL_Event *e) {
+    if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
+        for (int i = 0; i < 8; i++) g_mod_alone[i] = 0;   // a second key: whatever was held is part of a combination
+        if (is_mod(e->key.scancode)) {
+            int held = 0;
+            const bool *keys = SDL_GetKeyboardState(NULL);
+            for (int k = SDL_SCANCODE_LCTRL; k <= SDL_SCANCODE_RGUI; k++) held += k != (int)e->key.scancode && keys[k];
+            g_mod_alone[e->key.scancode - SDL_SCANCODE_LCTRL] = !held;
+        }
+    } else if (e->type == SDL_EVENT_KEY_UP && is_mod(e->key.scancode)) {
+        if (g_mod_alone[e->key.scancode - SDL_SCANCODE_LCTRL]) g_mod_pulse |= key_bits(e->key.scancode);
+        g_mod_alone[e->key.scancode - SDL_SCANCODE_LCTRL] = 0;
+    } else if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_WINDOW_FOCUS_LOST)
+        for (int i = 0; i < 8; i++) g_mod_alone[i] = 0;
+}
+static void note_input(const SDL_Event *e) {
+    note_mods(e);
+    if (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) g_last_keyboard = 1;
+    else if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_keyboard = 0;
+    else if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && (e->gaxis.value > 16000 || e->gaxis.value < -16000)) g_last_keyboard = 0;
+}
+/* What the overlay is driven by: the Switch buttons held now, the controller's through the game's bindings and the keys'
+   through theirs (the movement keys as the d-pad), with Enter as A, Esc / Backspace as B and the arrows as the d-pad
+   besides; sticks[4]: the controller's left and right stick, -1..1, y down. The game's own bindings, so that "Back" is
+   whatever B is (the user, 2026-11-13). */
+uint64_t window_nav_buttons(float sticks[4]) {
+    uint64_t bits = 0;
+    SDL_LockMutex(pad_lock);
+    if (pad) {
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
+            if (g_padbits[b] && SDL_GetGamepadButton(pad, (SDL_GamepadButton)b)) bits |= g_padbits[b];
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) bits |= g_trigbits[0];
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) bits |= g_trigbits[1];
+        static const SDL_GamepadAxis ax[4] = {SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY};
+        for (int i = 0; i < 4; i++) sticks[i] = SDL_GetGamepadAxis(pad, ax[i]) / 32767.0f;
+    } else
+        sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0;
+    SDL_UnlockMutex(pad_lock);
+    int n = 0;
+    const bool *keys = SDL_GetKeyboardState(&n);
+    for (int k = 0; k < n && k < SDL_SCANCODE_COUNT; k++)
+        if (keys[k] && !is_mod(k)) bits |= key_bits(k);   // the modifiers: at their release, alone (note_mods)
+    bits |= g_mod_pulse;
+    g_mod_pulse = 0;
+    if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER]) bits |= 1;
+    if (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_BACKSPACE]) bits |= 2;
+    if (keys[SDL_SCANCODE_UP]) bits |= 8192;
+    if (keys[SDL_SCANCODE_DOWN]) bits |= 32768;
+    if (keys[SDL_SCANCODE_LEFT]) bits |= 4096;
+    if (keys[SDL_SCANCODE_RIGHT]) bits |= 16384;
+    return bits;
+}
+// The overlay opened (1) or closed (0): the game's input let go, the mouse given back to the desktop while it is open
+void window_overlay_shown(int open) {
+    static bool had_mouse;
+    runtime_input_clear();
+    if (open) {
+        had_mouse = SDL_GetWindowRelativeMouseMode(window);
+        SDL_SetWindowRelativeMouseMode(window, false);
+    } else {
+        if (had_mouse) SDL_SetWindowRelativeMouseMode(window, true);
+        g_after_overlay = 1;   // (pad_update) until every button is up
+    }
+    pad_update();
+}
+SDL_Window *window_handle(void) { return window; }
+
 static void toggle_fullscreen(void) {
     bool on = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
     SDL_SetWindowFullscreen(window, !on);   // borderless desktop fullscreen (no display mode change)
@@ -333,8 +491,12 @@ static void title_update(void) {
 _Noreturn void window_loop(void) {
     for (;;) {
         SDL_Event e;
-        if (SDL_WaitEventTimeout(&e, 100)) {
+        int wait = ovl_wait_ms();
+        if (chord_timing() && wait > 5) wait = 5;
+        if (SDL_WaitEventTimeout(&e, wait)) {
             do {
+                note_input(&e);
+                if (ovl_event(&e)) continue;   // the settings overlay, while it is open
                 int text_entry_event(const SDL_Event *e);   // text_entry.c: the software keyboard's field first
                 if (text_entry_event(&e)) continue;
                 if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && text_entry_blocks_input() &&
@@ -360,6 +522,11 @@ _Noreturn void window_loop(void) {
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F10) {
                         void vk_overlay_toggle(void);   // vk/overlay.c: the frame counter
                         vk_overlay_toggle();
+                        break;
+                    }
+                    if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F1 &&
+                        g_keymap[SDL_SCANCODE_F1][0] < 0) {
+                        ovl_toggle();   // the settings overlay, unless F1 is bound to one of the game's buttons
                         break;
                     }
                     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F9) {
@@ -410,6 +577,12 @@ _Noreturn void window_loop(void) {
             SDL_UnlockMutex(pad_lock);
             if (held && !text_entry_blocks_input()) pad_update();
         }
+        if (chord_timing() || g_chord_tap[0] || g_chord_tap[1]) {   // Back / Start held alone long enough, or a tap's end
+            pad_update();
+            uint64_t now = runtime_now_ns();
+            for (int i = 0; i < 2; i++) if (g_chord_tap[i] && now >= g_chord_tap[i] + 1000000000ull) g_chord_tap[i] = 0;
+        }
+        ovl_frame();   // the settings overlay's frame, while it is open
         title_update();
     }
 }

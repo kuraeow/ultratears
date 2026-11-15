@@ -51,6 +51,13 @@ static VkShaderEXT make_shader(const uint32_t *code, size_t size) {
     return vk.vkCreateShadersEXT(vkc.device, 1, &ci, NULL, &s) == VK_SUCCESS ? s : VK_NULL_HANDLE;
 }
 
+// sharpness= changed in the settings overlay (src/overlay): read again, used from the next frame (both passes exist)
+void vk_fsr_sharp_reload(void) {
+    const char *s = getenv("TOTK_SHARPNESS");
+    int v = s && *s ? atoi(s) : 50;
+    F.sharp = v < 0 ? 0 : v > 100 ? 100 : v;
+    F.logged = 0;
+}
 static int init(void) {
     F.tried = 1;
     const char *u = getenv("TOTK_UPSCALER");

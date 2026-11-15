@@ -2986,6 +2986,7 @@ static int uncapped_cap(int scr) {
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; }
+void nvn_present_reset(void) { g_hz = -1; }   // UltraTears: the frame limit changed in the settings overlay (frame_rate.c)
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
@@ -3143,6 +3144,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
+    { extern void ovl_game_gate(void); ovl_game_gate(); }   // UltraTears: the settings overlay pauses the game here (src/overlay)
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     /* UltraTears: with the frame limit (uncapped, host/frame_rate.c), after MacNativeGames' nvn_pace.h (MIT): the display slot is paced here, at the game's present: the

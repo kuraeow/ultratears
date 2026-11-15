@@ -75,6 +75,9 @@ static void config(void) {
 
 // The limit for the pacer: frames per second, -1 the monitor's rate (the pacer holds it to totk_fr_limit_max).
 int totk_fr_limit(void) { config(); return g_limit; }
+// The settings overlay (src/overlay) changed fps=: read again at the next frame (the game thread waits in the overlay's
+// pause meanwhile); the pacer too (gfx/nvn/hle_nvn.c nvn_present_reset)
+void totk_fr_reload(void) { g_limit = -2; void nvn_present_reset(void); nvn_present_reset(); }
 int totk_fr_limit_max(void) { return LIMIT_MAX; }
 
 // Read by the patched game code (tools/lifter/patches.py).

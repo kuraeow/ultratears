@@ -28,6 +28,7 @@ static int on(void) {
     }
     return v;
 }
+void vk_overlay_reload(void) { atomic_store(&g_on, -1); }   // fps_overlay= changed in the settings overlay
 void vk_overlay_toggle(void) {   // F10: also kept in ultratears.cfg (host/boot.c), as the launcher's setting shows it
     int v = !on();
     atomic_store(&g_on, v);
