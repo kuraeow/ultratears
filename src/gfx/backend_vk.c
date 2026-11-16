@@ -173,6 +173,7 @@ __thread int vkb_mtag;
 static _Atomic uint64_t g_tag_bytes[MT_N];
 static pthread_mutex_t g_memtab_mu = PTHREAD_MUTEX_INITIALIZER;
 static __thread int t_retire;   // the retire thread: it completes the submissions, so it never waits for them
+static __thread uint64_t t_fence_wait_ns;   // this thread's time in mtl_wait for an unfinished submission (long-submission line)
 static _Atomic uint64_t g_oom_events, g_oom_recovered;
 // Out of memory (the commit limit, the GPU heap's budget - L7, #31): give back the upload memory of idle slots, let
 // the GPU finish what is in flight (the frees deferred to it: images, shaders, buffers) and try again, up to ~2 s.
@@ -3500,6 +3501,7 @@ struct mt_chunk {
     VkCommandBuffer cb;
     vkb_trk trk;
     uint64_t draws, ns;                   // the log line: its draws and dispatches, its recording time
+    uint64_t cpu_ns, fwait_ns; int worker;   // the long-submission line: on a core, waiting for a fence, which thread
     int split, stores;                    // it begins inside a cut pass; its shaders left storage writes pending
     int done;                             // recorded (g_mt_mu): partial submission sends the recorded ones in order
     uint64_t tsr[6];                      // the temporal upscaler's jitter state at its start (vkb_tsr.c)
@@ -3613,7 +3615,7 @@ void vkb_pro_end(void) {
 static int chunk_end_at(const mt_chunk *c, int hidx, const uint8_t *p) { return hidx == c->h1 && p == c->p1; }
 static vkb_cnt g_mt_rec_ns;   // chunk recording time, all threads (the log line)
 static void mt_record(mt_chunk *c) {
-    uint64_t t0 = runtime_now_ns();
+    uint64_t t0 = runtime_now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), f0 = t_fence_wait_ns;
     c->cb = wp_get(g_cur, t_worker);
     t_cb = c->cb;
     t_recording = 1;
@@ -3642,6 +3644,9 @@ static void mt_record(mt_chunk *c) {
     t_recording = 0;
     t_cb = VK_NULL_HANDLE;
     c->ns = runtime_now_ns() - t0;
+    c->cpu_ns = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0;
+    c->fwait_ns = t_fence_wait_ns - f0;
+    c->worker = t_worker;
     vkb_cnt_add(g_mt_rec_ns, c->ns);
 }
 static int mt_take(void) {   // the next chunk cut and not taken, or -1
@@ -3828,6 +3833,8 @@ static uint64_t g_part_t, g_glue_images;           // when the last part went; i
 static pthread_mutex_t g_part_mu = PTHREAD_MUTEX_INITIALIZER;   // part_flush and the submission's end, one at a time
 static int g_walk_done, g_part_closing;            // (g_part_mu) parts may go; the submission is sending the rest
 static uint64_t g_part_t0;                         // when the submission's recording began
+static uint64_t g_part_at[PART_MAX];               // (g_part_mu) when each part went, after g_part_t0 (long submission line)
+static int g_part_held_sub;                        // (g_part_mu) parts of this submission held back (long submission line)
 // uploads with partial submission: each in its own command buffer, ended by its thread and queued until a part takes it
 typedef struct { VkCommandBuffer cb; vkb_trk trk; } upq_e;
 static upq_e *g_upq[VKB_MAXREC];
@@ -3979,7 +3986,7 @@ static void part_flush(void) {
     if (!first && !part_drain_ok() && (g_pro_any || uploads_queued())) {   // it would drain the GPU: held back, unless idle
         if (!(part_idle_on() && gpu_idle())) {
             pthread_mutex_unlock(&g_pro_mu);
-            g_part_held++;
+            g_part_held++; g_part_held_sub++;
             pthread_mutex_unlock(&g_part_mu);
             return;
         }
@@ -4018,6 +4025,7 @@ static void part_flush(void) {
     vkb_step_add(PK_SUBMIT, ts0);
     if (r != VK_SUCCESS) { vk_check(r, "vkQueueSubmit2 (part)"); die("GPU submission failed"); }
     if (first) g_part_first_ns += ts0 - g_part_t0;
+    g_part_at[g_part_n] = ts0 - g_part_t0;
     if (g_part_sem) g_part_seq++;
     g_part_n++;
     g_part_t = runtime_now_ns();
@@ -4104,7 +4112,8 @@ static void uploads_close(VkCommandBuffer *list, int *n) {   // after the prolog
 }
 
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits
-    uint64_t t0 = runtime_now_ns();
+    uint64_t t0 = runtime_now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), f0 = t_fence_wait_ns, lk0 = 0;
+    for (int k = 0; k < LK_COUNT; k++) lk0 += atomic_load(&vkb_lock_wait_ns[k]);
     static uint64_t walk_ns, wall_ns, subs, chunks, said_at, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
     static int started;
     if (!started) {
@@ -4132,7 +4141,7 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
     g_pro_any = 0;
     int part = part_on();
     pthread_mutex_lock(&g_part_mu);   // (a recording thread may still be leaving part_flush of the last submission)
-    g_part_next = g_part_n = g_part_full = 0;
+    g_part_next = g_part_n = g_part_full = g_part_held_sub = 0;
     g_walk_done = g_part_closing = 0;
     g_part_t0 = t0;
     pthread_mutex_unlock(&g_part_mu);
@@ -4202,6 +4211,29 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
         if (all > 200) g_prev_draws = all;   // small submissions (a copy, a clear) keep the size of the frame's
         longest_ns += mx; longest_draws += md;
     }
+    if (te - t0 >= 40000000ull) {   // a long one (40 ms: GPU hitches of 50-95 ms in play, 2026-11-16) (GPU hitch: the GPU waits for its parts): where this thread and the chunks were
+        static int said;
+        if (said++ < 200) {
+            int li = 0;
+            uint64_t cpu = 0, lk = 0;
+            for (int i = 1; i < g_nch; i++) if (g_ch[i].ns > g_ch[li].ns) li = i;
+            for (int i = 0; i < g_nch; i++) cpu += g_ch[i].cpu_ns;
+            for (int k = 0; k < LK_COUNT; k++) lk += atomic_load(&vkb_lock_wait_ns[k]);
+            const mt_chunk *L = &g_ch[li];
+            VLOG("long submission %llu: recording %.0f ms: prologue %.0f, walk %.0f, chunks until the last is recorded %.0f, glue and "
+                 "submit %.0f; this thread on a core %.0f ms, waiting for fences %.0f; %d chunks on a core %.0f ms in all; the longest "
+                 "chunk %d: %.0f ms on recording thread %d (on a core %.0f, fences %.0f), %llu draws; lock waits (all threads) %.0f ms",
+                 (unsigned long long)g_fence, (te - t0) / 1e6, (tw - t0) / 1e6, (tr - tw) / 1e6, (tt - tr) / 1e6, (te - tt) / 1e6,
+                 (clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0) / 1e6, (t_fence_wait_ns - f0) / 1e6, g_nch, cpu / 1e6, li,
+                 g_nch ? L->ns / 1e6 : 0.0, g_nch ? L->worker : -1, g_nch ? L->cpu_ns / 1e6 : 0.0, g_nch ? L->fwait_ns / 1e6 : 0.0,
+                 g_nch ? (unsigned long long)L->draws : 0ull, (lk - lk0) / 1e6);
+            char at[160] = "";
+            for (int i = 0, o = 0; i < g_part_n && o < (int)sizeof at - 12; i++)
+                o += snprintf(at + o, sizeof at - o, "%s+%.0f", i ? ", " : "", g_part_at[i] / 1e6);
+            VLOG("long submission %llu: parts sent at %s ms, the rest with the submission at +%.0f ms; parts held back for a full barrier %d",
+                 (unsigned long long)g_fence, g_part_n ? at : "(none)", (te - t0) / 1e6, g_part_held_sub);
+        }
+    }
     if (dm_stats() && subs >= said_at + 600) {   // the log line: where a submission's recording time goes
         said_at = subs;
         static uint64_t prev_rec;
@@ -4227,7 +4259,7 @@ uint64_t mtl_done(void) { pthread_mutex_lock(&g_mu); uint64_t d = g_done; pthrea
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     pthread_mutex_lock(&g_mu);
     if (g_done >= fence || !timeout_ns) { int ok = g_done >= fence; pthread_mutex_unlock(&g_mu); return ok; }
-    uint64_t end = timeout_ns == UINT64_MAX ? UINT64_MAX : runtime_now_ns() + timeout_ns;
+    uint64_t tw0 = runtime_now_ns(), end = timeout_ns == UINT64_MAX ? UINT64_MAX : tw0 + timeout_ns;
     while (g_done < fence) {
         uint64_t now = runtime_now_ns();
         if (now >= end) break;
@@ -4241,6 +4273,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     }
     int ok = g_done >= fence;
     pthread_mutex_unlock(&g_mu);
+    t_fence_wait_ns += runtime_now_ns() - tw0;
     return ok;
 }
 void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); wb_held_take(0, 1); }   // everything done: the held copy backs too
