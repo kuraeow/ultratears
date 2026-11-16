@@ -260,6 +260,40 @@ void vkb_spv_input_int_masks(const uint32_t *in, size_t nw, uint32_t *umask, uin
     free(loc_of); free(pointee); free(kind);
 }
 
+uint32_t vkb_spv_input_bits_used(const uint32_t *in, size_t nw) {
+    enum { OP_STORE = 62, OP_COMPOSITE_EXTRACT = 81 };
+    if (nw < 5) return 0;
+    uint32_t bound = in[3], mask = 0;
+    uint32_t *loc_of = calloc(bound, sizeof *loc_of);   // decorated id -> location + 1
+    uint32_t *from = calloc(bound, sizeof *from);       // Input variable, access chain into it, value loaded from it -> location + 1
+    uint32_t *reg = calloc(bound, sizeof *reg);         // a register variable whose last store was such a value -> location + 1
+    uint8_t *is_int = calloc(bound, 1);                 // integer scalar / vector types
+    if (!loc_of || !from || !reg || !is_int) abort();
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = in[i] & 0xffff, wc = in[i] >> 16;
+        if (!wc || i + wc > nw) break;
+        const uint32_t *a = in + i + 1;
+        if (op == OP_DECORATE && wc >= 4 && a[1] == DEC_LOCATION && a[0] < bound) loc_of[a[0]] = a[2] + 1;
+        else if (op == OP_TYPE_INT && a[0] < bound) is_int[a[0]] = 1;
+        else if (op == OP_TYPE_VECTOR && a[0] < bound && a[1] < bound) is_int[a[0]] = is_int[a[1]];
+        else if (op == OP_VARIABLE && wc >= 4 && a[2] == SC_INPUT && a[1] < bound && loc_of[a[1]] && loc_of[a[1]] <= 32)
+            from[a[1]] = loc_of[a[1]];
+        else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN || op == OP_LOAD) && wc >= 4 && a[1] < bound &&
+                 a[2] < bound && from[a[2]])
+            from[a[1]] = from[a[2]];
+        // the translator copies an attribute into a register variable first and reads that (2026-11-16: all 425 integer
+        // variants a play met, and the 862 of the shader list, are found this way; none without it)
+        else if (op == OP_LOAD && wc >= 4 && a[1] < bound && a[2] < bound && reg[a[2]]) from[a[1]] = reg[a[2]];
+        else if (op == OP_STORE && wc >= 3 && a[0] < bound) reg[a[0]] = a[1] < bound ? from[a[1]] : 0;
+        else if (op == OP_COMPOSITE_EXTRACT && wc >= 4 && a[1] < bound && a[2] < bound && from[a[2]]) from[a[1]] = from[a[2]];
+        else if (op == OP_BITCAST && wc == 4 && a[0] < bound && a[2] < bound && from[a[2]] && is_int[a[0]])
+            mask |= 1u << (from[a[2]] - 1);
+        i += wc;
+    }
+    free(loc_of); free(from); free(reg); free(is_int);
+    return mask;
+}
+
 static uint32_t location_mask(const uint32_t *in, size_t nw, uint32_t storage);
 uint32_t vkb_spv_input_mask(const uint32_t *in, size_t nw) { return location_mask(in, nw, SC_INPUT); }
 uint32_t vkb_spv_output_mask(const uint32_t *in, size_t nw) { return location_mask(in, nw, 3); }   // StorageClass Output

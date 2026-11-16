@@ -37,6 +37,8 @@ Firmware/
 /mesa-cache/
 /update/
 /ultratears.cfg
+# made from the MacNativeGames shader list (tools/shader_variants.py): a package carries it, the repository does not
+/shader-variants.txt
 /ultratears-launcher.ini
 /ultratears-launcher
 /libSDL3.so.0

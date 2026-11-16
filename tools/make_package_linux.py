@@ -56,6 +56,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | deps/llvm | LLVM: clang, lld, llvm-ar, llvm-objcopy, the clang resource headers (Apache-2.0 WITH LLVM-exception); ninja (Apache-2.0) | as listed | deps/llvm/LICENSE.TXT |
 | deps/linux | The Linux kit: files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
 | ultratears-launcher, libSDL3.so.0 | The launcher (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt, licenses/linux-kit/ |
+| shader-variants.txt | Shader keys and the vertex attribute types / shader pairs they were drawn with, from the MacNativeGames shared shader list (games/totk/assets/shader_list.tsv, Copyright (c) 2026 MacNativeGames contributors): the vertex shader variants compiled ahead on your machine (tools/shader_variants.py) | MIT | licenses/MacNativeGames.txt |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
 | deps/launcher | Dear ImGui with its SDL3 and Vulkan backends (MIT), nanosvg (zlib), stb_image (MIT): compiled into the game on your machine for its settings overlay, with the fonts of assets/launcher (SIL OFL 1.1) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 
@@ -190,6 +191,10 @@ def main():
     for src, dst in LICENSE_COPIES.items():
         shutil.copy2(ROOT / src, lic / dst)
     shutil.copy2(ROOT / 'third_party/maxwell_shader/LICENSE.txt', lic / 'Ryujinx.txt')
+    # the vertex shader variants to compile ahead, from the MacNativeGames shader list (MIT; tools/make_package.py)
+    mng = ROOT / 'dev-local/refs/MacNativeGames'
+    subprocess.run([sys.executable, str(ROOT / 'tools/shader_variants.py'), str(mng), str(out / 'shader-variants.txt')], check=True)
+    shutil.copy2(mng / 'LICENSE', lic / 'MacNativeGames.txt')
     for p in NOT_IN_PACKAGE + ['tools/make_package_linux.py']:
         p = out / p
         if p.is_dir():

@@ -43,6 +43,7 @@ typedef struct vkb_shader {
     uint32_t stamp;                      // which translation (vkb_shbin_variant.stamp)
     uint32_t in_mask, out_mask;          // input / output locations
     uint32_t in_umask, in_imask;         // inputs of unsigned / signed integer type (fragment shaders)
+    uint32_t int_guess;                  // vertex shaders: inputs read as integer bits (vkb_spv_input_bits_used): variants ahead
     vkb_variant variants[VKB_VARIANTS]; int nvariants;   // vertex variants (integer attributes, added outputs) made so far
     // the last-frame position variant of a vertex shader (vkb_shader_prevpos; the translator's PreviousPosition): its
     // output location, the user banks the position reads, and for each cbuf slot the bank whose last-frame block is

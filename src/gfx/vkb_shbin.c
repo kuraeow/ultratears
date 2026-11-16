@@ -35,7 +35,7 @@
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
-enum { CAP = 1 << 17, HEADER = 32, RECORD = 64 };
+enum { CAP = 1 << 18, HEADER = 32, RECORD = 64 };   // 2026-11-16: a mark per shader (variants compiled ahead) and the variants: ~90 000 records
 static const char MAGIC[8] = {'U', 'T', 'S', 'H', 'B', 'I', 'N', '2'};   // 2: with the translation stamp
 static const uint32_t TAG = 0x31424853;   // "SHB1"
 

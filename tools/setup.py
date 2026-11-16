@@ -247,6 +247,24 @@ def choose_dump(home, requested):
 SOURCE_ONLY = ('tools/build_xlate.py', 'tools/make_package.py', 'src/launcher/main.cpp')
 
 
+SHADER_VARIANTS = 'shader-variants.txt'   # beside setup's folder: a builder package carries it (tools/make_package.py)
+
+
+def shader_variants_into(home):
+    """A build from the source: the vertex shader variants to compile ahead (tools/shader_variants.py), from a
+    MacNativeGames checkout (ULTRS_MNG_REPO, else dev-local/refs/MacNativeGames), into home - made again when that
+    checkout is at another commit. Without one the game compiles only what it guesses from the shaders themselves."""
+    repo = pathlib.Path(os.environ.get('ULTRS_MNG_REPO') or ROOT / 'dev-local/refs/MacNativeGames')
+    out = home / SHADER_VARIANTS
+    if not (repo / 'games/totk/assets/shader_list.tsv').is_file():
+        return
+    head = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    if out.is_file() and head and head in out.open(encoding='utf-8').readline():
+        return
+    say('The shader list (MacNativeGames) -> the vertex variants to compile ahead')
+    subprocess.run([sys.executable, str(ROOT / 'tools/shader_variants.py'), str(repo), str(out)], check=True)
+
+
 def build_from_checkout(a):
     home = (a.output or ROOT / 'build').resolve()
     missing = [f for f in SOURCE_ONLY if not (ROOT / f).exists()]
@@ -256,6 +274,7 @@ def build_from_checkout(a):
     try:
         changed, removed = sync_source(home)
         say(f'UltraTears source -> {home}: {changed} files updated, {removed} removed')
+        shader_variants_into(home)
         py = own_python(home)
     except (Fail, deps_install.DepsError) as e:
         say(f'\nERROR preparing the build folder: {e}')
@@ -759,6 +778,11 @@ def step_graphics(dump, state, cpus):
     game = ROOT / ('UltraTears.exe' if os.name == 'nt' else 'linux/ultratears')
     if not game.is_file():
         return 'no game for this PC'
+    # the vertex shader variants to compile with the shaders (src/gfx/vkb_variants.c reads them there)
+    variants, into = ROOT / SHADER_VARIANTS, DATA / 'shaders/variants.txt'
+    if variants.is_file() and not (into.is_file() and filecmp.cmp(variants, into, shallow=False)):
+        into.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(variants, into)
     last, rc = prepare_shaders(game)
     if last.startswith('ready'):   # every shader compiled before (an update that changed none)
         return 'up to date'

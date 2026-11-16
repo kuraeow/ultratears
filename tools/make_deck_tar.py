@@ -80,6 +80,9 @@ def main():
              (pack, 'data/shaders/translated.pack', 0o644), (a.appimage, 'UltraTears.AppImage', 0o755)]
     if setup.SOURCE_DATES.is_file():
         files.append((setup.SOURCE_DATES, 'data/source-dates.json', 0o644))
+    variants = ROOT / 'data/shaders/variants.txt'   # the vertex variants the Deck's launcher compiles ahead (tools/shader_variants.py)
+    if variants.is_file():
+        files.append((variants, 'data/shaders/variants.txt', 0o644))
     for sub in ('exefs', 'romfs', 'textures', 'fonts', 'generated'):
         for dirpath, _, names in os.walk(ROOT / 'data' / sub):
             for n in sorted(names):

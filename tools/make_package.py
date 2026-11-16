@@ -69,6 +69,7 @@ This package also carries tools to build it; each keeps its license, copied into
 | UltraTears Launcher.exe | The launcher (GPL-3.0-or-later) with SDL3 (zlib), Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts Inter and Montserrat Alternates (SIL OFL 1.1), libc++ (Apache-2.0 WITH LLVM-exception) | as listed | licenses/msys2/SDL3, licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-Inter.txt, licenses/OFL-MontserratAlternates.txt |
 | bin-linux/ultratears-launcher | The launcher for Linux / Steam Deck, put into the Deck's tar (GPL-3.0-or-later) with Dear ImGui (MIT), nanosvg (zlib), stb_image (MIT), the fonts (SIL OFL 1.1), libstdc++ (GPL-3.0+ with the GCC Runtime Library Exception); SDL3 (zlib) beside it in the tar | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 | deps/linux | The Linux kit for builds for the Steam Deck (tools/make_linux_kit.py): files of the Steam Runtime 3 "sniper" SDK sysroot (Valve), unchanged: glibc (LGPL-2.1+), libstdc++ and libgcc (GPL-3.0+ with the GCC Runtime Library Exception), SDL3 (zlib), Opus and libvpx (BSD); zstd (BSD) built static | as listed | licenses/linux-kit/ (with where their source is) |
+| shader-variants.txt | Shader keys and the vertex attribute types / shader pairs they were drawn with, from the MacNativeGames shared shader list (games/totk/assets/shader_list.tsv, Copyright (c) 2026 MacNativeGames contributors): the vertex shader variants compiled ahead on your PC (tools/shader_variants.py) | MIT | licenses/MacNativeGames.txt |
 | deps/shaders | ultrs-shaders: totk_xlate (MacNativeGames, MIT) around the Ryujinx 1.3.2 shader translator (MIT) with this project's patches, published self-contained with the .NET runtime (MIT) | MIT | licenses/Ryujinx.txt, licenses/totk_xlate.txt |
 | deps/launcher | Dear ImGui with its SDL3 and Vulkan backends (MIT), nanosvg (zlib), stb_image (MIT): compiled into the game on your PC for its settings overlay, with the fonts of assets/launcher (SIL OFL 1.1) | as listed | licenses/imgui.txt, licenses/nanosvg.txt, licenses/stb.txt, licenses/OFL-*.txt |
 
@@ -291,6 +292,11 @@ def main():
     # the package's own tools: a build from it installs nothing (tools/deps_install.py)
     (out / 'deps/installed.json').write_text(json.dumps({'python': 'package', 'clang64': 'package', 'shaders': 'package',
                                                          'linux_kit': 'package'}, indent=1))
+    # the vertex shader variants to compile ahead (tools/shader_variants.py), from the MacNativeGames shader list (MIT):
+    # identifiers only; the list stays out of the repository, the package carries what the game reads of it
+    mng = ROOT / 'dev-local/refs/MacNativeGames'
+    subprocess.run([sys.executable, str(ROOT / 'tools/shader_variants.py'), str(mng), str(out / 'shader-variants.txt')], check=True)
+    shutil.copy2(mng / 'LICENSE', lic / 'MacNativeGames.txt')
     shutil.copy2(ROOT / 'third_party/maxwell_shader/LICENSE.txt', lic / 'Ryujinx.txt')
     shutil.copy2(a.python / 'LICENSE.txt', lic / 'Python.txt')
     (out / 'THIRD-PARTY-NOTICES.md').write_text(NOTICES.replace('{commit}', git('rev-parse', 'HEAD').strip()))
