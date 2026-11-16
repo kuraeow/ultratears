@@ -286,6 +286,36 @@ static void memory_log(void) {
     }
 }
 
+/* One short memory line in every log, every 5 minutes (the replay thread, after a present): the process (committed, in
+   RAM, what the system can still commit), the driver's video heap use of its budget, ours, and the recording / texture
+   copies the NVN layer keeps. Issue #107: a 2.8-hour log ended at 1-2 fps with no memory figures in it, since the full
+   memory lines need TOTK_STATS. Cost: a few counters and one budget query per 5 minutes. */
+void vkb_memory_brief(void) {
+    static uint64_t next;
+    uint64_t now = runtime_now_ns();
+    if (!next) { next = now + 300000000000ull; return; }
+    if (now < next || g_ok <= 0) return;
+    next = now + 300000000000ull;
+    void plat_memory_brief(uint64_t *commit, uint64_t *ram, uint64_t *sys_left);   // runtime/platform
+    void dm_nvn_copy_stats(uint64_t *copies, uint64_t *bytes, uint64_t *buckets, uint64_t *bucket_cap, uint64_t *by_mark, uint64_t *tex_copies);   // hle_nvn.c
+    uint64_t commit = 0, ram = 0, left = 0, nc, cb, bk, bcap, bym, tc;
+    plat_memory_brief(&commit, &ram, &left);
+    dm_nvn_copy_stats(&nc, &cb, &bk, &bcap, &bym, &tc);
+    double vu = 0, vb = 0;
+    if (vkc.has_memory_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 p = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+        vk.vkGetPhysicalDeviceMemoryProperties2(vkc.gpu, &p);
+        for (uint32_t h = 0; h < p.memoryProperties.memoryHeapCount; h++)
+            if (p.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) { vu += b.heapUsage[h]; vb += b.heapBudget[h]; }
+    }
+    const double M = 1048576.0;
+    VLOG("memory (every 5 min): process %.0f MiB committed, %.0f in RAM, system commit left %.0f MiB; video %.0f of %.0f MiB "
+         "(driver), ours %.0f; recording copies %llu (%.0f MiB) in %llu of %llu index buckets, %llu released by their mark; "
+         "texture copies %llu", commit / M, ram / M, left / M, vu / M, vb / M, atomic_load(&g_mem_bytes[MK_DEVICE]) / M,
+         (unsigned long long)nc, cb / M, (unsigned long long)bk, (unsigned long long)bcap, (unsigned long long)bym, (unsigned long long)tc);
+}
+
 static void backend_init(void) {
     if (g_ok >= 0) return;
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;

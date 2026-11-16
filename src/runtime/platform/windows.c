@@ -92,6 +92,15 @@ typedef struct {
 } mem_counters;
 __declspec(dllimport) BOOL WINAPI K32GetProcessMemoryInfo(HANDLE process, mem_counters *counters, DWORD cb);
 
+// The 5-minute memory line: this process's commit charge and working set, and what the system can still commit.
+void plat_memory_brief(uint64_t *commit, uint64_t *ram, uint64_t *sys_left) {
+    mem_counters pc = {.cb = sizeof pc};
+    MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+    *commit = *ram = *sys_left = 0;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc)) { *commit = pc.PrivateUsage; *ram = pc.WorkingSetSize; }
+    if (GlobalMemoryStatusEx(&ms)) *sys_left = ms.ullAvailPageFile;
+}
+
 void plat_memory_map(void) {
     mem_counters pc = {.cb = sizeof pc};
     K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc);

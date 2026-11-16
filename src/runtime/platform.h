@@ -33,6 +33,7 @@ void plat_watch_freeze_stats(uint64_t *frozen_mib, uint64_t *thaws, uint64_t *sk
 // Development (TOTK_MEMMAP=1): the process's committed memory by kind (guest window, heaps, other private, mapped,
 // images) and its largest private regions, to stderr. Slow (walks the address space and the heaps).
 void plat_memory_map(void);
+void plat_memory_brief(uint64_t *commit, uint64_t *ram, uint64_t *sys_left);   // the 5-minute memory line
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)

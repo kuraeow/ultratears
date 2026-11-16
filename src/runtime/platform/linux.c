@@ -92,6 +92,15 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi) {
 // into a read-only page fails with EFAULT instead of faulting).
 void plat_commit(uint64_t addr, uint64_t size) { if (size) fz_thaw_range(addr, addr + size, 1); }
 void plat_memory_map(void) {}
+// The 5-minute memory line: this process's resident and private (anonymous resident) memory, and MemAvailable.
+void plat_memory_brief(uint64_t *commit, uint64_t *ram, uint64_t *sys_left) {
+    *commit = *ram = *sys_left = 0;
+    char line[256]; FILE *f = fopen("/proc/self/status", "r");
+    if (f) { while (fgets(line, sizeof line, f)) { unsigned long long k;
+        if (sscanf(line, "VmRSS: %llu", &k) == 1) *ram = k << 10; else if (sscanf(line, "RssAnon: %llu", &k) == 1) *commit = k << 10; } fclose(f); }
+    if ((f = fopen("/proc/meminfo", "r"))) { while (fgets(line, sizeof line, f)) { unsigned long long k;
+        if (sscanf(line, "MemAvailable: %llu", &k) == 1) { *sys_left = k << 10; break; } } fclose(f); }
+}
 
 // A file mapped read-only, its first len bytes (0: all of it); *size: the bytes mapped. NULL: not there. (The graphics
 // code reads the shader pack and the BC7 cache this way; mmap is not reachable from there.)

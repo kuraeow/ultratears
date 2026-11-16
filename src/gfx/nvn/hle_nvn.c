@@ -1050,11 +1050,33 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
 #define COPY_TOKEN_MAGIC 0x4e454b4f54594d43ull
 extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarded read of guest memory survives a fault
 static int async_replay(void);   /* below: TOTK_ASYNC_REPLAY */
-/* With the translation thread (TOTK_ASYNC_REPLAY=1, iPhone default) the game may reuse a submitted command buffer's control
-   memory as soon as the submit call returns, before the queued replay used the copy: marks are not used there yet (a copy
-   last submitted at or after the submission being replayed would have to be kept). */
-static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && !async_replay();
-    if (!v) LOG("[cmd] recording-copy stamps: off (%s); copies are released only when control memory is re-added", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "not supported by the translation thread yet"); } return v; }
+/* With the translation thread (TOTK_ASYNC_REPLAY=1) the game may reuse a submitted command buffer's control memory as soon
+   as the submit call returns, before the queued replay used the copy. Until 2026-11-16 marks were off there, so copies went
+   only when their control memory was added again, and the ones whose memory the game handed to something else stayed for
+   the whole run: the sweep's walk of them grew from 0.01 to over 0.2 ms a submit in a 2.8-hour session (issue #107, the
+   collection's mean in its log line), with their memory. Now a copy whose mark is gone is released only when no submission
+   still queued uses it: it was never submitted, or last submitted before the one being replayed (g_copy_replay_at).
+   TOTK_COPY_TOKEN=0: no marks (released only at a re-added control memory, as before). */
+static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0"));
+    if (!v) LOG("[cmd] recording-copy stamps: off (TOTK_COPY_TOKEN=0); copies are released only when control memory is re-added"); } return v; }
+/* The submit number (g_submits at the submit call) of the submission being replayed: a copy last submitted at or after it
+   may still be read by the replay. Set on the replay side before each submission (submit_exec's caller). Submit numbers
+   are taken in queue order when one thread submits; if the replay ever sees them out of order, marks stop releasing copies
+   (logged once) rather than guess. */
+static _Atomic uint64_t g_copy_replay_at;
+static _Atomic int g_copy_replay_unordered;
+static void copy_replay_point(uint64_t sub) {
+    uint64_t prev = atomic_load_explicit(&g_copy_replay_at, memory_order_relaxed);
+    if (sub < prev && !atomic_exchange(&g_copy_replay_unordered, 1))
+        LOG("[cmd] submissions replayed out of submit order (%llu after %llu): recording copies whose mark is gone are kept from now on", (unsigned long long)sub, (unsigned long long)prev);
+    if (sub > prev) atomic_store_explicit(&g_copy_replay_at, sub, memory_order_relaxed);
+}
+static int copy_unqueued(const cmd_copy *c) {   /* its mark is gone: may the copy go? (no queued submission reads it) */
+    atomic_thread_fence(memory_order_acquire);   /* the submit call stored used_at before the game reused the memory */
+    uint64_t used = atomic_load(&((copy_prefix *)(c->copy - sizeof(copy_prefix)))->used_at);
+    if (!used) return 1;   /* never submitted: only inlined, which copied its bytes at the call */
+    return !atomic_load_explicit(&g_copy_replay_unordered, memory_order_relaxed) && used < atomic_load_explicit(&g_copy_replay_at, memory_order_relaxed);
+}
 static void copy_token_write(uintptr_t at, const uint8_t *copy) { uint64_t v[2] = {COPY_TOKEN_MAGIC, (uint64_t)(uintptr_t)copy}; memcpy((void *)at, v, sizeof v); }
 static int copy_token_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 22; } return v; }   /* probe negative 22: marks never checked */
 /* Reading a mark (pin_scan): the fault guard is armed only around the 16-byte read; the jump buffer is set once per walked
@@ -1350,7 +1372,7 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
     for (; k < end; k++, i = 0) {
         copy_bucket *b = &g_cbk[k]; if (!b->used) continue;
         while (i < b->n) {
-            if (b->v[i].token && !copy_token_intact(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
+            if (b->v[i].token && !copy_token_intact(&b->v[i]) && copy_unqueued(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
             pin_mark_ops(b->v[i].copy); g_pin_scanned++; i++;
         }
     }
@@ -1436,7 +1458,7 @@ static void pin_step(uint64_t now) {
     uint64_t dt = now_ns() - t0; ns_total += dt; if (dt > ns_max) ns_max = dt;
     if (decided && (windows == 1 || windows % 10 == 0))
         LOG("[nvn] texture-copy collection through submit %llu: %zu live, %zu released this period (%llu total, %llu periodic, %llu undecided); %zu recorded over the last %d submits, %llu marks total; mean %.3f ms/submit, max %.2f ms (max deciding pass %.2f ms)",
-            (unsigned long long)now, live, freed, (unsigned long long)g_pin_freed, (unsigned long long)windows, (unsigned long long)skipped, PIN_SWEEP_SUBMITS, recent,
+            (unsigned long long)now, live, freed, (unsigned long long)g_pin_freed, (unsigned long long)windows, (unsigned long long)skipped, recent, PIN_SWEEP_SUBMITS,
             (unsigned long long)marks, ns_total / 1e6 / (double)now, ns_max / 1e6, ns_decide_max / 1e6);
 }
 /* The probe's whole sweep in one call: walk every bucket, then decide (now: the submit count it decides at). */
@@ -1447,6 +1469,14 @@ static void pin_sweep(uint64_t now, int force) {
     g_pin_win_end = 0;   /* the next pin_step starts a fresh window */
     pthread_mutex_unlock(&g_pin_mu); pthread_mutex_unlock(&g_copy_mu);
     pin_gone_flush();
+}
+/* The memory line (backend_vk.c, every few minutes): recording copies and their index, texture copies. */
+size_t dm_nvn_pin_count(void);
+void dm_nvn_copy_stats(uint64_t *copies, uint64_t *bytes, uint64_t *buckets, uint64_t *bucket_cap, uint64_t *by_mark, uint64_t *tex_copies) {
+    pthread_mutex_lock(&g_copy_mu);
+    *copies = g_ncopies; *bytes = g_copy_bytes; *buckets = g_cbk_used; *bucket_cap = g_cbk_cap; *by_mark = g_copy_drop_token;
+    pthread_mutex_unlock(&g_copy_mu);
+    *tex_copies = dm_nvn_pin_count();
 }
 size_t dm_nvn_pin_count(void) { pthread_mutex_lock(&g_pin_mu); size_t n = g_pin_n; pthread_mutex_unlock(&g_pin_mu); return n; }
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
@@ -2083,7 +2113,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. [Windows port] On by default since 2026-10-24: with
 // the Vulkan replay on the game's thread the Great Sky Island ran at ~95 ms a frame, with this thread at ~58 ms.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL, XJ_SHREL, XJ_POOLREL, XJ_TEXWRITE };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub, slot; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub, slot, gsub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -2127,7 +2157,7 @@ static void *x_thread(void *unused) {
         }
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
+        if (j.kind == XJ_SUBMIT) { copy_replay_point(j.gsub); submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else if (j.kind == XJ_SHREL) { void vkb_shader_release(void *rel); vkb_shader_release(j.ucap); }
         else if (j.kind == XJ_POOLREL) {   // unless a new pool over its memory deleted it already (x_pool_reuse)
@@ -2147,6 +2177,7 @@ static void *x_thread(void *unused) {
             present_exec(j.win, j.idx, j.period, j.crop, j.frame, j.slot);
             void vkb_tex_writeback_frame(void); vkb_tex_writeback_frame();   // GPU-drawn contents into game memory (vkb_tex.c)
             void vkb_tex_vram_check(void); vkb_tex_vram_check();             // video memory short: released images go (vkb_tex.c)
+            void vkb_memory_brief(void); vkb_memory_brief();                 // the memory line every 5 minutes (backend_vk.c)
             void vkb_tex_rtlog_frame(void); vkb_tex_rtlog_frame();           // TOTK_RT_LOG: how full the logged targets are
         }
         pthread_mutex_lock(&g_xq_mu);
@@ -2317,7 +2348,7 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     NVN_BLOCKING();
     totk_tl(TL_SUB_IN, (uint64_t)n, 0);
-    { uint64_t now = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], now); }
+    uint64_t gsub = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], gsub);
     if (totk_life_on()) { int k = 0; for (int i = 0; i < n; i++) k += totk_life_handle_has(h[i]); totk_life_log("submit n=%d followed=%d", n, k); }
     ((queue_t *)q)->submits++;
     /* TOTK: what the console reads at the submit call is read here, on the game thread, before the submission may be handed
@@ -2332,7 +2363,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         if (((queue_t *)q)->submits % 600 == 0 && dm_stats()) LOG("[nvn] deferred bindings through submit %llu: %llu handles read at submit, %llu differed from recording; mean handle-read time %.3f ms/submit", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
     if (async_replay()) {
-        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
+        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1)), .gsub = gsub};
         if (!j.h) die("submit job");
         memcpy(j.h, h, sizeof(uint64_t) * (size_t)n);
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
@@ -2340,6 +2371,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         totk_tl(TL_SUB_OUT, 1, 0);
         return;
     }
+    copy_replay_point(gsub);
     submit_exec(n, (const uint64_t *)h, NULL);
     totk_tl(TL_SUB_OUT, 0, 0);
 }
