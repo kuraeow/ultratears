@@ -155,8 +155,19 @@ static PFN_vkCmdBeginRendering g_real_begin;
 static vkb_cnt g_n_barriers, g_n_img_barriers, g_n_passes;
 static uint64_t g_parts;
 _Atomic uint64_t vkb_lock_wait_ns[LK_COUNT], vkb_lock_waits[LK_COUNT], vkb_step_ns[PK_COUNT], vkb_step_n[PK_COUNT];
+// TOTK_GPU_HITCH (development): the barriers this thread recorded since its last pass began, for the pass listing -
+// how many, how many of them changed an image's layout, and the first such change (old -> new layout)
+static __thread uint32_t t_hc_bars, t_hc_lays, t_hc_lay_old, t_hc_lay_new;
+static __thread uintptr_t t_hc_from[4];   // where they were recorded: distinct call sites (return addresses)
+static __thread uint32_t t_hc_from_n[4];
 static void VKAPI_CALL count_barrier(VkCommandBuffer cb, const VkDependencyInfo *d) {
     vkb_cnt_add(g_n_barriers, 1); vkb_cnt_add(g_n_img_barriers, d->imageMemoryBarrierCount);
+    t_hc_bars++;
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    for (int i = 0; i < 4; i++) if (!t_hc_from[i] || t_hc_from[i] == ra) { t_hc_from[i] = ra; t_hc_from_n[i]++; break; }
+    for (uint32_t i = 0; i < d->imageMemoryBarrierCount; i++)
+        if (d->pImageMemoryBarriers[i].oldLayout != d->pImageMemoryBarriers[i].newLayout && !t_hc_lays++)
+            t_hc_lay_old = (uint32_t)d->pImageMemoryBarriers[i].oldLayout, t_hc_lay_new = (uint32_t)d->pImageMemoryBarriers[i].newLayout;
     g_real_barrier(cb, d);
 }
 static void VKAPI_CALL count_begin(VkCommandBuffer cb, const VkRenderingInfo *r) { vkb_cnt_add(g_n_passes, 1); g_real_begin(cb, r); }
@@ -2137,6 +2148,35 @@ int vkb_ub_deferred(uint64_t addr, uint64_t size) {   // a kept update of this p
     return 0;
 }
 
+// Uniform updates outside a pass in a row (2026-11-16): each had a full GPU drain before and after it. TOTK filters its
+// environment cube map every 9th frame in 132 tiny passes with 5 updates before each: 1300 drains, 15 instead of 10 ms on
+// the GPU in that frame on the RTX 3060 - the frame rate jumped by 10-20 fps standing still. Now a run of them has one
+// barrier before and one after. TOTK_VK_UB_BATCH=0: two per update, as before (A/B).
+enum { UB_RUN = 32 };
+static __thread struct ub_range { uint64_t dst, n; } t_ub_run[UB_RUN];
+static __thread int t_ub_run_n, t_ub_tail;   // the run's ranges; its closing barrier not recorded yet
+static int ub_batch(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_UB_BATCH"); v = !(e && *e == '0'); }
+    return v;
+}
+static void ub_tail_flush(void) {
+    if (!t_ub_tail) return;
+    t_ub_tail = 0;
+    t_ub_run_n = 0;
+    full_barrier(vkb_cmd());
+}
+static int ub_tail_keeps(uint32_t op) {   // commands that record nothing on the GPU: the run goes on over them
+    switch (op) {
+    case OP_UPDATE_UB: case OP_BEGIN: case OP_SET_RT: case OP_COPY_STRIDE: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BIND_SAMP:
+    case OP_RENDER_ENABLE: case OP_RENDER_COND:
+    case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_STENCIL:
+    case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO:
+    case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_IMG: case OP_DEPTH_CLAMP: case OP_RASTER_DISCARD: case OP_PRIM_RESTART:
+        return 1;
+    default: return 0;
+    }
+}
 static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
     if (watched(dst, n)) {
         static int said;
@@ -2160,9 +2200,20 @@ static void update_buffer(uint64_t dst, uint64_t n, const uint8_t *data) {
     vkb_mirrors_evict(dst, n);
     vkb_pool_use(dst, n, 1);
     VkCommandBuffer cb = vkb_cmd();
-    full_barrier(cb);
+    if (!ub_batch()) {
+        full_barrier(cb);
+        ub_write(cb, dst, n, data);
+        full_barrier(cb);
+        return;
+    }
+    // a run of updates: one barrier before it, none between those to separate ranges (a range written again in the run
+    // gets one), the closing one before the next command that is not another update or state (ub_tail_flush)
+    int overlap = t_ub_run_n == UB_RUN;
+    for (int i = 0; i < t_ub_run_n && !overlap; i++) overlap = t_ub_run[i].dst < dst + n && dst < t_ub_run[i].dst + t_ub_run[i].n;
+    if (!t_ub_tail || overlap) { full_barrier(cb); t_ub_run_n = 0; }
     ub_write(cb, dst, n, data);
-    full_barrier(cb);
+    t_ub_run[t_ub_run_n++] = (struct ub_range){dst, n};
+    t_ub_tail = 1;
 }
 
 // ---------------- render passes (milestone 3.3 step 3) ----------------
@@ -2217,7 +2268,7 @@ void vkb_passprof_note(const char *key) {   // vkb_draw.c: every draw, with the 
    pass (copies, dispatches, barriers between them). Only when set (it was on in Debug mode until it was found to cost
    GPU time itself, hc_ms). */
 enum { HC_PER = 1024 };   // queries per slot: 512 passes a submission (a frame has ~220 over ~4 submissions)
-typedef struct { uint32_t w, h, ncolor, fmt0, depth, draws, worker; char kind, key[16]; } hc_info;   // kind: P pass, D dispatch, F FSR 3.1
+typedef struct { uint32_t w, h, ncolor, fmt0, depth, draws, worker, bars, lays, lay_old, lay_new, from_n[4]; uintptr_t from[4]; char kind, key[16]; } hc_info;   // kind: P pass, D dispatch, F FSR 3.1
 static VkQueryPool g_hcq;
 static hc_info g_hc[SLOTS][HC_PER / 2];
 static _Atomic int g_hc_n[SLOTS];
@@ -2254,6 +2305,10 @@ static int hc_open(VkCommandBuffer cb, char kind, uint32_t w, uint32_t h, const 
     memset(p, 0, sizeof *p);
     p->kind = kind; p->w = w; p->h = h;
     p->worker = (uint32_t)t_worker;
+    p->bars = t_hc_bars; p->lays = t_hc_lays; p->lay_old = t_hc_lay_old; p->lay_new = t_hc_lay_new;
+    t_hc_bars = t_hc_lays = 0;
+    memcpy(p->from, t_hc_from, sizeof p->from); memcpy(p->from_n, t_hc_from_n, sizeof p->from_n);
+    memset(t_hc_from, 0, sizeof t_hc_from); memset(t_hc_from_n, 0, sizeof t_hc_from_n);
     if (key) snprintf(p->key, sizeof p->key, "%.12s", key);
     vk.vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_hcq, (uint32_t)(slot * HC_PER + 2 * i));
     *slot_out = slot;
@@ -2351,14 +2406,21 @@ static void hc_check(int slot, uint64_t fence, uint64_t frame, uint64_t s0, uint
     VLOG("GPU hitch: submission %llu (frame %llu) %.1f ms on the GPU: %d passes timed of %d, %.1f ms in passes; longest stretch "
          "outside passes %.1f ms at +%.1f ms (after pass %d, before pass %d)", (unsigned long long)fence, (unsigned long long)frame,
          dur_ns / 1e6, m, n, inpass, gap, gap_at, gap_after, gap_before);
+    extern char __ImageBase;   // the module's base: call sites as offsets for llvm-symbolizer
+    uintptr_t hc_base = (uintptr_t)&__ImageBase;
     static int all = -1;   // TOTK_GPU_HITCH_ALL=1 (development, with _FROM): every entry, in GPU start order
     if (all < 0) all = getenv("TOTK_GPU_HITCH_ALL") != NULL;
     if (!(all && from >= 0)) qsort(r, (size_t)m, sizeof *r, hc_cmp_dur);
     for (int k = 0; k < m && k < (all && from >= 0 ? m : from >= 0 ? 16 : 8); k++) {
         const hc_info *p = &g_hc[slot][(int)r[k][3]];
         if (p->kind == 'P')
-            VLOG("  %8.2f ms at +%.1f  #%-3d pass %ux%u  %u colour (fmt %#x) depth %#x  %u draws  fs %s  (recording thread %u)", r[k][0],
-                 r[k][1], (int)r[k][3], p->w, p->h, p->ncolor, p->fmt0, p->depth, p->draws, p->key[0] ? p->key : "-", p->worker);
+            VLOG("  %8.2f ms at +%.1f  #%-3d pass %ux%u  %u colour (fmt %#x) depth %#x  %u draws  fs %s  (recording thread %u)  "
+                 "barriers before %u, layout changes %u (%#x -> %#x) from +%llx x%u +%llx x%u +%llx x%u +%llx x%u", r[k][0], r[k][1], (int)r[k][3],
+                 p->w, p->h, p->ncolor, p->fmt0, p->depth, p->draws, p->key[0] ? p->key : "-", p->worker, p->bars, p->lays, p->lay_old,
+                 p->lay_new, (unsigned long long)(p->from[0] ? p->from[0] - hc_base : 0), p->from_n[0],
+                 (unsigned long long)(p->from[1] ? p->from[1] - hc_base : 0), p->from_n[1],
+                 (unsigned long long)(p->from[2] ? p->from[2] - hc_base : 0), p->from_n[2],
+                 (unsigned long long)(p->from[3] ? p->from[3] - hc_base : 0), p->from_n[3]);
         else
             VLOG("  %8.2f ms at +%.1f  #%-3d %s %ux%u groups  cs %s  (recording thread %u)", r[k][0], r[k][1], (int)r[k][3],
                  p->kind == 'F' ? "FSR 3.1 dispatch" : "dispatch", p->w, p->h, p->key[0] ? p->key : "-", p->worker);
@@ -3305,7 +3367,13 @@ void mtl_exec(const uint8_t *p) {
 }
 static int chunk_end_at(const mt_chunk *c, int hidx, const uint8_t *p);
 static void walk_command(uint32_t op, const uint8_t *a);
+static int exec_ops_body(const uint8_t *p, int depth, int mode, int hidx, const mt_chunk *c);
 static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_chunk *c) {   // 1: stopped at the chunk's end
+    int r = exec_ops_body(p, depth, mode, hidx, c);
+    if (!depth) ub_tail_flush();   // a run of uniform updates closed before anything else records into the command buffer
+    return r;
+}
+static int exec_ops_body(const uint8_t *p, int depth, int mode, int hidx, const mt_chunk *c) {
     for (;;) {
         op_hdr h;
         memcpy(&h, p, sizeof h);
@@ -3323,6 +3391,7 @@ static int exec_ops(const uint8_t *p, int depth, int mode, int hidx, const mt_ch
             p += h.size;
             continue;
         }
+        if (t_ub_tail && !ub_tail_keeps(h.op)) ub_tail_flush();
         switch (h.op) {
         case OP_END: return 0;
         case OP_BEGIN: break;
