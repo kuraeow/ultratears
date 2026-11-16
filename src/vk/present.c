@@ -159,7 +159,8 @@ static VkClearColorValue frame_colour(uint64_t n) {
 #define OUTS 3
 typedef struct {
     VkImage img; VkDeviceMemory mem; uint32_t w, h;
-    int state;                   // 0 free, 1 written (pending), 2 being shown
+    int state;                   // 0 free, 1 written (pending), 2 being shown, 4 shown with the GPU's copy from it maybe not done (fence)
+    VkFence fence;               // state 4: the present's fence (in_flight), signalled once the copy is done
     uint64_t seq;                // when it was written (newest pending wins)
     VkSemaphore timeline; uint64_t value; int crop[4];
     uint64_t not_before;         // shown no earlier than this (runtime_now_ns; the pacer's slot)
@@ -187,12 +188,40 @@ int vkp_active(void) { return swapchain != VK_NULL_HANDLE || g_window != NULL; }
 VkFormat vkp_format(void) { return swapchain ? format : VK_FORMAT_UNDEFINED; }
 uint32_t vkp_image_count(void) { return nimages; }
 
+/* The present thread no longer waits for its own GPU work after a present (2026-11-16). That work sits in the queue
+   behind the game's next frame (the game runs a frame ahead of a busy GPU), so the wait ended when that next frame was
+   done too, and the thread then took the one after it: GPU-bound at ~110 fps on the RTX 3060, 1 game frame in 3 never
+   reached the screen and the frame counter jumped 70-114 standing still while the game's own timing was even. Now the
+   output image stays taken (state 4) until its fence says the copy is done. TOTK_PRESENT_WAIT=1: the wait, as before. */
+static int present_wait(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_PRESENT_WAIT"); v = e && *e == '1'; }
+    return v;
+}
+static int out_free(out_t *o) {   // under mu: free, or shown and its copy done
+    if (o->state == 4 && vk.vkGetFenceStatus(vkc.device, o->fence) == VK_SUCCESS) o->state = 0;
+    return o->state == 0;
+}
+static int g_async;   // present_one: the output image's copy may still run (state 4 after it)
+// Game frames that never reached the screen (2026-11-16, the log line every 600 shown): the game's own timing said
+// ~110 fps while the frame counter showed 70-114 standing still. Overwritten: a new game frame took the output image of
+// one not shown yet (the present thread takes the newest of several pending ones).
+static uint64_t g_seg[6];   // present_one's steps (the log line): acquire..copy, copy, counter, text panel+overlay, end, queue
+static uint64_t g_one_ns, g_one_max, g_qp_ns, g_qp_max, g_drop_over, g_shown_n, g_fence_ns, g_fence_max, g_acq_ns, g_acq_max;
 int vkp_out_acquire(uint32_t w, uint32_t h, VkImage *image) {
     pthread_mutex_lock(&mu);
     int pick = -1;
-    for (int i = 0; i < OUTS && pick < 0; i++) if (g_out[i].state == 0) pick = i;
-    if (pick < 0)   // none free: overwrite the oldest pending one (it was never shown; newer frames win)
+    for (int i = 0; i < OUTS && pick < 0; i++) if (out_free(&g_out[i])) pick = i;
+    if (pick < 0) {   // none free: overwrite the oldest pending one (it was never shown; newer frames win)
         for (int i = 0; i < OUTS; i++) if (g_out[i].state == 1 && (pick < 0 || g_out[i].seq < g_out[pick].seq)) pick = i;
+        if (pick >= 0) g_drop_over++;
+    }
+    for (int i = 0; i < OUTS && pick < 0; i++)   // else one shown whose copy still runs: wait for it (holding mu: its fence is
+        if (g_out[i].state == 4) {                // reset only after the present thread takes mu)
+            vk.vkWaitForFences(vkc.device, 1, &g_out[i].fence, VK_TRUE, UINT64_MAX);
+            g_out[i].state = 0;
+            pick = i;
+        }
     if (pick >= 0) g_out[pick].state = 3;   // being written
     pthread_mutex_unlock(&mu);
     if (pick < 0) return -1;
@@ -316,12 +345,23 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
         destroy_swapchain();
         if (!create_swapchain()) return 0;
     }
+    uint64_t tf0 = runtime_now_ns();
     vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);
+    uint64_t tf1 = runtime_now_ns();
     uint32_t idx;
     VkResult r = vk.vkAcquireNextImageKHR(vkc.device, swapchain, UINT64_MAX, image_ready[slot], VK_NULL_HANDLE, &idx);
+    if (out) {
+        uint64_t tf2 = runtime_now_ns();
+        g_fence_ns += tf1 - tf0; if (tf1 - tf0 > g_fence_max) g_fence_max = tf1 - tf0;
+        g_acq_ns += tf2 - tf1; if (tf2 - tf1 > g_acq_max) g_acq_max = tf2 - tf1;
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { atomic_store(&resized, 1); return 0; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_check(r, "vkAcquireNextImageKHR"); return 0; }
+    pthread_mutex_lock(&mu);   // an output image shown with this fence: its copy is done (the fence is about to be reset)
+    for (int i = 0; i < OUTS; i++) if (g_out[i].state == 4 && g_out[i].fence == in_flight[slot]) g_out[i].state = 0;
+    pthread_mutex_unlock(&mu);
     vk.vkResetFences(vkc.device, 1, &in_flight[slot]);
+    uint64_t ts0 = runtime_now_ns();
     VkCommandBuffer cb = cmd[slot];
     vk.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -350,17 +390,22 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
             vk.vkCmdBlitImage(cb, out->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               1, &b, VK_FILTER_LINEAR);
         }
+        uint64_t ts1 = runtime_now_ns(); g_seg[0] += ts1 - ts0;
         void vk_overlay_frame(void);
         void vk_overlay_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
         if (!g_again) vk_overlay_frame();   // the frame counter (overlay.c, F10): game frames only
         int ovl_visible(void);
         if (!ovl_visible()) vk_overlay_record(cb, images[idx], extent, format, slot);   // not under the settings overlay
+        uint64_t ts2 = runtime_now_ns(); g_seg[1] += ts2 - ts1;
         void vk_text_panel_record(VkCommandBuffer cb, VkImage dst, VkExtent2D ext, VkFormat fmt, unsigned slot);
         vk_text_panel_record(cb, images[idx], extent, format, slot);   // the software keyboard's field (host/text_entry.c)
+        g_seg[2] += runtime_now_ns() - ts2;
     }
+    uint64_t ts3 = runtime_now_ns();
     // the settings overlay over everything (src/overlay; nothing while it is closed)
     uint64_t ovl_record(VkCommandBuffer cb, VkImage img, VkImageView view, VkExtent2D ext);
     g_ovl_drawn = ovl_record(cb, images[idx], views[idx], extent);
+    uint64_t ts4 = runtime_now_ns(); g_seg[3] += ts4 - ts3;
     char shot[512];
     int shooting = getenv("TOTK_OVERLAY_DEMO") && shot_record(cb, images[idx], shot, sizeof shot);
     barrier(cb, images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -380,16 +425,20 @@ static int present_one(uint64_t n, unsigned slot, out_t *out) {
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &render_done[idx], .swapchainCount = 1, .pSwapchains = &swapchain,
                            .pImageIndices = &idx};
+    uint64_t tq0 = runtime_now_ns(); g_seg[4] += tq0 - ts4;
     vk_queue_lock();   // the replayer submits on the same queue
     VkResult s = vk.vkQueueSubmit2(vkc.queue, 1, &si, in_flight[slot]);
     r = s == VK_SUCCESS ? vk.vkQueuePresentKHR(vkc.queue, &pi) : s;
     vk_queue_unlock();
+    g_async = out && s == VK_SUCCESS && !present_wait() && !shooting;
+    if (g_async) out->fence = in_flight[slot];
+    if (out) { uint64_t d = runtime_now_ns() - tq0; g_qp_ns += d; if (d > g_qp_max) g_qp_max = d; }
     void ovl_record_done(void);
     ovl_record_done();   // the settings overlay's font texture may change again (src/overlay)
     if (!vk_check(s, "vkQueueSubmit2")) return 0;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&resized, 1);
     else if (r != VK_SUCCESS) { vk_check(r, "vkQueuePresentKHR"); return 0; }
-    if (out || shooting) vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);   // the output image is free again after this
+    if ((out && !g_async) || shooting) vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);   // the output image is free again after this
     if (shooting) shot_write(shot);
     atomic_fetch_add(&presented, 1);
     return 1;
@@ -409,7 +458,7 @@ static void *present_thread(void *unused) {
                new frames (the main thread draws them and wakes this thread, vkp_wake), the cycling colour before the first. */
             int ovl_visible(void);
             uint64_t ovl_seq(void);
-            if (ovl_visible() && ovl_seq() != g_ovl_drawn && (last < 0 || g_out[last].state == 0)) { again = 1; break; }
+            if (ovl_visible() && ovl_seq() != g_ovl_drawn && (last < 0 || g_out[last].state == 0 || g_out[last].state == 4)) { again = 1; break; }
             /* While the software keyboard's field is open the game may draw nothing (the thread that asked for it waits):
                the last frame is shown again with the field over it every 33 ms, so typing shows. */
             if (!text_entry_visible() || last < 0) { pthread_cond_wait(&cv, &mu); continue; }
@@ -417,7 +466,7 @@ static void *present_thread(void *unused) {
             clock_gettime(CLOCK_REALTIME, &dl);
             dl.tv_nsec += 33000000;
             if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-            if (pthread_cond_timedwait(&cv, &mu, &dl) == ETIMEDOUT && frames_in == shown && g_out[last].state == 0) again = 1;
+            if (pthread_cond_timedwait(&cv, &mu, &dl) == ETIMEDOUT && frames_in == shown && (g_out[last].state == 0 || g_out[last].state == 4)) again = 1;   // 4: its copy may run, read again
         }
         int pick = -1;
         if (again) pick = last;
@@ -429,6 +478,21 @@ static void *present_thread(void *unused) {
                 if (i != pick && g_out[i].state == 1) shown = frames_in - 1;
         }
         if (pick >= 0) g_out[pick].state = 2, last = pick;
+        if (pick >= 0 && !again) {
+            static uint64_t in0;
+            if (++g_shown_n % 600 == 0) {
+                LOG("frames shown: 600 of %llu game frames (to %llu); of the others %llu overwritten unshown; waits before a present: "
+                    "its slot's last present %.2f ms average (max %.1f), the swapchain image %.2f (max %.1f); a present %.2f ms (max %.1f), "
+                    "of it the queue (its lock, submit, vkQueuePresentKHR) %.2f (max %.1f); steps: picture %.2f, counter %.2f, text field %.2f, "
+                    "settings overlay %.2f, end %.2f ms",
+                    (unsigned long long)(frames_in - in0), (unsigned long long)g_shown_n, (unsigned long long)g_drop_over,
+                    g_fence_ns / 6e8, g_fence_max / 1e6, g_acq_ns / 6e8, g_acq_max / 1e6, g_one_ns / 6e8, g_one_max / 1e6, g_qp_ns / 6e8, g_qp_max / 1e6, g_seg[0] / 6e8, g_seg[1] / 6e8, g_seg[2] / 6e8,
+                    g_seg[3] / 6e8, g_seg[4] / 6e8);
+                memset(g_seg, 0, sizeof g_seg);
+                in0 = frames_in;
+                g_drop_over = g_fence_ns = g_fence_max = g_acq_ns = g_acq_max = g_one_ns = g_one_max = g_qp_ns = g_qp_max = 0;
+            }
+        }
         g_again = again;
         pthread_mutex_unlock(&mu);
         /* The steady rate (host/frame_rate.c): a frame drawn before its slot waits for it here, so frames reach the
@@ -437,10 +501,13 @@ static void *present_thread(void *unused) {
             uint64_t at = g_out[pick].not_before, now = runtime_now_ns();
             if (at > now && at - now < 500000000ull) plat_sleep_until_ns(at);
         }
+        uint64_t tp0 = runtime_now_ns();
+        g_async = 0;
         if (present_one(shown, slot, pick >= 0 ? &g_out[pick] : NULL)) slot = (slot + 1) % FRAMES;
+        if (pick >= 0 && !again) { uint64_t d = runtime_now_ns() - tp0; g_one_ns += d; if (d > g_one_max) g_one_max = d; }
         if (pick >= 0) {
             pthread_mutex_lock(&mu);
-            g_out[pick].state = 0;
+            g_out[pick].state = g_async ? 4 : 0;
             pthread_mutex_unlock(&mu);
         }
     }

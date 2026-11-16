@@ -4195,7 +4195,9 @@ static void uploads_close(VkCommandBuffer *list, int *n) {   // after the prolog
 
 void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the uniform capture; commits
     uint64_t t0 = runtime_now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), f0 = t_fence_wait_ns, lk0 = 0;
-    for (int k = 0; k < LK_COUNT; k++) lk0 += atomic_load(&vkb_lock_wait_ns[k]);
+    uint64_t lk0k[LK_COUNT], pk0[PK_COUNT];   // by kind, for the long-submission line
+    for (int k = 0; k < LK_COUNT; k++) lk0 += lk0k[k] = atomic_load(&vkb_lock_wait_ns[k]);
+    for (int k = 0; k < PK_COUNT; k++) pk0[k] = atomic_load(&vkb_step_ns[k]);
     static uint64_t walk_ns, wall_ns, subs, chunks, said_at, longest_ns, longest_draws, pro_ns, rec_ns, tail_ns;
     static int started;
     if (!started) {
@@ -4312,6 +4314,13 @@ void vkb_mt_submit(const uint64_t *h, int n) {   // after mtl_sub_begin and the 
             char at[160] = "";
             for (int i = 0, o = 0; i < g_part_n && o < (int)sizeof at - 12; i++)
                 o += snprintf(at + o, sizeof at - o, "%s+%.0f", i ? ", " : "", g_part_at[i] / 1e6);
+            double lkd[LK_COUNT], pkd[PK_COUNT];
+            for (int k = 0; k < LK_COUNT; k++) lkd[k] = (atomic_load(&vkb_lock_wait_ns[k]) - lk0k[k]) / 1e6;
+            for (int k = 0; k < PK_COUNT; k++) pkd[k] = (atomic_load(&vkb_step_ns[k]) - pk0[k]) / 1e6;
+            VLOG("long submission %llu: lock waits texture registry %.0f, images %.0f, pools %.0f ms; all threads in new images %.0f, "
+                 "uploads %.0f, upload waits %.0f, slow draws %.0f, memory %.0f, uniform snapshot %.0f, pool sync %.0f, queue submits %.0f ms",
+                 (unsigned long long)g_fence, lkd[LK_TEXREG], lkd[LK_IMAGES], lkd[LK_POOLS], pkd[PK_CREATE], pkd[PK_UPLOAD], pkd[PK_UPWAIT],
+                 pkd[PK_SLOWDRAW], pkd[PK_ALLOC], pkd[PK_UCAP], pkd[PK_SYNC], pkd[PK_SUBMIT]);
             VLOG("long submission %llu: parts sent at %s ms, the rest with the submission at +%.0f ms; parts held back for a full barrier %d",
                  (unsigned long long)g_fence, g_part_n ? at : "(none)", (te - t0) / 1e6, g_part_held_sub);
         }

@@ -21,7 +21,7 @@
     X(vkCreateCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
     X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) \
     X(vkCmdClearColorImage) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdBlitImage) X(vkCmdFillBuffer) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) X(vkDestroyFence) \
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) X(vkDestroyFence) \
     X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) X(vkMapMemory) X(vkUnmapMemory) \
     X(vkAllocateMemory) X(vkFreeMemory) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkBindBufferMemory) \
     X(vkGetBufferMemoryRequirements) X(vkGetMemoryHostPointerPropertiesEXT) X(vkGetBufferDeviceAddress) \
