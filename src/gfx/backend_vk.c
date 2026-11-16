@@ -2214,7 +2214,8 @@ void vkb_passprof_note(const char *key) {   // vkb_draw.c: every draw, with the 
    them. Here every pass of every submission gets a timestamp pair in its slot's range of a query pool (passes are
    recorded on several threads: an index taken atomically per slot); the retire thread, when a submission's GPU time
    is over the threshold, reads them and logs the longest passes and the longest stretch of the submission outside any
-   pass (copies, dispatches, barriers between them). On by default in Debug mode (TOTK_STATS) at 50 ms; 0: off. */
+   pass (copies, dispatches, barriers between them). Only when set (it was on in Debug mode until it was found to cost
+   GPU time itself, hc_ms). */
 enum { HC_PER = 1024 };   // queries per slot: 512 passes a submission (a frame has ~220 over ~4 submissions)
 typedef struct { uint32_t w, h, ncolor, fmt0, depth, draws, worker; char kind, key[16]; } hc_info;   // kind: P pass, D dispatch, F FSR 3.1
 static VkQueryPool g_hcq;
@@ -2225,7 +2226,11 @@ static double hc_ms(void) {
     static double v = -1;
     if (v < 0) {
         const char *e = getenv("TOTK_GPU_HITCH"), *st = getenv("TOTK_STATS");
-        v = e && *e ? atof(e) : st && *st && *st != '0' ? 50 : 0;
+        // Not on with TOTK_STATS any more (2026-11-16): its timestamp pair per pass cost ~35 us a pass on the RTX 3060 -
+        // every 9th frame, where the game filters its environment cube map in 132 tiny passes, 15 instead of 10 ms on
+        // the GPU (the frame rate jumped by 10-20 fps in Debug mode), and ~0.6 ms in the other frames.
+        (void)st;
+        v = e && *e ? atof(e) : 0;
         if (v < 0 || getenv("TOTK_GPU_PASSPROF")) v = 0;
         if (v > 0) VLOG("GPU hitches: the passes of a submission over %.0f ms on the GPU are logged (TOTK_GPU_HITCH; 0 = off)", v);
     }
@@ -2296,7 +2301,13 @@ static int hc_cmp_beg(const void *a, const void *b) {
 // The retire thread, the submission complete: its passes over the threshold. s0: the submission's first timestamp.
 static void hc_check(int slot, uint64_t fence, uint64_t frame, uint64_t s0, uint64_t dur_ns) {
     double lim = hc_ms();
-    if (lim <= 0 || !g_hcq || slot < 0 || dur_ns < lim * 1e6) return;
+    // TOTK_GPU_HITCH_FROM=<frame> (development): from that frame on, the next 40 submissions over 1 ms whatever the
+    // threshold, with 16 entries each - frames in a row, to compare a heavy one with its neighbours (every 9th frame
+    // 15 instead of 10 ms on the GPU at the 120 limit, 2026-11-16)
+    static long long from = -2;
+    if (from == -2) { const char *e = getenv("TOTK_GPU_HITCH_FROM"); from = e && *e ? atoll(e) : -1; }
+    if (lim <= 0 || !g_hcq || slot < 0) return;
+    if (from >= 0 ? frame < (uint64_t)from || dur_ns < 1000000 : dur_ns < lim * 1e6) return;
     static int said;
     if (said >= 40) return;
     said++;
@@ -2340,8 +2351,10 @@ static void hc_check(int slot, uint64_t fence, uint64_t frame, uint64_t s0, uint
     VLOG("GPU hitch: submission %llu (frame %llu) %.1f ms on the GPU: %d passes timed of %d, %.1f ms in passes; longest stretch "
          "outside passes %.1f ms at +%.1f ms (after pass %d, before pass %d)", (unsigned long long)fence, (unsigned long long)frame,
          dur_ns / 1e6, m, n, inpass, gap, gap_at, gap_after, gap_before);
-    qsort(r, (size_t)m, sizeof *r, hc_cmp_dur);
-    for (int k = 0; k < m && k < 8; k++) {
+    static int all = -1;   // TOTK_GPU_HITCH_ALL=1 (development, with _FROM): every entry, in GPU start order
+    if (all < 0) all = getenv("TOTK_GPU_HITCH_ALL") != NULL;
+    if (!(all && from >= 0)) qsort(r, (size_t)m, sizeof *r, hc_cmp_dur);
+    for (int k = 0; k < m && k < (all && from >= 0 ? m : from >= 0 ? 16 : 8); k++) {
         const hc_info *p = &g_hc[slot][(int)r[k][3]];
         if (p->kind == 'P')
             VLOG("  %8.2f ms at +%.1f  #%-3d pass %ux%u  %u colour (fmt %#x) depth %#x  %u draws  fs %s  (recording thread %u)", r[k][0],
