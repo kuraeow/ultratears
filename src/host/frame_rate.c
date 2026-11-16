@@ -6,10 +6,12 @@
  * the game fast above 120 fps), a gap over 0.25 s (loading, a debugger) restarting the average. Changes: our own limit
  * setting and switches, the last interval alone by default (TOTK_STEP_FRAMES below), read by the patched game code as functions.
  *
- * TOTK_FPS_LIMIT: 30 (the shipping code: the game presents every second 60 Hz tick and steps whole ticks), 40, 45, 60
- * (default), 120, 144 or any whole rate from 30 to 240, "display" (the refresh rate of the window's monitor, at most
- * 240) or "unlimited" (240). Above 30 the game may present every tick (fps60) and is stepped by the time frames really take
- * (realtime); our pacer (gfx/nvn/hle_nvn.c present_cfg) holds frames to the limit. [temporary] Above ~63 fps the game
+ * TOTK_FPS_LIMIT: 30, 40, 45, 60 (default), 120, 144 or any whole rate from 30 to 240, "display" (the refresh rate of the
+ * window's monitor, at most 240) or "unlimited" (240). At every limit the game may present every tick (fps60) and is
+ * stepped by the time frames really take (realtime); our pacer (gfx/nvn/hle_nvn.c present_cfg) holds frames to the limit,
+ * and the game's present-interval controller is held to interval 1 (hle_nvn.c nvnWindowSetPresentInterval): its interval
+ * 2 made the game wait inside its own frame and halved the frame rate for seconds at a time (2026-11-16). 30 was the
+ * shipping code (every second 60 Hz tick, whole-tick steps) until then; TOTK_REALTIME=0 still is. [temporary] Above ~63 fps the game
  * has known problems no port has fixed yet (MacNativeGames #1348: the camera turns too fast, Link does not climb
  * steps): such limits are a beta, said in the log.
  * The step is at least 1/240 s and the limit at most 240: with a shorter step 1.4.3
@@ -64,9 +66,9 @@ static void config(void) {
     snprintf(how, sizeof how, g_steps == 1 ? ", game stepped by the last frame's time (at most 1/15 s)"
              : ", game stepped by measured time (%d-frame average, at most 1/15 s)", g_steps);
     LOG("[totk] frame rate: limit %s; %s%s%s\n", lim,
-        g_limit == 30 ? "the shipping code (whole 60 Hz ticks, interval 2)" : "present interval from 1 tick",
+        g_realtime ? "present interval 1 (the game's controller held to it)" : "the game's own present interval",
         g_realtime ? how : ", whole-tick steps (TOTK_REALTIME=0)",
-        g_limit == 30 || g_cloth ? "" : ", cloth clock shipping (TOTK_CLOTH_REALTIME=0)");
+        !g_realtime || g_cloth ? "" : ", cloth clock shipping (TOTK_CLOTH_REALTIME=0)");
     if (g_limit != 30 && !g_realtime) LOG("[totk] [warning] frame rate: without TOTK_REALTIME the game runs fast above 30 fps when frames are shorter than its interval\n");
     if (g_limit == 0 || g_limit == -1 || g_limit > 63)
         LOG("[totk] [beta] frame rate above 60: known game problems remain there (the camera turns too fast, Link may not "
@@ -81,9 +83,9 @@ void totk_fr_reload(void) { g_limit = -2; void nvn_present_reset(void); nvn_pres
 int totk_fr_limit_max(void) { return LIMIT_MAX; }
 
 // Read by the patched game code (tools/lifter/patches.py).
-int totk_fr_fps60(void) { config(); return g_limit != 30; }
+int totk_fr_fps60(void) { config(); return g_realtime || g_limit != 30; }   // (30 without realtime: the shipping code)
 int totk_fr_realtime(void) { config(); return g_realtime; }
-int totk_fr_cloth(void) { config(); return g_cloth && g_limit != 30; }
+int totk_fr_cloth(void) { config(); return g_cloth; }
 int totk_fr_highfps(void) { config(); return g_highfps; }
 float totk_fr_step_seconds(void) { uint32_t u = atomic_load_explicit(&g_step_bits, memory_order_acquire); float s; memcpy(&s, &u, 4); return s; }
 float totk_fr_step_ratio30(void) { return totk_fr_step_seconds() * 30.0f; }

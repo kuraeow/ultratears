@@ -2347,11 +2347,12 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
        deadline, so when the submit was still being translated (most frames) the wait ended with "timeout expired"
        once it was, without the GPU; when it was already translated (used = 0) it waited for the GPU to the end, 8-9 ms,
        and that frame took ~21 ms instead of ~12 (72 of 73 frames over 16.7 ms at the 120 limit, none of 556 others).
-       TOTK_SYNC_WAIT=gpu: the timeout honoured (saturated): always for the GPU; =translated: never for the GPU (the
-       common case of before, every frame); unset: as before. */
+       Default (since 2026-11-16): never for the GPU, the common case of before, every frame (frames over 16.7 ms
+       27.7 -> 0.6 of 300, the same median). TOTK_SYNC_WAIT=gpu: the timeout honoured (saturated): always for the GPU;
+       =old: as before (one or the other). */
     static int mode = -1;
-    if (mode < 0) { const char *e = getenv("TOTK_SYNC_WAIT"); mode = e && !strcmp(e, "gpu") ? 1 : e && !strcmp(e, "translated") ? 2 : 0;
-                    if (mode) LOG("[nvn] sync waits for a submit: %s (TOTK_SYNC_WAIT)", mode == 1 ? "for the GPU, the timeout honoured" : "for its translation only"); }
+    if (mode < 0) { const char *e = getenv("TOTK_SYNC_WAIT"); mode = e && !strcmp(e, "gpu") ? 1 : e && !strcmp(e, "old") ? 0 : 2;
+                    LOG("[nvn] sync waits for a submit: %s (TOTK_SYNC_WAIT)", mode == 1 ? "for the GPU, the timeout honoured" : mode ? "for its translation only" : "as before 2026-11-16 (old)"); }
     if (mode == 2) return mtl_wait(f, 0);
     if (mode == 1) return mtl_wait(f, timeout_ns == UINT64_MAX || timeout_ns - used > UINT64_MAX / 2 ? UINT64_MAX : timeout_ns > used ? timeout_ns - used : 0);
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
@@ -2580,8 +2581,11 @@ void nvn_set_framewait(int on) {
    of 1.2.1): x0 / x20 its state {+0 minimum 2, +4 maximum 3, +0x40 current}, x1 / x19 the system object (+0x118 frame
    work ticks). It calls nvnWindowSetPresentInterval only when the interval changes (return address main+0x2db2ec) and
    after the call stores the chosen interval (x21) to system object +0x88, from which the game steps its time.
-   TOTK_MAX_INTERVAL=<n> (default 2; 0 = the game's own maximum): the highest interval the controller may pick, as
-   SavageWind does for BotW (SAVAGEWIND_MAX_INTERVAL). The game never drops to 20 fps (interval 3) when a frame misses
+   TOTK_MAX_INTERVAL=<n> (default 1 with the real-time step, else 2; 0 = the game's own maximum): the highest interval the
+   controller may pick, as SavageWind does for BotW (SAVAGEWIND_MAX_INTERVAL). Default 1 since 2026-11-16: at interval 2
+   the game waits inside its own frame (frame work 15.6 against 3.2 ms) and runs at 60 fps whatever the limit - 11 times
+   for 2-5 s in a user's 10 minutes at 120; held to 1, 10.7 instead of 16.1 ms a frame (FFFF, limit 120). Our pacer and
+   the real-time step already ignore the interval; only that wait was left of it. The game never drops to 20 fps (interval 3) when a frame misses
    its tick; it keeps stepping its time by the interval it chose, so its speed stays right (a slow frame slows the game
    down instead). A request for more than the maximum at that call is lowered together with the controller's current
    interval and x21, so the time step matches what is presented. */
@@ -2676,7 +2680,7 @@ NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
     Cpu *c = guest_cpu();
     if (c && c->x[30] == FRAME_CONTROLLER_LR) {
         static int max_iv = -1;
-        if (max_iv < 0) { const char *e = getenv("TOTK_MAX_INTERVAL"); max_iv = e && *e ? atoi(e) : 2; LOG("[nvn] present interval limit %d (TOTK_MAX_INTERVAL; 0 = the game's own limit)", max_iv); }
+        if (max_iv < 0) { extern int totk_fr_realtime(void); const char *e = getenv("TOTK_MAX_INTERVAL"); max_iv = e && *e ? atoi(e) : totk_fr_realtime() ? 1 : 2; LOG("[nvn] present interval limit %d (TOTK_MAX_INTERVAL; 0 = the game's own limit)", max_iv); }
         if (!g_frame_ctl) { g_frame_ctl = c->x[20]; if (!g_game_sys) { g_game_sys = c->x[19]; LOG("[nvn] game system object %#llx, interval controller %#llx", (unsigned long long)g_game_sys, (unsigned long long)g_frame_ctl); } }
         uint32_t *ctl = (uint32_t *)(uintptr_t)c->x[20];
         if (max_iv > 0 && ctl[1] > (uint32_t)max_iv) ctl[1] = (uint32_t)max_iv;
@@ -3056,10 +3060,11 @@ static void present_cfg(const win_t *o) {
     /* UltraTears: the frame limit (host/frame_rate.c, TOTK_FPS_LIMIT). Above 30 the game code carries the 60 fps and
        real-time step patches (tools/lifter/patches.py): our own clock paces at the limit (0: no pacing, unlimited),
        one frame per period whatever interval the game chose (the step follows the frames as they take), and the
-       window shows the newest frame. 30 keeps the shipping pacing by the game's interval. */
+       window shows the newest frame. At every limit since 2026-11-16, 30 too; TOTK_REALTIME=0 keeps the shipping
+       pacing by the game's interval. */
     { extern int totk_fr_limit(void), totk_fr_limit_max(void); extern float window_refresh_hz(void);
       int lim = totk_fr_limit();
-      g_uncapped = !e && realtime && lim != 30;
+      g_uncapped = !e && realtime;
       if (g_uncapped) {
           float mon = window_refresh_hz();
           g_hz = lim > 0 ? lim : lim < 0 ? (mon >= 30 ? (int)(mon + 0.5f) : 60) : 0;
