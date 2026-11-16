@@ -769,7 +769,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int tok = (o->fenced & 4) != 0;
     if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = now_ns();   // (a wait that blocks: the long-frame line counts the game's waits for the GPU)
-    totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
+    totk_tl(TL_WAIT_IN, o->fence, (o->fence == mtl_last_fence()) | (timeout / 1000 > (1ull << 40) ? 1ull << 41 : timeout / 1000 << 1));   // b: newest | timeout us << 1
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
     int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
@@ -2342,6 +2342,18 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
     pthread_mutex_unlock(&g_xq_mu);
     if (!ok) return 0;
     uint64_t used = now_ns() - t0;
+    /* T17 (2026-11-16): TotK waits each frame, on a worker thread its main thread then waits for, with the maximum
+       timeout for the frame it has just submitted. The time left here (UINT64_MAX - used) overflows mtl_wait's
+       deadline, so when the submit was still being translated (most frames) the wait ended with "timeout expired"
+       once it was, without the GPU; when it was already translated (used = 0) it waited for the GPU to the end, 8-9 ms,
+       and that frame took ~21 ms instead of ~12 (72 of 73 frames over 16.7 ms at the 120 limit, none of 556 others).
+       TOTK_SYNC_WAIT=gpu: the timeout honoured (saturated): always for the GPU; =translated: never for the GPU (the
+       common case of before, every frame); unset: as before. */
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("TOTK_SYNC_WAIT"); mode = e && !strcmp(e, "gpu") ? 1 : e && !strcmp(e, "translated") ? 2 : 0;
+                    if (mode) LOG("[nvn] sync waits for a submit: %s (TOTK_SYNC_WAIT)", mode == 1 ? "for the GPU, the timeout honoured" : "for its translation only"); }
+    if (mode == 2) return mtl_wait(f, 0);
+    if (mode == 1) return mtl_wait(f, timeout_ns == UINT64_MAX || timeout_ns - used > UINT64_MAX / 2 ? UINT64_MAX : timeout_ns > used ? timeout_ns - used : 0);
     return mtl_wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 
@@ -2544,6 +2556,9 @@ static void game_work_tick(uint64_t frame) {
         const int32_t *k = (const int32_t *)(uintptr_t)nvn_frame_ctl();
         LOG("[nvn] game frame work time (+0x118) through frame %llu: p50 %.2f / p90 %.2f / max %.2f ms (%d frames, %llu total over 33.3 ms); controller range %d..%d current %d",
             (unsigned long long)frame, v[n / 2], v[n * 9 / 10], v[n - 1], n, (unsigned long long)over33, k[0], k[1], k[0x40 / 4]);
+        const uint8_t *b = (const uint8_t *)(uintptr_t)g_game_sys;   // (T17: the frame-end mode on 1.4.3 too)
+        LOG("[nvn] frame-end mode through frame %llu: +0x222=%#x +0x223=%u (1 waits for the previous frame's GPU work each frame) +0x224=%u +0x225=%#x +0xa6=%u +0x50=%d +0x88=%u", (unsigned long long)frame,
+            b[0x222], b[0x223], b[0x224], b[0x225], b[0xa6], *(const int32_t *)(b + 0x50), *(const uint32_t *)(b + 0x88));
         n = 0;
         return;
     }
@@ -2831,6 +2846,9 @@ void nvn_gpu_recent(double *avg, double *p95, unsigned *n) {
     qsort(v, c, sizeof *v, dcmp); *n = c; *avg = c ? s / c : -1; *p95 = c ? v[(c * 95) / 100 < c ? (c * 95) / 100 : c - 1] : -1;
 }
 static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+// frames_ahead_wait over the window (the game thread; T17 of perf/tasks): spinning for the translation thread, waiting
+// for the GPU, frames that waited, and the frames by their whole wait: < 2 ms, 2-5, 5-10, > 10
+static uint64_t g_fa_spin_ns, g_fa_gpu_ns, g_fa_waits, g_fa_frames, g_fa_bucket[4];
 static void tsummary(uint64_t frame) {
     char line[1024]; size_t o = 0;
     for (int k = 0; k < 6; k++) {
@@ -2846,6 +2864,14 @@ static void tsummary(uint64_t frame) {
             "replay of the image's last present %.2f ms, its GPU copy %.2f ms", frame, over, n, hitch, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1],
             g_win_pace_ns / 1e6 / n, g_win_xjob_ns / 1e6 / n, g_win_pq_ns / 1e6 / n);
         g_win_pace_ns = g_win_xjob_ns = g_win_pq_ns = 0;
+        if (g_fa_frames)
+            LOG("[nvn] frames ahead of the GPU through frame %llu: waited %.2f ms a frame for the translation thread (spinning), %.2f ms "
+                "for the GPU, %llu waits in %llu frames; frames by their wait: <2 ms %llu, 2-5 %llu, 5-10 %llu, >10 %llu", frame,
+                g_fa_spin_ns / 1e6 / g_fa_frames, g_fa_gpu_ns / 1e6 / g_fa_frames, (unsigned long long)g_fa_waits,
+                (unsigned long long)g_fa_frames, (unsigned long long)g_fa_bucket[0], (unsigned long long)g_fa_bucket[1],
+                (unsigned long long)g_fa_bucket[2], (unsigned long long)g_fa_bucket[3]);
+        g_fa_spin_ns = g_fa_gpu_ns = g_fa_waits = g_fa_frames = 0;
+        memset(g_fa_bucket, 0, sizeof g_fa_bucket);
         { void runtime_threads_report(unsigned frames); runtime_threads_report(n); } } }   // UltraTears: the guest threads' waits
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
@@ -3156,14 +3182,18 @@ static int max_frames(void) {
 static void frames_ahead_wait(uint64_t frame) {   // the game thread, after queuing frame's present
     int k = max_frames();
     if (!k || frame <= (uint64_t)k) return;
-    uint64_t want = frame - (uint64_t)k, end = now_ns() + 250000000ull;   // a bound: never stuck behind the translation thread
+    uint64_t t0 = now_ns(), want = frame - (uint64_t)k, end = t0 + 250000000ull;   // a bound: never stuck behind the translation thread
     unsigned r = (unsigned)(want % PF_RING);
     while (atomic_load(&g_pf_frame[r]) < want) {   // its present not handled yet (the translation thread is behind)
-        if (now_ns() >= end) return;
+        if (now_ns() >= end) break;
         sched_yield();
     }
     uint64_t f = atomic_load(&g_pf_fence[r]), now = now_ns();
     if (atomic_load(&g_pf_frame[r]) == want && f && now < end) mtl_wait(f, end - now);
+    uint64_t t1 = now_ns(), spin = now - t0, gpu = t1 - now, all = t1 - t0;   // (the frame's line, tsummary)
+    g_fa_spin_ns += spin; g_fa_gpu_ns += gpu; g_fa_frames++;
+    if (all >= 100000) g_fa_waits++;
+    g_fa_bucket[all < 2000000 ? 0 : all < 5000000 ? 1 : all < 10000000 ? 2 : 3]++;
 }
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot) {
     gfx_enter();
