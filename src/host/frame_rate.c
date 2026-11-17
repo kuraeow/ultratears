@@ -208,9 +208,12 @@ static void step_error(double dt) {
     n = 0; sum_dt = sum_step = 0;
 }
 
-// ---- TOTK_CAMERA_NEAR=<metres> (default 1; 0.1 is the game's own): the near plane of the game's cameras. 1.4.3 keeps
-// it in its data at main+0x2d02970 (0.1, then the far plane 25000 and further clip settings: 0.01 0.1 0.01 0.1 0.025),
-// read by every camera and never written. With D32F depth and a near plane of 0.1 the far landscape (1-3 km) lies in
+// ---- TOTK_CAMERA_NEAR=<metres> (development; unset: the game's data stay as they are): the near plane of the player
+// camera. 1.4.3 keeps the defaults of game::camera::PlayerCameraBasicParam at main+0x2d02970 (DefaultNear 0.1, then
+// DefaultFar 25000, CollisionNear 0.01, ...); the camera's parameter files take DefaultNear (Near -1) in every mode but the
+// telescope's, so 0.1 is the game's own near plane. The game's logic reads DefaultNear too: with 1 written here animals
+// near the camera were hidden (GitHub #93), so it is no longer written by default (2026-11-17).
+// History (L27, 2026-11-10, then the default): with D32F depth and a near plane of 0.1 the far landscape (1-3 km) lies in
 // the last ~1e-4 of the depth range, where floats are spaced ~6e-8: the depths of distant terrain, water and the layers
 // drawn on them are rounded into steps of metres, so neighbouring layers tie and a camera turn of 1e-5 rad re-decides
 // them over the whole far view (L27: the distant islands, water edges and horizon shimmer and comb). The game also
@@ -224,8 +227,9 @@ static void camera_near(void) {
     static const float shipped[7] = {0.1f, 25000.0f, 0.01f, 0.1f, 0.01f, 0.1f, 0.025f};
     float *p = (float *)(uintptr_t)(0x800000000ull + 0x2d02970);
     const char *e = getenv("TOTK_CAMERA_NEAR");
-    float want = e && *e ? strtof(e, NULL) : 1.0f;
     done = 1;
+    if (!e || !*e) return;   // the game's own near plane
+    float want = strtof(e, NULL);
     if (!(want > 0.0f && want < 100.0f)) { LOG("[totk] TOTK_CAMERA_NEAR=%s: not a distance in metres, the game's 0.1\n", e); return; }
     if (memcmp(p, shipped, sizeof shipped)) { LOG("[totk] camera near plane: the game's data differ from 1.4.3, left as it is\n"); return; }
     p[0] = want;

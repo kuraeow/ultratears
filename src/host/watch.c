@@ -547,7 +547,7 @@ void runtime_watch_tick(uint64_t present) {
     if (ns_at > 0 && present >= (uint64_t)ns_at && !InterlockedExchange(&hw_used, 1)) {
         ns_at = 0;
         const char *e = getenv("TOTK_CAMERA_NEAR");
-        float nf[2] = {e && *e ? strtof(e, NULL) : 1.0f, 25000.0f}, fn[2] = {nf[1], nf[0]};
+        float nf[2] = {e && *e ? strtof(e, NULL) : 0.1f, 25000.0f}, fn[2] = {nf[1], nf[0]};   // unset: the game's 0.1
         uint64_t at[16];
         int n = 0;
         for (uint64_t a = GUEST_LO; a < GUEST_HI && n < 16;) {
