@@ -8,9 +8,9 @@
 </p>
 
 <p align="center">
-  <a><img alt="Stars" src="https://img.shields.io/github/stars/kuraeow/ultratears?style=flat-square&label=Stars&labelColor=2b2b2b&color=2bbfa4"></a>
-  <a href="https://github.com/kuraeow/ultratears/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/kuraeow/ultratears/total?style=flat-square&label=Downloads&labelColor=2b2b2b&color=2bbfa4"></a>
-  <a href="https://github.com/kuraeow/ultratears/releases/latest"><img alt="Latest" src="https://img.shields.io/github/v/release/kuraeow/ultratears?include_prereleases&sort=semver&style=flat-square&label=Latest&labelColor=2b2b2b&color=2bbfa4"></a>
+  <a><img alt="Stars" src="https://img.shields.io/github/stars/kuraeow/ultratears?style=flat-square&label=Stars&labelColor=2b2b2b&color=08ba7b"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/kuraeow/ultratears/total?style=flat-square&label=Downloads&labelColor=2b2b2b&color=08ba7b"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases/latest"><img alt="Latest" src="https://img.shields.io/github/v/release/kuraeow/ultratears?include_prereleases&sort=semver&style=flat-square&label=Latest&labelColor=2b2b2b&color=08ba7b"></a>
 </p>
 
 # UltraTears
