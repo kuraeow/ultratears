@@ -17,7 +17,7 @@
  * The step is at least 1/240 s and the limit at most 240: with a shorter step 1.4.3
  * aborts with Havok "Out of memory" in the physics pre-solve (main+0x1261630) seconds after some save loads, or crashes
  * reading a body's shape in main+0x1292560 on the Depths load (240-280 Hz monitors).
- * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0: the patches' shipping behaviour, for comparison.
+ * TOTK_REALTIME=0, TOTK_CLOTH_REALTIME=0, TOTK_HIGHFPS_FIX=0, TOTK_CLIMB_FIX=0: the patches' shipping behaviour, for comparison.
  * TOTK_STEP_FRAMES=<1..8> (default 1; MacNativeGames uses 5): present intervals averaged into the step. With a variable
  * refresh display a frame is shown as long as it took, and an average of 5 lags 2-3 frames behind: after slow frames the
  * game kept the long step for a fraction of a second and Link ran visibly faster (user's 165 Hz G-Sync run, 2026-10-31). */
@@ -34,7 +34,7 @@
 enum { STEP_MAX = 8, LIMIT_MAX = 240 };   // LIMIT_MAX: 1 / the shortest step the game survives
 static int g_steps = 5;    // TOTK_STEP_FRAMES: display intervals averaged into the step (5)
 static int g_limit = -2;   // frames per second; 0 unlimited, -1 the monitor's rate; -2 not read yet
-static int g_realtime = 1, g_cloth = 1, g_highfps = 1;
+static int g_realtime = 1, g_cloth = 1, g_highfps = 1, g_climb = 1;
 static _Atomic uint32_t g_step_bits;   // the step in seconds (float bits): what the game steps each frame
 static uint64_t g_last_ns;
 static double g_samples[STEP_MAX];
@@ -58,6 +58,7 @@ static void config(void) {
     g_realtime = !off("TOTK_REALTIME");
     g_cloth = g_realtime && !off("TOTK_CLOTH_REALTIME");
     g_highfps = !off("TOTK_HIGHFPS_FIX");
+    g_climb = g_realtime && !off("TOTK_CLIMB_FIX");   // the climb factor above 60 fps (tools/lifter/patches.py climb)
     { const char *n = getenv("TOTK_STEP_FRAMES"); int v = n ? atoi(n) : 5; g_steps = v >= 1 && v <= STEP_MAX ? v : 5; }
     step_store(g_limit == 30 ? 1.0f / 30.0f : 1.0f / 60.0f);
     char lim[32];
@@ -87,6 +88,7 @@ int totk_fr_fps60(void) { config(); return g_realtime || g_limit != 30; }   // (
 int totk_fr_realtime(void) { config(); return g_realtime; }
 int totk_fr_cloth(void) { config(); return g_cloth; }
 int totk_fr_highfps(void) { config(); return g_highfps; }
+int totk_fr_climb(void) { config(); return g_climb; }
 float totk_fr_step_seconds(void) { uint32_t u = atomic_load_explicit(&g_step_bits, memory_order_acquire); float s; memcpy(&s, &u, 4); return s; }
 float totk_fr_step_ratio30(void) { return totk_fr_step_seconds() * 30.0f; }
 /* TOTK_RT_PROBE=1 (development): the realtime producer site (tools/lifter/patches.py rt_step_ticks, before fmul s8, s0,

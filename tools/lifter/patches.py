@@ -177,6 +177,27 @@ def fade(reg):
     return f
 
 
+# climb (issue #105: ladders, trees and climb-overs slow above 60 fps, Link falling back at the top of a ladder): the
+# climb controller's velocity step (main+0x1f49754, shared by wall and ladder climbing, climb jumps and climb-overs)
+# multiplies the requested velocity by a factor that makes up for a movement loss growing with the frame rate. With the
+# ratio r < 1 (s8: the 30 Hz ratio times the time scale) it is 1.272 + 1.189 (1 - r) clamped to [1, 2]: right at 30 and
+# 60 fps, but flat at 2 from about 77 fps, so Link climbs at ~63% of the speed at 120 fps and ~34% at 240. Above 60 fps
+# the factor continues as g(u) = 0.66265 / u + 0.4982 + 0.0848 u (at most 8; 1.8665 at u = 0.5, the shipping value
+# there), u = max(the measured step's 30 Hz ratio, r): the step without the time scale, so slow motion at 60 fps keeps the
+# shipping factor. 16 max(u - 0.5, 0) is taken off g, which keeps it under the shipping factor from u = 0.5 up: 60 fps and
+# slower climb as shipped. Folded into the clamp that follows (fcmp s0, s1; fcsel ...; then the floor 1.0):
+# s0 = max(s0, g), s1 = max(2, g). TOTK_CLIMB_FIX=0, or no realtime step: the shipping factor.
+def climb(gen, addr):   # fmov s1, #2.0 (the clamp's upper bound)
+    expect(gen, addr, 0x1e201001, 'climb')
+    expect(gen, addr - 0x34, 0xbd400008, 'climb')   # ldr s8, [x0] (the ratio r)
+    return (f'{gen.c_of(0x1e201001, addr)} if ({fr("totk_fr_climb")}) {{ '
+            f'float r_ = {get_s(8)}, q_ = {fr("totk_fr_step_ratio30")}; if (!(q_ >= r_)) q_ = r_; '
+            'if (q_ > 0.0f) { '
+            'float g_ = 0.66265f / q_ + 0.4982f + 0.0848f * q_ - 16.0f * (q_ > 0.5f ? q_ - 0.5f : 0.0f); '
+            f'if (g_ > 8.0f) g_ = 8.0f; float s0_ = {get_s(0)}; '
+            f'if (g_ > s0_) {set_s(0, "g_")} if (g_ > 2.0f) {set_s(1, "g_")} }} }}')
+
+
 # shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
 # main+0x683604 (add w11, w11, #7); the rounded value is the width (+0x3d8) and, through the packed store at +0xf4, the
 # height (+0x3f8). The fixed size goes into w11 just before the rounding.
@@ -316,6 +337,7 @@ PATCHES = {
     MAIN + 0x345904: cloth_inline(0x1e210801, 1, 0, 0x114),    # fmul s1, s0, s1 (factor s0, ratio slot sp+0x114)
     MAIN + 0xa7ac4: fade(8), MAIN + 0x95dd24: fade(8), MAIN + 0x6155e4: fade(10), MAIN + 0x615660: fade(10),
     MAIN + 0x1bd01c8: ability_target_guard,
+    MAIN + 0x1f497f4: climb,
 }
 PRE_PATCHES = {
     MAIN + 0x3e5658: rt_step_ticks,
