@@ -2,6 +2,17 @@
 
 <p align="center"><img src="assets/cover.png" alt="UltraTears" width="100%"></p>
 
+<p align="center">
+  <a href="https://github.com/kuraeow/ultratears/releases/latest"><b>Скачать последнюю версию</b></a> ·
+  <a href="https://x.com/kuraeow">X (@kuraeow)</a>
+</p>
+
+<p align="center">
+  <a><img alt="Звёзды" src="https://img.shields.io/github/stars/kuraeow/ultratears?style=flat-square&label=%D0%97%D0%B2%D1%91%D0%B7%D0%B4%D1%8B&labelColor=2b2b2b&color=2bbfa4"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases"><img alt="Скачивания" src="https://img.shields.io/github/downloads/kuraeow/ultratears/total?style=flat-square&label=%D0%A1%D0%BA%D0%B0%D1%87%D0%B8%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F&labelColor=2b2b2b&color=2bbfa4"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases/latest"><img alt="Последняя версия" src="https://img.shields.io/github/v/release/kuraeow/ultratears?include_prereleases&sort=semver&style=flat-square&label=%D0%92%D0%B5%D1%80%D1%81%D0%B8%D1%8F&labelColor=2b2b2b&color=2bbfa4"></a>
+</p>
+
 # UltraTears
 
 **UltraTears** собирает нативную версию *The Legend of Zelda: Tears of the Kingdom* (версия 1.4.3) для Windows, Linux

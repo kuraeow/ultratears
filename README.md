@@ -2,6 +2,17 @@
 
 <p align="center"><img src="assets/cover.png" alt="UltraTears" width="100%"></p>
 
+<p align="center">
+  <a href="https://github.com/kuraeow/ultratears/releases/latest"><b>Download the latest release</b></a> ·
+  <a href="https://x.com/kuraeow">X (@kuraeow)</a>
+</p>
+
+<p align="center">
+  <a><img alt="Stars" src="https://img.shields.io/github/stars/kuraeow/ultratears?style=flat-square&label=Stars&labelColor=2b2b2b&color=2bbfa4"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/kuraeow/ultratears/total?style=flat-square&label=Downloads&labelColor=2b2b2b&color=2bbfa4"></a>
+  <a href="https://github.com/kuraeow/ultratears/releases/latest"><img alt="Latest" src="https://img.shields.io/github/v/release/kuraeow/ultratears?include_prereleases&sort=semver&style=flat-square&label=Latest&labelColor=2b2b2b&color=2bbfa4"></a>
+</p>
+
 # UltraTears
 
 **UltraTears** builds a native version of *The Legend of Zelda: Tears of the Kingdom* (version 1.4.3) for Windows, Linux
