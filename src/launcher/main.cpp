@@ -41,10 +41,12 @@ static std::string log_open() {
     SDL_SetLogOutputFunction(log_out, nullptr);
     return path;
 }
+static bool g_prepare = false;   // --prepare: nobody to read a message box, the log has it
 static int start_failed(const std::string &log, const char *what) {
     std::string err = std::string(what) + ": " + SDL_GetError();
     SDL_Log("cannot start: %s", err.c_str());
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, TITLE, Tf("start_failed", {{"err", err}, {"log", log}}).c_str(), nullptr);
+    if (!g_prepare)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, TITLE, Tf("start_failed", {{"err", err}, {"log", log}}).c_str(), nullptr);
     return 1;
 }
 
@@ -65,9 +67,11 @@ int main(int argc, char **argv) {
     }
     // --play (Steam's launch option, through the AppImage's AppRun): the graphics prepared, then the game, in its place
     bool play = argc > 1 && !SDL_strcmp(argv[1], "--play");
+    // --prepare --game <dump> (RecompLauncher's setup step): the build, without a window; the dump's folder is argv[3]
+    g_prepare = argc > 3 && !SDL_strcmp(argv[1], "--prepare") && !SDL_strcmp(argv[2], "--game");
     const char *dev_shot = SDL_getenv("ULTRS_LAUNCHER_SHOT");   // development screenshots run beside a real launcher
     if (!(dev_shot && *dev_shot) && !single_instance(TITLE))
-        return 0;
+        return g_prepare ? 4 : 0;   // another launcher is open (maybe building): not a built game
     SDL_SetHint(SDL_HINT_APP_NAME, "UltraTears Launcher");
     // the gamepad too: ImGui's SDL backend opens controllers only with it (the Steam Deck's own controls, any pad)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD))
@@ -109,6 +113,8 @@ int main(int argc, char **argv) {
         ui_demo(demo);
     if (play)
         ui_play_mode();
+    if (g_prepare)
+        ui_prepare_mode(argv[3]);
     int frame = 0;
     bool shown = false;
 
@@ -196,6 +202,8 @@ int main(int argc, char **argv) {
     SDL_DestroyWindow(win);
     SDL_Quit();
     SDL_Log("closed");
+    if (g_prepare)
+        return ui_prepare_code();
     if (play && ui_quit_wanted() && !ui_play_finish())
         return 1;
     return 0;
