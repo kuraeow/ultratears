@@ -1,4 +1,4 @@
-<p align="center"><a href="README.md">English</a> · <b>Русский</b></p>
+<p align="center"><a href="README.md">English</a> · <b>Русский</b> · <a href="README.tr.md">Türkçe</a></p>
 
 <p align="center"><img src="assets/cover.png" alt="UltraTears" width="100%"></p>
 
